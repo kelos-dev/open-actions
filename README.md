@@ -32,6 +32,28 @@ identity and the selected push, pull-request, or merge-group revision fields;
 actions that require other fields from GitHub's raw webhook payload are outside
 the supported execution subset.
 
+## Architecture
+
+![Open Actions architecture and event flow](docs/architecture.drawio.svg)
+
+The manager binary, `open-actions-controller`, serves the GitHub webhook
+endpoint and runs the controllers. A signed webhook delivery is verified,
+deduplicated, and persisted as a delivery-queue ConfigMap before the request
+returns. The delivery controller then discovers and validates workflows through
+the GitHub API and creates one `WorkflowRun` per matching workflow. The
+`WorkflowRun` controller plans jobs and enforces concurrency, creating one
+`WorkflowJob` per planned job. The `Runner` controller assigns each queued
+`WorkflowJob` to an idle `Runner` whose labels cover the job's `runs-on`
+labels, then creates the job-plan ConfigMap, a scoped installation-token
+Secret, and a native `batch/v1` Job. The Job's Pod runs the Go runner, which
+clones the repository and external actions and executes the steps. Status
+propagates back from the native Job through `WorkflowJob` and `WorkflowRun`
+conditions. An `ActionsGateway` holds the GitHub App configuration and
+credentials this flow depends on.
+
+The diagram is an editable [draw.io](https://www.drawio.com/) file at
+[`docs/architecture.drawio.svg`](docs/architecture.drawio.svg).
+
 ## Development
 
 ```console
@@ -118,17 +140,8 @@ Runner job tokens remain restricted to the selected repository with Contents
 read access.
 
 Move repository workflows from `.github/workflows` to
-`.open-actions/workflows`. A webhook delivery then follows this path:
-
-```text
-GitHub webhook
-  -> ConfigMap delivery queue
-    -> WorkflowRun
-      -> WorkflowJob
-        -> matching Runner
-          -> ConfigMap job plan + batch/v1 Job
-            -> Go runner
-```
+`.open-actions/workflows`. A webhook delivery then follows the path shown in
+[Architecture](#architecture).
 
 ## API behavior
 
