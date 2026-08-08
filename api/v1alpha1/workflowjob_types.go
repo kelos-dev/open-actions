@@ -1,0 +1,103 @@
+package v1alpha1
+
+import (
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+)
+
+const (
+	WorkflowJobConditionScheduled = "Scheduled"
+	WorkflowJobConditionSucceeded = "Succeeded"
+)
+
+// WorkflowJobSpec describes one immutable job expanded from a WorkflowRun.
+// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="spec is immutable"
+// +kubebuilder:validation:XValidation:rule="size(self.workflowRunRef.name) > 0",message="`workflowRunRef.name` must be specified"
+// +kubebuilder:validation:XValidation:rule="size(self.workflowRunRef.name) <= 253",message="`workflowRunRef.name` must be no more than 253 characters"
+// +kubebuilder:validation:XValidation:rule="self.workflowRunRef.name.matches('^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?([.][a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?)*$')",message="`workflowRunRef.name` must be a DNS subdomain"
+type WorkflowJobSpec struct {
+	// WorkflowRunRef identifies the owning WorkflowRun in the same namespace.
+	// +required
+	WorkflowRunRef corev1.LocalObjectReference `json:"workflowRunRef"`
+
+	// JobID is the workflow-local identifier of this job.
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=256
+	// +kubebuilder:validation:Pattern=`^[A-Za-z_][A-Za-z0-9_-]*$`
+	// +required
+	JobID string `json:"jobID"`
+
+	// RunsOn contains the canonical lowercase labels requested by the workflow
+	// job. Labels use lowercase ASCII letters, digits, '-', '_' and '.', and
+	// start with a letter or digit. A Runner must contain every label to accept
+	// this job.
+	// +listType=set
+	// +kubebuilder:validation:MinItems=1
+	// +kubebuilder:validation:MaxItems=16
+	// +kubebuilder:validation:items:MinLength=1
+	// +kubebuilder:validation:items:MaxLength=128
+	// +kubebuilder:validation:items:Pattern=`^[a-z0-9][a-z0-9._-]*$`
+	// +required
+	RunsOn []string `json:"runsOn"`
+}
+
+// WorkflowJobStatus contains observations made while executing a workflow job.
+// +kubebuilder:validation:XValidation:rule="!has(oldSelf.runnerRef) || self.runnerRef == oldSelf.runnerRef",message="runnerRef is immutable after assignment"
+// +kubebuilder:validation:XValidation:rule="!has(self.runnerRef) || (size(self.runnerRef.name) > 0 && size(self.runnerRef.name) <= 253 && self.runnerRef.name.matches('^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?([.][a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?)*$'))",message="`runnerRef.name` must be a DNS subdomain"
+type WorkflowJobStatus struct {
+	// ObservedGeneration is the most recent generation observed by the
+	// controller.
+	// +optional
+	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
+
+	// RunnerRef identifies the Runner assigned by the scheduler in the same
+	// namespace. It is set once when the job is scheduled.
+	// +optional
+	RunnerRef *corev1.LocalObjectReference `json:"runnerRef,omitempty"`
+
+	// StartTime is when the native Job started.
+	// +optional
+	StartTime *metav1.Time `json:"startTime,omitempty"`
+
+	// CompletionTime is when execution reached a terminal result.
+	// +optional
+	CompletionTime *metav1.Time `json:"completionTime,omitempty"`
+
+	// Conditions describe Runner assignment and the terminal result. Scheduled
+	// is true after the scheduler assigns status.runnerRef. Known condition types
+	// are Scheduled and Succeeded.
+	// +listType=map
+	// +listMapKey=type
+	// +kubebuilder:validation:MaxItems=16
+	// +optional
+	Conditions []metav1.Condition `json:"conditions,omitempty" patchStrategy:"merge" patchMergeKey:"type"`
+}
+
+// +kubebuilder:object:root=true
+// +kubebuilder:subresource:status
+// +kubebuilder:printcolumn:name="WorkflowRun",type=string,JSONPath=`.spec.workflowRunRef.name`
+// +kubebuilder:printcolumn:name="Runner",type=string,JSONPath=`.status.runnerRef.name`
+// +kubebuilder:printcolumn:name="Scheduled",type=string,JSONPath=`.status.conditions[?(@.type=="Scheduled")].status`
+// +kubebuilder:printcolumn:name="Succeeded",type=string,JSONPath=`.status.conditions[?(@.type=="Succeeded")].status`
+// +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
+
+// WorkflowJob represents one schedulable job expanded from a WorkflowRun.
+type WorkflowJob struct {
+	metav1.TypeMeta   `json:",inline"`
+	metav1.ObjectMeta `json:"metadata,omitempty"`
+
+	// +required
+	Spec WorkflowJobSpec `json:"spec"`
+
+	// +optional
+	Status WorkflowJobStatus `json:"status,omitempty"`
+}
+
+// +kubebuilder:object:root=true
+
+// WorkflowJobList contains WorkflowJob objects.
+type WorkflowJobList struct {
+	metav1.TypeMeta `json:",inline"`
+	metav1.ListMeta `json:"metadata,omitempty"`
+	Items           []WorkflowJob `json:"items"`
+}

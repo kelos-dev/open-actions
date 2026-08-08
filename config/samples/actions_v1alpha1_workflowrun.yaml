@@ -1,0 +1,24 @@
+apiVersion: actions.kelos.dev/v1alpha1
+kind: WorkflowRun
+metadata:
+  name: example-ci-72d3162e
+  namespace: open-actions
+spec:
+  gatewayRef:
+    name: default
+  source:
+    type: GitHub
+    github:
+      repository:
+        id: 123456789
+        owner: example
+        name: project
+      event:
+        name: pull_request
+        action: synchronize
+        deliveryID: 72d3162e-cc78-11e3-81ab-c9367dc0958
+      revision:
+        sha: 0123456789abcdef0123456789abcdef01234567
+        ref: refs/pull/42/merge
+        headRef: feature-branch
+  workflowPath: .open-actions/workflows/ci.yaml

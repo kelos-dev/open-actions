@@ -1,0 +1,71 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened]
+  merge_group:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Build
+        run: make build
+
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Verify
+        run: make verify
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Test
+        run: make test TEST_FLAGS=-race
+
+  test-e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: helm/kind-action@v1
+        with:
+          cluster_name: kind
+      - name: Build images
+        run: make image-e2e VERSION=e2e
+      - name: Load images
+        run: |
+          kind load docker-image ghcr.io/kelos-dev/open-actions-controller:e2e
+          kind load docker-image ghcr.io/kelos-dev/open-actions-runner:e2e
+          kind load docker-image ghcr.io/kelos-dev/open-actions-fixture:e2e
+      - name: End-to-end test
+        env:
+          E2E_PROCS: "4"
+          RUNNER_IMAGE: ghcr.io/kelos-dev/open-actions-runner:e2e
+        run: make test-e2e

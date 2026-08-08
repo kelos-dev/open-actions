@@ -1,0 +1,220 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.20.0
+  name: workflowjobs.actions.kelos.dev
+spec:
+  group: actions.kelos.dev
+  names:
+    kind: WorkflowJob
+    listKind: WorkflowJobList
+    plural: workflowjobs
+    singular: workflowjob
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.workflowRunRef.name
+      name: WorkflowRun
+      type: string
+    - jsonPath: .status.runnerRef.name
+      name: Runner
+      type: string
+    - jsonPath: .status.conditions[?(@.type=="Scheduled")].status
+      name: Scheduled
+      type: string
+    - jsonPath: .status.conditions[?(@.type=="Succeeded")].status
+      name: Succeeded
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: WorkflowJob represents one schedulable job expanded from a WorkflowRun.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: WorkflowJobSpec describes one immutable job expanded from
+              a WorkflowRun.
+            properties:
+              jobID:
+                description: JobID is the workflow-local identifier of this job.
+                maxLength: 256
+                minLength: 1
+                pattern: ^[A-Za-z_][A-Za-z0-9_-]*$
+                type: string
+              runsOn:
+                description: |-
+                  RunsOn contains the canonical lowercase labels requested by the workflow
+                  job. Labels use lowercase ASCII letters, digits, '-', '_' and '.', and
+                  start with a letter or digit. A Runner must contain every label to accept
+                  this job.
+                items:
+                  maxLength: 128
+                  minLength: 1
+                  pattern: ^[a-z0-9][a-z0-9._-]*$
+                  type: string
+                maxItems: 16
+                minItems: 1
+                type: array
+                x-kubernetes-list-type: set
+              workflowRunRef:
+                description: WorkflowRunRef identifies the owning WorkflowRun in the
+                  same namespace.
+                properties:
+                  name:
+                    default: ""
+                    description: |-
+                      Name of the referent.
+                      This field is effectively required, but due to backwards compatibility is
+                      allowed to be empty. Instances of this type with an empty value here are
+                      almost certainly wrong.
+                      More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                    type: string
+                type: object
+                x-kubernetes-map-type: atomic
+            required:
+            - jobID
+            - runsOn
+            - workflowRunRef
+            type: object
+            x-kubernetes-validations:
+            - message: spec is immutable
+              rule: self == oldSelf
+            - message: '`workflowRunRef.name` must be specified'
+              rule: size(self.workflowRunRef.name) > 0
+            - message: '`workflowRunRef.name` must be no more than 253 characters'
+              rule: size(self.workflowRunRef.name) <= 253
+            - message: '`workflowRunRef.name` must be a DNS subdomain'
+              rule: self.workflowRunRef.name.matches('^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?([.][a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?)*$')
+          status:
+            description: WorkflowJobStatus contains observations made while executing
+              a workflow job.
+            properties:
+              completionTime:
+                description: CompletionTime is when execution reached a terminal result.
+                format: date-time
+                type: string
+              conditions:
+                description: |-
+                  Conditions describe Runner assignment and the terminal result. Scheduled
+                  is true after the scheduler assigns status.runnerRef. Known condition types
+                  are Scheduled and Succeeded.
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                maxItems: 16
+                type: array
+                x-kubernetes-list-map-keys:
+                - type
+                x-kubernetes-list-type: map
+              observedGeneration:
+                description: |-
+                  ObservedGeneration is the most recent generation observed by the
+                  controller.
+                format: int64
+                type: integer
+              runnerRef:
+                description: |-
+                  RunnerRef identifies the Runner assigned by the scheduler in the same
+                  namespace. It is set once when the job is scheduled.
+                properties:
+                  name:
+                    default: ""
+                    description: |-
+                      Name of the referent.
+                      This field is effectively required, but due to backwards compatibility is
+                      allowed to be empty. Instances of this type with an empty value here are
+                      almost certainly wrong.
+                      More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                    type: string
+                type: object
+                x-kubernetes-map-type: atomic
+              startTime:
+                description: StartTime is when the native Job started.
+                format: date-time
+                type: string
+            type: object
+            x-kubernetes-validations:
+            - message: runnerRef is immutable after assignment
+              rule: '!has(oldSelf.runnerRef) || self.runnerRef == oldSelf.runnerRef'
+            - message: '`runnerRef.name` must be a DNS subdomain'
+              rule: '!has(self.runnerRef) || (size(self.runnerRef.name) > 0 && size(self.runnerRef.name)
+                <= 253 && self.runnerRef.name.matches(''^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?([.][a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?)*$''))'
+        required:
+        - spec
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}
