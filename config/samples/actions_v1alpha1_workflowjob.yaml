@@ -1,0 +1,12 @@
+# This illustrates the shape of a controller-owned child and is not applied independently.
+apiVersion: actions.kelos.dev/v1alpha1
+kind: WorkflowJob
+metadata:
+  name: example-ci-72d3162e-build
+  namespace: open-actions
+spec:
+  workflowRunRef:
+    name: example-ci-72d3162e
+  jobID: build
+  runsOn:
+    - ubuntu-latest

@@ -1,0 +1,287 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.20.0
+  name: runners.actions.kelos.dev
+spec:
+  group: actions.kelos.dev
+  names:
+    kind: Runner
+    listKind: RunnerList
+    plural: runners
+    singular: runner
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .status.conditions[?(@.type=="Ready")].status
+      name: Ready
+      type: string
+    - jsonPath: .status.conditions[?(@.type=="Busy")].status
+      name: Busy
+      type: string
+    - jsonPath: .status.workflowJobRef.name
+      name: WorkflowJob
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: |-
+          Runner represents one execution agent that accepts one matching WorkflowJob
+          at a time.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: |-
+              RunnerSpec describes one execution agent that accepts one matching
+              WorkflowJob at a time.
+            properties:
+              execution:
+                description: |-
+                  Execution describes the supported configuration of the environment used
+                  to execute assigned WorkflowJobs. The controller owns the underlying Pod
+                  and Job configuration. Changes apply only to Jobs created afterward.
+                properties:
+                  image:
+                    description: |-
+                      Image is a container image whose entrypoint launches the Open Actions
+                      runner.
+                    maxLength: 2048
+                    minLength: 1
+                    pattern: ^[^[:space:]]+$
+                    type: string
+                  resources:
+                    description: Resources describes the compute resources available
+                      to the runner.
+                    properties:
+                      limits:
+                        additionalProperties:
+                          anyOf:
+                          - type: integer
+                          - type: string
+                          pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                          x-kubernetes-int-or-string: true
+                        description: Limits describes the maximum compute resources
+                          available to the runner.
+                        maxProperties: 7
+                        type: object
+                        x-kubernetes-validations:
+                        - message: resource names must be qualified names
+                          rule: self.all(k, size(k.split('/')) <= 2 && size(k.split('/')[size(k.split('/'))
+                            - 1]) <= 63 && k.split('/')[size(k.split('/')) - 1].matches('^[A-Za-z0-9]([-A-Za-z0-9_.]*[A-Za-z0-9])?$')
+                            && (size(k.split('/')) == 1 || (size(k.split('/')[0])
+                            <= 253 && k.split('/')[0].split('.').all(p, size(p) <=
+                            63 && p.matches('^[a-z0-9]([-a-z0-9]*[a-z0-9])?$')))))
+                        - message: unprefixed resource names must be standard container
+                            resources
+                          rule: self.all(k, k == 'cpu' || k == 'memory' || k == 'ephemeral-storage'
+                            || k.startsWith('hugepages-') || k.contains('/'))
+                        - message: resource quantities must not be negative
+                          rule: self.all(k, sign(quantity(string(self[k]))) >= 0)
+                        - message: extended resource quantities must be whole numbers
+                          rule: self.all(k, !k.contains('/') || quantity(string(self[k])).isInteger())
+                      requests:
+                        additionalProperties:
+                          anyOf:
+                          - type: integer
+                          - type: string
+                          pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                          x-kubernetes-int-or-string: true
+                        description: Requests describes the minimum compute resources
+                          reserved for the runner.
+                        maxProperties: 7
+                        type: object
+                        x-kubernetes-validations:
+                        - message: resource names must be qualified names
+                          rule: self.all(k, size(k.split('/')) <= 2 && size(k.split('/')[size(k.split('/'))
+                            - 1]) <= 63 && k.split('/')[size(k.split('/')) - 1].matches('^[A-Za-z0-9]([-A-Za-z0-9_.]*[A-Za-z0-9])?$')
+                            && (size(k.split('/')) == 1 || (size(k.split('/')[0])
+                            <= 253 && k.split('/')[0].split('.').all(p, size(p) <=
+                            63 && p.matches('^[a-z0-9]([-a-z0-9]*[a-z0-9])?$')))))
+                        - message: unprefixed resource names must be standard container
+                            resources
+                          rule: self.all(k, k == 'cpu' || k == 'memory' || k == 'ephemeral-storage'
+                            || k.startsWith('hugepages-') || k.contains('/'))
+                        - message: resource quantities must not be negative
+                          rule: self.all(k, sign(quantity(string(self[k]))) >= 0)
+                        - message: extended resource quantities must be whole numbers
+                          rule: self.all(k, !k.contains('/') || quantity(string(self[k])).isInteger())
+                    type: object
+                    x-kubernetes-validations:
+                    - message: resource requests must not exceed limits
+                      rule: '!has(self.requests) || !has(self.limits) || self.requests.all(k,
+                        !(k in self.limits) || !quantity(string(self.requests[k])).isGreaterThan(quantity(string(self.limits[k]))))'
+                    - message: extended and huge-page resource requests require an
+                        equal limit
+                      rule: '!has(self.requests) || self.requests.all(k, k == ''cpu''
+                        || k == ''memory'' || k == ''ephemeral-storage'' || (has(self.limits)
+                        && k in self.limits && quantity(string(self.requests[k])).compareTo(quantity(string(self.limits[k])))
+                        == 0))'
+                required:
+                - image
+                type: object
+              gatewayRef:
+                description: |-
+                  GatewayRef identifies the ActionsGateway whose WorkflowJobs this Runner
+                  accepts. The gateway must be in the same namespace.
+                properties:
+                  name:
+                    default: ""
+                    description: |-
+                      Name of the referent.
+                      This field is effectively required, but due to backwards compatibility is
+                      allowed to be empty. Instances of this type with an empty value here are
+                      almost certainly wrong.
+                      More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                    type: string
+                type: object
+                x-kubernetes-map-type: atomic
+              labels:
+                description: |-
+                  Labels identify the jobs this Runner can accept. Labels use lowercase ASCII
+                  letters, digits, '-', '_' and '.', and start with a letter or digit. A
+                  WorkflowJob matches only when every requested runs-on label is present.
+                items:
+                  maxLength: 128
+                  minLength: 1
+                  pattern: ^[a-z0-9][a-z0-9._-]*$
+                  type: string
+                maxItems: 64
+                minItems: 1
+                type: array
+                x-kubernetes-list-type: set
+            required:
+            - execution
+            - gatewayRef
+            - labels
+            type: object
+            x-kubernetes-validations:
+            - message: gatewayRef is immutable
+              rule: self.gatewayRef == oldSelf.gatewayRef
+            - message: '`gatewayRef.name` must be specified'
+              rule: size(self.gatewayRef.name) > 0
+            - message: '`gatewayRef.name` must be no more than 253 characters'
+              rule: size(self.gatewayRef.name) <= 253
+            - message: '`gatewayRef.name` must be a DNS subdomain'
+              rule: self.gatewayRef.name.matches('^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?([.][a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?)*$')
+          status:
+            description: RunnerStatus contains observations about one execution agent.
+            properties:
+              conditions:
+                description: |-
+                  Conditions describe whether the Runner is operational and whether it has
+                  an assignment. Ready reports operational health independently of capacity;
+                  Busy is the capacity signal. Known condition types are Ready and Busy.
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                maxItems: 16
+                type: array
+                x-kubernetes-list-map-keys:
+                - type
+                x-kubernetes-list-type: map
+              observedGeneration:
+                description: |-
+                  ObservedGeneration is the most recent generation observed by the
+                  controller.
+                format: int64
+                type: integer
+              workflowJobRef:
+                description: |-
+                  WorkflowJobRef identifies the currently assigned WorkflowJob in the same
+                  namespace. It is unset while the Runner is idle.
+                properties:
+                  name:
+                    default: ""
+                    description: |-
+                      Name of the referent.
+                      This field is effectively required, but due to backwards compatibility is
+                      allowed to be empty. Instances of this type with an empty value here are
+                      almost certainly wrong.
+                      More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                    type: string
+                type: object
+                x-kubernetes-map-type: atomic
+            type: object
+            x-kubernetes-validations:
+            - message: '`workflowJobRef.name` must be a DNS subdomain'
+              rule: '!has(self.workflowJobRef) || (size(self.workflowJobRef.name)
+                > 0 && size(self.workflowJobRef.name) <= 253 && self.workflowJobRef.name.matches(''^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?([.][a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?)*$''))'
+        required:
+        - spec
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

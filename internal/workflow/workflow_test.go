@@ -1,0 +1,448 @@
+package workflow
+
+import (
+	"fmt"
+	"os"
+	"slices"
+	"strings"
+	"testing"
+)
+
+func TestParseCIWorkflow(t *testing.T) {
+	data, err := os.ReadFile("testdata/ci.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	definition, err := Parse(data)
+	if err != nil {
+		t.Fatalf("parse workflow: %v", err)
+	}
+	if len(definition.Jobs) != 3 {
+		t.Fatalf("jobs = %d, want 3", len(definition.Jobs))
+	}
+	for _, id := range []string{"build", "verify", "test"} {
+		if len(definition.Jobs[id].Steps) != 3 {
+			t.Errorf("job %q steps = %d, want 3", id, len(definition.Jobs[id].Steps))
+		}
+	}
+}
+
+func TestParseRejectsTrailingYAMLDocument(t *testing.T) {
+	data := []byte("name: CI\non: push\njobs:\n  build:\n    runs-on: linux\n    steps:\n      - run: true\n---\nname: ignored\n")
+	if _, err := Parse(data); err == nil {
+		t.Fatal("Parse() accepted a trailing YAML document")
+	}
+}
+
+func TestMatches(t *testing.T) {
+	data, err := os.ReadFile("testdata/ci.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	definition, err := Parse(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		name  string
+		event Event
+		want  bool
+	}{
+		{name: "push main", event: Event{Name: "push", Ref: "refs/heads/main", RefName: "main"}, want: true},
+		{name: "push branch", event: Event{Name: "push", Ref: "refs/heads/feature", RefName: "feature"}},
+		{name: "push tag with branch name", event: Event{Name: "push", Ref: "refs/tags/main", RefName: "main"}},
+		{name: "pull request", event: Event{Name: "pull_request", Action: "synchronize", BaseRef: "main"}, want: true},
+		{name: "pull request action", event: Event{Name: "pull_request", Action: "closed", BaseRef: "main"}},
+		{name: "merge group", event: Event{Name: "merge_group", Action: "checks_requested", BaseRef: "main"}, want: true},
+		{name: "merge group destroyed", event: Event{Name: "merge_group", Action: "destroyed", BaseRef: "main"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := Matches(definition.On, tt.event); got != tt.want {
+				t.Errorf("Matches() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestMatchesDefaultMergeGroupTypes(t *testing.T) {
+	definition, err := Parse([]byte("name: CI\non: merge_group\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: make test\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !Matches(definition.On, Event{Name: "merge_group", Action: "checks_requested"}) {
+		t.Error("default merge_group types did not match checks_requested")
+	}
+	if Matches(definition.On, Event{Name: "merge_group", Action: "destroyed"}) {
+		t.Error("default merge_group types matched destroyed")
+	}
+}
+
+func TestMatchesDefaultPullRequestTypes(t *testing.T) {
+	definition, err := Parse([]byte("name: CI\non: pull_request\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: make test\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, action := range []string{"opened", "synchronize", "reopened"} {
+		if !Matches(definition.On, Event{Name: "pull_request", Action: action}) {
+			t.Errorf("default pull_request types did not match %q", action)
+		}
+	}
+	for _, action := range []string{"closed", "labeled"} {
+		if Matches(definition.On, Event{Name: "pull_request", Action: action}) {
+			t.Errorf("default pull_request types matched %q", action)
+		}
+	}
+}
+
+func TestMatchesExplicitPullRequestTypes(t *testing.T) {
+	definition, err := Parse([]byte("name: CI\non:\n  pull_request:\n    types: [closed]\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: make test\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !Matches(definition.On, Event{Name: "pull_request", Action: "closed"}) {
+		t.Error("explicit pull_request type did not match")
+	}
+	if Matches(definition.On, Event{Name: "pull_request", Action: "opened"}) {
+		t.Error("explicit pull_request types used the default activity set")
+	}
+}
+
+func TestParseRejectsEmptyPullRequestTypes(t *testing.T) {
+	data := []byte("name: CI\non:\n  pull_request:\n    types: []\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: make test\n")
+	if _, err := Parse(data); err == nil {
+		t.Fatal("Parse() accepted an empty pull_request activity filter")
+	}
+}
+
+func TestParseRejectsEmptyBranchFilters(t *testing.T) {
+	data := []byte("name: CI\non:\n  push:\n    branches: []\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: make test\n")
+	if _, err := Parse(data); err == nil {
+		t.Fatal("Parse() accepted an empty branch filter")
+	}
+}
+
+func TestParseRejectsConcurrencyWithoutGroup(t *testing.T) {
+	for _, concurrency := range []string{"''", "{}", "{cancel-in-progress: true}"} {
+		t.Run(concurrency, func(t *testing.T) {
+			data := []byte("name: CI\non: push\nconcurrency: " + concurrency + "\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: make test\n")
+			if _, err := Parse(data); err == nil {
+				t.Fatal("Parse() accepted concurrency without a group")
+			}
+		})
+	}
+}
+
+func TestEvaluateConcurrency(t *testing.T) {
+	data, err := os.ReadFile("testdata/ci.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	definition, err := Parse(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	group, cancel, err := EvaluateConcurrency(definition, Event{RefName: "42/merge", HeadRef: "feature"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if group != "CI-feature" || !cancel {
+		t.Errorf("group = %q, cancel = %v", group, cancel)
+	}
+}
+
+func TestEvaluateConcurrencyUsesRefNameFallback(t *testing.T) {
+	definition := &Definition{
+		Name:        "CI",
+		Concurrency: Concurrency{Group: "${{ github.head_ref || github.ref_name }}"},
+	}
+	group, _, err := EvaluateConcurrency(definition, Event{Name: "push", RefName: "main"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if group != "main" {
+		t.Errorf("group = %q, want main", group)
+	}
+}
+
+func TestEvaluateConcurrencyRejectsUnavailableHeadRef(t *testing.T) {
+	for _, tt := range []struct {
+		name  string
+		group string
+		event Event
+	}{
+		{name: "push", group: "${{ github.head_ref }}", event: Event{Name: "push", RefName: "main"}},
+		{name: "prefixed push", group: "deploy-${{ github.head_ref }}", event: Event{Name: "push", RefName: "main"}},
+		{name: "merge group", group: "${{ github.head_ref }}", event: Event{Name: "merge_group", RefName: "gh-readonly-queue/main/pr-1"}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			definition := &Definition{Name: "CI", Concurrency: Concurrency{Group: tt.group}}
+			if _, _, err := EvaluateConcurrency(definition, tt.event); err == nil {
+				t.Fatal("EvaluateConcurrency() accepted unavailable github.head_ref")
+			}
+		})
+	}
+}
+
+func TestParseAcceptsExternalAction(t *testing.T) {
+	definition, err := Parse([]byte("name: CI\non: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: example/action/path@v1\n        with:\n          input: value\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if definition.Jobs["build"].Steps[0].Uses != "example/action/path@v1" {
+		t.Errorf("action = %q", definition.Jobs["build"].Steps[0].Uses)
+	}
+}
+
+func TestParseAcceptsRunsOnLabels(t *testing.T) {
+	definition, err := Parse([]byte("name: CI\non: push\njobs:\n  build:\n    runs-on: [self-hosted, Linux, ARM64]\n    steps:\n      - run: make test\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"self-hosted", "linux", "arm64"}
+	got := []string(definition.Jobs["build"].RunsOn)
+	if !slices.Equal(got, want) {
+		t.Errorf("runs-on = %v, want %v", got, want)
+	}
+}
+
+func TestMatchesGitHubBranchPatterns(t *testing.T) {
+	tests := []struct {
+		name     string
+		patterns []string
+		branch   string
+		want     bool
+	}{
+		{name: "double star spans slash", patterns: []string{"releases/**"}, branch: "releases/beta/1", want: true},
+		{name: "leading globstar matches zero segments", patterns: []string{"**/main"}, branch: "main", want: true},
+		{name: "leading globstar matches nested segments", patterns: []string{"**/main"}, branch: "feature/main", want: true},
+		{name: "middle globstar matches zero segments", patterns: []string{"release/**/stable"}, branch: "release/stable", want: true},
+		{name: "middle globstar matches nested segments", patterns: []string{"release/**/stable"}, branch: "release/candidate/v1/stable", want: true},
+		{name: "single star excludes slash", patterns: []string{"releases/*"}, branch: "releases/beta/1"},
+		{name: "plus repeats prior class", patterns: []string{"v[12].[0-9]+.[0-9]+"}, branch: "v2.10.3", want: true},
+		{name: "question mark makes prior character optional", patterns: []string{"*.jsx?"}, branch: "page.js", want: true},
+		{name: "escaped operator is literal", patterns: []string{`feature\+api`}, branch: "feature+api", want: true},
+		{name: "later negative pattern excludes", patterns: []string{"releases/**", "!releases/**-alpha"}, branch: "releases/beta/3-alpha"},
+		{name: "later positive pattern includes", patterns: []string{"**", "!releases/**", "releases/stable"}, branch: "releases/stable", want: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := matchesBranch(tt.patterns, tt.branch); got != tt.want {
+				t.Errorf("matchesBranch(%v, %q) = %v, want %v", tt.patterns, tt.branch, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestParseAcceptsGitHubJobID(t *testing.T) {
+	definition, err := Parse([]byte("name: CI\non: push\njobs:\n  _Build-1:\n    runs-on: ubuntu-latest\n    steps:\n      - run: make test\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, found := definition.Jobs["_Build-1"]; !found {
+		t.Fatal("valid workflow job ID was not parsed")
+	}
+}
+
+func TestParseRejectsInvalidJobID(t *testing.T) {
+	for _, id := range []string{"1build", "build.test", strings.Repeat("a", maxJobIDLength+1)} {
+		data := fmt.Sprintf("name: CI\non: push\njobs:\n  %s:\n    runs-on: ubuntu-latest\n    steps:\n      - run: make test\n", id)
+		if _, err := Parse([]byte(data)); err == nil {
+			t.Errorf("Parse() accepted workflow job ID %q", id)
+		}
+	}
+}
+
+func TestParseRejectsNonASCIIRunsOnLabel(t *testing.T) {
+	_, err := Parse([]byte("name: CI\non: push\njobs:\n  build:\n    runs-on: [self-hosted, Línux]\n    steps:\n      - run: make test\n"))
+	if err == nil {
+		t.Fatal("non-ASCII runs-on label was accepted")
+	}
+}
+
+func TestParseRejectsInvalidActionReference(t *testing.T) {
+	_, err := Parse([]byte("name: CI\non: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: ./local-action\n"))
+	if err == nil {
+		t.Fatal("Parse() accepted an invalid action reference")
+	}
+}
+
+func TestParseRejectsUnknownField(t *testing.T) {
+	_, err := Parse([]byte("name: CI\non: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    timeout-minutes: 10\n    steps:\n      - run: true\n"))
+	if err == nil {
+		t.Fatal("Parse() accepted an unsupported field")
+	}
+}
+
+func TestParseRejectsUnsupportedWorkflowExpressions(t *testing.T) {
+	tests := []struct {
+		name string
+		job  string
+	}{
+		{name: "job environment", job: "    env:\n      VALUE: '${{ github.sha }}'\n    steps:\n      - run: echo test\n"},
+		{name: "step environment", job: "    steps:\n      - run: echo test\n        env:\n          VALUE: '${{ github.sha }}'\n"},
+		{name: "action input", job: "    steps:\n      - uses: actions/example@v1\n        with:\n          value: '${{ github.sha }}'\n"},
+		{name: "run script", job: "    steps:\n      - run: 'echo ${{ github.sha }}'\n"},
+		{name: "working directory", job: "    steps:\n      - run: echo test\n        working-directory: '${{ github.workspace }}'\n"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			data := []byte("name: CI\non: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n" + tt.job)
+			if _, err := Parse(data); err == nil {
+				t.Fatal("Parse() accepted an unsupported workflow expression")
+			}
+		})
+	}
+}
+
+func TestParseRejectsReservedEnvironmentVariables(t *testing.T) {
+	tests := []string{
+		"    env:\n      GITHUB_SHA: untrusted\n    steps:\n      - run: echo test\n",
+		"    steps:\n      - run: echo test\n        env:\n          runner_os: Other\n",
+	}
+	for _, job := range tests {
+		data := []byte("name: CI\non: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n" + job)
+		if _, err := Parse(data); err == nil {
+			t.Fatal("Parse() accepted a reserved environment variable")
+		}
+	}
+}
+
+func TestParseRejectsUnknownTriggerField(t *testing.T) {
+	_, err := Parse([]byte("name: CI\non:\n  push:\n    branches-ignore: [main]\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo test\n"))
+	if err == nil {
+		t.Fatal("Parse() accepted an unsupported trigger field")
+	}
+}
+
+func TestParseRejectsWithOnRunStep(t *testing.T) {
+	data := []byte("name: CI\non: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo test\n        with:\n          value: ignored\n")
+	if _, err := Parse(data); err == nil {
+		t.Fatal("Parse() accepted with on a run step")
+	}
+}
+
+func TestParseRejectsDuplicateCustomMappingKeys(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		data string
+	}{
+		{
+			name: "trigger event",
+			data: "name: CI\non:\n  push:\n  push:\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo test\n",
+		},
+		{
+			name: "event filter",
+			data: "name: CI\non:\n  push:\n    branches: [main]\n    branches: [feature]\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo test\n",
+		},
+		{
+			name: "concurrency",
+			data: "name: CI\non: push\nconcurrency:\n  group: first\n  group: second\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo test\n",
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if _, err := Parse([]byte(tt.data)); err == nil {
+				t.Fatal("Parse() accepted duplicate mapping keys")
+			}
+		})
+	}
+}
+
+func TestParseRejectsUnsupportedTriggerConfiguration(t *testing.T) {
+	tests := []struct {
+		name    string
+		trigger string
+	}{
+		{name: "event", trigger: "schedule"},
+		{name: "push activity type", trigger: "push:\n    types: [created]"},
+		{name: "pull request activity type", trigger: "pull_request:\n    types: [typo]"},
+		{name: "branch pattern", trigger: "push:\n    branches: ['[invalid']"},
+		{name: "branch quantifier without atom", trigger: "push:\n    branches: ['?invalid']"},
+		{name: "only negative branch patterns", trigger: "push:\n    branches: ['!main']"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			data := []byte("name: CI\non:\n  " + tt.trigger + "\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo test\n")
+			if _, err := Parse(data); err == nil {
+				t.Fatal("Parse() accepted unsupported trigger configuration")
+			}
+		})
+	}
+}
+
+func TestParseNormalizesRunsOnLabels(t *testing.T) {
+	definition, err := Parse([]byte("name: CI\non: push\njobs:\n  build:\n    runs-on: [Self-Hosted, LINUX]\n    steps:\n      - run: make test\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := []string(definition.Jobs["build"].RunsOn); !slices.Equal(got, []string{"self-hosted", "linux"}) {
+		t.Fatalf("normalized runs-on = %v", got)
+	}
+}
+
+func TestParseRejectsNonStringRunsOnLabels(t *testing.T) {
+	for _, runsOn := range []string{"true", "123", "[self-hosted, true]", "[linux, 123]"} {
+		data := []byte("name: CI\non: push\njobs:\n  build:\n    runs-on: " + runsOn + "\n    steps:\n      - run: make test\n")
+		if _, err := Parse(data); err == nil {
+			t.Fatalf("Parse() accepted runs-on: %s", runsOn)
+		}
+	}
+}
+
+func TestParseEnforcesWorkflowConfigurationBounds(t *testing.T) {
+	base := "name: CI\non: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n"
+	tests := []struct {
+		name string
+		data string
+	}{
+		{name: "workflow bytes", data: strings.Repeat("x", maxWorkflowBytes+1)},
+		{name: "steps", data: base + strings.Repeat("      - run: true\n", maxSteps+1)},
+		{name: "run script", data: base + "      - run: " + strings.Repeat("x", maxRunScriptBytes+1) + "\n"},
+		{name: "working directory", data: base + "      - run: true\n        working-directory: " + strings.Repeat("x", maxWorkingDirectoryLength+1) + "\n"},
+		{name: "step name", data: base + "      - name: " + strings.Repeat("x", maxStepNameLength+1) + "\n        run: true\n"},
+		{name: "aggregate job content", data: base + "      - run: " + strings.Repeat("x", 60_000) + "\n      - run: " + strings.Repeat("x", 60_000) + "\n"},
+		{name: "branch patterns", data: workflowWithBranchPatterns(maxBranchPatterns + 1)},
+		{name: "environment entries", data: workflowWithEnvironment(maxMapEntries + 1)},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if _, err := Parse([]byte(tt.data)); err == nil {
+				t.Fatal("Parse() accepted configuration above its documented bound")
+			}
+		})
+	}
+
+	accepted := base + strings.Repeat("      - run: true\n", maxSteps)
+	if _, err := Parse([]byte(accepted)); err != nil {
+		t.Fatalf("Parse() rejected step count at the boundary: %v", err)
+	}
+}
+
+func workflowWithBranchPatterns(count int) string {
+	var builder strings.Builder
+	builder.WriteString("name: CI\non:\n  push:\n    branches:\n")
+	for index := 0; index < count; index++ {
+		fmt.Fprintf(&builder, "      - branch-%d\n", index)
+	}
+	builder.WriteString("jobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: true\n")
+	return builder.String()
+}
+
+func workflowWithEnvironment(count int) string {
+	var builder strings.Builder
+	builder.WriteString("name: CI\non: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    env:\n")
+	for index := 0; index < count; index++ {
+		fmt.Fprintf(&builder, "      KEY_%d: value\n", index)
+	}
+	builder.WriteString("    steps:\n      - run: true\n")
+	return builder.String()
+}
+
+func TestParseRejectsMissingOrLongWorkflowName(t *testing.T) {
+	for _, name := range []string{"", strings.Repeat("n", maxWorkflowNameLength+1)} {
+		data := []byte("name: " + name + "\non: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo test\n")
+		if _, err := Parse(data); err == nil {
+			t.Errorf("Parse() accepted workflow name with %d characters", len(name))
+		}
+	}
+}

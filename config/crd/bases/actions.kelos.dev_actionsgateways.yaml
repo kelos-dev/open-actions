@@ -1,0 +1,284 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.20.0
+  name: actionsgateways.actions.kelos.dev
+spec:
+  group: actions.kelos.dev
+  names:
+    kind: ActionsGateway
+    listKind: ActionsGatewayList
+    plural: actionsgateways
+    singular: actionsgateway
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .status.conditions[?(@.type=="Configured")].status
+      name: Configured
+      type: string
+    - jsonPath: .spec.source.github.installationID
+      name: Installation
+      type: integer
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: |-
+          ActionsGateway configures GitHub webhook authentication and asynchronous
+          workflow discovery.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: ActionsGatewaySpec describes a source gateway for Open Actions.
+            properties:
+              source:
+                description: Source selects and configures the external workflow source.
+                properties:
+                  github:
+                    description: |-
+                      GitHub configures a GitHub App source. Referenced Secrets must be in the
+                      ActionsGateway namespace.
+                    properties:
+                      appID:
+                        description: AppID is the numeric identifier of the GitHub
+                          App.
+                        format: int64
+                        maximum: 9007199254740991
+                        minimum: 1
+                        type: integer
+                      installationID:
+                        description: InstallationID is the GitHub App installation
+                          served by this gateway.
+                        format: int64
+                        maximum: 9007199254740991
+                        minimum: 1
+                        type: integer
+                      privateKeySecretRef:
+                        description: PrivateKeySecretRef selects the PEM-encoded GitHub
+                          App private key.
+                        properties:
+                          key:
+                            description: The key of the secret to select from.  Must
+                              be a valid secret key.
+                            type: string
+                          name:
+                            default: ""
+                            description: |-
+                              Name of the referent.
+                              This field is effectively required, but due to backwards compatibility is
+                              allowed to be empty. Instances of this type with an empty value here are
+                              almost certainly wrong.
+                              More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                            type: string
+                          optional:
+                            description: Specify whether the Secret or its key must
+                              be defined
+                            type: boolean
+                        required:
+                        - key
+                        type: object
+                        x-kubernetes-map-type: atomic
+                      webhookSecretRef:
+                        description: |-
+                          WebhookSecretRef selects the secret used to authenticate GitHub webhook
+                          deliveries.
+                        properties:
+                          key:
+                            description: The key of the secret to select from.  Must
+                              be a valid secret key.
+                            type: string
+                          name:
+                            default: ""
+                            description: |-
+                              Name of the referent.
+                              This field is effectively required, but due to backwards compatibility is
+                              allowed to be empty. Instances of this type with an empty value here are
+                              almost certainly wrong.
+                              More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                            type: string
+                          optional:
+                            description: Specify whether the Secret or its key must
+                              be defined
+                            type: boolean
+                        required:
+                        - key
+                        type: object
+                        x-kubernetes-map-type: atomic
+                    required:
+                    - appID
+                    - installationID
+                    - privateKeySecretRef
+                    - webhookSecretRef
+                    type: object
+                    x-kubernetes-validations:
+                    - message: '`appID` is immutable'
+                      rule: self.appID == oldSelf.appID
+                    - message: '`installationID` is immutable'
+                      rule: self.installationID == oldSelf.installationID
+                    - message: '`privateKeySecretRef.name` must be specified'
+                      rule: size(self.privateKeySecretRef.name) > 0
+                    - message: '`privateKeySecretRef.name` must be no more than 253
+                        characters'
+                      rule: size(self.privateKeySecretRef.name) <= 253
+                    - message: '`privateKeySecretRef.name` must be a DNS subdomain'
+                      rule: self.privateKeySecretRef.name.matches('^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?([.][a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?)*$')
+                    - message: '`privateKeySecretRef.key` must be specified'
+                      rule: size(self.privateKeySecretRef.key) > 0
+                    - message: '`privateKeySecretRef.key` must be no more than 253
+                        characters'
+                      rule: size(self.privateKeySecretRef.key) <= 253
+                    - message: '`privateKeySecretRef.key` must be a valid Secret data
+                        key'
+                      rule: self.privateKeySecretRef.key.matches('^[-._A-Za-z0-9]+$')
+                    - message: '`privateKeySecretRef.optional` may not be true'
+                      rule: '!has(self.privateKeySecretRef.optional) || !self.privateKeySecretRef.optional'
+                    - message: '`webhookSecretRef.name` must be specified'
+                      rule: size(self.webhookSecretRef.name) > 0
+                    - message: '`webhookSecretRef.name` must be no more than 253 characters'
+                      rule: size(self.webhookSecretRef.name) <= 253
+                    - message: '`webhookSecretRef.name` must be a DNS subdomain'
+                      rule: self.webhookSecretRef.name.matches('^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?([.][a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?)*$')
+                    - message: '`webhookSecretRef.key` must be specified'
+                      rule: size(self.webhookSecretRef.key) > 0
+                    - message: '`webhookSecretRef.key` must be no more than 253 characters'
+                      rule: size(self.webhookSecretRef.key) <= 253
+                    - message: '`webhookSecretRef.key` must be a valid Secret data
+                        key'
+                      rule: self.webhookSecretRef.key.matches('^[-._A-Za-z0-9]+$')
+                    - message: '`webhookSecretRef.optional` may not be true'
+                      rule: '!has(self.webhookSecretRef.optional) || !self.webhookSecretRef.optional'
+                  type:
+                    description: Type selects the source configuration variant.
+                    enum:
+                    - GitHub
+                    type: string
+                required:
+                - type
+                type: object
+                x-kubernetes-validations:
+                - message: github must be specified exactly when type is GitHub
+                  rule: 'self.type == ''GitHub'' ? has(self.github) : !has(self.github)'
+                - message: source type is immutable
+                  rule: self.type == oldSelf.type
+              workflowDirectory:
+                default: .open-actions/workflows
+                description: |-
+                  WorkflowDirectory is the repository-relative directory containing workflow
+                  files. The default keeps the files outside GitHub's native workflow path.
+                maxLength: 256
+                minLength: 1
+                type: string
+                x-kubernetes-validations:
+                - message: must be a repository-relative directory without empty or
+                    '.' path segments
+                  rule: '!self.startsWith(''/'') && !self.endsWith(''/'') && !self.contains(''//'')
+                    && self != ''.'' && !self.startsWith(''./'') && !self.contains(''/./'')
+                    && !self.endsWith(''/.'')'
+                - message: must not contain '..' path segments
+                  rule: self != '..' && !self.startsWith('../') && !self.contains('/../')
+                    && !self.endsWith('/..')
+            required:
+            - source
+            type: object
+          status:
+            description: ActionsGatewayStatus contains observations made by the gateway
+              controller.
+            properties:
+              conditions:
+                description: |-
+                  Conditions describe whether the gateway's local configuration is valid.
+                  Configured does not assert that the GitHub App or installation is remotely
+                  reachable. The known condition type is Configured.
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                maxItems: 16
+                type: array
+                x-kubernetes-list-map-keys:
+                - type
+                x-kubernetes-list-type: map
+              observedGeneration:
+                description: |-
+                  ObservedGeneration is the most recent generation observed by the
+                  controller.
+                format: int64
+                type: integer
+            type: object
+        required:
+        - spec
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}
