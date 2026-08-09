@@ -6,3 +6,7 @@ controller:
   githubAPIURL: https://api.github.com/
   githubServerURL: https://github.com
   actionCloneBaseURL: https://github.com
+
+service:
+  type: ClusterIP
+  nodePort: null

@@ -48,6 +48,11 @@ verify:
 	$(HELM) lint $(CHART_DIR)
 	$(HELM) template open-actions $(CHART_DIR) --namespace open-actions-system >/dev/null
 	$(HELM) template open-actions $(CHART_DIR) --namespace open-actions-system --values config/e2e/values.yaml >/dev/null
+	$(HELM) template open-actions $(CHART_DIR) --namespace open-actions-system --set service.type=NodePort --set service.nodePort=30082 >/dev/null
+	@if $(HELM) template open-actions $(CHART_DIR) --namespace open-actions-system --set service.type=ClusterIP --set service.nodePort=30082 >/dev/null 2>&1; then \
+		echo "Helm accepted service.nodePort for a ClusterIP Service" >&2; \
+		exit 1; \
+	fi
 	go vet ./...
 
 test:

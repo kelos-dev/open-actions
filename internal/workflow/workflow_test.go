@@ -27,6 +27,20 @@ func TestParseCIWorkflow(t *testing.T) {
 	}
 }
 
+func TestParseDogfoodCIWorkflow(t *testing.T) {
+	data, err := os.ReadFile("../../.open-actions/workflows/ci.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	definition, err := Parse(data)
+	if err != nil {
+		t.Fatalf("parse dogfood workflow: %v", err)
+	}
+	if len(definition.Jobs) != 3 {
+		t.Fatalf("jobs = %d, want 3", len(definition.Jobs))
+	}
+}
+
 func TestParseRejectsTrailingYAMLDocument(t *testing.T) {
 	data := []byte("name: CI\non: push\njobs:\n  build:\n    runs-on: linux\n    steps:\n      - run: true\n---\nname: ignored\n")
 	if _, err := Parse(data); err == nil {
