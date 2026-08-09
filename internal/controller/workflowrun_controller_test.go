@@ -59,6 +59,36 @@ func TestJobPlanCoversSupportedSteps(t *testing.T) {
 	}
 }
 
+func TestPlanWorkflowJobsSetsDisplayNames(t *testing.T) {
+	reconciler := &WorkflowRunReconciler{}
+	run := &actionsv1alpha1.WorkflowRun{Spec: actionsv1alpha1.WorkflowRunSpec{Source: actionsv1alpha1.WorkflowRunSource{
+		Type: actionsv1alpha1.SourceTypeGitHub,
+		GitHub: &actionsv1alpha1.GitHubWorkflowRunSource{
+			Repository: actionsv1alpha1.GitHubRepository{ID: 1},
+			Event:      actionsv1alpha1.GitHubEvent{Name: "push", DeliveryID: "delivery"},
+			Revision:   actionsv1alpha1.GitRevision{SHA: strings.Repeat("a", 40), Ref: "refs/heads/main"},
+		},
+	}}}
+	definition := &workflow.Definition{Name: "CI", Jobs: map[string]workflow.Job{
+		"build": {Name: "Build and test", RunsOn: workflow.StringList{"ubuntu-latest"}},
+		"lint":  {RunsOn: workflow.StringList{"ubuntu-latest"}},
+	}}
+
+	planned, err := reconciler.planWorkflowJobs(run, definition)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(planned) != 2 {
+		t.Fatalf("planned jobs = %d, want 2", len(planned))
+	}
+	if planned[0].id != "build" || planned[0].displayName != "Build and test" {
+		t.Errorf("build job = %#v", planned[0])
+	}
+	if planned[1].id != "lint" || planned[1].displayName != "lint" {
+		t.Errorf("lint job = %#v", planned[1])
+	}
+}
+
 func TestConcurrencyWaitsForOlderUnevaluatedRun(t *testing.T) {
 	older := concurrencyRun("older", "older", 1, time.Unix(1, 0), "", nil)
 	current := concurrencyRun("current", "current", 1, time.Unix(2, 0), "", nil)
@@ -233,15 +263,97 @@ func TestChildNameIsStableAndBounded(t *testing.T) {
 	}
 }
 
-func TestChildNameSeparatesCollidingJobIDsAndTheirPlans(t *testing.T) {
+func TestWorkflowJobNameIsStableReadableAndBounded(t *testing.T) {
+	runName := "ci-m4z2c6h5t3k7w2n4r6qa"
+	readable := workflowJobName(runName, "build")
+	if !strings.HasPrefix(readable, "ci-m4z2c6h5t3k7w2n4r6qa-build-") {
+		t.Errorf("readable child name = %q", readable)
+	}
+	if len(readable) > 63 {
+		t.Errorf("name has %d characters", len(readable))
+	}
+	if readable != workflowJobName(runName, "build") {
+		t.Error("name is not stable")
+	}
+}
+
+func TestWorkflowJobNameSeparatesCollidingJobIDs(t *testing.T) {
 	runName := strings.Repeat("workflow", 8)
-	first := childName(runName, "job_1230")
-	second := childName(runName, "job_103711")
+	first := workflowJobName(runName, "build_test")
+	second := workflowJobName(runName, "build-test")
 	if first == second {
 		t.Fatalf("colliding job IDs produced %q", first)
 	}
-	if childName(first, "plan") == childName(second, "plan") {
-		t.Fatal("distinct jobs produced the same plan name")
+}
+
+func TestEnsureWorkflowJobsCreatesReadableNames(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := actionsv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	run := &actionsv1alpha1.WorkflowRun{ObjectMeta: metav1.ObjectMeta{Name: "ci-m4z2c6h5t3k7w2n4r6qa", Namespace: "default", UID: "run-uid"}}
+	project := &actionsv1alpha1.Project{ObjectMeta: metav1.ObjectMeta{Name: "project", Namespace: "default", UID: "project-uid"}}
+	clusterClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(run, project).Build()
+	reconciler := &WorkflowRunReconciler{Client: clusterClient, APIReader: clusterClient}
+
+	if err := reconciler.ensureWorkflowJobs(context.Background(), run, project, []plannedWorkflowJob{{
+		id: "build", displayName: "Build and test", runsOn: []string{"linux"}, plan: "{}",
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	jobs := &actionsv1alpha1.WorkflowJobList{}
+	if err := clusterClient.List(context.Background(), jobs); err != nil {
+		t.Fatal(err)
+	}
+	if len(jobs.Items) != 1 {
+		t.Fatalf("WorkflowJobs = %d, want 1", len(jobs.Items))
+	}
+	job := &jobs.Items[0]
+	if job.Name != workflowJobName(run.Name, "build") || job.Spec.DisplayName != "Build and test" {
+		t.Errorf("WorkflowJob = %#v", job)
+	}
+}
+
+func TestEnsureWorkflowJobsAdoptsExistingName(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := actionsv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	run := &actionsv1alpha1.WorkflowRun{ObjectMeta: metav1.ObjectMeta{Name: "ci", Namespace: "default", UID: "run-uid"}}
+	project := &actionsv1alpha1.Project{ObjectMeta: metav1.ObjectMeta{Name: "project", Namespace: "default", UID: "project-uid"}}
+	existing := &actionsv1alpha1.WorkflowJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: childName(run.Name, "build"), Namespace: run.Namespace,
+			Labels:      workflowJobLabels(run, project, "build"),
+			Annotations: map[string]string{actionsv1alpha1.AnnotationProjectName: project.Name},
+		},
+		Spec: actionsv1alpha1.WorkflowJobSpec{
+			WorkflowRunRef: corev1.LocalObjectReference{Name: run.Name}, JobID: "build", RunsOn: []string{"linux"},
+		},
+	}
+	if err := controllerutil.SetControllerReference(run, existing, scheme); err != nil {
+		t.Fatal(err)
+	}
+	clusterClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(run, project, existing).Build()
+	reconciler := &WorkflowRunReconciler{Client: clusterClient, APIReader: clusterClient}
+
+	if err := reconciler.ensureWorkflowJobs(context.Background(), run, project, []plannedWorkflowJob{{
+		id: "build", displayName: "Build and test", runsOn: []string{"linux"}, plan: "{}",
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	jobs := &actionsv1alpha1.WorkflowJobList{}
+	if err := clusterClient.List(context.Background(), jobs); err != nil {
+		t.Fatal(err)
+	}
+	if len(jobs.Items) != 1 || jobs.Items[0].Name != existing.Name {
+		t.Fatalf("WorkflowJobs = %#v", jobs.Items)
 	}
 }
 
@@ -263,6 +375,7 @@ func TestWorkflowJobIdentityRequiresOwnerSpecAndLabels(t *testing.T) {
 		Spec: actionsv1alpha1.WorkflowJobSpec{
 			WorkflowRunRef: corev1.LocalObjectReference{Name: run.Name},
 			JobID:          "build",
+			DisplayName:    "Build and test",
 			RunsOn:         []string{"linux"},
 		},
 	}
@@ -273,6 +386,15 @@ func TestWorkflowJobIdentityRequiresOwnerSpecAndLabels(t *testing.T) {
 	if !workflowJobIdentityMatches(existing, desired, run) {
 		t.Fatal("matching WorkflowJob identity was rejected")
 	}
+	existing.Spec.DisplayName = ""
+	if !workflowJobIdentityMatches(existing, desired, run) {
+		t.Fatal("WorkflowJob created before display names was rejected")
+	}
+	existing.Spec.DisplayName = "Release"
+	if workflowJobIdentityMatches(existing, desired, run) {
+		t.Fatal("mismatched WorkflowJob display name was accepted")
+	}
+	existing = desired.DeepCopy()
 	existing.Spec.JobID = "release"
 	if workflowJobIdentityMatches(existing, desired, run) {
 		t.Fatal("mismatched WorkflowJob spec was accepted")

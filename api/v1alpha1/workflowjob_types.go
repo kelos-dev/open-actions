@@ -27,6 +27,13 @@ type WorkflowJobSpec struct {
 	// +required
 	JobID string `json:"jobID"`
 
+	// DisplayName is the user-facing name of the workflow job. The controller
+	// uses JobID when the workflow does not specify a name.
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=256
+	// +optional
+	DisplayName string `json:"displayName,omitempty"`
+
 	// RunsOn contains the canonical lowercase labels requested by the workflow
 	// job. Labels use lowercase ASCII letters, digits, '-', '_' and '.', and
 	// start with a letter or digit. A Runner must contain every label to accept
@@ -76,11 +83,13 @@ type WorkflowJobStatus struct {
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
 // +kubebuilder:metadata:annotations=helm.sh/resource-policy=keep
+// +kubebuilder:printcolumn:name="Job",type=string,JSONPath=`.spec.displayName`
 // +kubebuilder:printcolumn:name="WorkflowRun",type=string,JSONPath=`.spec.workflowRunRef.name`
 // +kubebuilder:printcolumn:name="Runner",type=string,JSONPath=`.status.runnerRef.name`
 // +kubebuilder:printcolumn:name="Scheduled",type=string,JSONPath=`.status.conditions[?(@.type=="Scheduled")].status`
 // +kubebuilder:printcolumn:name="Succeeded",type=string,JSONPath=`.status.conditions[?(@.type=="Succeeded")].status`
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
+// +kubebuilder:printcolumn:name="JobID",type=string,JSONPath=`.spec.jobID`,priority=1
 
 // WorkflowJob represents one schedulable job expanded from a WorkflowRun.
 type WorkflowJob struct {

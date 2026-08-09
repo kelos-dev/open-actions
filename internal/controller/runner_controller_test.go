@@ -46,7 +46,7 @@ func TestRunnerBuildsOwnedJob(t *testing.T) {
 			UID:       types.UID("workflow-job-uid"),
 			Labels:    map[string]string{actionsv1alpha1.LabelWorkflowJob: "build"},
 		},
-		Spec: actionsv1alpha1.WorkflowJobSpec{JobID: "build"},
+		Spec: actionsv1alpha1.WorkflowJobSpec{JobID: "build", DisplayName: "Build and test"},
 	}
 	job, err := reconciler.buildJob(workflowJob, run, project, runnerObject)
 	if err != nil {
@@ -64,6 +64,10 @@ func TestRunnerBuildsOwnedJob(t *testing.T) {
 	}
 	if job.Labels[actionsv1alpha1.LabelWorkflowJob] != "build" {
 		t.Errorf("workflow job label = %q", job.Labels[actionsv1alpha1.LabelWorkflowJob])
+	}
+	if job.Annotations[actionsv1alpha1.AnnotationWorkflowJobDisplayName] != "Build and test" ||
+		job.Spec.Template.Annotations[actionsv1alpha1.AnnotationWorkflowJobDisplayName] != "Build and test" {
+		t.Errorf("workflow job display name annotations = job %q, pod %q", job.Annotations[actionsv1alpha1.AnnotationWorkflowJobDisplayName], job.Spec.Template.Annotations[actionsv1alpha1.AnnotationWorkflowJobDisplayName])
 	}
 	if len(job.OwnerReferences) != 1 || job.OwnerReferences[0].UID != workflowJob.UID {
 		t.Errorf("owner references = %#v", job.OwnerReferences)

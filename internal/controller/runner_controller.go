@@ -571,6 +571,9 @@ func (r *RunnerReconciler) buildJob(workflowJob *actionsv1alpha1.WorkflowJob, ru
 		actionsv1alpha1.AnnotationWorkflowJobID: workflowJob.Spec.JobID,
 		actionsv1alpha1.AnnotationRunnerName:    runnerObject.Name,
 	}
+	if workflowJob.Spec.DisplayName != "" {
+		annotations[actionsv1alpha1.AnnotationWorkflowJobDisplayName] = workflowJob.Spec.DisplayName
+	}
 	podTemplate := corev1.PodTemplateSpec{
 		ObjectMeta: metav1.ObjectMeta{Labels: labels, Annotations: annotations},
 		Spec: corev1.PodSpec{

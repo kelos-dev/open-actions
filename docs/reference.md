@@ -87,11 +87,23 @@ Child resources carry `actions.kelos.dev/project-uid`, `runner-uid`,
 `workflow-run-uid`, and `workflow-job-uid` labels where applicable. The
 `actions.kelos.dev/workflow-job` label contains the workflow job ID when it is a
 valid Kubernetes label value, or the full SHA-256 digest encoded as lowercase
-unpadded base32 otherwise. The original job ID and assigned runner name remain
-available through `actions.kelos.dev/workflow-job-id` and
-`actions.kelos.dev/runner-name` annotations. Queued jobs record their project
-name in the `actions.kelos.dev/project-name` annotation so a recreated project
-can be distinguished from the original object.
+unpadded base32 otherwise. The original job ID, user-facing job display name,
+and assigned runner name remain available through
+`actions.kelos.dev/workflow-job-id`,
+`actions.kelos.dev/workflow-job-display-name`, and
+`actions.kelos.dev/runner-name` annotations. The workflow job display name is
+the user-facing `jobs.<id>.name` value, or the job ID when no name is
+configured. Queued jobs record their project name in the
+`actions.kelos.dev/project-name` annotation so a recreated project can be
+distinguished from the original object.
+
+Webhook-created WorkflowRuns use the workflow filename followed by a stable
+20-character digest of the project, delivery replay, and workflow path.
+WorkflowJobs and their native Jobs append the workflow job ID and a stable
+16-character digest. Readable portions are truncated as needed to keep names
+within the 63-character Kubernetes limit; retries of the same delivery reuse
+the same names, while different signed payloads create distinct runs. The full
+replay-and-path digest form is also recognized as an idempotency alias.
 
 ## Workflow API
 
