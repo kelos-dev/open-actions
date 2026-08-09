@@ -167,7 +167,7 @@ jobs:
           trap 'rm -f "$KEY_FILE"' EXIT
           printf '%s' "${OPEN_ACTIONS_GITHUB_APP_PRIVATE_KEY}" > "${KEY_FILE}"
           kubectl create secret generic open-actions-github-app \
-            --namespace open-actions-system \
+            --namespace default \
             --from-file=private-key.pem="${KEY_FILE}" \
             --from-literal=webhook-secret="${OPEN_ACTIONS_WEBHOOK_SECRET}" \
             --dry-run=client -o yaml \
@@ -178,7 +178,7 @@ jobs:
           kind: Project
           metadata:
             name: default
-            namespace: open-actions-system
+            namespace: default
           spec:
             source:
               type: GitHub
@@ -199,7 +199,7 @@ jobs:
           kind: Runner
           metadata:
             name: ${runner}
-            namespace: open-actions-system
+            namespace: default
           spec:
             projectRef:
               name: default
