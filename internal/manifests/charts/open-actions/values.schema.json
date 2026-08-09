@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["controller"],
+  "properties": {
+    "controller": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["image", "githubAPIURL", "githubServerURL", "actionCloneBaseURL"],
+      "properties": {
+        "image": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["repository", "tag", "pullPolicy"],
+          "properties": {
+            "repository": {"type": "string", "minLength": 1, "maxLength": 512},
+            "tag": {"type": "string", "minLength": 1, "maxLength": 128},
+            "pullPolicy": {
+              "type": "string",
+              "enum": ["Always", "IfNotPresent", "Never"]
+            }
+          }
+        },
+        "githubAPIURL": {"type": "string", "minLength": 1, "maxLength": 2048},
+        "githubServerURL": {"type": "string", "minLength": 1, "maxLength": 2048},
+        "actionCloneBaseURL": {"type": "string", "minLength": 1, "maxLength": 2048}
+      }
+    }
+  }
+}
