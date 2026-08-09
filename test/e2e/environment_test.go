@@ -116,7 +116,7 @@ var _ = ReportAfterEach(func(report SpecReport) {
 		return
 	}
 	for _, arguments := range [][]string{
-		{"get", "actionsgateways,runners,workflowruns,workflowjobs,jobs,pods", "-A", "-o", "wide"},
+		{"get", "projects,runners,workflowruns,workflowjobs,jobs,pods", "-A", "-o", "wide"},
 		{"get", "runners,workflowruns,workflowjobs,jobs,pods", "--namespace", e2eNamespace, "-o", "yaml"},
 		{"logs", "--namespace", e2eNamespace, "--all-containers=true", "--prefix=true", "--selector", "actions.kelos.dev/workflow-run-uid"},
 		{"logs", "--namespace", "open-actions-system", "deployment/open-actions-controller", "--tail=200"},
@@ -157,10 +157,10 @@ func setupControlPlane(withRunner bool) {
 				"webhook-secret":  []byte(webhookSecret),
 			},
 		},
-		&actionsv1alpha1.ActionsGateway{
+		&actionsv1alpha1.Project{
 			ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: e2eNamespace},
-			Spec: actionsv1alpha1.ActionsGatewaySpec{
-				Source: actionsv1alpha1.ActionsGatewaySource{
+			Spec: actionsv1alpha1.ProjectSpec{
+				Source: actionsv1alpha1.ProjectSource{
 					Type: actionsv1alpha1.SourceTypeGitHub,
 					GitHub: &actionsv1alpha1.GitHubAppConfiguration{
 						AppID:          12345,
@@ -187,7 +187,7 @@ func setupControlPlane(withRunner bool) {
 		objects = append(objects, &actionsv1alpha1.Runner{
 			ObjectMeta: metav1.ObjectMeta{Name: "runner-1", Namespace: e2eNamespace},
 			Spec: actionsv1alpha1.RunnerSpec{
-				GatewayRef: corev1.LocalObjectReference{Name: "default"},
+				ProjectRef: corev1.LocalObjectReference{Name: "default"},
 				Execution: actionsv1alpha1.RunnerExecutionSpec{
 					Image: runnerImage,
 					Resources: &actionsv1alpha1.RunnerResources{
@@ -210,9 +210,9 @@ func setupControlPlane(withRunner bool) {
 	}
 
 	Eventually(func(g Gomega) {
-		gateway := &actionsv1alpha1.ActionsGateway{}
-		g.Expect(clusterClient.Get(ctx, client.ObjectKey{Namespace: e2eNamespace, Name: "default"}, gateway)).To(Succeed())
-		condition := meta.FindStatusCondition(gateway.Status.Conditions, actionsv1alpha1.ActionsGatewayConditionConfigured)
+		project := &actionsv1alpha1.Project{}
+		g.Expect(clusterClient.Get(ctx, client.ObjectKey{Namespace: e2eNamespace, Name: "default"}, project)).To(Succeed())
+		condition := meta.FindStatusCondition(project.Status.Conditions, actionsv1alpha1.ProjectConditionConfigured)
 		g.Expect(condition).NotTo(BeNil())
 		if condition != nil {
 			g.Expect(condition.Status).To(Equal(metav1.ConditionTrue), condition.Message)

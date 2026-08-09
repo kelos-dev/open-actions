@@ -110,16 +110,16 @@ func TestCRDConventions(t *testing.T) {
 		immutable    bool
 	}{
 		{
-			file:         "actions.kelos.dev_actionsgateways.yaml",
-			sample:       "actions_v1alpha1_actionsgateway.yaml",
-			kind:         "ActionsGateway",
+			file:         "actions.kelos.dev_projects.yaml",
+			sample:       "actions_v1alpha1_project.yaml",
+			kind:         "Project",
 			requiredSpec: []string{"source"},
 		},
 		{
 			file:         "actions.kelos.dev_runners.yaml",
 			sample:       "actions_v1alpha1_runner.yaml",
 			kind:         "Runner",
-			requiredSpec: []string{"execution", "gatewayRef", "labels"},
+			requiredSpec: []string{"execution", "projectRef", "labels"},
 		},
 		{
 			file:         "actions.kelos.dev_workflowjobs.yaml",
@@ -132,7 +132,7 @@ func TestCRDConventions(t *testing.T) {
 			file:         "actions.kelos.dev_workflowruns.yaml",
 			sample:       "actions_v1alpha1_workflowrun.yaml",
 			kind:         "WorkflowRun",
-			requiredSpec: []string{"gatewayRef", "source", "workflowPath"},
+			requiredSpec: []string{"projectRef", "source", "workflowPath"},
 			immutable:    true,
 		},
 	}
@@ -206,32 +206,32 @@ func TestCRDRejectsInvalidCELValues(t *testing.T) {
 		mutate func(map[string]any)
 	}{
 		{
-			name: "ActionsGateway secret reference with empty DNS label",
-			crd:  "actions.kelos.dev_actionsgateways.yaml", sample: "actions_v1alpha1_actionsgateway.yaml",
+			name: "Project secret reference with empty DNS label",
+			crd:  "actions.kelos.dev_projects.yaml", sample: "actions_v1alpha1_project.yaml",
 			mutate: func(object map[string]any) {
 				github := object["spec"].(map[string]any)["source"].(map[string]any)["github"].(map[string]any)
 				github["privateKeySecretRef"].(map[string]any)["name"] = "invalid..name"
 			},
 		},
 		{
-			name: "ActionsGateway source missing selected variant",
-			crd:  "actions.kelos.dev_actionsgateways.yaml", sample: "actions_v1alpha1_actionsgateway.yaml",
+			name: "Project source missing selected variant",
+			crd:  "actions.kelos.dev_projects.yaml", sample: "actions_v1alpha1_project.yaml",
 			mutate: func(object map[string]any) {
 				delete(object["spec"].(map[string]any)["source"].(map[string]any), "github")
 			},
 		},
 		{
-			name: "ActionsGateway workflow directory with trailing slash",
-			crd:  "actions.kelos.dev_actionsgateways.yaml", sample: "actions_v1alpha1_actionsgateway.yaml",
+			name: "Project workflow directory with trailing slash",
+			crd:  "actions.kelos.dev_projects.yaml", sample: "actions_v1alpha1_project.yaml",
 			mutate: func(object map[string]any) {
 				object["spec"].(map[string]any)["workflowDirectory"] = ".open-actions/workflows/"
 			},
 		},
 		{
-			name: "Runner gateway reference with long DNS label",
+			name: "Runner project reference with long DNS label",
 			crd:  "actions.kelos.dev_runners.yaml", sample: "actions_v1alpha1_runner.yaml",
 			mutate: func(object map[string]any) {
-				object["spec"].(map[string]any)["gatewayRef"].(map[string]any)["name"] = strings.Repeat("a", 64) + ".valid"
+				object["spec"].(map[string]any)["projectRef"].(map[string]any)["name"] = strings.Repeat("a", 64) + ".valid"
 			},
 		},
 		{
@@ -350,7 +350,7 @@ func TestCRDRejectsInvalidCELValues(t *testing.T) {
 			name: "WorkflowRun reference with empty DNS label",
 			crd:  "actions.kelos.dev_workflowruns.yaml", sample: "actions_v1alpha1_workflowrun.yaml",
 			mutate: func(object map[string]any) {
-				object["spec"].(map[string]any)["gatewayRef"].(map[string]any)["name"] = "invalid..name"
+				object["spec"].(map[string]any)["projectRef"].(map[string]any)["name"] = "invalid..name"
 			},
 		},
 		{

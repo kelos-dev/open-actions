@@ -4,14 +4,14 @@ kind: CustomResourceDefinition
 metadata:
   annotations:
     controller-gen.kubebuilder.io/version: v0.20.0
-  name: actionsgateways.actions.kelos.dev
+  name: projects.actions.kelos.dev
 spec:
   group: actions.kelos.dev
   names:
-    kind: ActionsGateway
-    listKind: ActionsGatewayList
-    plural: actionsgateways
-    singular: actionsgateway
+    kind: Project
+    listKind: ProjectList
+    plural: projects
+    singular: project
   scope: Namespaced
   versions:
   - additionalPrinterColumns:
@@ -28,8 +28,8 @@ spec:
     schema:
       openAPIV3Schema:
         description: |-
-          ActionsGateway configures GitHub webhook authentication and asynchronous
-          workflow discovery.
+          Project defines an isolated Open Actions execution domain backed by an
+          external workflow source.
         properties:
           apiVersion:
             description: |-
@@ -49,7 +49,8 @@ spec:
           metadata:
             type: object
           spec:
-            description: ActionsGatewaySpec describes a source gateway for Open Actions.
+            description: ProjectSpec describes the workflow source for an Open Actions
+              Project.
             properties:
               source:
                 description: Source selects and configures the external workflow source.
@@ -57,7 +58,7 @@ spec:
                   github:
                     description: |-
                       GitHub configures a GitHub App source. Referenced Secrets must be in the
-                      ActionsGateway namespace.
+                      Project namespace.
                     properties:
                       appID:
                         description: AppID is the numeric identifier of the GitHub
@@ -68,7 +69,7 @@ spec:
                         type: integer
                       installationID:
                         description: InstallationID is the GitHub App installation
-                          served by this gateway.
+                          associated with this Project.
                         format: int64
                         maximum: 9007199254740991
                         minimum: 1
@@ -201,12 +202,11 @@ spec:
             - source
             type: object
           status:
-            description: ActionsGatewayStatus contains observations made by the gateway
-              controller.
+            description: ProjectStatus contains observations made by the project controller.
             properties:
               conditions:
                 description: |-
-                  Conditions describe whether the gateway's local configuration is valid.
+                  Conditions describe whether the project's local configuration is valid.
                   Configured does not assert that the GitHub App or installation is remotely
                   reachable. The known condition type is Configured.
                 items:

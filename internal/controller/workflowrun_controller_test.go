@@ -195,7 +195,7 @@ func concurrencyRun(name string, uid types.UID, repositoryID int64, created time
 	run := &actionsv1alpha1.WorkflowRun{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default", UID: uid, CreationTimestamp: metav1.NewTime(created)},
 		Spec: actionsv1alpha1.WorkflowRunSpec{
-			GatewayRef: corev1.LocalObjectReference{Name: "gateway"},
+			ProjectRef: corev1.LocalObjectReference{Name: "project"},
 			Source: actionsv1alpha1.WorkflowRunSource{
 				Type:   actionsv1alpha1.SourceTypeGitHub,
 				GitHub: &actionsv1alpha1.GitHubWorkflowRunSource{Repository: actionsv1alpha1.GitHubRepository{ID: repositoryID}},
@@ -256,7 +256,7 @@ func TestWorkflowJobIdentityRequiresOwnerSpecAndLabels(t *testing.T) {
 	}
 	desired := &actionsv1alpha1.WorkflowJob{
 		ObjectMeta: metav1.ObjectMeta{Name: "build", Namespace: "default", Labels: map[string]string{
-			actionsv1alpha1.LabelGatewayUID:     "gateway-uid",
+			actionsv1alpha1.LabelProjectUID:     "project-uid",
 			actionsv1alpha1.LabelWorkflowRunUID: string(run.UID),
 			actionsv1alpha1.LabelWorkflowJob:    "build",
 		}},
@@ -534,13 +534,13 @@ func TestWaitingWorkflowRunPersistsCancellationPolicy(t *testing.T) {
 
 func TestWorkflowJobLabelsEncodeInvalidLabelValues(t *testing.T) {
 	run := &actionsv1alpha1.WorkflowRun{ObjectMeta: metav1.ObjectMeta{UID: "run-uid"}}
-	gateway := &actionsv1alpha1.ActionsGateway{ObjectMeta: metav1.ObjectMeta{UID: "gateway-uid"}}
+	project := &actionsv1alpha1.Project{ObjectMeta: metav1.ObjectMeta{UID: "project-uid"}}
 
 	for _, jobID := range []string{"_build", strings.Repeat("a", 64)} {
 		t.Run(jobID[:1], func(t *testing.T) {
 			digest := sha256.Sum256([]byte(jobID))
 			want := strings.ToLower(digestEncoding.EncodeToString(digest[:]))
-			got := workflowJobLabels(run, gateway, jobID)[actionsv1alpha1.LabelWorkflowJob]
+			got := workflowJobLabels(run, project, jobID)[actionsv1alpha1.LabelWorkflowJob]
 			if got != want {
 				t.Errorf("workflow job label = %q, want %q", got, want)
 			}

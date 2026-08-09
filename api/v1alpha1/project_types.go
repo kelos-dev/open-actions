@@ -5,18 +5,18 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-const ActionsGatewayConditionConfigured = "Configured"
+const ProjectConditionConfigured = "Configured"
 
 const SourceTypeGitHub SourceType = "GitHub"
 
 // SourceType identifies an external workflow source provider.
 type SourceType string
 
-// ActionsGatewaySpec describes a source gateway for Open Actions.
-type ActionsGatewaySpec struct {
+// ProjectSpec describes the workflow source for an Open Actions Project.
+type ProjectSpec struct {
 	// Source selects and configures the external workflow source.
 	// +required
-	Source ActionsGatewaySource `json:"source"`
+	Source ProjectSource `json:"source"`
 
 	// WorkflowDirectory is the repository-relative directory containing workflow
 	// files. The default keeps the files outside GitHub's native workflow path.
@@ -29,17 +29,17 @@ type ActionsGatewaySpec struct {
 	WorkflowDirectory string `json:"workflowDirectory,omitempty"`
 }
 
-// ActionsGatewaySource is a discriminated union of supported workflow sources.
+// ProjectSource is a discriminated union of supported workflow sources.
 // +kubebuilder:validation:XValidation:rule="self.type == 'GitHub' ? has(self.github) : !has(self.github)",message="github must be specified exactly when type is GitHub"
 // +kubebuilder:validation:XValidation:rule="self.type == oldSelf.type",message="source type is immutable"
-type ActionsGatewaySource struct {
+type ProjectSource struct {
 	// Type selects the source configuration variant.
 	// +kubebuilder:validation:Enum=GitHub
 	// +required
 	Type SourceType `json:"type"`
 
 	// GitHub configures a GitHub App source. Referenced Secrets must be in the
-	// ActionsGateway namespace.
+	// Project namespace.
 	// +optional
 	GitHub *GitHubAppConfiguration `json:"github,omitempty"`
 }
@@ -68,7 +68,7 @@ type GitHubAppConfiguration struct {
 	// +required
 	AppID int64 `json:"appID"`
 
-	// InstallationID is the GitHub App installation served by this gateway.
+	// InstallationID is the GitHub App installation associated with this Project.
 	// +kubebuilder:validation:Minimum=1
 	// +kubebuilder:validation:Maximum=9007199254740991
 	// +required
@@ -84,14 +84,14 @@ type GitHubAppConfiguration struct {
 	WebhookSecretRef corev1.SecretKeySelector `json:"webhookSecretRef"`
 }
 
-// ActionsGatewayStatus contains observations made by the gateway controller.
-type ActionsGatewayStatus struct {
+// ProjectStatus contains observations made by the project controller.
+type ProjectStatus struct {
 	// ObservedGeneration is the most recent generation observed by the
 	// controller.
 	// +optional
 	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
 
-	// Conditions describe whether the gateway's local configuration is valid.
+	// Conditions describe whether the project's local configuration is valid.
 	// Configured does not assert that the GitHub App or installation is remotely
 	// reachable. The known condition type is Configured.
 	// +listType=map
@@ -107,24 +107,24 @@ type ActionsGatewayStatus struct {
 // +kubebuilder:printcolumn:name="Installation",type=integer,JSONPath=`.spec.source.github.installationID`
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
 
-// ActionsGateway configures GitHub webhook authentication and asynchronous
-// workflow discovery.
-type ActionsGateway struct {
+// Project defines an isolated Open Actions execution domain backed by an
+// external workflow source.
+type Project struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`
 
 	// +required
-	Spec ActionsGatewaySpec `json:"spec"`
+	Spec ProjectSpec `json:"spec"`
 
 	// +optional
-	Status ActionsGatewayStatus `json:"status,omitempty"`
+	Status ProjectStatus `json:"status,omitempty"`
 }
 
 // +kubebuilder:object:root=true
 
-// ActionsGatewayList contains ActionsGateway objects.
-type ActionsGatewayList struct {
+// ProjectList contains Project objects.
+type ProjectList struct {
 	metav1.TypeMeta `json:",inline"`
 	metav1.ListMeta `json:"metadata,omitempty"`
-	Items           []ActionsGateway `json:"items"`
+	Items           []Project `json:"items"`
 }

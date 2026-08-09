@@ -1,5 +1,5 @@
 apiVersion: actions.kelos.dev/v1alpha1
-kind: ActionsGateway
+kind: Project
 metadata:
   name: default
   namespace: open-actions

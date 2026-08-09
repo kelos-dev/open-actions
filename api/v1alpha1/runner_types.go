@@ -13,15 +13,15 @@ const (
 
 // RunnerSpec describes one execution agent that accepts one matching
 // WorkflowJob at a time.
-// +kubebuilder:validation:XValidation:rule="self.gatewayRef == oldSelf.gatewayRef",message="gatewayRef is immutable"
-// +kubebuilder:validation:XValidation:rule="size(self.gatewayRef.name) > 0",message="`gatewayRef.name` must be specified"
-// +kubebuilder:validation:XValidation:rule="size(self.gatewayRef.name) <= 253",message="`gatewayRef.name` must be no more than 253 characters"
-// +kubebuilder:validation:XValidation:rule="self.gatewayRef.name.matches('^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?([.][a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?)*$')",message="`gatewayRef.name` must be a DNS subdomain"
+// +kubebuilder:validation:XValidation:rule="self.projectRef == oldSelf.projectRef",message="projectRef is immutable"
+// +kubebuilder:validation:XValidation:rule="size(self.projectRef.name) > 0",message="`projectRef.name` must be specified"
+// +kubebuilder:validation:XValidation:rule="size(self.projectRef.name) <= 253",message="`projectRef.name` must be no more than 253 characters"
+// +kubebuilder:validation:XValidation:rule="self.projectRef.name.matches('^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?([.][a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?)*$')",message="`projectRef.name` must be a DNS subdomain"
 type RunnerSpec struct {
-	// GatewayRef identifies the ActionsGateway whose WorkflowJobs this Runner
-	// accepts. The gateway must be in the same namespace.
+	// ProjectRef identifies the Project whose WorkflowJobs this Runner
+	// accepts. The project must be in the same namespace.
 	// +required
-	GatewayRef corev1.LocalObjectReference `json:"gatewayRef"`
+	ProjectRef corev1.LocalObjectReference `json:"projectRef"`
 
 	// Execution describes the supported configuration of the environment used
 	// to execute assigned WorkflowJobs. The controller owns the underlying Pod

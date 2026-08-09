@@ -27,8 +27,8 @@ func TestRunnerBuildsOwnedJob(t *testing.T) {
 	scheme := runnerTestScheme(t)
 	reconciler := &RunnerReconciler{Client: fake.NewClientBuilder().WithScheme(scheme).Build()}
 	run := &actionsv1alpha1.WorkflowRun{ObjectMeta: metav1.ObjectMeta{Name: "ci", Namespace: "default", UID: types.UID("run-uid")}}
-	gateway := &actionsv1alpha1.ActionsGateway{
-		ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: "default", UID: types.UID("gateway-uid")},
+	project := &actionsv1alpha1.Project{
+		ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: "default", UID: types.UID("project-uid")},
 	}
 	runnerObject := &actionsv1alpha1.Runner{
 		ObjectMeta: metav1.ObjectMeta{Name: "runner-1", Namespace: "default", UID: types.UID("runner-uid")},
@@ -48,7 +48,7 @@ func TestRunnerBuildsOwnedJob(t *testing.T) {
 		},
 		Spec: actionsv1alpha1.WorkflowJobSpec{JobID: "build"},
 	}
-	job, err := reconciler.buildJob(workflowJob, run, gateway, runnerObject)
+	job, err := reconciler.buildJob(workflowJob, run, project, runnerObject)
 	if err != nil {
 		t.Fatalf("build job: %v", err)
 	}
@@ -98,7 +98,7 @@ func TestRunnerBuildsOwnedJob(t *testing.T) {
 	}
 }
 
-func TestRunnerClaimsOldestMatchingWorkflowJobInGateway(t *testing.T) {
+func TestRunnerClaimsOldestMatchingWorkflowJobInProject(t *testing.T) {
 	scheme := runnerTestScheme(t)
 	created := metav1.NewTime(time.Unix(100, 0))
 	runnerObject := &actionsv1alpha1.Runner{
@@ -108,7 +108,7 @@ func TestRunnerClaimsOldestMatchingWorkflowJobInGateway(t *testing.T) {
 			Labels:    []string{"self-hosted", "linux", "arm64"},
 		},
 	}
-	gateway := &actionsv1alpha1.ActionsGateway{ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: "default", UID: types.UID("gateway-uid")}}
+	project := &actionsv1alpha1.Project{ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: "default", UID: types.UID("project-uid")}}
 	run := &actionsv1alpha1.WorkflowRun{
 		ObjectMeta: metav1.ObjectMeta{Name: "ci", Namespace: "default", UID: types.UID("run-uid")},
 		Status: actionsv1alpha1.WorkflowRunStatus{Conditions: []metav1.Condition{
@@ -116,7 +116,7 @@ func TestRunnerClaimsOldestMatchingWorkflowJobInGateway(t *testing.T) {
 		}},
 	}
 	matching := &actionsv1alpha1.WorkflowJob{
-		ObjectMeta: metav1.ObjectMeta{Name: "matching", Namespace: "default", CreationTimestamp: created, Labels: map[string]string{actionsv1alpha1.LabelGatewayUID: string(gateway.UID)}, Annotations: map[string]string{actionsv1alpha1.AnnotationGatewayName: gateway.Name}},
+		ObjectMeta: metav1.ObjectMeta{Name: "matching", Namespace: "default", CreationTimestamp: created, Labels: map[string]string{actionsv1alpha1.LabelProjectUID: string(project.UID)}, Annotations: map[string]string{actionsv1alpha1.AnnotationProjectName: project.Name}},
 		Spec: actionsv1alpha1.WorkflowJobSpec{
 			WorkflowRunRef: corev1.LocalObjectReference{Name: run.Name},
 			RunsOn:         []string{"linux", "arm64"},
@@ -125,9 +125,9 @@ func TestRunnerClaimsOldestMatchingWorkflowJobInGateway(t *testing.T) {
 	newer := matching.DeepCopy()
 	newer.Name = "newer"
 	newer.CreationTimestamp = metav1.NewTime(created.Add(time.Minute))
-	wrongGateway := matching.DeepCopy()
-	wrongGateway.Name = "wrong-gateway"
-	wrongGateway.Labels = map[string]string{actionsv1alpha1.LabelGatewayUID: "other-gateway"}
+	wrongProject := matching.DeepCopy()
+	wrongProject.Name = "wrong-project"
+	wrongProject.Labels = map[string]string{actionsv1alpha1.LabelProjectUID: "other-project"}
 	wrongLabels := matching.DeepCopy()
 	wrongLabels.Name = "wrong-labels"
 	wrongLabels.Spec.RunsOn = []string{"windows"}
@@ -135,12 +135,12 @@ func TestRunnerClaimsOldestMatchingWorkflowJobInGateway(t *testing.T) {
 	clusterClient := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithIndex(&actionsv1alpha1.WorkflowJob{}, workflowJobQueuedIndex, indexQueuedWorkflowJob).
-		WithIndex(&actionsv1alpha1.WorkflowJob{}, workflowJobGatewayNameIndex, indexWorkflowJobGatewayName).
+		WithIndex(&actionsv1alpha1.WorkflowJob{}, workflowJobProjectNameIndex, indexWorkflowJobProjectName).
 		WithStatusSubresource(&actionsv1alpha1.Runner{}, &actionsv1alpha1.WorkflowJob{}).
-		WithObjects(runnerObject, gateway, run, matching, newer, wrongGateway, wrongLabels).
+		WithObjects(runnerObject, project, run, matching, newer, wrongProject, wrongLabels).
 		Build()
 	reconciler := &RunnerReconciler{Client: clusterClient, APIReader: clusterClient}
-	claimed, err := reconciler.claimWorkflowJob(context.Background(), runnerObject, gateway)
+	claimed, err := reconciler.claimWorkflowJob(context.Background(), runnerObject, project)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -175,12 +175,12 @@ func TestRunnerClaimsOldestMatchingWorkflowJobInGateway(t *testing.T) {
 		t.Errorf("busy condition = %#v", busy)
 	}
 	staleJob := &actionsv1alpha1.WorkflowJob{}
-	if err := clusterClient.Get(context.Background(), client.ObjectKeyFromObject(wrongGateway), staleJob); err != nil {
+	if err := clusterClient.Get(context.Background(), client.ObjectKeyFromObject(wrongProject), staleJob); err != nil {
 		t.Fatal(err)
 	}
 	staleCondition := meta.FindStatusCondition(staleJob.Status.Conditions, actionsv1alpha1.WorkflowJobConditionSucceeded)
-	if staleCondition == nil || staleCondition.Status != metav1.ConditionFalse || staleCondition.Reason != "GatewayRecreated" {
-		t.Fatalf("recreated gateway condition = %#v", staleCondition)
+	if staleCondition == nil || staleCondition.Status != metav1.ConditionFalse || staleCondition.Reason != "ProjectRecreated" {
+		t.Fatalf("recreated project condition = %#v", staleCondition)
 	}
 }
 
@@ -193,10 +193,10 @@ func TestRunnerDoesNotClaimWorkflowJobBeforePlanningCompletes(t *testing.T) {
 			Labels:    []string{"linux"},
 		},
 	}
-	gateway := &actionsv1alpha1.ActionsGateway{ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: "default", UID: types.UID("gateway-uid")}}
+	project := &actionsv1alpha1.Project{ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: "default", UID: types.UID("project-uid")}}
 	run := &actionsv1alpha1.WorkflowRun{ObjectMeta: metav1.ObjectMeta{Name: "ci", Namespace: "default", UID: types.UID("run-uid")}}
 	workflowJob := &actionsv1alpha1.WorkflowJob{
-		ObjectMeta: metav1.ObjectMeta{Name: "build", Namespace: "default", Labels: map[string]string{actionsv1alpha1.LabelGatewayUID: string(gateway.UID)}, Annotations: map[string]string{actionsv1alpha1.AnnotationGatewayName: gateway.Name}},
+		ObjectMeta: metav1.ObjectMeta{Name: "build", Namespace: "default", Labels: map[string]string{actionsv1alpha1.LabelProjectUID: string(project.UID)}, Annotations: map[string]string{actionsv1alpha1.AnnotationProjectName: project.Name}},
 		Spec: actionsv1alpha1.WorkflowJobSpec{
 			WorkflowRunRef: corev1.LocalObjectReference{Name: run.Name},
 			RunsOn:         []string{"linux"},
@@ -205,12 +205,12 @@ func TestRunnerDoesNotClaimWorkflowJobBeforePlanningCompletes(t *testing.T) {
 	clusterClient := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithIndex(&actionsv1alpha1.WorkflowJob{}, workflowJobQueuedIndex, indexQueuedWorkflowJob).
-		WithIndex(&actionsv1alpha1.WorkflowJob{}, workflowJobGatewayNameIndex, indexWorkflowJobGatewayName).
+		WithIndex(&actionsv1alpha1.WorkflowJob{}, workflowJobProjectNameIndex, indexWorkflowJobProjectName).
 		WithStatusSubresource(&actionsv1alpha1.Runner{}, &actionsv1alpha1.WorkflowJob{}).
-		WithObjects(runnerObject, gateway, run, workflowJob).
+		WithObjects(runnerObject, project, run, workflowJob).
 		Build()
 	reconciler := &RunnerReconciler{Client: clusterClient, APIReader: clusterClient}
-	claimed, err := reconciler.claimWorkflowJob(context.Background(), runnerObject, gateway)
+	claimed, err := reconciler.claimWorkflowJob(context.Background(), runnerObject, project)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -234,7 +234,7 @@ func TestRunnerDoesNotClaimAnotherJobWhenLiveStatusIsBusy(t *testing.T) {
 	}
 	liveRunner := runnerObject.DeepCopy()
 	liveRunner.Status.WorkflowJobRef = &corev1.LocalObjectReference{Name: "assigned"}
-	gateway := &actionsv1alpha1.ActionsGateway{ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: "default", UID: types.UID("gateway-uid")}}
+	project := &actionsv1alpha1.Project{ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: "default", UID: types.UID("project-uid")}}
 	run := &actionsv1alpha1.WorkflowRun{
 		ObjectMeta: metav1.ObjectMeta{Name: "ci", Namespace: "default"},
 		Status:     actionsv1alpha1.WorkflowRunStatus{Conditions: []metav1.Condition{plannedCondition(metav1.ConditionTrue, "JobsPlanned")}},
@@ -242,20 +242,20 @@ func TestRunnerDoesNotClaimAnotherJobWhenLiveStatusIsBusy(t *testing.T) {
 	workflowJob := &actionsv1alpha1.WorkflowJob{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: "queued", Namespace: "default",
-			Labels:      map[string]string{actionsv1alpha1.LabelGatewayUID: string(gateway.UID)},
-			Annotations: map[string]string{actionsv1alpha1.AnnotationGatewayName: gateway.Name},
+			Labels:      map[string]string{actionsv1alpha1.LabelProjectUID: string(project.UID)},
+			Annotations: map[string]string{actionsv1alpha1.AnnotationProjectName: project.Name},
 		},
 		Spec: actionsv1alpha1.WorkflowJobSpec{WorkflowRunRef: corev1.LocalObjectReference{Name: run.Name}, RunsOn: []string{"linux"}},
 	}
 	cachedClient := fake.NewClientBuilder().WithScheme(scheme).
 		WithIndex(&actionsv1alpha1.WorkflowJob{}, workflowJobQueuedIndex, indexQueuedWorkflowJob).
-		WithIndex(&actionsv1alpha1.WorkflowJob{}, workflowJobGatewayNameIndex, indexWorkflowJobGatewayName).
+		WithIndex(&actionsv1alpha1.WorkflowJob{}, workflowJobProjectNameIndex, indexWorkflowJobProjectName).
 		WithStatusSubresource(&actionsv1alpha1.Runner{}, &actionsv1alpha1.WorkflowJob{}).
-		WithObjects(runnerObject, gateway, run, workflowJob).Build()
+		WithObjects(runnerObject, project, run, workflowJob).Build()
 	liveReader := fake.NewClientBuilder().WithScheme(scheme).WithObjects(liveRunner, run).Build()
 	reconciler := &RunnerReconciler{Client: cachedClient, APIReader: liveReader}
 
-	claimed, err := reconciler.claimWorkflowJob(context.Background(), runnerObject, gateway)
+	claimed, err := reconciler.claimWorkflowJob(context.Background(), runnerObject, project)
 	if !errors.Is(err, errRunnerAlreadyAssigned) || claimed != nil {
 		t.Fatalf("claimWorkflowJob() = %#v, %v", claimed, err)
 	}
@@ -297,7 +297,7 @@ func TestRunnerDoesNotClaimWorkflowJobFromDeletingRun(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "runner-1", Namespace: "default"},
 		Spec:       actionsv1alpha1.RunnerSpec{Labels: []string{"linux"}},
 	}
-	gateway := &actionsv1alpha1.ActionsGateway{ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: "default", UID: types.UID("gateway-uid")}}
+	project := &actionsv1alpha1.Project{ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: "default", UID: types.UID("project-uid")}}
 	run := &actionsv1alpha1.WorkflowRun{
 		ObjectMeta: metav1.ObjectMeta{Name: "ci", Namespace: "default", UID: types.UID("run-uid"), DeletionTimestamp: &deletionTime, Finalizers: []string{"test"}},
 		Status: actionsv1alpha1.WorkflowRunStatus{Conditions: []metav1.Condition{
@@ -307,8 +307,8 @@ func TestRunnerDoesNotClaimWorkflowJobFromDeletingRun(t *testing.T) {
 	workflowJob := &actionsv1alpha1.WorkflowJob{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: "build", Namespace: "default",
-			Labels:      map[string]string{actionsv1alpha1.LabelGatewayUID: string(gateway.UID)},
-			Annotations: map[string]string{actionsv1alpha1.AnnotationGatewayName: gateway.Name},
+			Labels:      map[string]string{actionsv1alpha1.LabelProjectUID: string(project.UID)},
+			Annotations: map[string]string{actionsv1alpha1.AnnotationProjectName: project.Name},
 		},
 		Spec: actionsv1alpha1.WorkflowJobSpec{
 			WorkflowRunRef: corev1.LocalObjectReference{Name: run.Name},
@@ -318,13 +318,13 @@ func TestRunnerDoesNotClaimWorkflowJobFromDeletingRun(t *testing.T) {
 	clusterClient := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithIndex(&actionsv1alpha1.WorkflowJob{}, workflowJobQueuedIndex, indexQueuedWorkflowJob).
-		WithIndex(&actionsv1alpha1.WorkflowJob{}, workflowJobGatewayNameIndex, indexWorkflowJobGatewayName).
+		WithIndex(&actionsv1alpha1.WorkflowJob{}, workflowJobProjectNameIndex, indexWorkflowJobProjectName).
 		WithStatusSubresource(&actionsv1alpha1.Runner{}, &actionsv1alpha1.WorkflowJob{}).
-		WithObjects(runnerObject, gateway, run, workflowJob).
+		WithObjects(runnerObject, project, run, workflowJob).
 		Build()
 	reconciler := &RunnerReconciler{Client: clusterClient, APIReader: clusterClient}
 
-	claimed, err := reconciler.claimWorkflowJob(context.Background(), runnerObject, gateway)
+	claimed, err := reconciler.claimWorkflowJob(context.Background(), runnerObject, project)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -433,7 +433,7 @@ func TestMissingPlanFailsAssignedWorkflowJob(t *testing.T) {
 	run := &actionsv1alpha1.WorkflowRun{
 		TypeMeta:   metav1.TypeMeta{APIVersion: actionsv1alpha1.GroupVersion.String(), Kind: "WorkflowRun"},
 		ObjectMeta: metav1.ObjectMeta{Name: "ci", Namespace: "default", UID: types.UID("run-uid")},
-		Spec:       actionsv1alpha1.WorkflowRunSpec{GatewayRef: corev1.LocalObjectReference{Name: "gateway"}},
+		Spec:       actionsv1alpha1.WorkflowRunSpec{ProjectRef: corev1.LocalObjectReference{Name: "project"}},
 	}
 	workflowJob := &actionsv1alpha1.WorkflowJob{
 		TypeMeta: metav1.TypeMeta{APIVersion: actionsv1alpha1.GroupVersion.String(), Kind: "WorkflowJob"},
@@ -450,7 +450,7 @@ func TestMissingPlanFailsAssignedWorkflowJob(t *testing.T) {
 	if err := controllerutil.SetControllerReference(workflowJob, authSecret, scheme); err != nil {
 		t.Fatal(err)
 	}
-	gateway := &actionsv1alpha1.ActionsGateway{ObjectMeta: metav1.ObjectMeta{Name: "gateway", Namespace: "default"}}
+	project := &actionsv1alpha1.Project{ObjectMeta: metav1.ObjectMeta{Name: "project", Namespace: "default"}}
 	runnerObject := &actionsv1alpha1.Runner{ObjectMeta: metav1.ObjectMeta{Name: "runner", Namespace: "default"}}
 	clusterClient := fake.NewClientBuilder().
 		WithScheme(scheme).
@@ -458,7 +458,7 @@ func TestMissingPlanFailsAssignedWorkflowJob(t *testing.T) {
 		WithObjects(run, workflowJob, authSecret).
 		Build()
 	reconciler := &RunnerReconciler{Client: clusterClient, APIReader: clusterClient}
-	terminal, err := reconciler.executeWorkflowJob(context.Background(), runnerObject, workflowJob, gateway)
+	terminal, err := reconciler.executeWorkflowJob(context.Background(), runnerObject, workflowJob, project)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -483,7 +483,7 @@ func TestPlanReadUsesLiveReader(t *testing.T) {
 	run := &actionsv1alpha1.WorkflowRun{
 		TypeMeta:   metav1.TypeMeta{APIVersion: actionsv1alpha1.GroupVersion.String(), Kind: "WorkflowRun"},
 		ObjectMeta: metav1.ObjectMeta{Name: "ci", Namespace: "default", UID: types.UID("run-uid")},
-		Spec:       actionsv1alpha1.WorkflowRunSpec{GatewayRef: corev1.LocalObjectReference{Name: "gateway"}},
+		Spec:       actionsv1alpha1.WorkflowRunSpec{ProjectRef: corev1.LocalObjectReference{Name: "project"}},
 	}
 	workflowJob := &actionsv1alpha1.WorkflowJob{
 		TypeMeta:   metav1.TypeMeta{APIVersion: actionsv1alpha1.GroupVersion.String(), Kind: "WorkflowJob"},
@@ -501,15 +501,15 @@ func TestPlanReadUsesLiveReader(t *testing.T) {
 	cachedClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&actionsv1alpha1.WorkflowJob{}).WithObjects(run, workflowJob).Build()
 	liveReader := fake.NewClientBuilder().WithScheme(scheme).WithObjects(run, workflowJob, plan).Build()
 	reconciler := &RunnerReconciler{Client: cachedClient, APIReader: liveReader}
-	gateway := &actionsv1alpha1.ActionsGateway{
-		ObjectMeta: metav1.ObjectMeta{Name: "gateway", Namespace: "default"},
-		Spec: actionsv1alpha1.ActionsGatewaySpec{Source: actionsv1alpha1.ActionsGatewaySource{GitHub: &actionsv1alpha1.GitHubAppConfiguration{
+	project := &actionsv1alpha1.Project{
+		ObjectMeta: metav1.ObjectMeta{Name: "project", Namespace: "default"},
+		Spec: actionsv1alpha1.ProjectSpec{Source: actionsv1alpha1.ProjectSource{GitHub: &actionsv1alpha1.GitHubAppConfiguration{
 			PrivateKeySecretRef: corev1.SecretKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: "credentials"}, Key: "private-key"},
 		}}},
 	}
 	runnerObject := &actionsv1alpha1.Runner{ObjectMeta: metav1.ObjectMeta{Name: "runner", Namespace: "default"}}
 
-	terminal, err := reconciler.executeWorkflowJob(context.Background(), runnerObject, workflowJob, gateway)
+	terminal, err := reconciler.executeWorkflowJob(context.Background(), runnerObject, workflowJob, project)
 	if err == nil || terminal {
 		t.Fatalf("executeWorkflowJob() = terminal %v, error %v", terminal, err)
 	}
@@ -528,7 +528,7 @@ func TestMissingPlanDoesNotInterruptAnExistingNativeJob(t *testing.T) {
 	run := &actionsv1alpha1.WorkflowRun{
 		TypeMeta:   metav1.TypeMeta{APIVersion: actionsv1alpha1.GroupVersion.String(), Kind: "WorkflowRun"},
 		ObjectMeta: metav1.ObjectMeta{Name: "ci", Namespace: "default", UID: types.UID("run-uid")},
-		Spec:       actionsv1alpha1.WorkflowRunSpec{GatewayRef: corev1.LocalObjectReference{Name: "gateway"}},
+		Spec:       actionsv1alpha1.WorkflowRunSpec{ProjectRef: corev1.LocalObjectReference{Name: "project"}},
 	}
 	workflowJob := &actionsv1alpha1.WorkflowJob{
 		TypeMeta:   metav1.TypeMeta{APIVersion: actionsv1alpha1.GroupVersion.String(), Kind: "WorkflowJob"},
@@ -549,9 +549,9 @@ func TestMissingPlanDoesNotInterruptAnExistingNativeJob(t *testing.T) {
 		WithObjects(run, workflowJob, nativeJob).
 		Build()
 	reconciler := &RunnerReconciler{Client: clusterClient, APIReader: clusterClient}
-	gateway := &actionsv1alpha1.ActionsGateway{ObjectMeta: metav1.ObjectMeta{Name: "gateway", Namespace: "default"}}
+	project := &actionsv1alpha1.Project{ObjectMeta: metav1.ObjectMeta{Name: "project", Namespace: "default"}}
 	runnerObject := &actionsv1alpha1.Runner{ObjectMeta: metav1.ObjectMeta{Name: "runner", Namespace: "default"}}
-	terminal, err := reconciler.executeWorkflowJob(context.Background(), runnerObject, workflowJob, gateway)
+	terminal, err := reconciler.executeWorkflowJob(context.Background(), runnerObject, workflowJob, project)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -577,7 +577,7 @@ func TestDeletingWorkflowRunStopsAssignedJobBeforeExecution(t *testing.T) {
 			Name: "ci", Namespace: "default", UID: types.UID("run-uid"),
 			DeletionTimestamp: &deletionTime, Finalizers: []string{"test"},
 		},
-		Spec: actionsv1alpha1.WorkflowRunSpec{GatewayRef: corev1.LocalObjectReference{Name: "gateway"}},
+		Spec: actionsv1alpha1.WorkflowRunSpec{ProjectRef: corev1.LocalObjectReference{Name: "project"}},
 	}
 	workflowJob := &actionsv1alpha1.WorkflowJob{
 		TypeMeta:   metav1.TypeMeta{APIVersion: actionsv1alpha1.GroupVersion.String(), Kind: "WorkflowJob"},
@@ -594,10 +594,10 @@ func TestDeletingWorkflowRunStopsAssignedJobBeforeExecution(t *testing.T) {
 		WithObjects(run, workflowJob).
 		Build()
 	reconciler := &RunnerReconciler{Client: clusterClient, APIReader: clusterClient}
-	gateway := &actionsv1alpha1.ActionsGateway{ObjectMeta: metav1.ObjectMeta{Name: "gateway", Namespace: "default"}}
+	project := &actionsv1alpha1.Project{ObjectMeta: metav1.ObjectMeta{Name: "project", Namespace: "default"}}
 	runnerObject := &actionsv1alpha1.Runner{ObjectMeta: metav1.ObjectMeta{Name: "runner", Namespace: "default"}}
 
-	terminal, err := reconciler.executeWorkflowJob(context.Background(), runnerObject, workflowJob, gateway)
+	terminal, err := reconciler.executeWorkflowJob(context.Background(), runnerObject, workflowJob, project)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -626,7 +626,7 @@ func TestMissingNativeJobDoesNotRestartExecution(t *testing.T) {
 	run := &actionsv1alpha1.WorkflowRun{
 		TypeMeta:   metav1.TypeMeta{APIVersion: actionsv1alpha1.GroupVersion.String(), Kind: "WorkflowRun"},
 		ObjectMeta: metav1.ObjectMeta{Name: "ci", Namespace: "default", UID: types.UID("run-uid")},
-		Spec:       actionsv1alpha1.WorkflowRunSpec{GatewayRef: corev1.LocalObjectReference{Name: "gateway"}},
+		Spec:       actionsv1alpha1.WorkflowRunSpec{ProjectRef: corev1.LocalObjectReference{Name: "project"}},
 	}
 	workflowJob := &actionsv1alpha1.WorkflowJob{
 		TypeMeta:   metav1.TypeMeta{APIVersion: actionsv1alpha1.GroupVersion.String(), Kind: "WorkflowJob"},
@@ -657,10 +657,10 @@ func TestMissingNativeJobDoesNotRestartExecution(t *testing.T) {
 		WithObjects(run, workflowJob, authSecret, pod).
 		Build()
 	reconciler := &RunnerReconciler{Client: clusterClient, APIReader: clusterClient}
-	gateway := &actionsv1alpha1.ActionsGateway{ObjectMeta: metav1.ObjectMeta{Name: "gateway", Namespace: "default"}}
+	project := &actionsv1alpha1.Project{ObjectMeta: metav1.ObjectMeta{Name: "project", Namespace: "default"}}
 	runnerObject := &actionsv1alpha1.Runner{ObjectMeta: metav1.ObjectMeta{Name: "runner", Namespace: "default"}}
 
-	terminal, err := reconciler.executeWorkflowJob(context.Background(), runnerObject, workflowJob, gateway)
+	terminal, err := reconciler.executeWorkflowJob(context.Background(), runnerObject, workflowJob, project)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -670,7 +670,7 @@ func TestMissingNativeJobDoesNotRestartExecution(t *testing.T) {
 	if err := clusterClient.Delete(context.Background(), pod); err != nil {
 		t.Fatal(err)
 	}
-	terminal, err = reconciler.executeWorkflowJob(context.Background(), runnerObject, workflowJob, gateway)
+	terminal, err = reconciler.executeWorkflowJob(context.Background(), runnerObject, workflowJob, project)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -693,18 +693,18 @@ func TestMissingNativeJobDoesNotRestartExecution(t *testing.T) {
 	}
 }
 
-func TestAssignedWorkflowJobRejectsRecreatedGateway(t *testing.T) {
+func TestAssignedWorkflowJobRejectsRecreatedProject(t *testing.T) {
 	scheme := runnerTestScheme(t)
 	run := &actionsv1alpha1.WorkflowRun{
 		TypeMeta:   metav1.TypeMeta{APIVersion: actionsv1alpha1.GroupVersion.String(), Kind: "WorkflowRun"},
 		ObjectMeta: metav1.ObjectMeta{Name: "ci", Namespace: "default", UID: types.UID("run-uid")},
-		Spec:       actionsv1alpha1.WorkflowRunSpec{GatewayRef: corev1.LocalObjectReference{Name: "gateway"}},
+		Spec:       actionsv1alpha1.WorkflowRunSpec{ProjectRef: corev1.LocalObjectReference{Name: "project"}},
 	}
 	workflowJob := &actionsv1alpha1.WorkflowJob{
 		TypeMeta: metav1.TypeMeta{APIVersion: actionsv1alpha1.GroupVersion.String(), Kind: "WorkflowJob"},
 		ObjectMeta: metav1.ObjectMeta{
 			Name: "build", Namespace: "default", UID: types.UID("job-uid"),
-			Labels: map[string]string{actionsv1alpha1.LabelGatewayUID: "original-gateway-uid"},
+			Labels: map[string]string{actionsv1alpha1.LabelProjectUID: "original-project-uid"},
 		},
 		Spec:   actionsv1alpha1.WorkflowJobSpec{WorkflowRunRef: corev1.LocalObjectReference{Name: run.Name}},
 		Status: actionsv1alpha1.WorkflowJobStatus{RunnerRef: &corev1.LocalObjectReference{Name: "runner"}},
@@ -718,22 +718,22 @@ func TestAssignedWorkflowJobRejectsRecreatedGateway(t *testing.T) {
 	}
 	clusterClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&actionsv1alpha1.WorkflowJob{}).WithObjects(run, workflowJob, authSecret).Build()
 	reconciler := &RunnerReconciler{Client: clusterClient, APIReader: clusterClient}
-	gateway := &actionsv1alpha1.ActionsGateway{ObjectMeta: metav1.ObjectMeta{Name: "gateway", Namespace: "default", UID: types.UID("replacement-gateway-uid")}}
+	project := &actionsv1alpha1.Project{ObjectMeta: metav1.ObjectMeta{Name: "project", Namespace: "default", UID: types.UID("replacement-project-uid")}}
 	runnerObject := &actionsv1alpha1.Runner{ObjectMeta: metav1.ObjectMeta{Name: "runner", Namespace: "default"}}
 
-	terminal, err := reconciler.executeWorkflowJob(context.Background(), runnerObject, workflowJob, gateway)
+	terminal, err := reconciler.executeWorkflowJob(context.Background(), runnerObject, workflowJob, project)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !terminal {
-		t.Fatal("WorkflowJob remained active after its gateway was recreated")
+		t.Fatal("WorkflowJob remained active after its project was recreated")
 	}
 	stored := &actionsv1alpha1.WorkflowJob{}
 	if err := clusterClient.Get(context.Background(), client.ObjectKeyFromObject(workflowJob), stored); err != nil {
 		t.Fatal(err)
 	}
 	condition := meta.FindStatusCondition(stored.Status.Conditions, actionsv1alpha1.WorkflowJobConditionSucceeded)
-	if condition == nil || condition.Status != metav1.ConditionFalse || condition.Reason != "GatewayRecreated" {
+	if condition == nil || condition.Status != metav1.ConditionFalse || condition.Reason != "ProjectRecreated" {
 		t.Fatalf("succeeded condition = %#v", condition)
 	}
 	if err := clusterClient.Get(context.Background(), client.ObjectKeyFromObject(authSecret), &corev1.Secret{}); !apierrors.IsNotFound(err) {
@@ -816,7 +816,7 @@ func TestWorkflowJobEventEnqueuesOneIdleMatchingRunner(t *testing.T) {
 	scheme := runnerTestScheme(t)
 	run := &actionsv1alpha1.WorkflowRun{
 		ObjectMeta: metav1.ObjectMeta{Name: "ci", Namespace: "default"},
-		Spec:       actionsv1alpha1.WorkflowRunSpec{GatewayRef: corev1.LocalObjectReference{Name: "gateway"}},
+		Spec:       actionsv1alpha1.WorkflowRunSpec{ProjectRef: corev1.LocalObjectReference{Name: "project"}},
 	}
 	workflowJob := &actionsv1alpha1.WorkflowJob{
 		ObjectMeta: metav1.ObjectMeta{Name: "build", Namespace: "default"},
@@ -825,22 +825,22 @@ func TestWorkflowJobEventEnqueuesOneIdleMatchingRunner(t *testing.T) {
 			RunsOn:         []string{"linux"},
 		},
 	}
-	runner := func(name, gateway string, labels []string) *actionsv1alpha1.Runner {
+	runner := func(name, project string, labels []string) *actionsv1alpha1.Runner {
 		return &actionsv1alpha1.Runner{
 			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default"},
 			Spec: actionsv1alpha1.RunnerSpec{
-				GatewayRef: corev1.LocalObjectReference{Name: gateway},
+				ProjectRef: corev1.LocalObjectReference{Name: project},
 				Labels:     labels,
 			},
 		}
 	}
-	idleA := runner("idle-a", "gateway", []string{"linux"})
-	idleB := runner("idle-b", "gateway", []string{"linux"})
-	busy := runner("busy", "gateway", []string{"linux"})
+	idleA := runner("idle-a", "project", []string{"linux"})
+	idleB := runner("idle-b", "project", []string{"linux"})
+	busy := runner("busy", "project", []string{"linux"})
 	busy.Status.WorkflowJobRef = &corev1.LocalObjectReference{Name: "other-job"}
-	wrongGateway := runner("wrong-gateway", "other", []string{"linux"})
-	wrongLabels := runner("wrong-labels", "gateway", []string{"windows"})
-	clusterClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(run, idleA, idleB, busy, wrongGateway, wrongLabels).Build()
+	wrongProject := runner("wrong-project", "other", []string{"linux"})
+	wrongLabels := runner("wrong-labels", "project", []string{"windows"})
+	clusterClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(run, idleA, idleB, busy, wrongProject, wrongLabels).Build()
 	reconciler := &RunnerReconciler{Client: clusterClient, APIReader: clusterClient}
 	requests := reconciler.runnersForWorkflowJob(context.Background(), workflowJob)
 	if len(requests) != 1 {
@@ -852,18 +852,18 @@ func TestWorkflowJobEventEnqueuesOneIdleMatchingRunner(t *testing.T) {
 	}
 }
 
-func TestPlannedWorkflowRunWakesIdleGatewayRunners(t *testing.T) {
+func TestPlannedWorkflowRunWakesIdleProjectRunners(t *testing.T) {
 	scheme := runnerTestScheme(t)
 	run := &actionsv1alpha1.WorkflowRun{
 		ObjectMeta: metav1.ObjectMeta{Name: "ci", Namespace: "default"},
-		Spec:       actionsv1alpha1.WorkflowRunSpec{GatewayRef: corev1.LocalObjectReference{Name: "gateway"}},
+		Spec:       actionsv1alpha1.WorkflowRunSpec{ProjectRef: corev1.LocalObjectReference{Name: "project"}},
 		Status: actionsv1alpha1.WorkflowRunStatus{Conditions: []metav1.Condition{{
 			Type: actionsv1alpha1.WorkflowRunConditionPlanned, Status: metav1.ConditionTrue, Reason: "JobsPlanned", LastTransitionTime: metav1.Now(),
 		}}},
 	}
-	idle := &actionsv1alpha1.Runner{ObjectMeta: metav1.ObjectMeta{Name: "idle", Namespace: "default"}, Spec: actionsv1alpha1.RunnerSpec{GatewayRef: corev1.LocalObjectReference{Name: "gateway"}}}
-	busy := &actionsv1alpha1.Runner{ObjectMeta: metav1.ObjectMeta{Name: "busy", Namespace: "default"}, Spec: actionsv1alpha1.RunnerSpec{GatewayRef: corev1.LocalObjectReference{Name: "gateway"}}, Status: actionsv1alpha1.RunnerStatus{WorkflowJobRef: &corev1.LocalObjectReference{Name: "other"}}}
-	other := &actionsv1alpha1.Runner{ObjectMeta: metav1.ObjectMeta{Name: "other", Namespace: "default"}, Spec: actionsv1alpha1.RunnerSpec{GatewayRef: corev1.LocalObjectReference{Name: "other"}}}
+	idle := &actionsv1alpha1.Runner{ObjectMeta: metav1.ObjectMeta{Name: "idle", Namespace: "default"}, Spec: actionsv1alpha1.RunnerSpec{ProjectRef: corev1.LocalObjectReference{Name: "project"}}}
+	busy := &actionsv1alpha1.Runner{ObjectMeta: metav1.ObjectMeta{Name: "busy", Namespace: "default"}, Spec: actionsv1alpha1.RunnerSpec{ProjectRef: corev1.LocalObjectReference{Name: "project"}}, Status: actionsv1alpha1.RunnerStatus{WorkflowJobRef: &corev1.LocalObjectReference{Name: "other"}}}
+	other := &actionsv1alpha1.Runner{ObjectMeta: metav1.ObjectMeta{Name: "other", Namespace: "default"}, Spec: actionsv1alpha1.RunnerSpec{ProjectRef: corev1.LocalObjectReference{Name: "other"}}}
 	clusterClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(run, idle, busy, other).Build()
 	reconciler := &RunnerReconciler{Client: clusterClient, APIReader: clusterClient}
 	requests := reconciler.runnersForWorkflowRun(context.Background(), run)

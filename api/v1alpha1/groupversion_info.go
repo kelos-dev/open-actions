@@ -14,8 +14,8 @@ var (
 
 func addKnownTypes(scheme *runtime.Scheme) error {
 	scheme.AddKnownTypes(GroupVersion,
-		&ActionsGateway{},
-		&ActionsGatewayList{},
+		&Project{},
+		&ProjectList{},
 		&Runner{},
 		&RunnerList{},
 		&WorkflowJob{},
