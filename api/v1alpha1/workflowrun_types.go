@@ -20,13 +20,13 @@ type GitHubEventName string
 // WorkflowRunSpec is an immutable description of one workflow execution.
 // Deleting a WorkflowRun requests cancellation of its child resources.
 // +kubebuilder:validation:XValidation:rule="self == oldSelf",message="spec is immutable"
-// +kubebuilder:validation:XValidation:rule="size(self.gatewayRef.name) > 0",message="`gatewayRef.name` must be specified"
-// +kubebuilder:validation:XValidation:rule="size(self.gatewayRef.name) <= 253",message="`gatewayRef.name` must be no more than 253 characters"
-// +kubebuilder:validation:XValidation:rule="self.gatewayRef.name.matches('^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?([.][a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?)*$')",message="`gatewayRef.name` must be a DNS subdomain"
+// +kubebuilder:validation:XValidation:rule="size(self.projectRef.name) > 0",message="`projectRef.name` must be specified"
+// +kubebuilder:validation:XValidation:rule="size(self.projectRef.name) <= 253",message="`projectRef.name` must be no more than 253 characters"
+// +kubebuilder:validation:XValidation:rule="self.projectRef.name.matches('^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?([.][a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?)*$')",message="`projectRef.name` must be a DNS subdomain"
 type WorkflowRunSpec struct {
-	// GatewayRef identifies an ActionsGateway in the same namespace.
+	// ProjectRef identifies a Project in the same namespace.
 	// +required
-	GatewayRef corev1.LocalObjectReference `json:"gatewayRef"`
+	ProjectRef corev1.LocalObjectReference `json:"projectRef"`
 
 	// Source identifies the provider-specific event and repository revision.
 	// +required

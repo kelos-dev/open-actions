@@ -4,7 +4,7 @@ metadata:
   name: example-ci-72d3162e
   namespace: open-actions
 spec:
-  gatewayRef:
+  projectRef:
     name: default
   source:
     type: GitHub

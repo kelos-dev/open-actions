@@ -124,8 +124,8 @@ func runManager(arguments []string) error {
 	if err != nil {
 		return fmt.Errorf("create controller manager: %w", err)
 	}
-	if err := (&controller.ActionsGatewayReconciler{Client: controllerManager.GetClient(), APIReader: controllerManager.GetAPIReader()}).SetupWithManager(controllerManager); err != nil {
-		return fmt.Errorf("configure ActionsGateway controller: %w", err)
+	if err := (&controller.ProjectReconciler{Client: controllerManager.GetClient(), APIReader: controllerManager.GetAPIReader()}).SetupWithManager(controllerManager); err != nil {
+		return fmt.Errorf("configure Project controller: %w", err)
 	}
 	if err := (&controller.WorkflowRunReconciler{
 		Client:             controllerManager.GetClient(),

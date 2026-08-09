@@ -48,8 +48,8 @@ labels, then creates the job-plan ConfigMap, a scoped installation-token
 Secret, and a native `batch/v1` Job. The Job's Pod runs the Go runner, which
 clones the repository and external actions and executes the steps. Status
 propagates back from the native Job through `WorkflowJob` and `WorkflowRun`
-conditions. An `ActionsGateway` holds the GitHub App configuration and
-credentials this flow depends on.
+conditions. A `Project` defines the execution domain and holds the GitHub App
+configuration and credential references this flow depends on.
 
 The diagram is an editable [draw.io](https://www.drawio.com/) file at
 [`docs/architecture.drawio.svg`](docs/architecture.drawio.svg).
@@ -65,7 +65,7 @@ make build      # Build the controller and runner binaries under bin/.
 
 The Ginkgo/Gomega end-to-end suite expects a current Kubernetes context. CI
 creates a Kind cluster, builds and loads the images, and installs the controller
-and CRDs. The `ActionsGateway` tests verify webhook authentication, typed
+and CRDs. The `Project` tests verify webhook authentication, typed
 `WorkflowRun` creation, and queued delivery failures for invalid workflows.
 The `Runner` tests create a typed `WorkflowRun` and verify job assignment,
 native Job execution, status updates, and cleanup. The GitHub fixture serves
@@ -115,10 +115,10 @@ open-actions-controller \
   --action-clone-base-url=https://github.example
 ```
 
-Create a Secret containing a GitHub App RSA private key and webhook secret, an
-`ActionsGateway`, and one or more `Runner` resources. Each `Runner` is one
+Create a Secret containing a GitHub App RSA private key and webhook secret, a
+`Project`, and one or more `Runner` resources. Each `Runner` is one
 reusable execution slot: it accepts one queued
-`WorkflowJob` from its `spec.gatewayRef` whose `runs-on` labels are all present
+`WorkflowJob` from its `spec.projectRef` whose `runs-on` labels are all present
 in `spec.labels`. Native Jobs have a 50-minute execution deadline so their
 GitHub installation token remains valid and a broken image pull or
 unschedulable Pod cannot hold a Runner indefinitely. An assigned job that
@@ -145,23 +145,23 @@ Move repository workflows from `.github/workflows` to
 
 ## API behavior
 
-All references resolve within the resource's namespace. An `ActionsGateway`
+All references resolve within the resource's namespace. A `Project`
 selects its integration through the discriminated `spec.source` union. The
 supported variant is `type: GitHub` with GitHub App configuration under
-`source.github`. The gateway defaults `spec.workflowDirectory` to
+`source.github`. The project defaults `spec.workflowDirectory` to
 `.open-actions/workflows`; its source type and GitHub App and installation IDs
-are immutable, and only one gateway in the cluster may claim an installation.
-The earliest-created gateway retains that claim; later duplicates remain
+are immutable, and only one project in the cluster may claim an installation.
+The earliest-created project retains that claim; later duplicates remain
 unconfigured until the owner is deleted.
 A `WorkflowRun` records provider-specific event data under its own immutable
 `spec.source` union. A Runner's
-`spec.gatewayRef` is immutable; changes to `spec.execution` apply only to native
+`spec.projectRef` is immutable; changes to `spec.execution` apply only to native
 Jobs created afterward. The controller owns the Pod shape, including its
 authentication, workspace, retry, and security configuration. A `WorkflowJob`
 spec is immutable. The scheduler records its one-time Runner assignment in
 `status.runnerRef`.
 
-Concurrency groups are case-insensitive and scoped by gateway and GitHub's
+Concurrency groups are case-insensitive and scoped by project and GitHub's
 stable repository ID. One run may execute while one newer run waits. A newer
 waiting run supersedes the existing waiting run. With `cancel-in-progress: true`,
 it also cancels the executing run. A run waits conservatively for an
@@ -174,43 +174,43 @@ The controllers publish these condition contracts:
 
 | Resource | Condition | Status | Reasons |
 | --- | --- | --- | --- |
-| `ActionsGateway` | `Configured` | `True` | `ConfigurationValid` |
-| `ActionsGateway` | `Configured` | `False` | `DuplicateInstallation`, `CredentialsUnavailable`, `InvalidCredentials` |
+| `Project` | `Configured` | `True` | `ConfigurationValid` |
+| `Project` | `Configured` | `False` | `DuplicateInstallation`, `CredentialsUnavailable`, `InvalidCredentials` |
 | `Runner` | `Ready` | `True` | `Ready` |
-| `Runner` | `Ready` | `False` | `GatewayUnavailable`, `GatewayNotConfigured` |
+| `Runner` | `Ready` | `False` | `ProjectUnavailable`, `ProjectNotConfigured` |
 | `Runner` | `Busy` | `False` | `Idle` |
 | `Runner` | `Busy` | `True` | `JobAssigned` |
 | `WorkflowRun` | `Planned` | `True` | `JobsPlanned` |
-| `WorkflowRun` | `Planned` | `Unknown` | `WaitingForConcurrency`, `WaitingForConcurrencyCancellation`, `GatewayUnavailable`, `CredentialsUnavailable`, `GitHubAuthenticationFailed`, `WorkflowFetchFailed`, `ChildCreationFailed`, `ConcurrencyCheckFailed` |
-| `WorkflowRun` | `Planned` | `False` | `GatewayUnavailable`, `WorkflowFetchFailed`, `WorkflowInvalid`, `ChildCreationFailed`, `ExecutionStateLost` |
+| `WorkflowRun` | `Planned` | `Unknown` | `WaitingForConcurrency`, `WaitingForConcurrencyCancellation`, `ProjectUnavailable`, `CredentialsUnavailable`, `GitHubAuthenticationFailed`, `WorkflowFetchFailed`, `ChildCreationFailed`, `ConcurrencyCheckFailed` |
+| `WorkflowRun` | `Planned` | `False` | `ProjectUnavailable`, `WorkflowFetchFailed`, `WorkflowInvalid`, `ChildCreationFailed`, `ExecutionStateLost` |
 | `WorkflowRun` | `Succeeded` | `Unknown` | `JobsQueued`, `JobsRunning` |
 | `WorkflowRun` | `Succeeded` | `True` | `JobsSucceeded` |
-| `WorkflowRun` | `Succeeded` | `False` | `GatewayUnavailable`, `WorkflowFetchFailed`, `WorkflowInvalid`, `ChildCreationFailed`, `JobFailed`, `ExecutionStateLost` |
+| `WorkflowRun` | `Succeeded` | `False` | `ProjectUnavailable`, `WorkflowFetchFailed`, `WorkflowInvalid`, `ChildCreationFailed`, `JobFailed`, `ExecutionStateLost` |
 | `WorkflowJob` | `Scheduled` | `True` | `RunnerAssigned` |
-| `WorkflowJob` | `Scheduled` | `False` | `GatewayRecreated` |
+| `WorkflowJob` | `Scheduled` | `False` | `ProjectRecreated` |
 | `WorkflowJob` | `Succeeded` | `Unknown` | `JobRunning` |
 | `WorkflowJob` | `Succeeded` | `True` | `JobSucceeded` |
-| `WorkflowJob` | `Succeeded` | `False` | `JobFailed`, `PlanUnavailable`, `JobStartFailed`, `ExecutionStateLost`, `GatewayRecreated` |
+| `WorkflowJob` | `Succeeded` | `False` | `JobFailed`, `PlanUnavailable`, `JobStartFailed`, `ExecutionStateLost`, `ProjectRecreated` |
 
-`ActionsGateway/Configured` covers local Secret availability, private-key
+`Project/Configured` covers local Secret availability, private-key
 parsing, and installation uniqueness. It does not assert remote GitHub App or
 installation availability. `Runner/Ready` reports operational health
 independently of capacity; clients use `Runner/Busy` to determine whether a
 Runner already has an assignment.
 
-Child resources carry `actions.kelos.dev/gateway-uid`, `runner-uid`,
+Child resources carry `actions.kelos.dev/project-uid`, `runner-uid`,
 `workflow-run-uid`, and `workflow-job-uid` labels where applicable. The
 `actions.kelos.dev/workflow-job` label contains the workflow job ID when it is a
 valid Kubernetes label value, or the full SHA-256 digest encoded as lowercase
 unpadded base32 otherwise. The original job ID and assigned runner name remain
 available through
 `actions.kelos.dev/workflow-job-id` and `actions.kelos.dev/runner-name`
-annotations. Queued jobs record their gateway name in the
-`actions.kelos.dev/gateway-name` annotation so a recreated gateway can be
+annotations. Queued jobs record their project name in the
+`actions.kelos.dev/project-name` annotation so a recreated project can be
 distinguished from the original object.
 
 The webhook endpoint accepts only signed GitHub `POST` deliveries up to 10 MiB
-and requires exactly one configured gateway for the installation. Supported
+and requires exactly one configured project for the installation. Supported
 deliveries return HTTP 202 with `{"accepted":true,"queued":true}`. Unsupported event names,
 conflicted pull requests, and pull requests from fork repositories return HTTP
 202 with `{"accepted":true,"queued":false}`. Pull request deliveries whose merge

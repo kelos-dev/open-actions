@@ -9,10 +9,10 @@ metadata:
   name: open-actions-controller
 rules:
   - apiGroups: [actions.kelos.dev]
-    resources: [actionsgateways, runners, workflowjobs, workflowruns]
+    resources: [projects, runners, workflowjobs, workflowruns]
     verbs: [get, list, watch, create, update, patch, delete]
   - apiGroups: [actions.kelos.dev]
-    resources: [actionsgateways/status, runners/status, workflowjobs/status, workflowruns/status]
+    resources: [projects/status, runners/status, workflowjobs/status, workflowruns/status]
     verbs: [get, update, patch]
   - apiGroups: [""]
     resources: [secrets]

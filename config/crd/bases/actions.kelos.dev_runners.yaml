@@ -140,22 +140,6 @@ spec:
                 required:
                 - image
                 type: object
-              gatewayRef:
-                description: |-
-                  GatewayRef identifies the ActionsGateway whose WorkflowJobs this Runner
-                  accepts. The gateway must be in the same namespace.
-                properties:
-                  name:
-                    default: ""
-                    description: |-
-                      Name of the referent.
-                      This field is effectively required, but due to backwards compatibility is
-                      allowed to be empty. Instances of this type with an empty value here are
-                      almost certainly wrong.
-                      More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
-                    type: string
-                type: object
-                x-kubernetes-map-type: atomic
               labels:
                 description: |-
                   Labels identify the jobs this Runner can accept. Labels use lowercase ASCII
@@ -170,20 +154,36 @@ spec:
                 minItems: 1
                 type: array
                 x-kubernetes-list-type: set
+              projectRef:
+                description: |-
+                  ProjectRef identifies the Project whose WorkflowJobs this Runner
+                  accepts. The project must be in the same namespace.
+                properties:
+                  name:
+                    default: ""
+                    description: |-
+                      Name of the referent.
+                      This field is effectively required, but due to backwards compatibility is
+                      allowed to be empty. Instances of this type with an empty value here are
+                      almost certainly wrong.
+                      More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                    type: string
+                type: object
+                x-kubernetes-map-type: atomic
             required:
             - execution
-            - gatewayRef
             - labels
+            - projectRef
             type: object
             x-kubernetes-validations:
-            - message: gatewayRef is immutable
-              rule: self.gatewayRef == oldSelf.gatewayRef
-            - message: '`gatewayRef.name` must be specified'
-              rule: size(self.gatewayRef.name) > 0
-            - message: '`gatewayRef.name` must be no more than 253 characters'
-              rule: size(self.gatewayRef.name) <= 253
-            - message: '`gatewayRef.name` must be a DNS subdomain'
-              rule: self.gatewayRef.name.matches('^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?([.][a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?)*$')
+            - message: projectRef is immutable
+              rule: self.projectRef == oldSelf.projectRef
+            - message: '`projectRef.name` must be specified'
+              rule: size(self.projectRef.name) > 0
+            - message: '`projectRef.name` must be no more than 253 characters'
+              rule: size(self.projectRef.name) <= 253
+            - message: '`projectRef.name` must be a DNS subdomain'
+              rule: self.projectRef.name.matches('^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?([.][a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?)*$')
           status:
             description: RunnerStatus contains observations about one execution agent.
             properties:

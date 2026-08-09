@@ -30,7 +30,7 @@ func TestValidSignature(t *testing.T) {
 	}
 }
 
-func TestGatewayForInstallationUsesConfiguredOwner(t *testing.T) {
+func TestProjectForInstallationUsesConfiguredOwner(t *testing.T) {
 	scheme := runtime.NewScheme()
 	if err := actionsv1alpha1.AddToScheme(scheme); err != nil {
 		t.Fatal(err)
@@ -45,13 +45,13 @@ func TestGatewayForInstallationUsesConfiguredOwner(t *testing.T) {
 			Key:                  "webhook-secret",
 		},
 	}
-	owner := &actionsv1alpha1.ActionsGateway{
+	owner := &actionsv1alpha1.Project{
 		ObjectMeta: metav1.ObjectMeta{Name: "owner", Namespace: "trusted", Generation: 1},
-		Spec: actionsv1alpha1.ActionsGatewaySpec{Source: actionsv1alpha1.ActionsGatewaySource{
+		Spec: actionsv1alpha1.ProjectSpec{Source: actionsv1alpha1.ProjectSource{
 			Type: actionsv1alpha1.SourceTypeGitHub, GitHub: githubConfiguration.DeepCopy(),
 		}},
-		Status: actionsv1alpha1.ActionsGatewayStatus{Conditions: []metav1.Condition{{
-			Type: actionsv1alpha1.ActionsGatewayConditionConfigured, Status: metav1.ConditionTrue, ObservedGeneration: 1,
+		Status: actionsv1alpha1.ProjectStatus{Conditions: []metav1.Condition{{
+			Type: actionsv1alpha1.ProjectConditionConfigured, Status: metav1.ConditionTrue, ObservedGeneration: 1,
 		}}},
 	}
 	duplicate := owner.DeepCopy()
@@ -62,12 +62,12 @@ func TestGatewayForInstallationUsesConfiguredOwner(t *testing.T) {
 	clusterClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(owner, duplicate, secret).Build()
 	handler := &GitHubHandler{Client: clusterClient, APIReader: clusterClient}
 
-	selected, webhookSecret, err := handler.gatewayForInstallation(context.Background(), 42)
+	selected, webhookSecret, err := handler.projectForInstallation(context.Background(), 42)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if selected.Namespace != owner.Namespace || selected.Name != owner.Name || string(webhookSecret) != "secret" {
-		t.Fatalf("selected gateway = %s/%s", selected.Namespace, selected.Name)
+		t.Fatalf("selected project = %s/%s", selected.Namespace, selected.Name)
 	}
 }
 

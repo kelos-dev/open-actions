@@ -27,7 +27,7 @@ var _ = Describe("Runner", func() {
 		run := &actionsv1alpha1.WorkflowRun{
 			ObjectMeta: metav1.ObjectMeta{Name: "runner-execution", Namespace: e2eNamespace},
 			Spec: actionsv1alpha1.WorkflowRunSpec{
-				GatewayRef: corev1.LocalObjectReference{Name: "default"},
+				ProjectRef: corev1.LocalObjectReference{Name: "default"},
 				Source: actionsv1alpha1.WorkflowRunSource{
 					Type: actionsv1alpha1.SourceTypeGitHub,
 					GitHub: &actionsv1alpha1.GitHubWorkflowRunSource{

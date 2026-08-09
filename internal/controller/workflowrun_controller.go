@@ -93,17 +93,17 @@ func (r *WorkflowRunReconciler) Reconcile(ctx context.Context, request ctrl.Requ
 		return r.observeWorkflowJobs(ctx, run, run.Status.WorkflowName, run.Status.ConcurrencyGroup, run.Status.Jobs.Total)
 	}
 
-	gateway := &actionsv1alpha1.ActionsGateway{}
-	if err := r.APIReader.Get(ctx, client.ObjectKey{Namespace: run.Namespace, Name: run.Spec.GatewayRef.Name}, gateway); err != nil {
+	project := &actionsv1alpha1.Project{}
+	if err := r.APIReader.Get(ctx, client.ObjectKey{Namespace: run.Namespace, Name: run.Spec.ProjectRef.Name}, project); err != nil {
 		disposition := planningFailureRetry
 		if apierrors.IsNotFound(err) {
 			disposition = planningFailureTerminal
 		}
-		return r.planningFailed(ctx, run, "GatewayUnavailable", err, disposition)
+		return r.planningFailed(ctx, run, "ProjectUnavailable", err, disposition)
 	}
-	githubConfig := gateway.Spec.Source.GitHub
+	githubConfig := project.Spec.Source.GitHub
 	githubSource := run.Spec.Source.GitHub
-	privateKey, err := secretValue(ctx, r.APIReader, gateway.Namespace, githubConfig.PrivateKeySecretRef)
+	privateKey, err := secretValue(ctx, r.APIReader, project.Namespace, githubConfig.PrivateKeySecretRef)
 	if err != nil {
 		return r.planningFailed(ctx, run, "CredentialsUnavailable", err, planningFailureRetry)
 	}
@@ -137,7 +137,7 @@ func (r *WorkflowRunReconciler) Reconcile(ctx context.Context, request ctrl.Requ
 	run.Status.WorkflowName = definition.Name
 	run.Status.ConcurrencyGroup = concurrencyGroup
 	run.Status.Jobs = &actionsv1alpha1.WorkflowRunJobStatus{Total: jobCount}
-	if err := r.ensureWorkflowJobs(ctx, run, gateway, plannedJobs); err != nil {
+	if err := r.ensureWorkflowJobs(ctx, run, project, plannedJobs); err != nil {
 		return r.planningFailed(ctx, run, "ChildCreationFailed", err, childCreationFailureDisposition(err))
 	}
 	waiting, err := r.handleConcurrency(ctx, run, concurrencyGroup, cancelInProgress)
@@ -156,16 +156,16 @@ type plannedWorkflowJob struct {
 	plan   string
 }
 
-func (r *WorkflowRunReconciler) ensureWorkflowJobs(ctx context.Context, run *actionsv1alpha1.WorkflowRun, gateway *actionsv1alpha1.ActionsGateway, plannedJobs []plannedWorkflowJob) error {
+func (r *WorkflowRunReconciler) ensureWorkflowJobs(ctx context.Context, run *actionsv1alpha1.WorkflowRun, project *actionsv1alpha1.Project, plannedJobs []plannedWorkflowJob) error {
 	for _, item := range plannedJobs {
 		id := item.id
-		labels := workflowJobLabels(run, gateway, id)
+		labels := workflowJobLabels(run, project, id)
 		workflowJob := &actionsv1alpha1.WorkflowJob{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:        childName(run.Name, id),
 				Namespace:   run.Namespace,
 				Labels:      labels,
-				Annotations: map[string]string{actionsv1alpha1.AnnotationGatewayName: gateway.Name},
+				Annotations: map[string]string{actionsv1alpha1.AnnotationProjectName: project.Name},
 			},
 			Spec: actionsv1alpha1.WorkflowJobSpec{
 				WorkflowRunRef: corev1.LocalObjectReference{Name: run.Name},
@@ -615,7 +615,7 @@ func (r *WorkflowRunReconciler) executionWorkloadsRemain(ctx context.Context, ru
 }
 
 func sameConcurrencyScope(left, right *actionsv1alpha1.WorkflowRun) bool {
-	if left.Spec.GatewayRef.Name != right.Spec.GatewayRef.Name || left.Spec.Source.Type != right.Spec.Source.Type {
+	if left.Spec.ProjectRef.Name != right.Spec.ProjectRef.Name || left.Spec.Source.Type != right.Spec.Source.Type {
 		return false
 	}
 	if left.Spec.Source.Type != actionsv1alpha1.SourceTypeGitHub || left.Spec.Source.GitHub == nil || right.Spec.Source.GitHub == nil {
@@ -754,14 +754,14 @@ func sanitizeName(value string) string {
 	return strings.Trim(builder.String(), "-")
 }
 
-func workflowJobLabels(run *actionsv1alpha1.WorkflowRun, gateway *actionsv1alpha1.ActionsGateway, jobID string) map[string]string {
+func workflowJobLabels(run *actionsv1alpha1.WorkflowRun, project *actionsv1alpha1.Project, jobID string) map[string]string {
 	jobLabel := jobID
 	if len(validation.IsValidLabelValue(jobLabel)) > 0 {
 		digest := sha256.Sum256([]byte(jobID))
 		jobLabel = strings.ToLower(digestEncoding.EncodeToString(digest[:]))
 	}
 	return map[string]string{
-		actionsv1alpha1.LabelGatewayUID:     string(gateway.UID),
+		actionsv1alpha1.LabelProjectUID:     string(project.UID),
 		actionsv1alpha1.LabelWorkflowRunUID: string(run.UID),
 		actionsv1alpha1.LabelWorkflowJob:    jobLabel,
 	}

@@ -4,7 +4,7 @@ metadata:
   name: runner-1
   namespace: open-actions
 spec:
-  gatewayRef:
+  projectRef:
     name: default
   execution:
     image: ghcr.io/kelos-dev/open-actions-runner:latest

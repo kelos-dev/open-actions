@@ -1,7 +1,7 @@
 package v1alpha1
 
 const (
-	LabelGatewayUID     = "actions.kelos.dev/gateway-uid"
+	LabelProjectUID     = "actions.kelos.dev/project-uid"
 	LabelRunnerUID      = "actions.kelos.dev/runner-uid"
 	LabelWorkflowRunUID = "actions.kelos.dev/workflow-run-uid"
 	LabelWorkflowJobUID = "actions.kelos.dev/workflow-job-uid"
@@ -9,5 +9,5 @@ const (
 
 	AnnotationWorkflowJobID = "actions.kelos.dev/workflow-job-id"
 	AnnotationRunnerName    = "actions.kelos.dev/runner-name"
-	AnnotationGatewayName   = "actions.kelos.dev/gateway-name"
+	AnnotationProjectName   = "actions.kelos.dev/project-name"
 )

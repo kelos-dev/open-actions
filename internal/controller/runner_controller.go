@@ -37,7 +37,7 @@ const (
 	runnerFinalizer             = "actions.kelos.dev/runner-finalizer"
 	workflowJobQueuedIndex      = "actions.kelos.dev/workflow-job-queued"
 	workflowJobRunnerNameIndex  = "actions.kelos.dev/workflow-job-runner-name"
-	workflowJobGatewayNameIndex = "actions.kelos.dev/workflow-job-gateway-name"
+	workflowJobProjectNameIndex = "actions.kelos.dev/workflow-job-project-name"
 )
 
 type RunnerReconciler struct {
@@ -102,32 +102,32 @@ func (r *RunnerReconciler) Reconcile(ctx context.Context, request ctrl.Request) 
 		}
 	}
 
-	gateway := &actionsv1alpha1.ActionsGateway{}
-	gatewayKey := client.ObjectKey{Namespace: runnerObject.Namespace, Name: runnerObject.Spec.GatewayRef.Name}
-	if err := r.APIReader.Get(ctx, gatewayKey, gateway); err != nil {
-		message := fmt.Sprintf("Get ActionsGateway %q: %v", gatewayKey.Name, err)
+	project := &actionsv1alpha1.Project{}
+	projectKey := client.ObjectKey{Namespace: runnerObject.Namespace, Name: runnerObject.Spec.ProjectRef.Name}
+	if err := r.APIReader.Get(ctx, projectKey, project); err != nil {
+		message := fmt.Sprintf("Get Project %q: %v", projectKey.Name, err)
 		if workflowJob != nil {
 			expired, failureErr := r.failExpiredPreStart(ctx, workflowJob, message)
 			if failureErr != nil {
 				return ctrl.Result{}, failureErr
 			}
 			if expired {
-				if statusErr := r.updateRunnerStatus(ctx, runnerObject, metav1.ConditionFalse, "GatewayUnavailable", message, nil); statusErr != nil {
+				if statusErr := r.updateRunnerStatus(ctx, runnerObject, metav1.ConditionFalse, "ProjectUnavailable", message, nil); statusErr != nil {
 					return ctrl.Result{}, statusErr
 				}
 				return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 			}
 		}
-		if statusErr := r.updateRunnerStatus(ctx, runnerObject, metav1.ConditionFalse, "GatewayUnavailable", message, runnerObject.Status.WorkflowJobRef); statusErr != nil {
+		if statusErr := r.updateRunnerStatus(ctx, runnerObject, metav1.ConditionFalse, "ProjectUnavailable", message, runnerObject.Status.WorkflowJobRef); statusErr != nil {
 			return ctrl.Result{}, statusErr
 		}
 		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 	}
-	gatewayConfigured := meta.FindStatusCondition(gateway.Status.Conditions, actionsv1alpha1.ActionsGatewayConditionConfigured)
-	if gatewayConfigured == nil || gatewayConfigured.Status != metav1.ConditionTrue {
-		message := fmt.Sprintf("ActionsGateway %q is not configured", gateway.Name)
-		if gatewayConfigured != nil && gatewayConfigured.Message != "" {
-			message = gatewayConfigured.Message
+	projectConfigured := meta.FindStatusCondition(project.Status.Conditions, actionsv1alpha1.ProjectConditionConfigured)
+	if projectConfigured == nil || projectConfigured.Status != metav1.ConditionTrue {
+		message := fmt.Sprintf("Project %q is not configured", project.Name)
+		if projectConfigured != nil && projectConfigured.Message != "" {
+			message = projectConfigured.Message
 		}
 		if workflowJob != nil {
 			expired, failureErr := r.failExpiredPreStart(ctx, workflowJob, message)
@@ -135,20 +135,20 @@ func (r *RunnerReconciler) Reconcile(ctx context.Context, request ctrl.Request) 
 				return ctrl.Result{}, failureErr
 			}
 			if expired {
-				if statusErr := r.updateRunnerStatus(ctx, runnerObject, metav1.ConditionFalse, "GatewayNotConfigured", message, nil); statusErr != nil {
+				if statusErr := r.updateRunnerStatus(ctx, runnerObject, metav1.ConditionFalse, "ProjectNotConfigured", message, nil); statusErr != nil {
 					return ctrl.Result{}, statusErr
 				}
 				return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 			}
 		}
-		if err := r.updateRunnerStatus(ctx, runnerObject, metav1.ConditionFalse, "GatewayNotConfigured", message, runnerObject.Status.WorkflowJobRef); err != nil {
+		if err := r.updateRunnerStatus(ctx, runnerObject, metav1.ConditionFalse, "ProjectNotConfigured", message, runnerObject.Status.WorkflowJobRef); err != nil {
 			return ctrl.Result{}, err
 		}
 		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 	}
 
 	if workflowJob == nil {
-		workflowJob, err = r.claimWorkflowJob(ctx, runnerObject, gateway)
+		workflowJob, err = r.claimWorkflowJob(ctx, runnerObject, project)
 		if err != nil {
 			if errors.Is(err, errRunnerAlreadyAssigned) {
 				return ctrl.Result{Requeue: true}, nil
@@ -164,7 +164,7 @@ func (r *RunnerReconciler) Reconcile(ctx context.Context, request ctrl.Request) 
 		return ctrl.Result{Requeue: true}, nil
 	}
 
-	terminal, err := r.executeWorkflowJob(ctx, runnerObject, workflowJob, gateway)
+	terminal, err := r.executeWorkflowJob(ctx, runnerObject, workflowJob, project)
 	if err != nil {
 		expired, failureErr := r.failExpiredPreStart(ctx, workflowJob, err.Error())
 		if failureErr != nil {
@@ -234,11 +234,11 @@ func (r *RunnerReconciler) assignedWorkflowJob(ctx context.Context, runnerObject
 	return nil, nil
 }
 
-func (r *RunnerReconciler) claimWorkflowJob(ctx context.Context, runnerObject *actionsv1alpha1.Runner, gateway *actionsv1alpha1.ActionsGateway) (*actionsv1alpha1.WorkflowJob, error) {
+func (r *RunnerReconciler) claimWorkflowJob(ctx context.Context, runnerObject *actionsv1alpha1.Runner, project *actionsv1alpha1.Project) (*actionsv1alpha1.WorkflowJob, error) {
 	jobs := &actionsv1alpha1.WorkflowJobList{}
 	if err := r.List(ctx, jobs,
 		client.InNamespace(runnerObject.Namespace),
-		client.MatchingFields{workflowJobQueuedIndex: "true", workflowJobGatewayNameIndex: gateway.Name},
+		client.MatchingFields{workflowJobQueuedIndex: "true", workflowJobProjectNameIndex: project.Name},
 	); err != nil {
 		return nil, err
 	}
@@ -250,8 +250,8 @@ func (r *RunnerReconciler) claimWorkflowJob(ctx context.Context, runnerObject *a
 		if !workflowJob.DeletionTimestamp.IsZero() || terminalWorkflowJob(workflowJob) {
 			continue
 		}
-		if workflowJob.Labels[actionsv1alpha1.LabelGatewayUID] != string(gateway.UID) {
-			if err := r.failQueuedWorkflowJob(ctx, workflowJob, "GatewayRecreated", fmt.Sprintf("ActionsGateway %q was recreated before the job was assigned", gateway.Name)); err != nil {
+		if workflowJob.Labels[actionsv1alpha1.LabelProjectUID] != string(project.UID) {
+			if err := r.failQueuedWorkflowJob(ctx, workflowJob, "ProjectRecreated", fmt.Sprintf("Project %q was recreated before the job was assigned", project.Name)); err != nil {
 				return nil, err
 			}
 			continue
@@ -317,13 +317,13 @@ func (r *RunnerReconciler) releaseRunnerClaim(ctx context.Context, runnerObject 
 	return r.updateRunnerStatus(ctx, current, metav1.ConditionTrue, "Ready", "Runner is operational", nil)
 }
 
-func (r *RunnerReconciler) executeWorkflowJob(ctx context.Context, runnerObject *actionsv1alpha1.Runner, workflowJob *actionsv1alpha1.WorkflowJob, gateway *actionsv1alpha1.ActionsGateway) (bool, error) {
+func (r *RunnerReconciler) executeWorkflowJob(ctx context.Context, runnerObject *actionsv1alpha1.Runner, workflowJob *actionsv1alpha1.WorkflowJob, project *actionsv1alpha1.Project) (bool, error) {
 	run := &actionsv1alpha1.WorkflowRun{}
 	if err := r.Get(ctx, client.ObjectKey{Namespace: workflowJob.Namespace, Name: workflowJob.Spec.WorkflowRunRef.Name}, run); err != nil {
 		return false, err
 	}
-	if run.Spec.GatewayRef.Name != gateway.Name {
-		return false, fmt.Errorf("WorkflowJob %q belongs to ActionsGateway %q, not Runner gateway %q", workflowJob.Name, run.Spec.GatewayRef.Name, gateway.Name)
+	if run.Spec.ProjectRef.Name != project.Name {
+		return false, fmt.Errorf("WorkflowJob %q belongs to Project %q, not Runner project %q", workflowJob.Name, run.Spec.ProjectRef.Name, project.Name)
 	}
 	if !metav1.IsControlledBy(workflowJob, run) {
 		return false, fmt.Errorf("WorkflowJob %q is not controlled by WorkflowRun %q", workflowJob.Name, run.Name)
@@ -336,8 +336,8 @@ func (r *RunnerReconciler) executeWorkflowJob(ctx context.Context, runnerObject 
 	} else if canceled {
 		return true, r.cancelWorkflowJob(ctx, workflowJob)
 	}
-	if workflowJob.Labels[actionsv1alpha1.LabelGatewayUID] != string(gateway.UID) {
-		return true, r.failAssignedWorkflowJob(ctx, workflowJob, "GatewayRecreated", fmt.Sprintf("ActionsGateway %q was recreated before execution started", gateway.Name))
+	if workflowJob.Labels[actionsv1alpha1.LabelProjectUID] != string(project.UID) {
+		return true, r.failAssignedWorkflowJob(ctx, workflowJob, "ProjectRecreated", fmt.Sprintf("Project %q was recreated before execution started", project.Name))
 	}
 	if workflowJobStarted(workflowJob) {
 		active, err := r.activeWorkflowJobPods(ctx, workflowJob)
@@ -360,9 +360,9 @@ func (r *RunnerReconciler) executeWorkflowJob(ctx context.Context, runnerObject 
 	if !metav1.IsControlledBy(plan, workflowJob) {
 		return false, fmt.Errorf("job plan ConfigMap %q is not controlled by WorkflowJob %q", plan.Name, workflowJob.Name)
 	}
-	githubConfig := gateway.Spec.Source.GitHub
+	githubConfig := project.Spec.Source.GitHub
 	githubSource := run.Spec.Source.GitHub
-	privateKey, err := secretValue(ctx, r.APIReader, gateway.Namespace, githubConfig.PrivateKeySecretRef)
+	privateKey, err := secretValue(ctx, r.APIReader, project.Namespace, githubConfig.PrivateKeySecretRef)
 	if err != nil {
 		return false, err
 	}
@@ -378,7 +378,7 @@ func (r *RunnerReconciler) executeWorkflowJob(ctx context.Context, runnerObject 
 	if err := r.ensureAuthSecret(ctx, workflowJob, installation.Token()); err != nil {
 		return false, err
 	}
-	nativeJob, err := r.buildJob(workflowJob, run, gateway, runnerObject)
+	nativeJob, err := r.buildJob(workflowJob, run, project, runnerObject)
 	if err != nil {
 		return false, err
 	}
@@ -565,8 +565,8 @@ func (r *RunnerReconciler) ensureAuthSecret(ctx context.Context, workflowJob *ac
 	return r.Patch(ctx, existing, client.MergeFrom(before))
 }
 
-func (r *RunnerReconciler) buildJob(workflowJob *actionsv1alpha1.WorkflowJob, run *actionsv1alpha1.WorkflowRun, gateway *actionsv1alpha1.ActionsGateway, runnerObject *actionsv1alpha1.Runner) (*batchv1.Job, error) {
-	labels := nativeJobLabels(workflowJob, run, gateway, runnerObject)
+func (r *RunnerReconciler) buildJob(workflowJob *actionsv1alpha1.WorkflowJob, run *actionsv1alpha1.WorkflowRun, project *actionsv1alpha1.Project, runnerObject *actionsv1alpha1.Runner) (*batchv1.Job, error) {
+	labels := nativeJobLabels(workflowJob, run, project, runnerObject)
 	annotations := map[string]string{
 		actionsv1alpha1.AnnotationWorkflowJobID: workflowJob.Spec.JobID,
 		actionsv1alpha1.AnnotationRunnerName:    runnerObject.Name,
@@ -798,14 +798,14 @@ func (r *RunnerReconciler) SetupWithManager(manager ctrl.Manager) error {
 	if err := manager.GetFieldIndexer().IndexField(context.Background(), &actionsv1alpha1.WorkflowJob{}, workflowJobRunnerNameIndex, indexWorkflowJobRunnerName); err != nil {
 		return err
 	}
-	if err := manager.GetFieldIndexer().IndexField(context.Background(), &actionsv1alpha1.WorkflowJob{}, workflowJobGatewayNameIndex, indexWorkflowJobGatewayName); err != nil {
+	if err := manager.GetFieldIndexer().IndexField(context.Background(), &actionsv1alpha1.WorkflowJob{}, workflowJobProjectNameIndex, indexWorkflowJobProjectName); err != nil {
 		return err
 	}
 	return ctrl.NewControllerManagedBy(manager).
 		For(&actionsv1alpha1.Runner{}).
 		Watches(&actionsv1alpha1.WorkflowJob{}, handler.EnqueueRequestsFromMapFunc(r.runnersForWorkflowJob)).
 		Watches(&actionsv1alpha1.WorkflowRun{}, handler.EnqueueRequestsFromMapFunc(r.runnersForWorkflowRun)).
-		Watches(&actionsv1alpha1.ActionsGateway{}, handler.EnqueueRequestsFromMapFunc(r.runnersForGateway)).
+		Watches(&actionsv1alpha1.Project{}, handler.EnqueueRequestsFromMapFunc(r.runnersForProject)).
 		Watches(&batchv1.Job{}, handler.EnqueueRequestsFromMapFunc(r.runnerForNativeJob)).
 		Complete(r)
 }
@@ -829,7 +829,7 @@ func (r *RunnerReconciler) runnersForWorkflowRun(ctx context.Context, object cli
 	requests := make([]reconcile.Request, 0, len(runners.Items))
 	for index := range runners.Items {
 		runnerObject := &runners.Items[index]
-		if runnerObject.Status.WorkflowJobRef == nil && runnerObject.Spec.GatewayRef.Name == run.Spec.GatewayRef.Name {
+		if runnerObject.Status.WorkflowJobRef == nil && runnerObject.Spec.ProjectRef.Name == run.Spec.ProjectRef.Name {
 			requests = append(requests, requestFor(runnerObject))
 		}
 	}
@@ -852,15 +852,15 @@ func indexWorkflowJobRunnerName(object client.Object) []string {
 	return []string{workflowJob.Status.RunnerRef.Name}
 }
 
-func indexWorkflowJobGatewayName(object client.Object) []string {
-	name := object.GetAnnotations()[actionsv1alpha1.AnnotationGatewayName]
+func indexWorkflowJobProjectName(object client.Object) []string {
+	name := object.GetAnnotations()[actionsv1alpha1.AnnotationProjectName]
 	if name == "" {
 		return nil
 	}
 	return []string{name}
 }
 
-func (r *RunnerReconciler) runnersForGateway(ctx context.Context, object client.Object) []reconcile.Request {
+func (r *RunnerReconciler) runnersForProject(ctx context.Context, object client.Object) []reconcile.Request {
 	runners := &actionsv1alpha1.RunnerList{}
 	if err := r.List(ctx, runners, client.InNamespace(object.GetNamespace())); err != nil {
 		return nil
@@ -868,7 +868,7 @@ func (r *RunnerReconciler) runnersForGateway(ctx context.Context, object client.
 	requests := []reconcile.Request{}
 	for index := range runners.Items {
 		runnerObject := &runners.Items[index]
-		if runnerObject.Spec.GatewayRef.Name == object.GetName() {
+		if runnerObject.Spec.ProjectRef.Name == object.GetName() {
 			requests = append(requests, requestFor(runnerObject))
 		}
 	}
@@ -898,7 +898,7 @@ func (r *RunnerReconciler) runnersForWorkflowJob(ctx context.Context, object cli
 	for index := range runners.Items {
 		candidate := &runners.Items[index]
 		if candidate.Status.WorkflowJobRef == nil &&
-			candidate.Spec.GatewayRef.Name == run.Spec.GatewayRef.Name &&
+			candidate.Spec.ProjectRef.Name == run.Spec.ProjectRef.Name &&
 			runnerLabelsMatch(candidate.Spec.Labels, workflowJob.Spec.RunsOn) {
 			candidates = append(candidates, candidate)
 		}
@@ -940,9 +940,9 @@ func terminalWorkflowJob(workflowJob *actionsv1alpha1.WorkflowJob) bool {
 	return condition != nil && (condition.Status == metav1.ConditionTrue || condition.Status == metav1.ConditionFalse)
 }
 
-func nativeJobLabels(workflowJob *actionsv1alpha1.WorkflowJob, run *actionsv1alpha1.WorkflowRun, gateway *actionsv1alpha1.ActionsGateway, runnerObject *actionsv1alpha1.Runner) map[string]string {
+func nativeJobLabels(workflowJob *actionsv1alpha1.WorkflowJob, run *actionsv1alpha1.WorkflowRun, project *actionsv1alpha1.Project, runnerObject *actionsv1alpha1.Runner) map[string]string {
 	return map[string]string{
-		actionsv1alpha1.LabelGatewayUID:     string(gateway.UID),
+		actionsv1alpha1.LabelProjectUID:     string(project.UID),
 		actionsv1alpha1.LabelRunnerUID:      string(runnerObject.UID),
 		actionsv1alpha1.LabelWorkflowRunUID: string(run.UID),
 		actionsv1alpha1.LabelWorkflowJobUID: string(workflowJob.UID),

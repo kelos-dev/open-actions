@@ -23,11 +23,11 @@ import (
 
 func TestWebhookReplayIDUsesSignedBody(t *testing.T) {
 	scheme := deliveryTestScheme(t)
-	gateway := &actionsv1alpha1.ActionsGateway{
-		TypeMeta:   metav1.TypeMeta{APIVersion: actionsv1alpha1.GroupVersion.String(), Kind: "ActionsGateway"},
-		ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: "default", UID: "gateway-uid"},
+	project := &actionsv1alpha1.Project{
+		TypeMeta:   metav1.TypeMeta{APIVersion: actionsv1alpha1.GroupVersion.String(), Kind: "Project"},
+		ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: "default", UID: "project-uid"},
 	}
-	clusterClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(gateway).Build()
+	clusterClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(project).Build()
 	handler := &GitHubHandler{Client: clusterClient, APIReader: clusterClient}
 	event := &payload{}
 	event.Repository.ID = 1
@@ -36,10 +36,10 @@ func TestWebhookReplayIDUsesSignedBody(t *testing.T) {
 	body := []byte(`{"after":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","repository":{"id":1,"name":"example"}}`)
 	normalized := normalizedEvent{Name: "push", SHA: strings.Repeat("a", 40), Ref: "refs/heads/main"}
 
-	if err := handler.enqueueDelivery(context.Background(), gateway, event, normalized, "original-delivery", body); err != nil {
+	if err := handler.enqueueDelivery(context.Background(), project, event, normalized, "original-delivery", body); err != nil {
 		t.Fatal(err)
 	}
-	if err := handler.enqueueDelivery(context.Background(), gateway, event, normalized, "replay-delivery", body); err != nil {
+	if err := handler.enqueueDelivery(context.Background(), project, event, normalized, "replay-delivery", body); err != nil {
 		t.Fatalf("signed-body replay was not idempotent: %v", err)
 	}
 	deliveries := &corev1.ConfigMapList{}
@@ -60,7 +60,7 @@ func TestWebhookReplayIDUsesSignedBody(t *testing.T) {
 
 func TestCreateWorkflowRunIsIdempotent(t *testing.T) {
 	scheme := deliveryTestScheme(t)
-	gateway := &actionsv1alpha1.ActionsGateway{ObjectMeta: metav1.ObjectMeta{Name: "gateway", Namespace: "default"}}
+	project := &actionsv1alpha1.Project{ObjectMeta: metav1.ObjectMeta{Name: "project", Namespace: "default"}}
 	event := &payload{}
 	event.Repository.ID = 1
 	event.Repository.Owner.Login = "acme"
@@ -70,18 +70,18 @@ func TestCreateWorkflowRunIsIdempotent(t *testing.T) {
 
 	clusterClient := fake.NewClientBuilder().WithScheme(scheme).Build()
 	reconciler := &DeliveryReconciler{Client: clusterClient, APIReader: clusterClient}
-	if err := reconciler.createWorkflowRun(context.Background(), gateway, delivery, ".open-actions/workflows/ci.yaml"); err != nil {
+	if err := reconciler.createWorkflowRun(context.Background(), project, delivery, ".open-actions/workflows/ci.yaml"); err != nil {
 		t.Fatal(err)
 	}
-	if err := reconciler.createWorkflowRun(context.Background(), gateway, delivery, ".open-actions/workflows/ci.yaml"); err != nil {
+	if err := reconciler.createWorkflowRun(context.Background(), project, delivery, ".open-actions/workflows/ci.yaml"); err != nil {
 		t.Fatalf("matching replay failed: %v", err)
 	}
 
 	workflowPath := ".open-actions/workflows/deploy.yaml"
 	conflicting := &actionsv1alpha1.WorkflowRun{
-		ObjectMeta: metav1.ObjectMeta{Name: workflowRunName(workflowPath, "conflict"), Namespace: gateway.Namespace},
+		ObjectMeta: metav1.ObjectMeta{Name: workflowRunName(workflowPath, "conflict"), Namespace: project.Namespace},
 		Spec: actionsv1alpha1.WorkflowRunSpec{
-			GatewayRef:   corev1.LocalObjectReference{Name: "other-gateway"},
+			ProjectRef:   corev1.LocalObjectReference{Name: "other-project"},
 			Source:       actionsv1alpha1.WorkflowRunSource{Type: actionsv1alpha1.SourceTypeGitHub, GitHub: &actionsv1alpha1.GitHubWorkflowRunSource{Repository: actionsv1alpha1.GitHubRepository{ID: 2}}},
 			WorkflowPath: workflowPath,
 		},
@@ -91,7 +91,7 @@ func TestCreateWorkflowRunIsIdempotent(t *testing.T) {
 	}
 	conflictingDelivery := *delivery
 	conflictingDelivery.ReplayID = "conflict"
-	err := reconciler.createWorkflowRun(context.Background(), gateway, &conflictingDelivery, workflowPath)
+	err := reconciler.createWorkflowRun(context.Background(), project, &conflictingDelivery, workflowPath)
 	if !apierrors.IsConflict(err) {
 		t.Fatalf("conflicting WorkflowRun error = %v, want conflict", err)
 	}
@@ -109,7 +109,7 @@ func TestInvalidWorkflowRunCreationIsTerminal(t *testing.T) {
 
 func TestCreateWorkflowRunReplayUsesLiveReader(t *testing.T) {
 	scheme := deliveryTestScheme(t)
-	gateway := &actionsv1alpha1.ActionsGateway{ObjectMeta: metav1.ObjectMeta{Name: "gateway", Namespace: "default"}}
+	project := &actionsv1alpha1.Project{ObjectMeta: metav1.ObjectMeta{Name: "project", Namespace: "default"}}
 	event := &payload{}
 	event.Repository.ID = 1
 	event.Repository.Owner.Login = "acme"
@@ -118,9 +118,9 @@ func TestCreateWorkflowRunReplayUsesLiveReader(t *testing.T) {
 	workflowPath := ".open-actions/workflows/ci.yaml"
 	delivery := &queuedDelivery{Payload: *event, Event: normalized, ReplayID: "replay", DeliveryID: "delivery"}
 	existing := &actionsv1alpha1.WorkflowRun{
-		ObjectMeta: metav1.ObjectMeta{Name: workflowRunName(workflowPath, delivery.ReplayID), Namespace: gateway.Namespace},
+		ObjectMeta: metav1.ObjectMeta{Name: workflowRunName(workflowPath, delivery.ReplayID), Namespace: project.Namespace},
 		Spec: actionsv1alpha1.WorkflowRunSpec{
-			GatewayRef: corev1.LocalObjectReference{Name: gateway.Name},
+			ProjectRef: corev1.LocalObjectReference{Name: project.Name},
 			Source: actionsv1alpha1.WorkflowRunSource{
 				Type: actionsv1alpha1.SourceTypeGitHub,
 				GitHub: &actionsv1alpha1.GitHubWorkflowRunSource{
@@ -138,7 +138,7 @@ func TestCreateWorkflowRunReplayUsesLiveReader(t *testing.T) {
 		Client:    &workflowRunAlreadyExistsClient{Client: cachedClient},
 		APIReader: liveReader,
 	}
-	if err := reconciler.createWorkflowRun(context.Background(), gateway, delivery, workflowPath); err != nil {
+	if err := reconciler.createWorkflowRun(context.Background(), project, delivery, workflowPath); err != nil {
 		t.Fatalf("matching replay failed against stale cache: %v", err)
 	}
 }

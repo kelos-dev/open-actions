@@ -20,7 +20,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
-var _ = Describe("ActionsGateway", func() {
+var _ = Describe("Project", func() {
 	BeforeEach(func() {
 		setupControlPlane(false)
 	})
@@ -47,7 +47,7 @@ var _ = Describe("ActionsGateway", func() {
 			}
 			run := runs.Items[0]
 			githubSource := run.Spec.Source.GitHub
-			g.Expect(run.Spec.GatewayRef.Name).To(Equal("default"))
+			g.Expect(run.Spec.ProjectRef.Name).To(Equal("default"))
 			g.Expect(run.Spec.Source.Type).To(Equal(actionsv1alpha1.SourceTypeGitHub))
 			g.Expect(githubSource.Repository.Owner).To(Equal("acme"))
 			g.Expect(githubSource.Repository.Name).To(Equal("example"))

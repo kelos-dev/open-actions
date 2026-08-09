@@ -46,8 +46,8 @@ const (
 )
 
 type queuedDelivery struct {
-	GatewayName string          `json:"gatewayName"`
-	GatewayUID  string          `json:"gatewayUID"`
+	ProjectName string          `json:"projectName"`
+	ProjectUID  string          `json:"projectUID"`
 	Payload     payload         `json:"payload"`
 	Event       normalizedEvent `json:"event"`
 	ReplayID    string          `json:"replayID"`
@@ -62,10 +62,10 @@ type DeliveryReconciler struct {
 	Now       func() time.Time
 }
 
-func (h *GitHubHandler) enqueueDelivery(ctx context.Context, gateway *actionsv1alpha1.ActionsGateway, event *payload, normalized normalizedEvent, deliveryID string, signedBody []byte) error {
+func (h *GitHubHandler) enqueueDelivery(ctx context.Context, project *actionsv1alpha1.Project, event *payload, normalized normalizedEvent, deliveryID string, signedBody []byte) error {
 	delivery := queuedDelivery{
-		GatewayName: gateway.Name,
-		GatewayUID:  string(gateway.UID),
+		ProjectName: project.Name,
+		ProjectUID:  string(project.UID),
 		Payload:     *event,
 		Event:       normalized,
 		ReplayID:    webhookReplayID(signedBody),
@@ -80,10 +80,10 @@ func (h *GitHubHandler) enqueueDelivery(ctx context.Context, gateway *actionsv1a
 	}
 	object := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{
 		Name:      webhookDeliveryName(signedBody),
-		Namespace: gateway.Namespace,
+		Namespace: project.Namespace,
 		Labels:    map[string]string{deliveryLabel: "true"},
 	}, Data: map[string]string{deliveryDataKey: string(data)}}
-	if err := controllerutil.SetControllerReference(gateway, object, h.Client.Scheme()); err != nil {
+	if err := controllerutil.SetControllerReference(project, object, h.Client.Scheme()); err != nil {
 		return err
 	}
 	if err := h.Client.Create(ctx, object); err != nil {
@@ -97,7 +97,7 @@ func (h *GitHubHandler) enqueueDelivery(ctx context.Context, gateway *actionsv1a
 		existingDelivery := queuedDelivery{}
 		decodeErr := json.Unmarshal([]byte(existing.Data[deliveryDataKey]), &existingDelivery)
 		existingDelivery.DeliveryID = delivery.DeliveryID
-		if !metav1.IsControlledBy(existing, gateway) || decodeErr != nil || !apiequality.Semantic.DeepEqual(existingDelivery, delivery) {
+		if !metav1.IsControlledBy(existing, project) || decodeErr != nil || !apiequality.Semantic.DeepEqual(existingDelivery, delivery) {
 			return apierrors.NewConflict(corev1.Resource("configmaps"), object.Name, errors.New("existing webhook delivery does not match the signed payload"))
 		}
 	}
@@ -180,18 +180,18 @@ func (r *DeliveryReconciler) Reconcile(ctx context.Context, request ctrl.Request
 		return ctrl.Result{}, r.finish(ctx, object, deliveryStateFailed, 0, fmt.Sprintf("decode delivery: %v", err))
 	}
 	reader := r.APIReader
-	gateway := &actionsv1alpha1.ActionsGateway{}
-	if err := reader.Get(ctx, client.ObjectKey{Namespace: object.Namespace, Name: delivery.GatewayName}, gateway); err != nil {
+	project := &actionsv1alpha1.Project{}
+	if err := reader.Get(ctx, client.ObjectKey{Namespace: object.Namespace, Name: delivery.ProjectName}, project); err != nil {
 		if apierrors.IsNotFound(err) {
-			return ctrl.Result{}, r.finish(ctx, object, deliveryStateFailed, 0, "ActionsGateway was deleted")
+			return ctrl.Result{}, r.finish(ctx, object, deliveryStateFailed, 0, "Project was deleted")
 		}
 		return ctrl.Result{}, err
 	}
-	if string(gateway.UID) != delivery.GatewayUID || !metav1.IsControlledBy(object, gateway) {
-		return ctrl.Result{}, r.finish(ctx, object, deliveryStateFailed, 0, "ActionsGateway was recreated")
+	if string(project.UID) != delivery.ProjectUID || !metav1.IsControlledBy(object, project) {
+		return ctrl.Result{}, r.finish(ctx, object, deliveryStateFailed, 0, "Project was recreated")
 	}
-	githubConfig := gateway.Spec.Source.GitHub
-	privateKey, err := readSecretValue(ctx, reader, gateway.Namespace, githubConfig.PrivateKeySecretRef)
+	githubConfig := project.Spec.Source.GitHub
+	privateKey, err := readSecretValue(ctx, reader, project.Namespace, githubConfig.PrivateKeySecretRef)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -205,7 +205,7 @@ func (r *DeliveryReconciler) Reconcile(ctx context.Context, request ctrl.Request
 			return ctrl.Result{}, err
 		}
 	}
-	contents, err := installation.ListDirectory(ctx, delivery.Payload.Repository.Owner.Login, delivery.Payload.Repository.Name, gateway.Spec.WorkflowDirectory, delivery.Event.SHA)
+	contents, err := installation.ListDirectory(ctx, delivery.Payload.Repository.Owner.Login, delivery.Payload.Repository.Name, project.Spec.WorkflowDirectory, delivery.Event.SHA)
 	if err != nil {
 		if missingWorkflowDirectory(err) {
 			contents = nil
@@ -246,7 +246,7 @@ func (r *DeliveryReconciler) Reconcile(ctx context.Context, request ctrl.Request
 		}
 	}
 	for _, workflowPath := range workflowPaths {
-		if err := r.createWorkflowRun(ctx, gateway, &delivery, workflowPath); err != nil {
+		if err := r.createWorkflowRun(ctx, project, &delivery, workflowPath); err != nil {
 			if terminalWorkflowRunCreationError(err) {
 				return ctrl.Result{}, r.finish(ctx, object, deliveryStateFailed, 0, err.Error())
 			}
@@ -261,12 +261,12 @@ func terminalWorkflowRunCreationError(err error) bool {
 	return apierrors.IsConflict(err) || apierrors.IsInvalid(err)
 }
 
-func (r *DeliveryReconciler) createWorkflowRun(ctx context.Context, gateway *actionsv1alpha1.ActionsGateway, delivery *queuedDelivery, workflowPath string) error {
+func (r *DeliveryReconciler) createWorkflowRun(ctx context.Context, project *actionsv1alpha1.Project, delivery *queuedDelivery, workflowPath string) error {
 	name := workflowRunName(workflowPath, delivery.ReplayID)
 	desired := &actionsv1alpha1.WorkflowRun{
-		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: gateway.Namespace},
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: project.Namespace},
 		Spec: actionsv1alpha1.WorkflowRunSpec{
-			GatewayRef: corev1.LocalObjectReference{Name: gateway.Name},
+			ProjectRef: corev1.LocalObjectReference{Name: project.Name},
 			Source: actionsv1alpha1.WorkflowRunSource{
 				Type: actionsv1alpha1.SourceTypeGitHub,
 				GitHub: &actionsv1alpha1.GitHubWorkflowRunSource{

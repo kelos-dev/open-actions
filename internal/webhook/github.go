@@ -109,10 +109,10 @@ func (h *GitHubHandler) ServeHTTP(writer http.ResponseWriter, request *http.Requ
 		return
 	}
 
-	gateway, webhookSecret, err := h.gatewayForInstallation(request.Context(), parsed.Installation.ID)
+	project, webhookSecret, err := h.projectForInstallation(request.Context(), parsed.Installation.ID)
 	if err != nil {
-		h.Logger.Error("failed to resolve webhook gateway", "installation_id", parsed.Installation.ID, "error", err)
-		http.Error(writer, "gateway unavailable", http.StatusServiceUnavailable)
+		h.Logger.Error("failed to resolve project for webhook", "installation_id", parsed.Installation.ID, "error", err)
+		http.Error(writer, "project unavailable", http.StatusServiceUnavailable)
 		return
 	}
 	if !validSignature(body, webhookSecret, request.Header.Get("X-Hub-Signature-256")) {
@@ -128,7 +128,7 @@ func (h *GitHubHandler) ServeHTTP(writer http.ResponseWriter, request *http.Requ
 		writeJSON(writer, http.StatusAccepted, map[string]any{"accepted": true, "queued": false})
 		return
 	}
-	if err := h.enqueueDelivery(request.Context(), gateway, parsed, normalized, deliveryID, body); err != nil {
+	if err := h.enqueueDelivery(request.Context(), project, parsed, normalized, deliveryID, body); err != nil {
 		h.Logger.Error("failed to enqueue GitHub webhook", "delivery_id", deliveryID, "event", eventName, "error", err)
 		if apierrors.IsConflict(err) {
 			http.Error(writer, "webhook replay conflict", http.StatusConflict)
@@ -141,29 +141,29 @@ func (h *GitHubHandler) ServeHTTP(writer http.ResponseWriter, request *http.Requ
 	writeJSON(writer, http.StatusAccepted, map[string]any{"accepted": true, "queued": true})
 }
 
-func (h *GitHubHandler) gatewayForInstallation(ctx context.Context, installationID int64) (*actionsv1alpha1.ActionsGateway, []byte, error) {
-	gateways := &actionsv1alpha1.ActionsGatewayList{}
-	if err := h.APIReader.List(ctx, gateways); err != nil {
+func (h *GitHubHandler) projectForInstallation(ctx context.Context, installationID int64) (*actionsv1alpha1.Project, []byte, error) {
+	projects := &actionsv1alpha1.ProjectList{}
+	if err := h.APIReader.List(ctx, projects); err != nil {
 		return nil, nil, err
 	}
-	matches := []*actionsv1alpha1.ActionsGateway{}
-	for index := range gateways.Items {
-		gateway := &gateways.Items[index]
-		configured := meta.FindStatusCondition(gateway.Status.Conditions, actionsv1alpha1.ActionsGatewayConditionConfigured)
-		if gateway.Spec.Source.GitHub.InstallationID == installationID && configured != nil && configured.Status == metav1.ConditionTrue && configured.ObservedGeneration == gateway.Generation {
-			matches = append(matches, gateway)
+	matches := []*actionsv1alpha1.Project{}
+	for index := range projects.Items {
+		project := &projects.Items[index]
+		configured := meta.FindStatusCondition(project.Status.Conditions, actionsv1alpha1.ProjectConditionConfigured)
+		if project.Spec.Source.GitHub.InstallationID == installationID && configured != nil && configured.Status == metav1.ConditionTrue && configured.ObservedGeneration == project.Generation {
+			matches = append(matches, project)
 		}
 	}
 	if len(matches) != 1 {
-		return nil, nil, fmt.Errorf("installation %d matched %d gateways", installationID, len(matches))
+		return nil, nil, fmt.Errorf("installation %d matched %d projects", installationID, len(matches))
 	}
-	gateway := matches[0]
-	github := gateway.Spec.Source.GitHub
-	webhookSecret, err := readSecretValue(ctx, h.APIReader, gateway.Namespace, github.WebhookSecretRef)
+	project := matches[0]
+	github := project.Spec.Source.GitHub
+	webhookSecret, err := readSecretValue(ctx, h.APIReader, project.Namespace, github.WebhookSecretRef)
 	if err != nil {
 		return nil, nil, err
 	}
-	return gateway, webhookSecret, nil
+	return project, webhookSecret, nil
 }
 
 func normalize(eventName string, event *payload) (normalizedEvent, bool, error) {
