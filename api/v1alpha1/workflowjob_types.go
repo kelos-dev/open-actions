@@ -75,6 +75,7 @@ type WorkflowJobStatus struct {
 
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
+// +kubebuilder:metadata:annotations=helm.sh/resource-policy=keep
 // +kubebuilder:printcolumn:name="WorkflowRun",type=string,JSONPath=`.spec.workflowRunRef.name`
 // +kubebuilder:printcolumn:name="Runner",type=string,JSONPath=`.status.runnerRef.name`
 // +kubebuilder:printcolumn:name="Scheduled",type=string,JSONPath=`.status.conditions[?(@.type=="Scheduled")].status`

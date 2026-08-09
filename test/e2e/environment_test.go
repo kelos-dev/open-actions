@@ -54,7 +54,8 @@ var _ = SynchronizedBeforeSuite(func() []byte {
 	repositoryRoot, err = filepath.Abs(filepath.Join("..", ".."))
 	Expect(err).NotTo(HaveOccurred())
 
-	Expect(kubectl("apply", "-k", "config/e2e")).To(Succeed())
+	Expect(openActions("install", "--values", "config/e2e/values.yaml")).To(Succeed())
+	Expect(kubectl("apply", "-f", "config/e2e/fixture.yaml")).To(Succeed())
 	Expect(kubectl(
 		"wait", "--for=condition=Available",
 		"deployment/open-actions-controller", "deployment/github-fixture",
@@ -261,6 +262,16 @@ func stop(command *exec.Cmd) {
 func kubectl(arguments ...string) error {
 	_, err := kubectlOutput(arguments...)
 	return err
+}
+
+func openActions(arguments ...string) error {
+	command := exec.Command(filepath.Join(repositoryRoot, "bin", "open-actions"), arguments...)
+	command.Dir = repositoryRoot
+	output, err := command.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("open-actions %s: %w: %s", strings.Join(arguments, " "), err, output)
+	}
+	return nil
 }
 
 func kubectlOutput(arguments ...string) (string, error) {

@@ -1,7 +1,0 @@
-apiVersion: kustomize.config.k8s.io/v1beta1
-kind: Kustomization
-resources:
-  - bases/actions.kelos.dev_projects.yaml
-  - bases/actions.kelos.dev_runners.yaml
-  - bases/actions.kelos.dev_workflowjobs.yaml
-  - bases/actions.kelos.dev_workflowruns.yaml

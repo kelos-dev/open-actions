@@ -1,0 +1,8 @@
+controller:
+  image:
+    repository: ghcr.io/kelos-dev/open-actions-controller
+    tag: latest
+    pullPolicy: IfNotPresent
+  githubAPIURL: https://api.github.com/
+  githubServerURL: https://github.com
+  actionCloneBaseURL: https://github.com

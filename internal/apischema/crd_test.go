@@ -623,7 +623,7 @@ func convertCRD(t *testing.T, crd *apiextensionsv1.CustomResourceDefinition) *ap
 
 func loadCRD(t *testing.T, name string) (*apiextensionsv1.CustomResourceDefinition, int) {
 	t.Helper()
-	path := filepath.Join("..", "..", "config", "crd", "bases", name)
+	path := filepath.Join("..", "manifests", "charts", "open-actions", "templates", "crds", name)
 	data, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("read %s: %v", path, err)

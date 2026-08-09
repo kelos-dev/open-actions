@@ -60,21 +60,24 @@ The diagram is an editable [draw.io](https://www.drawio.com/) file at
 make update     # Format, generate Go code and CRDs, and tidy modules.
 make verify     # Check generated files, formatting, modules, and go vet.
 make test       # Run unit and schema tests.
-make build      # Build the controller and runner binaries under bin/.
+make build      # Build the CLI, controller, and runner binaries under bin/.
+make build WHAT=cmd/open-actions  # Build only the CLI.
+make image      # Build the controller and runner images.
+make image WHAT=test/fixture/github  # Build only the end-to-end fixture image.
 ```
 
-The Ginkgo/Gomega end-to-end suite expects a current Kubernetes context. CI
-creates a Kind cluster, builds and loads the images, and installs the controller
-and CRDs. The `Project` tests verify webhook authentication, typed
-`WorkflowRun` creation, and queued delivery failures for invalid workflows.
-The `Runner` tests create a typed `WorkflowRun` and verify job assignment,
-native Job execution, status updates, and cleanup. The GitHub fixture serves
-separate tagged action repositories so the Runner tests cover JavaScript and
-composite actions, nested action outputs, file commands, and post hooks without
-public network access.
+The Ginkgo/Gomega end-to-end suite requires Helm and expects a current
+Kubernetes context. CI creates a Kind cluster, builds and loads the images, and
+installs the controller and CRDs. The `Project` tests verify webhook
+authentication, typed `WorkflowRun` creation, and queued delivery failures for
+invalid workflows. The `Runner` tests create a typed `WorkflowRun` and verify
+job assignment, native Job execution, status updates, and cleanup. The GitHub
+fixture serves separate tagged action repositories so the Runner tests cover
+JavaScript and composite actions, nested action outputs, file commands, and
+post hooks without public network access.
 
 ```console
-make image-e2e VERSION=e2e
+make image WHAT="cmd/open-actions-controller cmd/open-actions-runner test/fixture/github" VERSION=e2e
 kind load docker-image ghcr.io/kelos-dev/open-actions-controller:e2e
 kind load docker-image ghcr.io/kelos-dev/open-actions-runner:e2e
 kind load docker-image ghcr.io/kelos-dev/open-actions-fixture:e2e
@@ -83,11 +86,25 @@ RUNNER_IMAGE=ghcr.io/kelos-dev/open-actions-runner:e2e make test-e2e
 
 ## Installation
 
-Install the CRDs, RBAC, controller, and webhook Service:
+Install the CLI:
 
 ```console
-make install
+go install github.com/kelos-dev/open-actions/cmd/open-actions@latest
 ```
+
+Then install the CRDs, RBAC, controller, and webhook Service in the cluster
+selected by the current Kubernetes context:
+
+```console
+open-actions install
+```
+
+The command installs or upgrades the embedded Helm chart as the `open-actions`
+release in the `open-actions-system` namespace. It requires Helm on `PATH` and
+uses Helm's current Kubernetes context. Pass custom chart configuration with
+`open-actions install --values values.yaml`. The chart and its values are
+documented in
+[`internal/manifests/charts/open-actions`](internal/manifests/charts/open-actions).
 
 The controller deployment uses `open-actions-controller`. Each Runner's
 `spec.execution.image` selects the `open-actions-runner` image used by its

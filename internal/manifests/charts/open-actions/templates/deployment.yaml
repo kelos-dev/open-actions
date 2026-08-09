@@ -2,6 +2,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: open-actions-controller
+  namespace: {{ .Release.Namespace }}
   labels:
     app.kubernetes.io/name: open-actions
     app.kubernetes.io/component: controller
@@ -24,10 +25,13 @@ spec:
           type: RuntimeDefault
       containers:
         - name: manager
-          image: ghcr.io/kelos-dev/open-actions-controller:latest
-          imagePullPolicy: IfNotPresent
+          image: "{{ .Values.controller.image.repository }}:{{ .Values.controller.image.tag }}"
+          imagePullPolicy: {{ .Values.controller.image.pullPolicy }}
           args:
             - --leader-elect=true
+            - {{ printf "--github-api-url=%s" .Values.controller.githubAPIURL | quote }}
+            - {{ printf "--github-server-url=%s" .Values.controller.githubServerURL | quote }}
+            - {{ printf "--action-clone-base-url=%s" .Values.controller.actionCloneBaseURL | quote }}
           ports:
             - name: webhook
               containerPort: 8080

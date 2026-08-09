@@ -1,0 +1,6 @@
+controller:
+  image:
+    tag: e2e
+  githubAPIURL: http://github-fixture.open-actions-system.svc.cluster.local:8080/
+  githubServerURL: http://github-fixture.open-actions-system.svc.cluster.local:8080
+  actionCloneBaseURL: http://github-fixture.open-actions-system.svc.cluster.local:8080

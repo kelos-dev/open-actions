@@ -1,0 +1,6 @@
+apiVersion: v2
+name: open-actions
+description: Open Actions controller and custom resource definitions
+type: application
+version: 0.1.0
+appVersion: latest

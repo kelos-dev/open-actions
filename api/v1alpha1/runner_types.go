@@ -106,6 +106,7 @@ type RunnerStatus struct {
 
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
+// +kubebuilder:metadata:annotations=helm.sh/resource-policy=keep
 // +kubebuilder:printcolumn:name="Ready",type=string,JSONPath=`.status.conditions[?(@.type=="Ready")].status`
 // +kubebuilder:printcolumn:name="Busy",type=string,JSONPath=`.status.conditions[?(@.type=="Busy")].status`
 // +kubebuilder:printcolumn:name="WorkflowJob",type=string,JSONPath=`.status.workflowJobRef.name`
