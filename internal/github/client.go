@@ -45,6 +45,13 @@ type Content struct {
 	Type string `json:"type"`
 }
 
+type repositoryCommit struct {
+	SHA     string `json:"sha"`
+	Parents []struct {
+		SHA string `json:"sha"`
+	} `json:"parents"`
+}
+
 // APIError describes a non-success response from the GitHub API.
 type APIError struct {
 	StatusCode int
@@ -169,23 +176,45 @@ func (c *InstallationClient) GetFile(ctx context.Context, owner, repository, fil
 // ResolveRevision resolves a branch, tag, or commit expression to a full commit
 // SHA.
 func (c *InstallationClient) ResolveRevision(ctx context.Context, owner, repository, revision string) (string, error) {
+	commit, err := c.resolveRevision(ctx, owner, repository, revision)
+	if err != nil {
+		return "", err
+	}
+	return commit.SHA, nil
+}
+
+func (c *InstallationClient) resolveRevision(ctx context.Context, owner, repository, revision string) (repositoryCommit, error) {
 	identity := fmt.Sprintf("resolve repository revision %q from %s/%s", revision, owner, repository)
 	requestPath := "repos/" + owner + "/" + repository + "/commits"
-	commits := []struct {
-		SHA string `json:"sha"`
-	}{}
+	commits := []repositoryCommit{}
 	if err := c.client.doJSONWithQuery(ctx, http.MethodGet, requestPath, url.Values{"sha": []string{revision}, "per_page": []string{"1"}}, c.token, &commits); err != nil {
-		return "", fmt.Errorf("%s: %w", identity, err)
+		return repositoryCommit{}, fmt.Errorf("%s: %w", identity, err)
 	}
 	if len(commits) == 0 {
-		return "", fmt.Errorf("%s: GitHub returned no commits", identity)
+		return repositoryCommit{}, fmt.Errorf("%s: GitHub returned no commits", identity)
 	}
-	sha := commits[0].SHA
+	commit := commits[0]
+	sha := commit.SHA
 	decoded, err := hex.DecodeString(sha)
 	if err != nil || len(decoded) != gitSHA1Bytes || sha != strings.ToLower(sha) {
-		return "", fmt.Errorf("%s: GitHub returned invalid commit SHA %q", identity, sha)
+		return repositoryCommit{}, fmt.Errorf("%s: GitHub returned invalid commit SHA %q", identity, sha)
 	}
-	return sha, nil
+	return commit, nil
+}
+
+// ResolvePullRequestRevision resolves a pull request merge ref and reports
+// whether its merge commit includes the expected head commit.
+func (c *InstallationClient) ResolvePullRequestRevision(ctx context.Context, owner, repository, revision, headSHA string) (string, bool, error) {
+	commit, err := c.resolveRevision(ctx, owner, repository, revision)
+	if err != nil {
+		return "", false, err
+	}
+	for _, parent := range commit.Parents {
+		if parent.SHA == headSHA {
+			return commit.SHA, true, nil
+		}
+	}
+	return commit.SHA, false, nil
 }
 
 func (c *Client) doJSON(ctx context.Context, method, requestPath, token string, destination any) error {

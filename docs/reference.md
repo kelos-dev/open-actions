@@ -163,8 +163,10 @@ The webhook endpoint accepts only signed GitHub `POST` deliveries up to 10 MiB
 and requires exactly one configured project for the installation. Supported
 deliveries return HTTP 202 with `{"accepted":true,"queued":true}`. Unsupported
 event names, conflicted pull requests, and pull requests from fork repositories
-return HTTP 202 with `{"accepted":true,"queued":false}`. Pull request deliveries
-whose merge ref is still being prepared are queued and resolved asynchronously.
+return HTTP 202 with `{"accepted":true,"queued":false}`. Open pull request
+workflows use GitHub's test merge revision for the webhook head. Deliveries wait
+up to two minutes for that revision; unavailable or superseded revisions
+produce a `Failed` delivery.
 
 Queued deliveries are processed asynchronously. Invalid or unsupported workflow
 definitions fail the whole delivery before any `WorkflowRun` resources are
