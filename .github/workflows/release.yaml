@@ -1,0 +1,160 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+  queue: max
+
+jobs:
+  determine-version:
+    runs-on: ubuntu-latest
+    outputs:
+      revision: ${{ steps.version.outputs.revision }}
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Determine version
+        id: version
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            VERSION=${GITHUB_REF#refs/tags/}
+            if [[ ! "${VERSION}" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || [ "${#VERSION}" -gt 128 ]; then
+              echo "Release tags must use vMAJOR.MINOR.PATCH and be no more than 128 characters" >&2
+              exit 1
+            fi
+          else
+            VERSION=main
+          fi
+          printf 'revision=sha-%s\n' "${GITHUB_SHA}" >> "${GITHUB_OUTPUT}"
+          printf 'version=%s\n' "${VERSION}" >> "${GITHUB_OUTPUT}"
+
+  build-images:
+    needs: determine-version
+    strategy:
+      matrix:
+        arch: [amd64, arm64]
+    runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build images
+        env:
+          ARCH: ${{ matrix.arch }}
+          REVISION: ${{ needs.determine-version.outputs.revision }}
+        run: make image VERSION="${REVISION}-${ARCH}"
+
+      - name: Push images
+        env:
+          ARCH: ${{ matrix.arch }}
+          REVISION: ${{ needs.determine-version.outputs.revision }}
+        run: |
+          for image in open-actions-controller open-actions-runner; do
+            docker push "ghcr.io/kelos-dev/${image}:${REVISION}-${ARCH}"
+          done
+
+  merge-manifests:
+    needs: [determine-version, build-images]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create and push immutable manifests
+        env:
+          REVISION: ${{ needs.determine-version.outputs.revision }}
+        run: |
+          for image in open-actions-controller open-actions-runner; do
+            docker buildx imagetools create \
+              -t "ghcr.io/kelos-dev/${image}:${REVISION}" \
+              "ghcr.io/kelos-dev/${image}:${REVISION}-amd64" \
+              "ghcr.io/kelos-dev/${image}:${REVISION}-arm64"
+          done
+
+      - name: Create and push version manifests
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REF_TYPE: ${{ github.ref_type }}
+          REVISION: ${{ needs.determine-version.outputs.revision }}
+          VERSION: ${{ needs.determine-version.outputs.version }}
+        run: |
+          if [ "${REF_TYPE}" = branch ]; then
+            CURRENT_SHA=$(gh api \
+              "repos/${GITHUB_REPOSITORY}/git/ref/heads/main" \
+              --jq '.object.sha')
+          elif ! CURRENT_SHA=$(gh api \
+            "repos/${GITHUB_REPOSITORY}/commits/${VERSION}" \
+            --jq '.sha' 2>/dev/null); then
+            echo "::notice::Skipping ${VERSION} tag because the release tag no longer exists"
+            exit 0
+          fi
+          if [ "${GITHUB_SHA}" != "${CURRENT_SHA}" ]; then
+            echo "::notice::Skipping ${VERSION} tag because it no longer points to ${GITHUB_SHA}"
+            exit 0
+          fi
+
+          for image in open-actions-controller open-actions-runner; do
+            docker buildx imagetools create \
+              -t "ghcr.io/kelos-dev/${image}:${VERSION}" \
+              "ghcr.io/kelos-dev/${image}:${REVISION}-amd64" \
+              "ghcr.io/kelos-dev/${image}:${REVISION}-arm64"
+          done
+
+      - name: Create and push latest manifests
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REVISION: ${{ needs.determine-version.outputs.revision }}
+          VERSION: ${{ needs.determine-version.outputs.version }}
+        run: |
+          if ! CURRENT_SHA=$(gh api \
+            "repos/${GITHUB_REPOSITORY}/commits/${VERSION}" \
+            --jq '.sha' 2>/dev/null); then
+            echo "::notice::Skipping latest tag because ${VERSION} no longer exists"
+            exit 0
+          fi
+          if [ "${GITHUB_SHA}" != "${CURRENT_SHA}" ]; then
+            echo "::notice::Skipping latest tag because ${VERSION} no longer points to ${GITHUB_SHA}"
+            exit 0
+          fi
+          LATEST_VERSION=$(gh api --paginate \
+            "repos/${GITHUB_REPOSITORY}/git/matching-refs/tags/v" \
+            --jq '.[].ref' \
+            | sed 's|refs/tags/||' \
+            | grep -E '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$' \
+            | sort -V \
+            | tail -n 1)
+          if [ "${VERSION}" != "${LATEST_VERSION}" ]; then
+            echo "::notice::Skipping latest tag because ${VERSION} is not the highest release tag"
+            exit 0
+          fi
+
+          for image in open-actions-controller open-actions-runner; do
+            docker buildx imagetools create \
+              -t "ghcr.io/kelos-dev/${image}:latest" \
+              "ghcr.io/kelos-dev/${image}:${REVISION}-amd64" \
+              "ghcr.io/kelos-dev/${image}:${REVISION}-arm64"
+          done

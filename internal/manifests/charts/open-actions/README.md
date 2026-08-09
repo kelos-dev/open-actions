@@ -20,3 +20,5 @@ delete Open Actions resources.
 | `controller.githubAPIURL` | `https://api.github.com/` | Base URL for the GitHub API |
 | `controller.githubServerURL` | `https://github.com` | GitHub web-server URL exposed to workflows |
 | `controller.actionCloneBaseURL` | `https://github.com` | Base URL used to clone external action repositories |
+| `service.type` | `ClusterIP` | Webhook Service type (`ClusterIP`, `NodePort`, or `LoadBalancer`) |
+| `service.nodePort` | `null` | Fixed webhook node port for a `NodePort` or `LoadBalancer` Service |

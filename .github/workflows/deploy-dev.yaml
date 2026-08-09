@@ -1,0 +1,232 @@
+name: Deploy to Dev
+
+on:
+  workflow_run:
+    workflows: [Release]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-dev-cluster
+  cancel-in-progress: false
+
+jobs:
+  select-revision:
+    if: (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    outputs:
+      deploy: ${{ steps.current.outputs.deploy }}
+    steps:
+      - name: Select current main revision
+        id: current
+        env:
+          EXPECTED_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          CURRENT_SHA=$(gh api \
+            "repos/${GITHUB_REPOSITORY}/git/ref/heads/main" \
+            --jq '.object.sha')
+          if [ "${EXPECTED_SHA}" = "${CURRENT_SHA}" ]; then
+            echo "deploy=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "deploy=false" >> "${GITHUB_OUTPUT}"
+            echo "::notice::Skipping deployment because ${EXPECTED_SHA} is not the current main revision"
+          fi
+
+  deploy:
+    needs: select-revision
+    if: needs.select-revision.outputs.deploy == 'true'
+    runs-on: ubuntu-latest
+    env:
+      DEV_CLUSTER_API_HOSTNAME: dev-cluster.kelos.dev
+      OPEN_ACTIONS_IMAGE_TAG: sha-${{ github.event.workflow_run.head_sha || github.sha }}
+      CLOUDFLARED_VERSION: 2026.7.1
+      CLOUDFLARED_DEB_SHA256: 79f790b45e6a9152c6cf63f60f4901e3d8a029f7f4be1345a24cd2373aba8e7d
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - uses: azure/setup-helm@v4
+        with:
+          version: 3.20.1
+
+      - name: Install cloudflared
+        run: |
+          CLOUDFLARED_DEB="${RUNNER_TEMP}/cloudflared.deb"
+          curl --fail --location --silent --show-error \
+            --output "${CLOUDFLARED_DEB}" \
+            "https://github.com/cloudflare/cloudflared/releases/download/${CLOUDFLARED_VERSION}/cloudflared-linux-amd64.deb"
+          echo "${CLOUDFLARED_DEB_SHA256}  ${CLOUDFLARED_DEB}" | sha256sum --check
+          sudo dpkg --install "${CLOUDFLARED_DEB}"
+
+      - name: Connect to dev cluster
+        env:
+          DEV_CLUSTER_KUBECONFIG: ${{ secrets.DEV_CLUSTER_KUBECONFIG }}
+          TUNNEL_SERVICE_TOKEN_ID: ${{ secrets.CLOUDFLARE_ACCESS_CLIENT_ID }}
+          TUNNEL_SERVICE_TOKEN_SECRET: ${{ secrets.CLOUDFLARE_ACCESS_CLIENT_SECRET }}
+        run: |
+          for name in DEV_CLUSTER_KUBECONFIG TUNNEL_SERVICE_TOKEN_ID TUNNEL_SERVICE_TOKEN_SECRET; do
+            if [ -z "${!name}" ]; then
+              echo "${name} is required" >&2
+              exit 1
+            fi
+          done
+
+          KUBECONFIG_PATH="${RUNNER_TEMP}/dev-cluster-kubeconfig"
+          printf '%s' "${DEV_CLUSTER_KUBECONFIG}" > "${KUBECONFIG_PATH}"
+          chmod 600 "${KUBECONFIG_PATH}"
+          KUBE_CLUSTER=$(KUBECONFIG="${KUBECONFIG_PATH}" kubectl config view \
+            --minify -o jsonpath='{.contexts[0].context.cluster}')
+          KUBECONFIG="${KUBECONFIG_PATH}" kubectl config set-cluster "${KUBE_CLUSTER}" \
+            --server=https://127.0.0.1:6443
+
+          CLOUDFLARED_LOG="${RUNNER_TEMP}/cloudflared-access.log"
+          cloudflared access tcp \
+            --hostname "${DEV_CLUSTER_API_HOSTNAME}" \
+            --url 127.0.0.1:6443 \
+            >"${CLOUDFLARED_LOG}" 2>&1 &
+          echo "$!" > "${RUNNER_TEMP}/cloudflared-access.pid"
+
+          for _ in $(seq 1 30); do
+            if nc -z 127.0.0.1 6443; then
+              break
+            fi
+            sleep 1
+          done
+          if ! nc -z 127.0.0.1 6443; then
+            cat "${CLOUDFLARED_LOG}" >&2
+            exit 1
+          fi
+
+          echo "KUBECONFIG=${KUBECONFIG_PATH}" >> "${GITHUB_ENV}"
+          KUBECONFIG="${KUBECONFIG_PATH}" kubectl get --raw=/readyz
+
+      - name: Install Open Actions
+        id: install
+        env:
+          EXPECTED_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          make build WHAT=cmd/open-actions
+          VALUES_FILE="${RUNNER_TEMP}/open-actions-dev-values.yaml"
+          cat > "${VALUES_FILE}" <<EOF
+          controller:
+            image:
+              tag: ${OPEN_ACTIONS_IMAGE_TAG}
+              pullPolicy: Always
+          service:
+            type: NodePort
+            nodePort: 30082
+          EOF
+          CURRENT_SHA=$(gh api \
+            "repos/${GITHUB_REPOSITORY}/git/ref/heads/main" \
+            --jq '.object.sha')
+          if [ "${EXPECTED_SHA}" != "${CURRENT_SHA}" ]; then
+            echo "deployed=false" >> "${GITHUB_OUTPUT}"
+            echo "::notice::Skipping deployment because ${EXPECTED_SHA} is not the current main revision"
+            exit 0
+          fi
+          bin/open-actions install --values "${VALUES_FILE}"
+          kubectl rollout status deployment/open-actions-controller -n open-actions-system --timeout=300s
+          echo "deployed=true" >> "${GITHUB_OUTPUT}"
+
+      - name: Apply project credentials and resources
+        if: steps.install.outputs.deployed == 'true'
+        env:
+          OPEN_ACTIONS_GITHUB_APP_ID: ${{ secrets.OPEN_ACTIONS_GITHUB_APP_ID }}
+          OPEN_ACTIONS_GITHUB_APP_INSTALLATION_ID: ${{ secrets.OPEN_ACTIONS_GITHUB_APP_INSTALLATION_ID }}
+          OPEN_ACTIONS_GITHUB_APP_PRIVATE_KEY: ${{ secrets.OPEN_ACTIONS_GITHUB_APP_PRIVATE_KEY }}
+          OPEN_ACTIONS_WEBHOOK_SECRET: ${{ secrets.OPEN_ACTIONS_WEBHOOK_SECRET }}
+        run: |
+          PROJECT_SECRETS="OPEN_ACTIONS_GITHUB_APP_ID OPEN_ACTIONS_GITHUB_APP_INSTALLATION_ID OPEN_ACTIONS_GITHUB_APP_PRIVATE_KEY OPEN_ACTIONS_WEBHOOK_SECRET"
+          MISSING=""
+          for name in ${PROJECT_SECRETS}; do
+            if [ -z "${!name}" ]; then
+              MISSING="${MISSING} ${name}"
+            fi
+          done
+          if [ "${MISSING# }" = "${PROJECT_SECRETS}" ]; then
+            echo "::notice::GitHub App secrets are not configured; skipping Project provisioning"
+            exit 0
+          fi
+          if [ -n "${MISSING}" ]; then
+            echo "Missing required secrets:${MISSING}" >&2
+            exit 1
+          fi
+
+          KEY_FILE=$(mktemp)
+          trap 'rm -f "$KEY_FILE"' EXIT
+          printf '%s' "${OPEN_ACTIONS_GITHUB_APP_PRIVATE_KEY}" > "${KEY_FILE}"
+          kubectl create secret generic open-actions-github-app \
+            --namespace open-actions-system \
+            --from-file=private-key.pem="${KEY_FILE}" \
+            --from-literal=webhook-secret="${OPEN_ACTIONS_WEBHOOK_SECRET}" \
+            --dry-run=client -o yaml \
+            | kubectl apply -f -
+
+          kubectl apply -f - <<EOF
+          apiVersion: actions.kelos.dev/v1alpha1
+          kind: Project
+          metadata:
+            name: default
+            namespace: open-actions-system
+          spec:
+            source:
+              type: GitHub
+              github:
+                appID: ${OPEN_ACTIONS_GITHUB_APP_ID}
+                installationID: ${OPEN_ACTIONS_GITHUB_APP_INSTALLATION_ID}
+                privateKeySecretRef:
+                  name: open-actions-github-app
+                  key: private-key.pem
+                webhookSecretRef:
+                  name: open-actions-github-app
+                  key: webhook-secret
+          EOF
+
+          for runner in runner-1 runner-2; do
+            kubectl apply -f - <<EOF
+          apiVersion: actions.kelos.dev/v1alpha1
+          kind: Runner
+          metadata:
+            name: ${runner}
+            namespace: open-actions-system
+          spec:
+            projectRef:
+              name: default
+            execution:
+              image: ghcr.io/kelos-dev/open-actions-runner:${OPEN_ACTIONS_IMAGE_TAG}
+              resources:
+                requests:
+                  cpu: 100m
+                  memory: 256Mi
+                limits:
+                  cpu: "2"
+                  memory: 4Gi
+            labels:
+              - self-hosted
+              - linux
+              - x64
+              - ubuntu-latest
+          EOF
+          done
+
+      - name: Show Cloudflare Access logs
+        if: failure()
+        run: cat "${RUNNER_TEMP}/cloudflared-access.log" 2>/dev/null || true
+
+      - name: Stop Cloudflare Access proxy
+        if: always()
+        run: |
+          if [ -f "${RUNNER_TEMP}/cloudflared-access.pid" ]; then
+            kill "$(cat "${RUNNER_TEMP}/cloudflared-access.pid")" 2>/dev/null || true
+          fi
