@@ -230,6 +230,7 @@ type WorkflowRunStatus struct {
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
 // +kubebuilder:metadata:annotations=helm.sh/resource-policy=keep
+// +kubebuilder:printcolumn:name="Workflow",type=string,JSONPath=`.status.workflowName`
 // +kubebuilder:printcolumn:name="Repository",type=string,JSONPath=`.spec.source.github.repository.name`
 // +kubebuilder:printcolumn:name="Event",type=string,JSONPath=`.spec.source.github.event.name`
 // +kubebuilder:printcolumn:name="Succeeded",type=string,JSONPath=`.status.conditions[?(@.type=="Succeeded")].status`

@@ -30,6 +30,8 @@ import (
 const (
 	jobPlanKey                       = "job.json"
 	maxJobPlanBytes                  = 900_000
+	resourceNameMaxLength            = 63
+	workflowJobNameDigestLength      = 16
 	workflowRunCancellationFinalizer = "actions.kelos.dev/concurrency-cancellation"
 )
 
@@ -151,18 +153,32 @@ func (r *WorkflowRunReconciler) Reconcile(ctx context.Context, request ctrl.Requ
 }
 
 type plannedWorkflowJob struct {
-	id     string
-	runsOn []string
-	plan   string
+	id          string
+	displayName string
+	runsOn      []string
+	plan        string
 }
 
 func (r *WorkflowRunReconciler) ensureWorkflowJobs(ctx context.Context, run *actionsv1alpha1.WorkflowRun, project *actionsv1alpha1.Project, plannedJobs []plannedWorkflowJob) error {
+	existingJobs := &actionsv1alpha1.WorkflowJobList{}
+	if err := r.APIReader.List(ctx, existingJobs, client.InNamespace(run.Namespace), client.MatchingLabels{actionsv1alpha1.LabelWorkflowRunUID: string(run.UID)}); err != nil {
+		return err
+	}
+	existingByJobID := make(map[string]*actionsv1alpha1.WorkflowJob, len(existingJobs.Items))
+	for index := range existingJobs.Items {
+		existing := &existingJobs.Items[index]
+		if other := existingByJobID[existing.Spec.JobID]; other != nil {
+			return &terminalPlanningError{cause: fmt.Errorf("WorkflowJobs %q and %q both represent job %q in WorkflowRun %q", other.Name, existing.Name, existing.Spec.JobID, run.Name)}
+		}
+		existingByJobID[existing.Spec.JobID] = existing
+	}
+
 	for _, item := range plannedJobs {
 		id := item.id
 		labels := workflowJobLabels(run, project, id)
 		workflowJob := &actionsv1alpha1.WorkflowJob{
 			ObjectMeta: metav1.ObjectMeta{
-				Name:        childName(run.Name, id),
+				Name:        workflowJobName(run.Name, id),
 				Namespace:   run.Namespace,
 				Labels:      labels,
 				Annotations: map[string]string{actionsv1alpha1.AnnotationProjectName: project.Name},
@@ -170,13 +186,19 @@ func (r *WorkflowRunReconciler) ensureWorkflowJobs(ctx context.Context, run *act
 			Spec: actionsv1alpha1.WorkflowJobSpec{
 				WorkflowRunRef: corev1.LocalObjectReference{Name: run.Name},
 				JobID:          id,
+				DisplayName:    item.displayName,
 				RunsOn:         append([]string(nil), item.runsOn...),
 			},
 		}
 		if err := controllerutil.SetControllerReference(run, workflowJob, r.Scheme()); err != nil {
 			return &terminalPlanningError{cause: err}
 		}
-		if err := r.Create(ctx, workflowJob); err != nil {
+		if existing := existingByJobID[id]; existing != nil {
+			if !workflowJobIdentityMatches(existing, workflowJob, run) {
+				return &terminalPlanningError{cause: fmt.Errorf("WorkflowJob %q does not match job %q in WorkflowRun %q", existing.Name, id, run.Name)}
+			}
+			workflowJob = existing
+		} else if err := r.Create(ctx, workflowJob); err != nil {
 			if !apierrors.IsAlreadyExists(err) {
 				return err
 			}
@@ -206,6 +228,10 @@ func (r *WorkflowRunReconciler) planWorkflowJobs(run *actionsv1alpha1.WorkflowRu
 	plannedJobs := make([]plannedWorkflowJob, 0, len(jobIDs))
 	for _, id := range jobIDs {
 		definitionJob := definition.Jobs[id]
+		displayName := definitionJob.Name
+		if displayName == "" {
+			displayName = id
+		}
 		plan, err := r.jobPlan(run, definition.Name, id, definitionJob)
 		if err != nil {
 			return nil, err
@@ -217,13 +243,17 @@ func (r *WorkflowRunReconciler) planWorkflowJobs(run *actionsv1alpha1.WorkflowRu
 		if len(data) > maxJobPlanBytes {
 			return nil, fmt.Errorf("job plan for %q exceeds %d bytes", id, maxJobPlanBytes)
 		}
-		plannedJobs = append(plannedJobs, plannedWorkflowJob{id: id, runsOn: append([]string(nil), definitionJob.RunsOn...), plan: string(data)})
+		plannedJobs = append(plannedJobs, plannedWorkflowJob{id: id, displayName: displayName, runsOn: append([]string(nil), definitionJob.RunsOn...), plan: string(data)})
 	}
 	return plannedJobs, nil
 }
 
 func workflowJobIdentityMatches(existing, desired *actionsv1alpha1.WorkflowJob, run *actionsv1alpha1.WorkflowRun) bool {
-	if !metav1.IsControlledBy(existing, run) || !apiEquality.Semantic.DeepEqual(existing.Spec, desired.Spec) {
+	existingSpec := existing.Spec
+	if existingSpec.DisplayName == "" {
+		existingSpec.DisplayName = desired.Spec.DisplayName
+	}
+	if !metav1.IsControlledBy(existing, run) || !apiEquality.Semantic.DeepEqual(existingSpec, desired.Spec) {
 		return false
 	}
 	for key, value := range desired.Labels {
@@ -723,11 +753,35 @@ func olderThan(left, right *actionsv1alpha1.WorkflowRun) bool {
 	return left.Name < right.Name
 }
 
+func workflowJobName(runName, jobID string) string {
+	digest := sha256.Sum256([]byte(runName + "\x00" + jobID))
+	suffix := strings.ToLower(digestEncoding.EncodeToString(digest[:]))[:workflowJobNameDigestLength]
+	parentPrefix := sanitizeName(runName)
+	childPrefix := sanitizeName(jobID)
+	if childPrefix == "" {
+		childPrefix = "job"
+	}
+	maxPrefix := resourceNameMaxLength - len(suffix) - 1
+	if len(childPrefix) >= maxPrefix {
+		childPrefix = strings.Trim(childPrefix[:maxPrefix], "-")
+		return childPrefix + "-" + suffix
+	}
+	maxParentLength := maxPrefix - len(childPrefix) - 1
+	if len(parentPrefix) > maxParentLength {
+		parentPrefix = strings.Trim(parentPrefix[:maxParentLength], "-")
+	}
+	prefix := childPrefix
+	if parentPrefix != "" {
+		prefix = parentPrefix + "-" + childPrefix
+	}
+	return prefix + "-" + suffix
+}
+
 func childName(parentName, childID string) string {
 	digest := sha256.Sum256([]byte(parentName + "\x00" + childID))
 	suffix := strings.ToLower(digestEncoding.EncodeToString(digest[:]))
 	prefix := sanitizeName(parentName + "-" + childID)
-	maxPrefix := 63 - len(suffix) - 1
+	maxPrefix := resourceNameMaxLength - len(suffix) - 1
 	if len(prefix) > maxPrefix {
 		prefix = strings.Trim(prefix[:maxPrefix], "-")
 	}

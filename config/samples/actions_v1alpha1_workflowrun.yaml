@@ -1,7 +1,7 @@
 apiVersion: actions.kelos.dev/v1alpha1
 kind: WorkflowRun
 metadata:
-  name: example-ci-72d3162e
+  name: example-ci-m4z2c6h5t3k7w2n4r6qa
   namespace: open-actions
 spec:
   projectRef:

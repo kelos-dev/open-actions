@@ -7,7 +7,8 @@ const (
 	LabelWorkflowJobUID = "actions.kelos.dev/workflow-job-uid"
 	LabelWorkflowJob    = "actions.kelos.dev/workflow-job"
 
-	AnnotationWorkflowJobID = "actions.kelos.dev/workflow-job-id"
-	AnnotationRunnerName    = "actions.kelos.dev/runner-name"
-	AnnotationProjectName   = "actions.kelos.dev/project-name"
+	AnnotationWorkflowJobID          = "actions.kelos.dev/workflow-job-id"
+	AnnotationWorkflowJobDisplayName = "actions.kelos.dev/workflow-job-display-name"
+	AnnotationRunnerName             = "actions.kelos.dev/runner-name"
+	AnnotationProjectName            = "actions.kelos.dev/project-name"
 )

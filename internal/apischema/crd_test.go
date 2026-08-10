@@ -333,6 +333,20 @@ func TestCRDRejectsInvalidCELValues(t *testing.T) {
 			},
 		},
 		{
+			name: "WorkflowJob display name empty",
+			crd:  "actions.kelos.dev_workflowjobs.yaml", sample: "actions_v1alpha1_workflowjob.yaml",
+			mutate: func(object map[string]any) {
+				object["spec"].(map[string]any)["displayName"] = ""
+			},
+		},
+		{
+			name: "WorkflowJob display name exceeding length bound",
+			crd:  "actions.kelos.dev_workflowjobs.yaml", sample: "actions_v1alpha1_workflowjob.yaml",
+			mutate: func(object map[string]any) {
+				object["spec"].(map[string]any)["displayName"] = strings.Repeat("a", 257)
+			},
+		},
+		{
 			name: "WorkflowJob label containing uppercase characters",
 			crd:  "actions.kelos.dev_workflowjobs.yaml", sample: "actions_v1alpha1_workflowjob.yaml",
 			mutate: func(object map[string]any) {

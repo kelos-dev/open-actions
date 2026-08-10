@@ -78,7 +78,7 @@ func TestWebhookReplayIDUsesSignedBody(t *testing.T) {
 
 func TestCreateWorkflowRunIsIdempotent(t *testing.T) {
 	scheme := deliveryTestScheme(t)
-	project := &actionsv1alpha1.Project{ObjectMeta: metav1.ObjectMeta{Name: "project", Namespace: "default"}}
+	project := &actionsv1alpha1.Project{ObjectMeta: metav1.ObjectMeta{Name: "project", Namespace: "default", UID: "project-uid"}}
 	event := &payload{}
 	event.Repository.ID = 1
 	event.Repository.Owner.Login = "acme"
@@ -97,7 +97,7 @@ func TestCreateWorkflowRunIsIdempotent(t *testing.T) {
 
 	workflowPath := ".open-actions/workflows/deploy.yaml"
 	conflicting := &actionsv1alpha1.WorkflowRun{
-		ObjectMeta: metav1.ObjectMeta{Name: workflowRunName(workflowPath, "conflict"), Namespace: project.Namespace},
+		ObjectMeta: metav1.ObjectMeta{Name: workflowRunName(workflowPath, string(project.UID), "conflict"), Namespace: project.Namespace},
 		Spec: actionsv1alpha1.WorkflowRunSpec{
 			ProjectRef:   corev1.LocalObjectReference{Name: "other-project"},
 			Source:       actionsv1alpha1.WorkflowRunSource{Type: actionsv1alpha1.SourceTypeGitHub, GitHub: &actionsv1alpha1.GitHubWorkflowRunSource{Repository: actionsv1alpha1.GitHubRepository{ID: 2}}},
@@ -127,7 +127,7 @@ func TestInvalidWorkflowRunCreationIsTerminal(t *testing.T) {
 
 func TestCreateWorkflowRunReplayUsesLiveReader(t *testing.T) {
 	scheme := deliveryTestScheme(t)
-	project := &actionsv1alpha1.Project{ObjectMeta: metav1.ObjectMeta{Name: "project", Namespace: "default"}}
+	project := &actionsv1alpha1.Project{ObjectMeta: metav1.ObjectMeta{Name: "project", Namespace: "default", UID: "project-uid"}}
 	event := &payload{}
 	event.Repository.ID = 1
 	event.Repository.Owner.Login = "acme"
@@ -136,7 +136,7 @@ func TestCreateWorkflowRunReplayUsesLiveReader(t *testing.T) {
 	workflowPath := ".open-actions/workflows/ci.yaml"
 	delivery := &queuedDelivery{Payload: *event, Event: normalized, ReplayID: "replay", DeliveryID: "delivery"}
 	existing := &actionsv1alpha1.WorkflowRun{
-		ObjectMeta: metav1.ObjectMeta{Name: workflowRunName(workflowPath, delivery.ReplayID), Namespace: project.Namespace},
+		ObjectMeta: metav1.ObjectMeta{Name: fullDigestWorkflowRunName(workflowPath, delivery.ReplayID), Namespace: project.Namespace},
 		Spec: actionsv1alpha1.WorkflowRunSpec{
 			ProjectRef: corev1.LocalObjectReference{Name: project.Name},
 			Source: actionsv1alpha1.WorkflowRunSource{
@@ -364,15 +364,25 @@ func (c *workflowRunAlreadyExistsClient) Create(_ context.Context, object client
 }
 
 func TestWorkflowRunNameIsStableAndBounded(t *testing.T) {
-	name := workflowRunName(strings.Repeat("workflow", 20)+".yaml", "replay")
+	workflowPath := strings.Repeat("workflow", 20) + ".yaml"
+	name := workflowRunName(workflowPath, "project-uid", "replay")
 	if len(name) > 63 {
 		t.Errorf("name has %d characters", len(name))
 	}
-	if name != workflowRunName(strings.Repeat("workflow", 20)+".yaml", "replay") {
+	if name != workflowRunName(workflowPath, "project-uid", "replay") {
 		t.Error("name is not stable")
 	}
-	if suffix := name[len(name)-52:]; suffix != strings.ToLower(digestEncoding.EncodeToString(sha256Digest("replay|"+strings.Repeat("workflow", 20)+".yaml"))) {
-		t.Errorf("name does not contain the full replay and path digest")
+	wantSuffix := strings.ToLower(digestEncoding.EncodeToString(sha256Digest("project-uid\x00replay\x00" + workflowPath)))[:workflowRunDigestLength]
+	if suffix := name[len(name)-workflowRunDigestLength:]; suffix != wantSuffix {
+		t.Errorf("name suffix = %q, want %q", suffix, wantSuffix)
+	}
+	if other := workflowRunName(workflowPath, "other-project-uid", "replay"); other == name {
+		t.Error("projects share a WorkflowRun name")
+	}
+	fullDigestName := fullDigestWorkflowRunName(workflowPath, "replay")
+	fullDigestSuffix := strings.ToLower(digestEncoding.EncodeToString(sha256Digest("replay|" + workflowPath)))
+	if suffix := fullDigestName[len(fullDigestName)-len(fullDigestSuffix):]; suffix != fullDigestSuffix {
+		t.Errorf("full digest name suffix = %q, want %q", suffix, fullDigestSuffix)
 	}
 }
 

@@ -2,11 +2,12 @@
 apiVersion: actions.kelos.dev/v1alpha1
 kind: WorkflowJob
 metadata:
-  name: example-ci-72d3162e-build
+  name: example-ci-m4z2c6h5t3k7w2n4r6qa-build-75y5dpzcxgbiqe3u
   namespace: open-actions
 spec:
   workflowRunRef:
-    name: example-ci-72d3162e
+    name: example-ci-m4z2c6h5t3k7w2n4r6qa
   jobID: build
+  displayName: Build and test
   runsOn:
     - ubuntu-latest

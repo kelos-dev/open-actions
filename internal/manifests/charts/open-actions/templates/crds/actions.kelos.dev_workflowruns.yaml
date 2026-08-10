@@ -16,6 +16,9 @@ spec:
   scope: Namespaced
   versions:
   - additionalPrinterColumns:
+    - jsonPath: .status.workflowName
+      name: Workflow
+      type: string
     - jsonPath: .spec.source.github.repository.name
       name: Repository
       type: string

@@ -31,20 +31,22 @@ import (
 var digestEncoding = base32.StdEncoding.WithPadding(base32.NoPadding)
 
 const (
-	deliveryLabel          = "actions.kelos.dev/webhook-delivery"
-	deliveryDataKey        = "delivery.json"
-	deliveryRevisionKey    = "resolvedRevision"
-	deliveryStateKey       = "state"
-	deliveryMessageKey     = "message"
-	deliveryRunCountKey    = "workflowRuns"
-	deliveryFinishedKey    = "finishedAt"
-	deliveryStateCompleted = "Completed"
-	deliveryStateFailed    = "Failed"
-	maxDeliveryBytes       = 900_000
-	maxWorkflowFiles       = 100
-	maxWorkflowJobs        = 1000
-	mergeRefWaitTimeout    = 2 * time.Minute
-	deliveryRetention      = 24 * time.Hour
+	deliveryLabel           = "actions.kelos.dev/webhook-delivery"
+	deliveryDataKey         = "delivery.json"
+	deliveryRevisionKey     = "resolvedRevision"
+	deliveryStateKey        = "state"
+	deliveryMessageKey      = "message"
+	deliveryRunCountKey     = "workflowRuns"
+	deliveryFinishedKey     = "finishedAt"
+	deliveryStateCompleted  = "Completed"
+	deliveryStateFailed     = "Failed"
+	maxDeliveryBytes        = 900_000
+	maxWorkflowFiles        = 100
+	maxWorkflowJobs         = 1000
+	mergeRefWaitTimeout     = 2 * time.Minute
+	resourceNameMaxLength   = 63
+	workflowRunDigestLength = 20
+	deliveryRetention       = 24 * time.Hour
 )
 
 type queuedDelivery struct {
@@ -130,7 +132,21 @@ func validateDeliveryFanOut(workflowFiles, workflowJobs int) error {
 	return nil
 }
 
-func workflowRunName(workflowPath, replayID string) string {
+func workflowRunName(workflowPath, projectUID, replayID string) string {
+	base := strings.TrimSuffix(filepath.Base(workflowPath), filepath.Ext(workflowPath))
+	base = sanitizeName(base)
+	if base == "" {
+		base = "workflow"
+	}
+	digest := sha256.Sum256([]byte(projectUID + "\x00" + replayID + "\x00" + workflowPath))
+	suffix := strings.ToLower(digestEncoding.EncodeToString(digest[:]))[:workflowRunDigestLength]
+	if len(base) > resourceNameMaxLength-len(suffix)-1 {
+		base = strings.Trim(base[:resourceNameMaxLength-len(suffix)-1], "-")
+	}
+	return base + "-" + suffix
+}
+
+func fullDigestWorkflowRunName(workflowPath, replayID string) string {
 	base := strings.TrimSuffix(filepath.Base(workflowPath), filepath.Ext(workflowPath))
 	base = sanitizeName(base)
 	if base == "" {
@@ -138,8 +154,8 @@ func workflowRunName(workflowPath, replayID string) string {
 	}
 	digest := sha256.Sum256([]byte(replayID + "|" + workflowPath))
 	suffix := strings.ToLower(digestEncoding.EncodeToString(digest[:]))
-	if len(base) > 63-len(suffix)-1 {
-		base = strings.Trim(base[:63-len(suffix)-1], "-")
+	if len(base) > resourceNameMaxLength-len(suffix)-1 {
+		base = strings.Trim(base[:resourceNameMaxLength-len(suffix)-1], "-")
 	}
 	return base + "-" + suffix
 }
@@ -312,7 +328,7 @@ func terminalWorkflowRunCreationError(err error) bool {
 }
 
 func (r *DeliveryReconciler) createWorkflowRun(ctx context.Context, project *actionsv1alpha1.Project, delivery *queuedDelivery, workflowPath string) error {
-	name := workflowRunName(workflowPath, delivery.ReplayID)
+	name := workflowRunName(workflowPath, string(project.UID), delivery.ReplayID)
 	desired := &actionsv1alpha1.WorkflowRun{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: project.Namespace},
 		Spec: actionsv1alpha1.WorkflowRunSpec{
@@ -332,6 +348,13 @@ func (r *DeliveryReconciler) createWorkflowRun(ctx context.Context, project *act
 			WorkflowPath: workflowPath,
 		},
 	}
+	alias := &actionsv1alpha1.WorkflowRun{}
+	aliasKey := client.ObjectKey{Namespace: desired.Namespace, Name: fullDigestWorkflowRunName(workflowPath, delivery.ReplayID)}
+	if err := r.APIReader.Get(ctx, aliasKey, alias); err == nil {
+		return matchingWorkflowRun(alias, desired)
+	} else if !apierrors.IsNotFound(err) {
+		return err
+	}
 	if err := r.Create(ctx, desired); err != nil {
 		if !apierrors.IsAlreadyExists(err) {
 			return err
@@ -340,15 +363,20 @@ func (r *DeliveryReconciler) createWorkflowRun(ctx context.Context, project *act
 		if err := r.APIReader.Get(ctx, client.ObjectKeyFromObject(desired), existing); err != nil {
 			return err
 		}
-		if !apiequality.Semantic.DeepEqual(existing.Spec, desired.Spec) {
-			return apierrors.NewConflict(
-				actionsv1alpha1.GroupVersion.WithResource("workflowruns").GroupResource(),
-				name,
-				errors.New("existing WorkflowRun does not match the webhook delivery"),
-			)
-		}
+		return matchingWorkflowRun(existing, desired)
 	}
 	return nil
+}
+
+func matchingWorkflowRun(existing, desired *actionsv1alpha1.WorkflowRun) error {
+	if apiequality.Semantic.DeepEqual(existing.Spec, desired.Spec) {
+		return nil
+	}
+	return apierrors.NewConflict(
+		actionsv1alpha1.GroupVersion.WithResource("workflowruns").GroupResource(),
+		existing.Name,
+		errors.New("existing WorkflowRun does not match the webhook delivery"),
+	)
 }
 
 func (r *DeliveryReconciler) finish(ctx context.Context, object *corev1.ConfigMap, state string, workflowRuns int, message string) error {
