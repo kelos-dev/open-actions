@@ -74,7 +74,10 @@ in the cluster may claim an installation; the earliest-created project retains
 the claim, and later duplicates remain unconfigured until the owner is deleted.
 A `WorkflowRun` records provider-specific event data under its own immutable
 `spec.source` union. `status.source.github.checkRun` records the GitHub Check Run
-ID and the last report accepted by GitHub. A Runner's `spec.projectRef` is
+ID and the last report accepted by GitHub. For open pull requests,
+`spec.source.github.revision.sha` identifies the test merge commit used for
+execution, while `headSHA` identifies the pull request commit used for check
+reporting. A Runner's `spec.projectRef` is
 immutable, and changes to `spec.execution` apply only to Kubernetes Jobs created
 afterward. A `WorkflowJob` spec is immutable, and `status.runnerRef` identifies
 its one-time Runner assignment.

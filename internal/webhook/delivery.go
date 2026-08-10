@@ -344,7 +344,7 @@ func (r *DeliveryReconciler) createWorkflowRun(ctx context.Context, project *act
 						Action:     delivery.Event.Action,
 						DeliveryID: delivery.DeliveryID,
 					},
-					Revision: actionsv1alpha1.GitRevision{SHA: delivery.Event.SHA, Ref: delivery.Event.Ref, HeadRef: delivery.Event.HeadRef, BaseRef: delivery.Event.BaseRef},
+					Revision: actionsv1alpha1.GitRevision{SHA: delivery.Event.SHA, HeadSHA: delivery.Event.HeadSHA, Ref: delivery.Event.Ref, HeadRef: delivery.Event.HeadRef, BaseRef: delivery.Event.BaseRef},
 				},
 			},
 			WorkflowPath: workflowPath,
@@ -375,6 +375,10 @@ func matchingWorkflowRun(existing, desired *actionsv1alpha1.WorkflowRun) error {
 	desiredSpec := desired.Spec.DeepCopy()
 	existingSpec.TTLSecondsAfterFinished = nil
 	desiredSpec.TTLSecondsAfterFinished = nil
+	if existingGitHub, desiredGitHub := existingSpec.Source.GitHub, desiredSpec.Source.GitHub; existingGitHub != nil && desiredGitHub != nil && existingGitHub.Revision.HeadSHA == "" {
+		// Missing HeadSHA is compatible because the API defines SHA as its reporting fallback.
+		existingGitHub.Revision.HeadSHA = desiredGitHub.Revision.HeadSHA
+	}
 	if apiequality.Semantic.DeepEqual(existingSpec, desiredSpec) {
 		return nil
 	}

@@ -107,6 +107,35 @@ func TestWorkflowEventIncludesRevisionValues(t *testing.T) {
 }
 
 func TestGitHubCheckRunIsCreatedAndRecorded(t *testing.T) {
+	executionSHA := strings.Repeat("a", 40)
+	tests := []struct {
+		name         string
+		eventName    actionsv1alpha1.GitHubEventName
+		headSHA      string
+		checkHeadSHA string
+	}{
+		{
+			name:         "pull request head SHA",
+			eventName:    actionsv1alpha1.GitHubEventNamePullRequest,
+			headSHA:      strings.Repeat("b", 40),
+			checkHeadSHA: strings.Repeat("b", 40),
+		},
+		{
+			name:         "execution SHA fallback",
+			eventName:    actionsv1alpha1.GitHubEventNamePush,
+			checkHeadSHA: executionSHA,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			testGitHubCheckRunLifecycle(t, executionSHA, test.headSHA, test.checkHeadSHA, test.eventName)
+		})
+	}
+}
+
+func testGitHubCheckRunLifecycle(t *testing.T, executionSHA, headSHA, checkHeadSHA string, eventName actionsv1alpha1.GitHubEventName) {
+	t.Helper()
 	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
 		t.Fatal(err)
@@ -125,11 +154,11 @@ func TestGitHubCheckRunIsCreatedAndRecorded(t *testing.T) {
 				return
 			}
 			fmt.Fprint(writer, `{"token":"checks-token"}`)
-		case request.Method == http.MethodGet && strings.HasSuffix(request.URL.Path, "/check-runs"):
+		case request.Method == http.MethodGet && request.URL.Path == "/repos/acme/example/commits/"+checkHeadSHA+"/check-runs":
 			fmt.Fprint(writer, `{"total_count":0,"check_runs":[]}`)
 		case request.Method == http.MethodPost && request.URL.Path == "/repos/acme/example/check-runs":
 			body := githubclient.CreateCheckRunRequest{}
-			if err := json.NewDecoder(request.Body).Decode(&body); err != nil || body.ExternalID != "run-uid" || body.Status != "queued" || body.HeadSHA != strings.Repeat("a", 40) {
+			if err := json.NewDecoder(request.Body).Decode(&body); err != nil || body.ExternalID != "run-uid" || body.Status != "queued" || body.HeadSHA != checkHeadSHA {
 				http.Error(writer, "unexpected check run", http.StatusBadRequest)
 				return
 			}
@@ -190,7 +219,8 @@ func TestGitHubCheckRunIsCreatedAndRecorded(t *testing.T) {
 			WorkflowPath: ".open-actions/workflows/ci.yaml",
 			Source: actionsv1alpha1.WorkflowRunSource{Type: actionsv1alpha1.SourceTypeGitHub, GitHub: &actionsv1alpha1.GitHubWorkflowRunSource{
 				Repository: actionsv1alpha1.GitHubRepository{ID: 3, Owner: "acme", Name: "example"},
-				Revision:   actionsv1alpha1.GitRevision{SHA: strings.Repeat("a", 40)},
+				Event:      actionsv1alpha1.GitHubEvent{Name: eventName},
+				Revision:   actionsv1alpha1.GitRevision{SHA: executionSHA, HeadSHA: headSHA},
 			}},
 		},
 	}
