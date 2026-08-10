@@ -25,64 +25,16 @@ The supported execution subset includes:
 
 Unsupported workflow fields and action reference forms are rejected during
 planning. Unsupported action runtimes fail explicitly in the runner so a
-workflow is never silently executed with different semantics. Workflow files
-must define a non-empty `name` of at most 256 characters.
-`GITHUB_EVENT_PATH` contains a bounded normalized document with repository
-identity and the selected push, pull-request, or merge-group revision fields;
-actions that require other fields from GitHub's raw webhook payload are outside
-the supported execution subset.
+workflow is never silently executed with different semantics.
 
 ## Architecture
 
 ![Open Actions architecture and event flow](docs/architecture.drawio.svg)
 
-The manager binary, `open-actions-controller`, serves the GitHub webhook
-endpoint and runs the controllers. A signed webhook delivery is verified,
-deduplicated, and persisted as a delivery-queue ConfigMap before the request
-returns. The delivery controller then discovers and validates workflows through
-the GitHub API and creates one `WorkflowRun` per matching workflow. The
-`WorkflowRun` controller plans jobs and enforces concurrency, creating one
-`WorkflowJob` per planned job. The `Runner` controller assigns each queued
-`WorkflowJob` to an idle `Runner` whose labels cover the job's `runs-on`
-labels, then creates the job-plan ConfigMap, a scoped installation-token
-Secret, and a native `batch/v1` Job. The Job's Pod runs the Go runner, which
-clones the repository and external actions and executes the steps. Status
-propagates back from the native Job through `WorkflowJob` and `WorkflowRun`
-conditions. A `Project` defines the execution domain and holds the GitHub App
-configuration and credential references this flow depends on.
-
-The diagram is an editable [draw.io](https://www.drawio.com/) file at
-[`docs/architecture.drawio.svg`](docs/architecture.drawio.svg).
-
-## Development
-
-```console
-make update     # Format, generate Go code and CRDs, and tidy modules.
-make verify     # Check generated files, formatting, modules, and go vet.
-make test       # Run unit and schema tests.
-make build      # Build the CLI, controller, and runner binaries under bin/.
-make build WHAT=cmd/open-actions  # Build only the CLI.
-make image      # Build the controller and runner images.
-make image WHAT=test/fixture/github  # Build only the end-to-end fixture image.
-```
-
-The Ginkgo/Gomega end-to-end suite requires Helm and expects a current
-Kubernetes context. CI creates a Kind cluster, builds and loads the images, and
-installs the controller and CRDs. The `Project` tests verify webhook
-authentication, typed `WorkflowRun` creation, and queued delivery failures for
-invalid workflows. The `Runner` tests create a typed `WorkflowRun` and verify
-job assignment, native Job execution, status updates, and cleanup. The GitHub
-fixture serves separate tagged action repositories so the Runner tests cover
-JavaScript and composite actions, nested action outputs, file commands, and
-post hooks without public network access.
-
-```console
-make image WHAT="cmd/open-actions-controller cmd/open-actions-runner test/fixture/github" VERSION=e2e
-kind load docker-image ghcr.io/kelos-dev/open-actions-controller:e2e
-kind load docker-image ghcr.io/kelos-dev/open-actions-runner:e2e
-kind load docker-image ghcr.io/kelos-dev/open-actions-fixture:e2e
-RUNNER_IMAGE=ghcr.io/kelos-dev/open-actions-runner:e2e make test-e2e
-```
+The `open-actions-controller` accepts GitHub webhooks, discovers workflows, and
+creates `WorkflowRun` and `WorkflowJob` resources. It assigns queued jobs to
+matching `Runner` resources, which execute the workflow steps in Kubernetes
+Jobs. A `Project` defines the execution domain and its GitHub App integration.
 
 ## Installation
 
@@ -106,42 +58,9 @@ uses Helm's current Kubernetes context. Pass custom chart configuration with
 documented in
 [`internal/manifests/charts/open-actions`](internal/manifests/charts/open-actions).
 
-The controller deployment uses `open-actions-controller`. Each Runner's
-`spec.execution.image` selects the `open-actions-runner` image used by its
-Workflow Jobs. Controller and Runner images may use different image tags only
-while both support the same job-plan schema; the current schema version is 1,
-and Runners reject missing, unknown, or unsupported plan fields and versions.
-Future plan changes must deploy reader support before a controller begins
-emitting a new version. The
-`open-actions-fixture` image is only used by the end-to-end test environment.
-
-`--github-api-url` defaults to `https://api.github.com/` and may include a
-GitHub Enterprise API path such as `/api/v3`. `--github-server-url` defaults to
-`https://github.com` and supplies `github.server_url`; it requires `http` or
-`https`. `--action-clone-base-url` defaults to `https://github.com`, is used
-only to fetch external action repositories, and also requires `http` or `https`.
-Each flag requires an absolute URL with a host and an optional clean path prefix.
-User information, queries, fragments, escaped paths, and `.` or `..` path
-segments are rejected. The API URL is normalized with a trailing slash, while
-the server and clone bases are normalized without one. For example:
-
-```console
-open-actions-controller \
-  --github-api-url=https://github.example/api/v3 \
-  --github-server-url=https://github.example \
-  --action-clone-base-url=https://github.example
-```
-
 Create a Secret containing a GitHub App RSA private key and webhook secret, a
-`Project`, and one or more `Runner` resources. Each `Runner` is one
-reusable execution slot: it accepts one queued
-`WorkflowJob` from its `spec.projectRef` whose `runs-on` labels are all present
-in `spec.labels`. Native Jobs have a 50-minute execution deadline so their
-GitHub installation token remains valid and a broken image pull or
-unschedulable Pod cannot hold a Runner indefinitely. An assigned job that
-cannot create its native Job within five minutes fails with `JobStartFailed`,
-releases the Runner, and removes any job credential. Create more
-`Runner` resources to provide more concurrent slots. Examples are under
+`Project`, and one or more `Runner` resources. Each `Runner` is one reusable
+execution slot; create more Runners to increase concurrency. Examples are under
 [`config/samples`](config/samples). The `WorkflowJob` manifest illustrates the
 controller-owned child shape and is not applied independently. Expose the
 `open-actions-webhook.open-actions-system` Service through HTTPS and set
@@ -160,123 +79,20 @@ Move repository workflows from `.github/workflows` to
 `.open-actions/workflows`. A webhook delivery then follows the path shown in
 [Architecture](#architecture).
 
-## API behavior
+## API reference
 
-All references resolve within the resource's namespace. A `Project`
-selects its integration through the discriminated `spec.source` union. The
-supported variant is `type: GitHub` with GitHub App configuration under
-`source.github`. The project defaults `spec.workflowDirectory` to
-`.open-actions/workflows`; its source type and GitHub App and installation IDs
-are immutable, and only one project in the cluster may claim an installation.
-The earliest-created project retains that claim; later duplicates remain
-unconfigured until the owner is deleted.
-A `WorkflowRun` records provider-specific event data under its own immutable
-`spec.source` union. A Runner's
-`spec.projectRef` is immutable; changes to `spec.execution` apply only to native
-Jobs created afterward. The controller owns the Pod shape, including its
-authentication, workspace, retry, and security configuration. A `WorkflowJob`
-spec is immutable. The scheduler records its one-time Runner assignment in
-`status.runnerRef`.
+See the [API reference](docs/reference.md) for Kubernetes resources, command-line
+configuration, supported workflow syntax, and the webhook contract.
 
-Concurrency groups are case-insensitive and scoped by project and GitHub's
-stable repository ID. One run may execute while one newer run waits. A newer
-waiting run supersedes the existing waiting run. With `cancel-in-progress: true`,
-it also cancels the executing run. A run waits conservatively for an
-older run in the same repository until that older run has evaluated its
-workflow concurrency configuration. Concurrency expressions reject unavailable
-context and empty evaluated groups; use
-`github.head_ref || github.ref_name` for workflows that need a ref fallback.
+## Development
 
-The controllers publish these condition contracts:
+```console
+make update     # Format, generate Go code and CRDs, and tidy modules.
+make verify     # Check generated files, formatting, modules, and go vet.
+make test       # Run unit and schema tests.
+make build      # Build the CLI, controller, and runner binaries under bin/.
+make image      # Build the controller and runner images.
+```
 
-| Resource | Condition | Status | Reasons |
-| --- | --- | --- | --- |
-| `Project` | `Configured` | `True` | `ConfigurationValid` |
-| `Project` | `Configured` | `False` | `DuplicateInstallation`, `CredentialsUnavailable`, `InvalidCredentials` |
-| `Runner` | `Ready` | `True` | `Ready` |
-| `Runner` | `Ready` | `False` | `ProjectUnavailable`, `ProjectNotConfigured` |
-| `Runner` | `Busy` | `False` | `Idle` |
-| `Runner` | `Busy` | `True` | `JobAssigned` |
-| `WorkflowRun` | `Planned` | `True` | `JobsPlanned` |
-| `WorkflowRun` | `Planned` | `Unknown` | `WaitingForConcurrency`, `WaitingForConcurrencyCancellation`, `ProjectUnavailable`, `CredentialsUnavailable`, `GitHubAuthenticationFailed`, `WorkflowFetchFailed`, `ChildCreationFailed`, `ConcurrencyCheckFailed` |
-| `WorkflowRun` | `Planned` | `False` | `ProjectUnavailable`, `WorkflowFetchFailed`, `WorkflowInvalid`, `ChildCreationFailed`, `ExecutionStateLost` |
-| `WorkflowRun` | `Succeeded` | `Unknown` | `JobsQueued`, `JobsRunning` |
-| `WorkflowRun` | `Succeeded` | `True` | `JobsSucceeded` |
-| `WorkflowRun` | `Succeeded` | `False` | `ProjectUnavailable`, `WorkflowFetchFailed`, `WorkflowInvalid`, `ChildCreationFailed`, `JobFailed`, `ExecutionStateLost` |
-| `WorkflowJob` | `Scheduled` | `True` | `RunnerAssigned` |
-| `WorkflowJob` | `Scheduled` | `False` | `ProjectRecreated` |
-| `WorkflowJob` | `Succeeded` | `Unknown` | `JobRunning` |
-| `WorkflowJob` | `Succeeded` | `True` | `JobSucceeded` |
-| `WorkflowJob` | `Succeeded` | `False` | `JobFailed`, `PlanUnavailable`, `JobStartFailed`, `ExecutionStateLost`, `ProjectRecreated` |
-
-`Project/Configured` covers local Secret availability, private-key
-parsing, and installation uniqueness. It does not assert remote GitHub App or
-installation availability. `Runner/Ready` reports operational health
-independently of capacity; clients use `Runner/Busy` to determine whether a
-Runner already has an assignment.
-
-Child resources carry `actions.kelos.dev/project-uid`, `runner-uid`,
-`workflow-run-uid`, and `workflow-job-uid` labels where applicable. The
-`actions.kelos.dev/workflow-job` label contains the workflow job ID when it is a
-valid Kubernetes label value, or the full SHA-256 digest encoded as lowercase
-unpadded base32 otherwise. The original job ID and assigned runner name remain
-available through
-`actions.kelos.dev/workflow-job-id` and `actions.kelos.dev/runner-name`
-annotations. Queued jobs record their project name in the
-`actions.kelos.dev/project-name` annotation so a recreated project can be
-distinguished from the original object.
-
-The webhook endpoint accepts only signed GitHub `POST` deliveries up to 10 MiB
-and requires exactly one configured project for the installation. Supported
-deliveries return HTTP 202 with `{"accepted":true,"queued":true}`. Unsupported event names,
-conflicted pull requests, and pull requests from fork repositories return HTTP
-202 with `{"accepted":true,"queued":false}`. Pull request deliveries whose merge
-ref is still being prepared are queued and resolved asynchronously. The
-controller derives replay identity from
-the signed body, persists a normalized delivery as a ConfigMap, and performs
-workflow discovery asynchronously. The ConfigMap's `state` is `Completed` or
-`Failed`, with `workflowRuns` and an optional validation `message`. Invalid or
-unsupported workflow definitions fail the whole delivery before any runs are
-created. Terminal delivery ConfigMaps are retained for 24 hours to deduplicate
-replays and then deleted. Installation tokens are limited to read-only
-repository contents, mounted only into the assigned job, and their Secrets are
-deleted after execution reaches a terminal result.
-
-A repository without the configured workflow directory is accepted with zero
-runs. For a deleted branch or tag, trigger matching uses the deleted ref while
-workflow discovery and `github.sha` use the current commit of the repository's
-default branch.
-
-Workflow discovery also enforces explicit configuration limits before creating
-a `WorkflowRun`: a delivery may contain at most 100 workflow files and 1,000
-jobs across matching workflows; workflow files are at most 1,000,000 bytes;
-workflows have at most 1,000 jobs; jobs have at most 100 steps and 100,000 bytes
-of aggregate planned content; run scripts are at most 65,536 bytes; and each
-`env` or `with` map has at most 100 entries. Names, branch patterns, action
-references, paths, map keys, and values are bounded by the
-[`internal/workflow` parser](internal/workflow/workflow.go). The
-[`api/v1alpha1` Go types and markers](api/v1alpha1) define the Kubernetes API
-schema and generate the checked-in CRDs. Runner labels are canonical lowercase
-ASCII in Kubernetes resources; workflow `runs-on` labels are normalized to
-that representation during discovery.
-
-Push branch filters apply only to branch refs, not tags with the same short
-name. An omitted `pull_request.types` filter matches GitHub's default `opened`,
-`synchronize`, and `reopened` activities. Explicit empty `branches` and `types`
-lists are invalid. Configured concurrency requires a non-empty group.
-
-## Limitations
-
-Open Actions provides a focused workflow subset with GitHub as its source and
-repository integration. External actions must use the `node20`
-JavaScript runtime and be available from the configured GitHub server, or use
-the composite runtime with Bash run steps and external action references.
-Composite expressions cover inputs, step outputs, selected GitHub and runner
-values, and environment variables. Docker and local actions; private
-cross-repository action authentication; job dependencies; matrices; service
-containers; general expression evaluation; caches; artifacts; and GitHub check
-reporting are outside the supported subset. WorkflowJobs are not retried or
-reassigned when a Runner is removed.
-General expressions outside the supported concurrency and composite-action
-contexts are rejected during planning or execution and are never interpreted as
-literal values.
+Run `make test-e2e` against the cluster selected by the current Kubernetes
+context. The end-to-end suite requires Helm.
