@@ -115,6 +115,7 @@ jobs:
         env:
           EXPECTED_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
           GH_TOKEN: ${{ github.token }}
+          OPEN_ACTIONS_CONSOLE_TOKEN: ${{ secrets.OPEN_ACTIONS_CONSOLE_TOKEN }}
         run: |
           make build WHAT=cmd/open-actions
           VALUES_FILE="${RUNNER_TEMP}/open-actions-dev-values.yaml"
@@ -123,6 +124,16 @@ jobs:
             image:
               tag: ${OPEN_ACTIONS_IMAGE_TAG}
               pullPolicy: Always
+          console:
+            publicURL: https://dev-open-actions-console.kelos.dev
+            secretName: open-actions-console-auth
+            tokenKey: token
+            image:
+              tag: ${OPEN_ACTIONS_IMAGE_TAG}
+              pullPolicy: Always
+            service:
+              type: NodePort
+              nodePort: 30083
           service:
             type: NodePort
             nodePort: 30082
@@ -135,8 +146,21 @@ jobs:
             echo "::notice::Skipping deployment because ${EXPECTED_SHA} is not the current main revision"
             exit 0
           fi
+          if [ -z "${OPEN_ACTIONS_CONSOLE_TOKEN}" ]; then
+            echo "OPEN_ACTIONS_CONSOLE_TOKEN is required" >&2
+            exit 1
+          fi
+          kubectl create namespace open-actions-system \
+            --dry-run=client -o yaml \
+            | kubectl apply -f -
+          kubectl create secret generic open-actions-console-auth \
+            --namespace open-actions-system \
+            --from-literal=token="${OPEN_ACTIONS_CONSOLE_TOKEN}" \
+            --dry-run=client -o yaml \
+            | kubectl apply -f -
           bin/open-actions install --values "${VALUES_FILE}"
           kubectl rollout status deployment/open-actions-controller -n open-actions-system --timeout=300s
+          kubectl rollout status deployment/open-actions-console -n open-actions-system --timeout=300s
           echo "deployed=true" >> "${GITHUB_OUTPUT}"
 
       - name: Apply project credentials and resources

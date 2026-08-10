@@ -19,7 +19,7 @@ import (
 
 var _ = Describe("Runner", func() {
 	BeforeEach(func() {
-		setupControlPlane(true)
+		setupTestProject(true)
 	})
 
 	It("claims a typed WorkflowRun job and executes it in an owned native Job", func() {

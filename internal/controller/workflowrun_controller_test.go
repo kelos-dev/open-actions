@@ -2,9 +2,16 @@ package controller
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
 	"crypto/sha256"
+	"crypto/x509"
+	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -86,6 +93,151 @@ func TestPlanWorkflowJobsSetsDisplayNames(t *testing.T) {
 	}
 	if planned[1].id != "lint" || planned[1].displayName != "lint" {
 		t.Errorf("lint job = %#v", planned[1])
+	}
+}
+
+func TestGitHubCheckRunIsCreatedAndRecorded(t *testing.T) {
+	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	privateKeyData := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(privateKey)})
+	created := 0
+	updated := 0
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		switch {
+		case request.URL.Path == "/app/installations/2/access_tokens":
+			body := struct {
+				Permissions map[string]string `json:"permissions"`
+			}{}
+			if err := json.NewDecoder(request.Body).Decode(&body); err != nil || body.Permissions["checks"] != "write" || len(body.Permissions) != 1 {
+				http.Error(writer, "unexpected permissions", http.StatusBadRequest)
+				return
+			}
+			fmt.Fprint(writer, `{"token":"checks-token"}`)
+		case request.Method == http.MethodGet && strings.HasSuffix(request.URL.Path, "/check-runs"):
+			fmt.Fprint(writer, `{"total_count":0,"check_runs":[]}`)
+		case request.Method == http.MethodPost && request.URL.Path == "/repos/acme/example/check-runs":
+			body := githubclient.CreateCheckRunRequest{}
+			if err := json.NewDecoder(request.Body).Decode(&body); err != nil || body.ExternalID != "run-uid" || body.Status != "queued" || body.HeadSHA != strings.Repeat("a", 40) {
+				http.Error(writer, "unexpected check run", http.StatusBadRequest)
+				return
+			}
+			created++
+			fmt.Fprint(writer, `{"id":17,"external_id":"run-uid","status":"queued"}`)
+		case request.Method == http.MethodPatch && request.URL.Path == "/repos/acme/example/check-runs/17":
+			body := githubclient.UpdateCheckRunRequest{}
+			if err := json.NewDecoder(request.Body).Decode(&body); err != nil {
+				http.Error(writer, "unexpected check update", http.StatusBadRequest)
+				return
+			}
+			switch updated {
+			case 0:
+				if body.Status != "queued" || body.Output == nil || body.Output.Title != "CI" {
+					http.Error(writer, "unexpected queued check update", http.StatusBadRequest)
+					return
+				}
+			case 1:
+				if body.Status != "completed" || body.Conclusion != "success" {
+					http.Error(writer, "unexpected completed check update", http.StatusBadRequest)
+					return
+				}
+			default:
+				http.Error(writer, "unexpected extra check update", http.StatusBadRequest)
+				return
+			}
+			updated++
+			fmt.Fprintf(writer, `{"id":17,"external_id":"run-uid","status":%q,"conclusion":%q}`, body.Status, body.Conclusion)
+		default:
+			http.NotFound(writer, request)
+		}
+	}))
+	defer server.Close()
+	github, err := githubclient.NewClient(server.URL, server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	scheme := runtime.NewScheme()
+	if err := actionsv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	project := &actionsv1alpha1.Project{
+		ObjectMeta: metav1.ObjectMeta{Name: "project", Namespace: "default", UID: "project-uid"},
+		Spec: actionsv1alpha1.ProjectSpec{Source: actionsv1alpha1.ProjectSource{Type: actionsv1alpha1.SourceTypeGitHub, GitHub: &actionsv1alpha1.GitHubAppConfiguration{
+			AppID: 1, InstallationID: 2,
+			PrivateKeySecretRef: corev1.SecretKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: "github"}, Key: "private-key"},
+			WebhookSecretRef:    corev1.SecretKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: "github"}, Key: "webhook-secret"},
+		}}},
+	}
+	secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "github", Namespace: "default"}, Data: map[string][]byte{"private-key": privateKeyData}}
+	run := &actionsv1alpha1.WorkflowRun{
+		ObjectMeta: metav1.ObjectMeta{Name: "ci", Namespace: "default", UID: "run-uid"},
+		Spec: actionsv1alpha1.WorkflowRunSpec{
+			ProjectRef:   corev1.LocalObjectReference{Name: project.Name},
+			WorkflowPath: ".open-actions/workflows/ci.yaml",
+			Source: actionsv1alpha1.WorkflowRunSource{Type: actionsv1alpha1.SourceTypeGitHub, GitHub: &actionsv1alpha1.GitHubWorkflowRunSource{
+				Repository: actionsv1alpha1.GitHubRepository{ID: 3, Owner: "acme", Name: "example"},
+				Revision:   actionsv1alpha1.GitRevision{SHA: strings.Repeat("a", 40)},
+			}},
+		},
+	}
+	clusterClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&actionsv1alpha1.WorkflowRun{}).WithObjects(project, secret, run).Build()
+	reconciler := &WorkflowRunReconciler{Client: clusterClient, APIReader: clusterClient, GitHub: github}
+	if err := reconciler.reconcileGitHubCheck(context.Background(), run); err != nil {
+		t.Fatal(err)
+	}
+	stored := &actionsv1alpha1.WorkflowRun{}
+	if err := clusterClient.Get(context.Background(), client.ObjectKeyFromObject(run), stored); err != nil {
+		t.Fatal(err)
+	}
+	checkRun := workflowRunCheckRunStatus(stored)
+	if checkRun == nil || checkRun.ID != 17 || checkRun.Status != "queued" || checkRun.ReportDigest == "" || created != 1 {
+		t.Fatalf("check run status = %#v, creates = %d", checkRun, created)
+	}
+	stored.Status.WorkflowName = "CI"
+	if err := reconciler.reconcileGitHubCheck(context.Background(), stored); err != nil {
+		t.Fatal(err)
+	}
+	if err := clusterClient.Get(context.Background(), client.ObjectKeyFromObject(run), stored); err != nil {
+		t.Fatal(err)
+	}
+	completionTime := metav1.Now()
+	stored.Status.CompletionTime = &completionTime
+	meta.SetStatusCondition(&stored.Status.Conditions, metav1.Condition{Type: actionsv1alpha1.WorkflowRunConditionSucceeded, Status: metav1.ConditionTrue, Reason: "JobsSucceeded", Message: "All jobs succeeded", LastTransitionTime: completionTime})
+	if err := reconciler.reconcileGitHubCheck(context.Background(), stored); err != nil {
+		t.Fatal(err)
+	}
+	if err := clusterClient.Get(context.Background(), client.ObjectKeyFromObject(run), stored); err != nil {
+		t.Fatal(err)
+	}
+	if updated != 2 || workflowRunCheckRunStatus(stored).Conclusion != "success" {
+		t.Fatalf("updates = %d, check run = %#v", updated, workflowRunCheckRunStatus(stored))
+	}
+}
+
+func TestWorkflowRunCheckReportMapsLifecycle(t *testing.T) {
+	run := &actionsv1alpha1.WorkflowRun{Spec: actionsv1alpha1.WorkflowRunSpec{WorkflowPath: ".open-actions/workflows/ci.yaml"}}
+	if report := workflowRunCheckReport(run); report.Status != "queued" || report.Conclusion != "" {
+		t.Fatalf("queued report = %#v", report)
+	}
+	start := metav1.Now()
+	run.Status.StartTime = &start
+	if report := workflowRunCheckReport(run); report.Status != "in_progress" || report.StartedAt == "" {
+		t.Fatalf("running report = %#v", report)
+	}
+	completion := metav1.Now()
+	run.Status.CompletionTime = &completion
+	meta.SetStatusCondition(&run.Status.Conditions, metav1.Condition{Type: actionsv1alpha1.WorkflowRunConditionSucceeded, Status: metav1.ConditionFalse, Reason: "JobFailed", Message: "A job failed", LastTransitionTime: completion})
+	if report := workflowRunCheckReport(run); report.Status != "completed" || report.Conclusion != "failure" || report.CompletedAt == "" {
+		t.Fatalf("failed report = %#v", report)
+	}
+	deletionTime := metav1.NewTime(time.Unix(1_700_000_000, 0))
+	canceled := &actionsv1alpha1.WorkflowRun{ObjectMeta: metav1.ObjectMeta{DeletionTimestamp: &deletionTime}}
+	if report := workflowRunCheckReport(canceled); report.Status != "completed" || report.Conclusion != "cancelled" || report.CompletedAt != deletionTime.UTC().Format(time.RFC3339) {
+		t.Fatalf("canceled report = %#v", report)
 	}
 }
 
@@ -184,7 +336,7 @@ func TestCanceledWorkflowRunWaitsForPodsBeforeFinalizing(t *testing.T) {
 	deletionTime := metav1.Now()
 	run := &actionsv1alpha1.WorkflowRun{ObjectMeta: metav1.ObjectMeta{
 		Name: "canceling", Namespace: "default", UID: types.UID("run-uid"),
-		DeletionTimestamp: &deletionTime, Finalizers: []string{workflowRunCancellationFinalizer},
+		DeletionTimestamp: &deletionTime, Finalizers: []string{workflowRunCancellationFinalizer, workflowRunCheckFinalizer},
 	}}
 	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
 		Name: "canceling-job", Namespace: "default", Labels: map[string]string{actionsv1alpha1.LabelWorkflowRunUID: string(run.UID)},
@@ -205,6 +357,9 @@ func TestCanceledWorkflowRunWaitsForPodsBeforeFinalizing(t *testing.T) {
 	if !controllerutil.ContainsFinalizer(stored, workflowRunCancellationFinalizer) {
 		t.Fatal("cancellation finalizer was removed while a Pod remained")
 	}
+	if !controllerutil.ContainsFinalizer(stored, workflowRunCheckFinalizer) {
+		t.Fatal("check finalizer was removed while cancellation remained")
+	}
 	if err := clusterClient.Delete(context.Background(), pod); err != nil {
 		t.Fatal(err)
 	}
@@ -216,8 +371,95 @@ func TestCanceledWorkflowRunWaitsForPodsBeforeFinalizing(t *testing.T) {
 		if client.IgnoreNotFound(err) != nil {
 			t.Fatal(err)
 		}
-	} else if controllerutil.ContainsFinalizer(stored, workflowRunCancellationFinalizer) {
-		t.Fatal("cancellation finalizer remained after the Pod was deleted")
+	} else if controllerutil.ContainsFinalizer(stored, workflowRunCancellationFinalizer) || controllerutil.ContainsFinalizer(stored, workflowRunCheckFinalizer) {
+		t.Fatal("WorkflowRun finalizer remained after the Pod was deleted")
+	}
+}
+
+func TestCanceledWorkflowRunRetainsCheckFinalizerWhenReportingFails(t *testing.T) {
+	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	privateKeyData := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(privateKey)})
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		http.Error(writer, "GitHub unavailable", http.StatusServiceUnavailable)
+	}))
+	defer server.Close()
+	github, err := githubclient.NewClient(server.URL, server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	scheme := runtime.NewScheme()
+	if err := actionsv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	project := &actionsv1alpha1.Project{
+		ObjectMeta: metav1.ObjectMeta{Name: "project", Namespace: "default"},
+		Spec: actionsv1alpha1.ProjectSpec{Source: actionsv1alpha1.ProjectSource{Type: actionsv1alpha1.SourceTypeGitHub, GitHub: &actionsv1alpha1.GitHubAppConfiguration{
+			AppID: 1, InstallationID: 2,
+			PrivateKeySecretRef: corev1.SecretKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: "github"}, Key: "private-key"},
+		}}},
+	}
+	secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "github", Namespace: "default"}, Data: map[string][]byte{"private-key": privateKeyData}}
+	deletionTime := metav1.Now()
+	run := &actionsv1alpha1.WorkflowRun{
+		ObjectMeta: metav1.ObjectMeta{Name: "canceling", Namespace: "default", UID: types.UID("run-uid"), DeletionTimestamp: &deletionTime, Finalizers: []string{workflowRunCheckFinalizer}},
+		Spec: actionsv1alpha1.WorkflowRunSpec{
+			ProjectRef: corev1.LocalObjectReference{Name: project.Name}, WorkflowPath: ".open-actions/workflows/ci.yaml",
+			Source: actionsv1alpha1.WorkflowRunSource{Type: actionsv1alpha1.SourceTypeGitHub, GitHub: &actionsv1alpha1.GitHubWorkflowRunSource{
+				Repository: actionsv1alpha1.GitHubRepository{ID: 3, Owner: "acme", Name: "example"},
+				Revision:   actionsv1alpha1.GitRevision{SHA: strings.Repeat("a", 40)},
+			}},
+		},
+	}
+	clusterClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(project, secret, run).Build()
+	reconciler := &WorkflowRunReconciler{Client: clusterClient, APIReader: clusterClient, GitHub: github}
+	if _, err := reconciler.finalizeCanceledWorkflowRun(context.Background(), run); err == nil {
+		t.Fatal("terminal Check reporting failure did not request a retry")
+	}
+	stored := &actionsv1alpha1.WorkflowRun{}
+	if err := clusterClient.Get(context.Background(), client.ObjectKeyFromObject(run), stored); err != nil {
+		t.Fatal(err)
+	}
+	if !controllerutil.ContainsFinalizer(stored, workflowRunCheckFinalizer) {
+		t.Fatal("check finalizer was removed after a transient reporting failure")
+	}
+}
+
+func TestCanceledWorkflowRunRemovesCheckFinalizerWhenProjectIsGone(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := actionsv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	github, err := githubclient.NewClient("https://api.github.test", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deletionTime := metav1.Now()
+	run := &actionsv1alpha1.WorkflowRun{
+		ObjectMeta: metav1.ObjectMeta{Name: "canceling", Namespace: "default", UID: types.UID("run-uid"), DeletionTimestamp: &deletionTime, Finalizers: []string{workflowRunCheckFinalizer}},
+		Spec: actionsv1alpha1.WorkflowRunSpec{
+			ProjectRef: corev1.LocalObjectReference{Name: "deleted-project"}, WorkflowPath: ".open-actions/workflows/ci.yaml",
+			Source: actionsv1alpha1.WorkflowRunSource{Type: actionsv1alpha1.SourceTypeGitHub, GitHub: &actionsv1alpha1.GitHubWorkflowRunSource{
+				Repository: actionsv1alpha1.GitHubRepository{ID: 3, Owner: "acme", Name: "example"},
+				Revision:   actionsv1alpha1.GitRevision{SHA: strings.Repeat("a", 40)},
+			}},
+		},
+	}
+	clusterClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(run).Build()
+	reconciler := &WorkflowRunReconciler{Client: clusterClient, APIReader: clusterClient, GitHub: github}
+	if _, err := reconciler.finalizeCanceledWorkflowRun(context.Background(), run); err != nil {
+		t.Fatal(err)
+	}
+	stored := &actionsv1alpha1.WorkflowRun{}
+	if err := clusterClient.Get(context.Background(), client.ObjectKeyFromObject(run), stored); client.IgnoreNotFound(err) != nil {
+		t.Fatal(err)
+	} else if err == nil && controllerutil.ContainsFinalizer(stored, workflowRunCheckFinalizer) {
+		t.Fatal("check finalizer blocked WorkflowRun deletion")
 	}
 }
 
@@ -627,6 +869,33 @@ func TestWaitingWorkflowRunResumesWithoutRefetchingWorkflow(t *testing.T) {
 	result, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(current)})
 	if err != nil {
 		t.Fatal(err)
+	}
+	if result.RequeueAfter != 2*time.Second {
+		t.Fatalf("requeue after = %v, want 2s", result.RequeueAfter)
+	}
+}
+
+func TestGitHubCheckFailurePreservesWorkflowRequeue(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := actionsv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	github, err := githubclient.NewClient("https://api.github.test", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	olderCondition := plannedCondition(metav1.ConditionTrue, "JobsPlanned")
+	waitingCondition := plannedCondition(metav1.ConditionUnknown, "WaitingForConcurrency")
+	older := concurrencyRun("older", "run-older", 1, time.Now().Add(-time.Minute), "deploy", &olderCondition)
+	current := concurrencyRun("current", "run-current", 1, time.Now(), "deploy", &waitingCondition)
+	current.Status.WorkflowName = "CI"
+	current.Status.Jobs = &actionsv1alpha1.WorkflowRunJobStatus{Total: 1, Queued: 1}
+	clusterClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&actionsv1alpha1.WorkflowRun{}).WithObjects(older, current).Build()
+	reconciler := &WorkflowRunReconciler{Client: clusterClient, APIReader: clusterClient, GitHub: github}
+
+	result, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(current)})
+	if err != nil {
+		t.Fatalf("Check reporting failure replaced the workflow requeue: %v", err)
 	}
 	if result.RequeueAfter != 2*time.Second {
 		t.Fatalf("requeue after = %v, want 2s", result.RequeueAfter)

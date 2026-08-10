@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"sort"
 	"strings"
 	"time"
@@ -33,6 +34,7 @@ const (
 	resourceNameMaxLength            = 63
 	workflowJobNameDigestLength      = 16
 	workflowRunCancellationFinalizer = "actions.kelos.dev/concurrency-cancellation"
+	workflowRunCheckFinalizer        = "actions.kelos.dev/github-check"
 )
 
 var digestEncoding = base32.StdEncoding.WithPadding(base32.NoPadding)
@@ -63,6 +65,7 @@ type WorkflowRunReconciler struct {
 	GitHubAPIBase      string
 	GitHubServerURL    string
 	ActionCloneBaseURL string
+	ConsoleURL         string
 }
 
 func (r *WorkflowRunReconciler) Reconcile(ctx context.Context, request ctrl.Request) (ctrl.Result, error) {
@@ -70,9 +73,36 @@ func (r *WorkflowRunReconciler) Reconcile(ctx context.Context, request ctrl.Requ
 	if err := r.Get(ctx, request.NamespacedName, run); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
+	if r.githubCheckEnabled(run) && run.DeletionTimestamp.IsZero() && !controllerutil.ContainsFinalizer(run, workflowRunCheckFinalizer) {
+		before := run.DeepCopy()
+		controllerutil.AddFinalizer(run, workflowRunCheckFinalizer)
+		if err := r.Patch(ctx, run, client.MergeFrom(before)); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
 	if !run.DeletionTimestamp.IsZero() {
 		return r.finalizeCanceledWorkflowRun(ctx, run)
 	}
+	reportError := r.reconcileGitHubCheck(ctx, run)
+	result, reconcileError := r.reconcileWorkflowRun(ctx, run)
+	if reconcileError != nil {
+		return result, errors.Join(reportError, reconcileError)
+	}
+	if reportError != nil {
+		if result.Requeue || result.RequeueAfter > 0 {
+			ctrl.LoggerFrom(ctx).Error(reportError, "GitHub Check reporting failed while workflow reconciliation is pending")
+			return result, nil
+		}
+		return result, reportError
+	}
+	return result, nil
+}
+
+func (r *WorkflowRunReconciler) githubCheckEnabled(run *actionsv1alpha1.WorkflowRun) bool {
+	return r.GitHub != nil && run.Spec.Source.Type == actionsv1alpha1.SourceTypeGitHub && run.Spec.Source.GitHub != nil && run.UID != ""
+}
+
+func (r *WorkflowRunReconciler) reconcileWorkflowRun(ctx context.Context, run *actionsv1alpha1.WorkflowRun) (ctrl.Result, error) {
 	if terminalRun(run) {
 		return ctrl.Result{}, nil
 	}
@@ -109,7 +139,7 @@ func (r *WorkflowRunReconciler) Reconcile(ctx context.Context, request ctrl.Requ
 	if err != nil {
 		return r.planningFailed(ctx, run, "CredentialsUnavailable", err, planningFailureRetry)
 	}
-	installation, err := r.GitHub.Installation(ctx, githubConfig.AppID, githubConfig.InstallationID, privateKey, githubSource.Repository.Name)
+	installation, err := r.GitHub.Installation(ctx, githubConfig.AppID, githubConfig.InstallationID, privateKey, githubSource.Repository.Name, githubclient.InstallationPermissions{ContentsRead: true})
 	if err != nil {
 		return r.planningFailed(ctx, run, "GitHubAuthenticationFailed", err, planningFailureRetry)
 	}
@@ -150,6 +180,192 @@ func (r *WorkflowRunReconciler) Reconcile(ctx context.Context, request ctrl.Requ
 		return r.waitingForConcurrency(ctx, run, definition.Name, concurrencyGroup, jobCount, cancelInProgress)
 	}
 	return r.observeWorkflowJobs(ctx, run, definition.Name, concurrencyGroup, jobCount)
+}
+
+type checkRunReport struct {
+	Status      string
+	Conclusion  string
+	StartedAt   string
+	CompletedAt string
+	Output      githubclient.CheckRunOutput
+}
+
+func (r *WorkflowRunReconciler) reconcileGitHubCheck(ctx context.Context, run *actionsv1alpha1.WorkflowRun) error {
+	githubSource := run.Spec.Source.GitHub
+	if !r.githubCheckEnabled(run) {
+		return nil
+	}
+	report := workflowRunCheckReport(run)
+	project := &actionsv1alpha1.Project{}
+	projectKey := client.ObjectKey{Namespace: run.Namespace, Name: run.Spec.ProjectRef.Name}
+	if err := r.APIReader.Get(ctx, projectKey, project); err != nil {
+		return fmt.Errorf("get Project %q for GitHub check: %w", projectKey.Name, err)
+	}
+	githubConfig := project.Spec.Source.GitHub
+	detailsURL := ""
+	if r.ConsoleURL != "" {
+		detailsURL = workflowRunConsoleURL(r.ConsoleURL, run)
+	}
+	name := "Open Actions / " + run.Spec.WorkflowPath
+	externalID := string(run.UID)
+	createRequest := githubclient.CreateCheckRunRequest{
+		Name:        name,
+		HeadSHA:     githubSource.Revision.SHA,
+		DetailsURL:  detailsURL,
+		ExternalID:  externalID,
+		Status:      report.Status,
+		Conclusion:  report.Conclusion,
+		StartedAt:   report.StartedAt,
+		CompletedAt: report.CompletedAt,
+		Output:      &report.Output,
+	}
+	reportDigest := checkRunReportDigest(createRequest)
+	current := workflowRunCheckRunStatus(run)
+	if current != nil && current.Status == report.Status && current.Conclusion == report.Conclusion && current.ReportDigest == reportDigest {
+		return nil
+	}
+
+	privateKey, err := secretValue(ctx, r.APIReader, project.Namespace, githubConfig.PrivateKeySecretRef)
+	if err != nil {
+		return fmt.Errorf("read credentials for GitHub check: %w", err)
+	}
+	installation, err := r.GitHub.Installation(ctx, githubConfig.AppID, githubConfig.InstallationID, privateKey, githubSource.Repository.Name, githubclient.InstallationPermissions{ChecksWrite: true})
+	if err != nil {
+		return fmt.Errorf("authenticate GitHub check reporter: %w", err)
+	}
+
+	var checkRun *githubclient.CheckRun
+	if current == nil {
+		checkRun, err = installation.FindCheckRun(ctx, githubSource.Repository.Owner, githubSource.Repository.Name, githubSource.Revision.SHA, githubConfig.AppID, externalID)
+		if err != nil {
+			return err
+		}
+	}
+	if current == nil && checkRun == nil {
+		checkRun, err = installation.CreateCheckRun(ctx, githubSource.Repository.Owner, githubSource.Repository.Name, createRequest)
+		if err != nil {
+			return err
+		}
+	} else {
+		var id int64
+		if current != nil {
+			id = current.ID
+		} else {
+			id = checkRun.ID
+		}
+		if id < 1 {
+			return errors.New("GitHub returned an invalid check-run ID")
+		}
+		checkRun, err = installation.UpdateCheckRun(ctx, githubSource.Repository.Owner, githubSource.Repository.Name, id, githubclient.UpdateCheckRunRequest{
+			Name:        name,
+			DetailsURL:  detailsURL,
+			ExternalID:  externalID,
+			Status:      report.Status,
+			Conclusion:  report.Conclusion,
+			StartedAt:   report.StartedAt,
+			CompletedAt: report.CompletedAt,
+			Output:      &report.Output,
+		})
+		if err != nil {
+			return err
+		}
+	}
+	if checkRun == nil || checkRun.ID < 1 {
+		return errors.New("GitHub returned an invalid check-run ID")
+	}
+	return r.recordGitHubCheckRun(ctx, run, checkRun.ID, report.Status, report.Conclusion, reportDigest)
+}
+
+func checkRunReportDigest(request githubclient.CreateCheckRunRequest) string {
+	data, _ := json.Marshal(request)
+	digest := sha256.Sum256(data)
+	return fmt.Sprintf("%x", digest)
+}
+
+func workflowRunCheckReport(run *actionsv1alpha1.WorkflowRun) checkRunReport {
+	title := run.Status.WorkflowName
+	if title == "" {
+		title = run.Spec.WorkflowPath
+	}
+	report := checkRunReport{
+		Status: "queued",
+		Output: githubclient.CheckRunOutput{
+			Title:   title,
+			Summary: "The workflow is queued.",
+		},
+	}
+	succeeded := meta.FindStatusCondition(run.Status.Conditions, actionsv1alpha1.WorkflowRunConditionSucceeded)
+	switch {
+	case succeeded != nil && succeeded.Status == metav1.ConditionTrue:
+		report.Status = "completed"
+		report.Conclusion = "success"
+		report.summaryFromCondition(succeeded)
+	case succeeded != nil && succeeded.Status == metav1.ConditionFalse:
+		report.Status = "completed"
+		report.Conclusion = "failure"
+		report.summaryFromCondition(succeeded)
+	case !run.DeletionTimestamp.IsZero():
+		report.Status = "completed"
+		report.Conclusion = "cancelled"
+		report.Output.Summary = "The workflow was cancelled."
+	case run.Status.StartTime != nil:
+		report.Status = "in_progress"
+		report.Output.Summary = "The workflow is running."
+	default:
+		planned := meta.FindStatusCondition(run.Status.Conditions, actionsv1alpha1.WorkflowRunConditionPlanned)
+		if planned != nil && planned.Message != "" {
+			report.Output.Summary = planned.Message
+		}
+	}
+	if run.Status.StartTime != nil {
+		report.StartedAt = run.Status.StartTime.UTC().Format(time.RFC3339)
+	}
+	if run.Status.CompletionTime != nil {
+		report.CompletedAt = run.Status.CompletionTime.UTC().Format(time.RFC3339)
+	} else if !run.DeletionTimestamp.IsZero() {
+		report.CompletedAt = run.DeletionTimestamp.UTC().Format(time.RFC3339)
+	} else if report.Status == "completed" && succeeded != nil {
+		report.CompletedAt = succeeded.LastTransitionTime.UTC().Format(time.RFC3339)
+	}
+	if run.Status.Jobs != nil {
+		jobs := run.Status.Jobs
+		report.Output.Text = fmt.Sprintf("Jobs: %d total, %d queued, %d active, %d succeeded, %d failed.", jobs.Total, jobs.Queued, jobs.Active, jobs.Succeeded, jobs.Failed)
+	}
+	return report
+}
+
+func (r *checkRunReport) summaryFromCondition(condition *metav1.Condition) {
+	if condition.Message != "" {
+		r.Output.Summary = condition.Message
+	}
+}
+
+func workflowRunCheckRunStatus(run *actionsv1alpha1.WorkflowRun) *actionsv1alpha1.GitHubCheckRunStatus {
+	if run.Status.Source == nil || run.Status.Source.GitHub == nil {
+		return nil
+	}
+	return run.Status.Source.GitHub.CheckRun
+}
+
+func (r *WorkflowRunReconciler) recordGitHubCheckRun(ctx context.Context, run *actionsv1alpha1.WorkflowRun, id int64, status, conclusion, reportDigest string) error {
+	before := run.DeepCopy()
+	if run.Status.Source == nil {
+		run.Status.Source = &actionsv1alpha1.WorkflowRunSourceStatus{}
+	}
+	if run.Status.Source.GitHub == nil {
+		run.Status.Source.GitHub = &actionsv1alpha1.GitHubWorkflowRunStatus{}
+	}
+	run.Status.Source.GitHub.CheckRun = &actionsv1alpha1.GitHubCheckRunStatus{ID: id, Status: status, Conclusion: conclusion, ReportDigest: reportDigest}
+	return r.Status().Patch(ctx, run, client.MergeFrom(before))
+}
+
+func workflowRunConsoleURL(baseURL string, run *actionsv1alpha1.WorkflowRun) string {
+	parsed, err := url.Parse(baseURL)
+	if err != nil {
+		return ""
+	}
+	parsed.Path = strings.TrimRight(parsed.Path, "/") + "/runs/" + url.PathEscape(run.Namespace) + "/" + url.PathEscape(run.Name)
+	return parsed.String()
 }
 
 type plannedWorkflowJob struct {
@@ -602,22 +818,76 @@ func (r *WorkflowRunReconciler) cancelWorkflowRun(ctx context.Context, run *acti
 }
 
 func (r *WorkflowRunReconciler) finalizeCanceledWorkflowRun(ctx context.Context, run *actionsv1alpha1.WorkflowRun) (ctrl.Result, error) {
-	if !controllerutil.ContainsFinalizer(run, workflowRunCancellationFinalizer) {
+	cancellationFinalizer := controllerutil.ContainsFinalizer(run, workflowRunCancellationFinalizer)
+	checkFinalizer := controllerutil.ContainsFinalizer(run, workflowRunCheckFinalizer)
+	if !cancellationFinalizer && !checkFinalizer {
 		return ctrl.Result{}, nil
 	}
-	remaining, err := r.executionWorkloadsRemain(ctx, run)
-	if err != nil {
-		return ctrl.Result{}, err
+	var reportError error
+	if checkFinalizer {
+		reportError = r.reconcileGitHubCheck(ctx, run)
 	}
-	if remaining {
-		return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+	if cancellationFinalizer {
+		remaining, err := r.executionWorkloadsRemain(ctx, run)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		if remaining {
+			if reportError != nil {
+				ctrl.LoggerFrom(ctx).Error(reportError, "GitHub Check reporting failed while workflow cleanup is pending")
+			}
+			return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+		}
 	}
 	before := run.DeepCopy()
 	controllerutil.RemoveFinalizer(run, workflowRunCancellationFinalizer)
-	if err := r.Patch(ctx, run, client.MergeFrom(before)); err != nil {
-		return ctrl.Result{}, err
+	retryReport := false
+	if checkFinalizer {
+		switch {
+		case reportError == nil:
+			controllerutil.RemoveFinalizer(run, workflowRunCheckFinalizer)
+		case r.githubCheckReportPermanentlyUnavailable(ctx, run, reportError):
+			ctrl.LoggerFrom(ctx).Info("Skipping terminal GitHub Check report because reporting is unavailable", "error", reportError)
+			controllerutil.RemoveFinalizer(run, workflowRunCheckFinalizer)
+		default:
+			retryReport = true
+		}
+	}
+	finalizersChanged := cancellationFinalizer || (checkFinalizer && !retryReport)
+	if finalizersChanged {
+		if err := r.Patch(ctx, run, client.MergeFrom(before)); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
+	if retryReport {
+		return ctrl.Result{}, reportError
 	}
 	return ctrl.Result{}, nil
+}
+
+func (r *WorkflowRunReconciler) githubCheckReportPermanentlyUnavailable(ctx context.Context, run *actionsv1alpha1.WorkflowRun, reportError error) bool {
+	apiError := &githubclient.APIError{}
+	if errors.As(reportError, &apiError) && apiError.StatusCode >= 400 && apiError.StatusCode < 500 && apiError.StatusCode != 408 && apiError.StatusCode != 409 && apiError.StatusCode != 429 {
+		return true
+	}
+	project := &actionsv1alpha1.Project{}
+	projectKey := client.ObjectKey{Namespace: run.Namespace, Name: run.Spec.ProjectRef.Name}
+	if err := r.APIReader.Get(ctx, projectKey, project); err != nil {
+		return apierrors.IsNotFound(err)
+	}
+	if project.Spec.Source.GitHub == nil {
+		return true
+	}
+	selector := project.Spec.Source.GitHub.PrivateKeySecretRef
+	if selector.Name == "" || selector.Key == "" {
+		return true
+	}
+	secret := &corev1.Secret{}
+	if err := r.APIReader.Get(ctx, client.ObjectKey{Namespace: project.Namespace, Name: selector.Name}, secret); err != nil {
+		return apierrors.IsNotFound(err)
+	}
+	privateKey := secret.Data[selector.Key]
+	return len(privateKey) == 0 || githubclient.ValidatePrivateKey(privateKey) != nil
 }
 
 func (r *WorkflowRunReconciler) executionWorkloadsRemain(ctx context.Context, run *actionsv1alpha1.WorkflowRun) (bool, error) {

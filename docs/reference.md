@@ -11,7 +11,11 @@ and installation instructions.
 GitHub Enterprise API path such as `/api/v3`. `--github-server-url` defaults to
 `https://github.com` and supplies `github.server_url`. `--action-clone-base-url`
 defaults to `https://github.com` and is used only to fetch external action
-repositories.
+repositories. The controller's optional `--console-url` adds Console links to
+GitHub Check Runs. The Console serves HTTP on `--bind-address` (default
+`:8080`) and requires `--token-file`. Set `--secure-cookie` when it is served
+through HTTPS. The Helm chart configures both authentication flags from its
+configured Secret and `console.publicURL`.
 
 Each URL requires an absolute `http` or `https` URL with a host and an optional
 clean path prefix. User information, queries, fragments, escaped paths, and `.`
@@ -22,7 +26,12 @@ slash, while the server and clone base URLs are normalized without one.
 open-actions-controller \
   --github-api-url=https://github.example/api/v3 \
   --github-server-url=https://github.example \
-  --action-clone-base-url=https://github.example
+  --action-clone-base-url=https://github.example \
+  --console-url=https://actions.example
+
+open-actions-console \
+  --token-file=/var/run/secrets/open-actions-console/token \
+  --secure-cookie
 ```
 
 ## Kubernetes API
@@ -39,12 +48,12 @@ The project defaults `spec.workflowDirectory` to `.open-actions/workflows`. Its
 source type and GitHub App and installation IDs are immutable. Only one project
 in the cluster may claim an installation; the earliest-created project retains
 the claim, and later duplicates remain unconfigured until the owner is deleted.
-
 A `WorkflowRun` records provider-specific event data under its own immutable
-`spec.source` union. A Runner's `spec.projectRef` is immutable, and changes to
-`spec.execution` apply only to Kubernetes Jobs created afterward. A
-`WorkflowJob` spec is immutable, and `status.runnerRef` identifies its one-time
-Runner assignment.
+`spec.source` union. `status.source.github.checkRun` records the GitHub Check Run
+ID and the last report accepted by GitHub. A Runner's `spec.projectRef` is
+immutable, and changes to `spec.execution` apply only to Kubernetes Jobs created
+afterward. A `WorkflowJob` spec is immutable, and `status.runnerRef` identifies
+its one-time Runner assignment.
 
 Runner labels are canonical lowercase ASCII in Kubernetes resources. Workflow
 `runs-on` labels use the same representation. Each Runner is one reusable
@@ -78,8 +87,8 @@ The resources expose these condition contracts:
 `Project/Configured` covers local Secret availability, private-key parsing, and
 installation uniqueness. It does not assert remote GitHub App or installation
 availability. `Runner/Ready` reports operational health independently of
-capacity; clients use `Runner/Busy` to determine whether a Runner already has an
-assignment.
+capacity; clients use `Runner/Busy` to determine whether a Runner already has
+an assignment.
 
 ### Resource metadata
 
@@ -163,11 +172,12 @@ supported.
 
 Docker and local actions, private cross-repository action authentication, job
 dependencies, matrices, service containers, general expression evaluation,
-caches, artifacts, and GitHub check reporting are not supported. General
-expressions outside the supported concurrency and composite-action contexts are
-rejected during planning or execution and are never interpreted as literal
-values. `WorkflowJob` resources are not retried or reassigned when a Runner is
-removed.
+caches, and artifacts are not supported. General expressions outside the
+supported concurrency and composite-action contexts are rejected during
+planning or execution and are never interpreted as literal values.
+`WorkflowJob` resources are not retried or reassigned when a Runner is removed.
+Native Jobs and their Pod logs are deleted one hour after completion; Open
+Actions does not archive logs.
 
 ## Webhook API
 

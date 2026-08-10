@@ -13,6 +13,7 @@ import (
 
 	actionsv1alpha1 "github.com/kelos-dev/open-actions/api/v1alpha1"
 	"github.com/kelos-dev/open-actions/internal/controller"
+	"github.com/kelos-dev/open-actions/internal/endpointurl"
 	githubclient "github.com/kelos-dev/open-actions/internal/github"
 	githubwebhook "github.com/kelos-dev/open-actions/internal/webhook"
 	corev1 "k8s.io/api/core/v1"
@@ -77,6 +78,7 @@ func runManager(arguments []string) error {
 	githubAPIURL := flags.String("github-api-url", "https://api.github.com/", "Base URL for the GitHub API")
 	githubServerURL := flags.String("github-server-url", "https://github.com", "GitHub web-server URL exposed to workflows")
 	actionCloneBaseURL := flags.String("action-clone-base-url", "https://github.com", "Base URL used to clone external action repositories")
+	consoleURL := flags.String("console-url", "", "Public URL for the Open Actions Console")
 	leaderElection := flags.Bool("leader-elect", false, "Use leader election for the controller manager")
 	if err := flags.Parse(arguments); err != nil {
 		return err
@@ -92,6 +94,13 @@ func runManager(arguments []string) error {
 	normalizedActionCloneBaseURL, err := githubclient.NormalizeActionCloneBaseURL(*actionCloneBaseURL)
 	if err != nil {
 		return err
+	}
+	normalizedConsoleURL := ""
+	if *consoleURL != "" {
+		normalizedConsoleURL, err = endpointurl.NormalizeOrigin(*consoleURL, "Console URL")
+		if err != nil {
+			return err
+		}
 	}
 
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&zap.Options{Development: false})))
@@ -134,6 +143,7 @@ func runManager(arguments []string) error {
 		GitHubAPIBase:      normalizedGitHubAPIURL,
 		GitHubServerURL:    normalizedGitHubServerURL,
 		ActionCloneBaseURL: normalizedActionCloneBaseURL,
+		ConsoleURL:         normalizedConsoleURL,
 	}).SetupWithManager(controllerManager); err != nil {
 		return fmt.Errorf("configure WorkflowRun controller: %w", err)
 	}

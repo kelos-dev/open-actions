@@ -1,0 +1,22 @@
+{{- if .Values.console.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: open-actions-console
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: open-actions
+    app.kubernetes.io/component: console
+spec:
+  type: {{ .Values.console.service.type }}
+  selector:
+    app.kubernetes.io/name: open-actions
+    app.kubernetes.io/component: console
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+      {{- with .Values.console.service.nodePort }}
+      nodePort: {{ . }}
+      {{- end }}
+{{- end }}

@@ -247,7 +247,7 @@ func (r *DeliveryReconciler) Reconcile(ctx context.Context, request ctrl.Request
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	installation, err := r.GitHub.Installation(ctx, githubConfig.AppID, githubConfig.InstallationID, privateKey, delivery.Payload.Repository.Name)
+	installation, err := r.GitHub.Installation(ctx, githubConfig.AppID, githubConfig.InstallationID, privateKey, delivery.Payload.Repository.Name, githubclient.InstallationPermissions{ContentsRead: true})
 	if err != nil {
 		return ctrl.Result{}, err
 	}

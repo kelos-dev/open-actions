@@ -19,6 +19,8 @@ func TestRunManagerRejectsInvalidEndpointURLs(t *testing.T) {
 		{name: "GitHub API URL", arguments: []string{"--github-api-url=https://user:password@github.example"}, want: "GitHub API URL must not include user information"},
 		{name: "GitHub server URL", arguments: []string{"--github-server-url=git://github.example"}, want: "GitHub server URL must use http or https"},
 		{name: "action clone base URL", arguments: []string{"--action-clone-base-url=https://github.example?token=secret"}, want: "action clone base URL must not include a query"},
+		{name: "Console URL scheme", arguments: []string{"--console-url=git://actions.example"}, want: "Console URL must use http or https"},
+		{name: "Console URL", arguments: []string{"--console-url=https://actions.example/open-actions"}, want: "Console URL must not include a path"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			err := runManager(tt.arguments)
@@ -35,7 +37,7 @@ func TestWebhookServerRunsWithoutLeaderElectionAndTracksReadiness(t *testing.T) 
 		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}
 	if runnable.NeedLeaderElection() {
-		t.Fatal("webhook server requires leader election")
+		t.Fatal("HTTP server requires leader election")
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
@@ -46,7 +48,7 @@ func TestWebhookServerRunsWithoutLeaderElectionAndTracksReadiness(t *testing.T) 
 	}
 	if err := runnable.Readiness(nil); err != nil {
 		cancel()
-		t.Fatalf("webhook server did not become ready: %v", err)
+		t.Fatalf("HTTP server did not become ready: %v", err)
 	}
 	cancel()
 	select {
@@ -55,9 +57,9 @@ func TestWebhookServerRunsWithoutLeaderElectionAndTracksReadiness(t *testing.T) 
 			t.Fatal(err)
 		}
 	case <-time.After(time.Second):
-		t.Fatal("webhook server did not stop")
+		t.Fatal("HTTP server did not stop")
 	}
 	if err := runnable.Readiness(nil); err == nil {
-		t.Fatal("stopped webhook server remained ready")
+		t.Fatal("stopped HTTP server remained ready")
 	}
 }

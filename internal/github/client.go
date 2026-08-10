@@ -21,6 +21,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/kelos-dev/open-actions/internal/endpointurl"
 )
 
 const (
@@ -52,6 +54,54 @@ type repositoryCommit struct {
 	} `json:"parents"`
 }
 
+// InstallationPermissions selects the repository permissions for a scoped
+// installation token.
+type InstallationPermissions struct {
+	ContentsRead bool
+	ChecksWrite  bool
+}
+
+// CheckRun is the GitHub representation needed to reconcile a workflow check.
+type CheckRun struct {
+	ID         int64  `json:"id"`
+	ExternalID string `json:"external_id"`
+	HTMLURL    string `json:"html_url"`
+	Status     string `json:"status"`
+	Conclusion string `json:"conclusion"`
+}
+
+// CheckRunOutput is the user-visible content of a check run.
+type CheckRunOutput struct {
+	Title   string `json:"title"`
+	Summary string `json:"summary"`
+	Text    string `json:"text,omitempty"`
+}
+
+// CreateCheckRunRequest describes a new check run.
+type CreateCheckRunRequest struct {
+	Name        string          `json:"name"`
+	HeadSHA     string          `json:"head_sha"`
+	DetailsURL  string          `json:"details_url,omitempty"`
+	ExternalID  string          `json:"external_id"`
+	Status      string          `json:"status"`
+	Conclusion  string          `json:"conclusion,omitempty"`
+	StartedAt   string          `json:"started_at,omitempty"`
+	CompletedAt string          `json:"completed_at,omitempty"`
+	Output      *CheckRunOutput `json:"output,omitempty"`
+}
+
+// UpdateCheckRunRequest describes mutable check-run fields.
+type UpdateCheckRunRequest struct {
+	Name        string          `json:"name,omitempty"`
+	DetailsURL  string          `json:"details_url,omitempty"`
+	ExternalID  string          `json:"external_id,omitempty"`
+	Status      string          `json:"status,omitempty"`
+	Conclusion  string          `json:"conclusion,omitempty"`
+	StartedAt   string          `json:"started_at,omitempty"`
+	CompletedAt string          `json:"completed_at,omitempty"`
+	Output      *CheckRunOutput `json:"output,omitempty"`
+}
+
 // APIError describes a non-success response from the GitHub API.
 type APIError struct {
 	StatusCode int
@@ -68,18 +118,18 @@ func (e *APIError) Error() string {
 
 // NormalizeAPIURL validates and canonicalizes a GitHub REST API base URL.
 func NormalizeAPIURL(value string) (string, error) {
-	return normalizeEndpointURL(value, "GitHub API URL", true)
+	return endpointurl.Normalize(value, "GitHub API URL", true)
 }
 
 // NormalizeServerURL validates and canonicalizes a GitHub web-server URL.
 func NormalizeServerURL(value string) (string, error) {
-	return normalizeEndpointURL(value, "GitHub server URL", false)
+	return endpointurl.Normalize(value, "GitHub server URL", false)
 }
 
 // NormalizeActionCloneBaseURL validates and canonicalizes the base URL used to
 // clone external action repositories.
 func NormalizeActionCloneBaseURL(value string) (string, error) {
-	return normalizeEndpointURL(value, "action clone base URL", false)
+	return endpointurl.Normalize(value, "action clone base URL", false)
 }
 
 // RefName returns the short GitHub Actions name for a fully qualified ref.
@@ -112,9 +162,19 @@ func ValidatePrivateKey(data []byte) error {
 	return err
 }
 
-func (c *Client) Installation(ctx context.Context, appID, installationID int64, privateKey []byte, repository string) (*InstallationClient, error) {
+func (c *Client) Installation(ctx context.Context, appID, installationID int64, privateKey []byte, repository string, permissions InstallationPermissions) (*InstallationClient, error) {
 	if repository == "" {
 		return nil, errors.New("repository must be specified for an installation token")
+	}
+	tokenPermissions := map[string]string{}
+	if permissions.ContentsRead {
+		tokenPermissions["contents"] = "read"
+	}
+	if permissions.ChecksWrite {
+		tokenPermissions["checks"] = "write"
+	}
+	if len(tokenPermissions) == 0 {
+		return nil, errors.New("installation token permissions must be specified")
 	}
 	key, err := parsePrivateKey(privateKey)
 	if err != nil {
@@ -130,7 +190,7 @@ func (c *Client) Installation(ctx context.Context, appID, installationID int64, 
 	}{}
 	tokenRequest := map[string]any{
 		"repositories": []string{repository},
-		"permissions":  map[string]string{"contents": "read"},
+		"permissions":  tokenPermissions,
 	}
 	if err := c.doJSONWithBody(ctx, http.MethodPost, requestPath, jwt, tokenRequest, &response); err != nil {
 		return nil, fmt.Errorf("create installation access token: %w", err)
@@ -217,6 +277,54 @@ func (c *InstallationClient) ResolvePullRequestRevision(ctx context.Context, own
 	return commit.SHA, false, nil
 }
 
+// CreateCheckRun creates a check run for a repository commit.
+func (c *InstallationClient) CreateCheckRun(ctx context.Context, owner, repository string, request CreateCheckRunRequest) (*CheckRun, error) {
+	result := &CheckRun{}
+	requestPath := "repos/" + owner + "/" + repository + "/check-runs"
+	if err := c.client.doJSONWithBody(ctx, http.MethodPost, requestPath, c.token, request, result); err != nil {
+		return nil, fmt.Errorf("create check run for %s/%s: %w", owner, repository, err)
+	}
+	return result, nil
+}
+
+// UpdateCheckRun updates a check run created by the authenticated GitHub App.
+func (c *InstallationClient) UpdateCheckRun(ctx context.Context, owner, repository string, id int64, request UpdateCheckRunRequest) (*CheckRun, error) {
+	result := &CheckRun{}
+	requestPath := "repos/" + owner + "/" + repository + "/check-runs/" + strconv.FormatInt(id, 10)
+	if err := c.client.doJSONWithBody(ctx, http.MethodPatch, requestPath, c.token, request, result); err != nil {
+		return nil, fmt.Errorf("update check run %d for %s/%s: %w", id, owner, repository, err)
+	}
+	return result, nil
+}
+
+// FindCheckRun returns the check run with an external ID for an app and commit.
+func (c *InstallationClient) FindCheckRun(ctx context.Context, owner, repository, revision string, appID int64, externalID string) (*CheckRun, error) {
+	requestPath := "repos/" + owner + "/" + repository + "/commits/" + revision + "/check-runs"
+	for page := 1; ; page++ {
+		response := struct {
+			TotalCount int        `json:"total_count"`
+			CheckRuns  []CheckRun `json:"check_runs"`
+		}{}
+		query := url.Values{
+			"app_id":   []string{strconv.FormatInt(appID, 10)},
+			"filter":   []string{"all"},
+			"page":     []string{strconv.Itoa(page)},
+			"per_page": []string{"100"},
+		}
+		if err := c.client.doJSONWithQuery(ctx, http.MethodGet, requestPath, query, c.token, &response); err != nil {
+			return nil, fmt.Errorf("list check runs for %s/%s at revision %q: %w", owner, repository, revision, err)
+		}
+		for index := range response.CheckRuns {
+			if response.CheckRuns[index].ExternalID == externalID {
+				return &response.CheckRuns[index], nil
+			}
+		}
+		if len(response.CheckRuns) == 0 || page*100 >= response.TotalCount {
+			return nil, nil
+		}
+	}
+}
+
 func (c *Client) doJSON(ctx context.Context, method, requestPath, token string, destination any) error {
 	return c.doJSONWithBodyAndQuery(ctx, method, requestPath, nil, token, nil, destination)
 }
@@ -280,65 +388,6 @@ func (c *Client) doJSONWithBodyAndQuery(ctx context.Context, method, requestPath
 		return fmt.Errorf("decode GitHub response: %w", err)
 	}
 	return nil
-}
-
-func normalizeEndpointURL(value, label string, trailingSlash bool) (string, error) {
-	parsed, err := url.Parse(value)
-	if err != nil {
-		return "", fmt.Errorf("parse %s: %w", label, err)
-	}
-	if parsed.Scheme != "http" && parsed.Scheme != "https" {
-		return "", fmt.Errorf("%s must use http or https", label)
-	}
-	if parsed.Host == "" {
-		return "", fmt.Errorf("%s must include a host", label)
-	}
-	if parsed.User != nil {
-		return "", fmt.Errorf("%s must not include user information", label)
-	}
-	if parsed.RawQuery != "" || parsed.ForceQuery {
-		return "", fmt.Errorf("%s must not include a query", label)
-	}
-	if parsed.Fragment != "" {
-		return "", fmt.Errorf("%s must not include a fragment", label)
-	}
-	if parsed.Opaque != "" || parsed.RawPath != "" {
-		return "", fmt.Errorf("%s must use an unescaped hierarchical path", label)
-	}
-	if strings.Contains(parsed.Path, "//") {
-		return "", fmt.Errorf("%s path must not contain empty segments", label)
-	}
-	trimmedPath := strings.TrimRight(parsed.Path, "/")
-	if trimmedPath == "" {
-		trimmedPath = "/"
-	}
-	if parsed.Path != "" && path.Clean(parsed.Path) != trimmedPath {
-		return "", fmt.Errorf("%s path must not contain empty, '.' or '..' segments", label)
-	}
-	for _, character := range strings.Trim(parsed.Path, "/") {
-		if !isEndpointPathCharacter(character) {
-			return "", fmt.Errorf("%s path must contain only URL-safe path characters", label)
-		}
-	}
-	if trailingSlash {
-		if trimmedPath == "/" {
-			parsed.Path = "/"
-		} else {
-			parsed.Path = trimmedPath + "/"
-		}
-	} else if trimmedPath == "/" {
-		parsed.Path = ""
-	} else {
-		parsed.Path = trimmedPath
-	}
-	return parsed.String(), nil
-}
-
-func isEndpointPathCharacter(character rune) bool {
-	return character >= 'a' && character <= 'z' ||
-		character >= 'A' && character <= 'Z' ||
-		character >= '0' && character <= '9' ||
-		strings.ContainsRune("-._~/", character)
 }
 
 func repositoryContentPath(owner, repository, contentPath string) string {

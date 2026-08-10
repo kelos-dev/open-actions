@@ -1,9 +1,10 @@
 REGISTRY ?= ghcr.io/kelos-dev
 VERSION ?= latest
 CONTROLLER_IMAGE ?= $(REGISTRY)/open-actions-controller:$(VERSION)
+CONSOLE_IMAGE ?= $(REGISTRY)/open-actions-console:$(VERSION)
 RUNNER_IMAGE ?= $(REGISTRY)/open-actions-runner:$(VERSION)
 FIXTURE_IMAGE ?= $(REGISTRY)/open-actions-fixture:$(VERSION)
-IMAGE_DIRS ?= cmd/open-actions-controller cmd/open-actions-runner
+IMAGE_DIRS ?= cmd/open-actions-controller cmd/open-actions-console cmd/open-actions-runner
 TEST_FLAGS ?=
 E2E_PROCS ?= 1
 
@@ -48,6 +49,13 @@ verify:
 	$(HELM) lint $(CHART_DIR)
 	$(HELM) template open-actions $(CHART_DIR) --namespace open-actions-system >/dev/null
 	$(HELM) template open-actions $(CHART_DIR) --namespace open-actions-system --values config/e2e/values.yaml >/dev/null
+	$(HELM) template open-actions $(CHART_DIR) --namespace open-actions-system --set console.publicURL=https://actions.example >/dev/null
+	$(HELM) template open-actions $(CHART_DIR) --namespace open-actions-system --set console.secretName=open-actions-console-auth >/dev/null
+	$(HELM) template open-actions $(CHART_DIR) --namespace open-actions-system --set console.enabled=false >/dev/null
+	@if $(HELM) template open-actions $(CHART_DIR) --namespace open-actions-system --set console.publicURL= >/dev/null 2>&1; then \
+		echo "Helm accepted an enabled Console without a public URL" >&2; \
+		exit 1; \
+	fi
 	$(HELM) template open-actions $(CHART_DIR) --namespace open-actions-system --set service.type=NodePort --set service.nodePort=30082 >/dev/null
 	@if $(HELM) template open-actions $(CHART_DIR) --namespace open-actions-system --set service.type=ClusterIP --set service.nodePort=30082 >/dev/null 2>&1; then \
 		echo "Helm accepted service.nodePort for a ClusterIP Service" >&2; \
@@ -61,16 +69,16 @@ test:
 image:
 	@set -e; for dir in $(or $(WHAT),$(IMAGE_DIRS)); do \
 		case "$${dir#./}" in \
-			cmd/open-actions-controller) target=controller; image="$(CONTROLLER_IMAGE)" ;; \
-			cmd/open-actions-runner) target=runner; image="$(RUNNER_IMAGE)" ;; \
-			test/fixture/github) target=fixture; image="$(FIXTURE_IMAGE)" ;; \
+			cmd/open-actions-controller) image="$(CONTROLLER_IMAGE)" ;; \
+			cmd/open-actions-console) image="$(CONSOLE_IMAGE)" ;; \
+			cmd/open-actions-runner) image="$(RUNNER_IMAGE)" ;; \
+			test/fixture/github) image="$(FIXTURE_IMAGE)" ;; \
 			*) echo "unsupported image path: $$dir" >&2; exit 1 ;; \
 		esac; \
-		docker build --target "$$target" -t "$$image" .; \
+		docker build -f "$${dir#./}/Dockerfile" -t "$$image" .; \
 	done
 
-test-e2e: ginkgo ## Run e2e tests (requires Helm and a cluster).
-	$(MAKE) build WHAT=cmd/open-actions
+test-e2e: ginkgo ## Run e2e tests against an installed control plane.
 	$(GINKGO) -v --tags=e2e --timeout 30m --procs=$(E2E_PROCS) ./test/e2e/...
 
 ginkgo: $(GINKGO)

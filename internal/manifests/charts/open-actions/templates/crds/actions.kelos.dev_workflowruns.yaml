@@ -389,6 +389,56 @@ spec:
                   controller.
                 format: int64
                 type: integer
+              source:
+                description: Source contains provider-specific reporting state.
+                properties:
+                  github:
+                    description: GitHub contains observations for a GitHub workflow
+                      source.
+                    properties:
+                      checkRun:
+                        description: CheckRun is the GitHub check that reports this
+                          WorkflowRun.
+                        properties:
+                          conclusion:
+                            description: Conclusion is the terminal result accepted
+                              by GitHub.
+                            enum:
+                            - success
+                            - failure
+                            - cancelled
+                            type: string
+                          id:
+                            description: ID is GitHub's check-run identifier.
+                            format: int64
+                            maximum: 9007199254740991
+                            minimum: 1
+                            type: integer
+                          reportDigest:
+                            description: |-
+                              ReportDigest is the SHA-256 digest of the check-run fields last accepted
+                              by GitHub.
+                            pattern: ^[0-9a-f]{64}$
+                            type: string
+                          status:
+                            description: Status is the last check-run status accepted
+                              by GitHub.
+                            enum:
+                            - queued
+                            - in_progress
+                            - completed
+                            type: string
+                        required:
+                        - id
+                        - status
+                        type: object
+                        x-kubernetes-validations:
+                        - message: conclusion must be specified exactly when status
+                            is completed
+                          rule: 'self.status == ''completed'' ? has(self.conclusion)
+                            : !has(self.conclusion)'
+                    type: object
+                type: object
               startTime:
                 description: StartTime is when the first child Job started.
                 format: date-time

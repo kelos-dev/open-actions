@@ -22,7 +22,7 @@ import (
 
 var _ = Describe("Project", func() {
 	BeforeEach(func() {
-		setupControlPlane(false)
+		setupTestProject(false)
 	})
 
 	It("turns a signed GitHub webhook into a typed WorkflowRun", func() {

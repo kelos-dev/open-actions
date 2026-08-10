@@ -189,6 +189,47 @@ type WorkflowRunJobStatus struct {
 	Failed int32 `json:"failed,omitempty"`
 }
 
+// GitHubCheckRunStatus records the GitHub Check Run that reports this
+// WorkflowRun.
+// +kubebuilder:validation:XValidation:rule="self.status == 'completed' ? has(self.conclusion) : !has(self.conclusion)",message="conclusion must be specified exactly when status is completed"
+type GitHubCheckRunStatus struct {
+	// ID is GitHub's check-run identifier.
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=9007199254740991
+	// +required
+	ID int64 `json:"id"`
+
+	// Status is the last check-run status accepted by GitHub.
+	// +kubebuilder:validation:Enum=queued;in_progress;completed
+	// +required
+	Status string `json:"status"`
+
+	// Conclusion is the terminal result accepted by GitHub.
+	// +kubebuilder:validation:Enum=success;failure;cancelled
+	// +optional
+	Conclusion string `json:"conclusion,omitempty"`
+
+	// ReportDigest is the SHA-256 digest of the check-run fields last accepted
+	// by GitHub.
+	// +kubebuilder:validation:Pattern=`^[0-9a-f]{64}$`
+	// +optional
+	ReportDigest string `json:"reportDigest,omitempty"`
+}
+
+// GitHubWorkflowRunStatus contains GitHub observations for a WorkflowRun.
+type GitHubWorkflowRunStatus struct {
+	// CheckRun is the GitHub check that reports this WorkflowRun.
+	// +optional
+	CheckRun *GitHubCheckRunStatus `json:"checkRun,omitempty"`
+}
+
+// WorkflowRunSourceStatus contains provider-specific observations.
+type WorkflowRunSourceStatus struct {
+	// GitHub contains observations for a GitHub workflow source.
+	// +optional
+	GitHub *GitHubWorkflowRunStatus `json:"github,omitempty"`
+}
+
 // WorkflowRunStatus contains observations made while executing a workflow.
 type WorkflowRunStatus struct {
 	// ObservedGeneration is the most recent generation observed by the
@@ -217,6 +258,10 @@ type WorkflowRunStatus struct {
 	// CompletionTime is when the run reached a terminal result.
 	// +optional
 	CompletionTime *metav1.Time `json:"completionTime,omitempty"`
+
+	// Source contains provider-specific reporting state.
+	// +optional
+	Source *WorkflowRunSourceStatus `json:"source,omitempty"`
 
 	// Conditions describe planning and the terminal result.
 	// Known condition types are Planned and Succeeded.

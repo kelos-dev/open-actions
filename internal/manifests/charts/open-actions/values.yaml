@@ -7,6 +7,20 @@ controller:
   githubServerURL: https://github.com
   actionCloneBaseURL: https://github.com
 
+console:
+  enabled: true
+  replicas: 1
+  publicURL: http://localhost:8080
+  secretName: ""
+  tokenKey: token
+  image:
+    repository: ghcr.io/kelos-dev/open-actions-console
+    tag: latest
+    pullPolicy: IfNotPresent
+  service:
+    type: ClusterIP
+    nodePort: null
+
 service:
   type: ClusterIP
   nodePort: null

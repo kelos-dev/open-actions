@@ -36,6 +36,7 @@ const (
 	webhookSecret = "open-actions-e2e-secret"
 	fixtureURL    = "http://127.0.0.1:18081"
 	webhookURL    = "http://127.0.0.1:18080"
+	consoleURL    = "http://127.0.0.1:18082"
 	workflowPath  = ".open-actions/workflows/ci.yaml"
 )
 
@@ -45,6 +46,7 @@ var (
 	portForwards    []*exec.Cmd
 	clusterClient   client.Client
 	clientset       kubernetes.Interface
+	consoleToken    string
 	e2eNamespace    string
 	installationID  int64
 )
@@ -53,14 +55,6 @@ var _ = SynchronizedBeforeSuite(func() []byte {
 	var err error
 	repositoryRoot, err = filepath.Abs(filepath.Join("..", ".."))
 	Expect(err).NotTo(HaveOccurred())
-
-	Expect(openActions("install", "--values", "config/e2e/values.yaml")).To(Succeed())
-	Expect(kubectl("apply", "-f", "config/e2e/fixture.yaml")).To(Succeed())
-	Expect(kubectl(
-		"wait", "--for=condition=Available",
-		"deployment/open-actions-controller", "deployment/github-fixture",
-		"--namespace", "open-actions-system", "--timeout=180s",
-	)).To(Succeed())
 
 	startPortForward("open-actions-system", "service/github-fixture", "18081:8080")
 	Eventually(func() error {
@@ -88,6 +82,19 @@ var _ = SynchronizedBeforeSuite(func() []byte {
 		}
 		return response.Body.Close()
 	}, 30*time.Second, 500*time.Millisecond).Should(Succeed())
+
+	startPortForward("open-actions-system", "service/open-actions-console", "18082:80")
+	Eventually(func() error {
+		response, err := http.Get(consoleURL + "/readyz")
+		if err != nil {
+			return err
+		}
+		defer response.Body.Close()
+		if response.StatusCode != http.StatusOK {
+			return fmt.Errorf("Console readiness returned status %d", response.StatusCode)
+		}
+		return nil
+	}, 30*time.Second, 500*time.Millisecond).Should(Succeed())
 	return []byte(fixtureRevision)
 }, func(data []byte) {
 	var err error
@@ -104,6 +111,10 @@ var _ = SynchronizedBeforeSuite(func() []byte {
 	Expect(err).NotTo(HaveOccurred())
 	clientset, err = kubernetes.NewForConfig(restConfig)
 	Expect(err).NotTo(HaveOccurred())
+	consoleSecret := &corev1.Secret{}
+	Expect(clusterClient.Get(context.Background(), client.ObjectKey{Namespace: "open-actions-system", Name: "open-actions-console-auth"}, consoleSecret)).To(Succeed())
+	consoleToken = string(consoleSecret.Data["token"])
+	Expect(consoleToken).NotTo(BeEmpty())
 })
 
 var _ = SynchronizedAfterSuite(func() {}, func() {
@@ -121,6 +132,7 @@ var _ = ReportAfterEach(func(report SpecReport) {
 		{"get", "runners,workflowruns,workflowjobs,jobs,pods", "--namespace", e2eNamespace, "-o", "yaml"},
 		{"logs", "--namespace", e2eNamespace, "--all-containers=true", "--prefix=true", "--selector", "actions.kelos.dev/workflow-run-uid"},
 		{"logs", "--namespace", "open-actions-system", "deployment/open-actions-controller", "--tail=200"},
+		{"logs", "--namespace", "open-actions-system", "deployment/open-actions-console", "--tail=200"},
 		{"get", "events", "-A", "--sort-by=.lastTimestamp"},
 	} {
 		output, _ := kubectlOutput(arguments...)
@@ -128,7 +140,7 @@ var _ = ReportAfterEach(func(report SpecReport) {
 	}
 })
 
-func setupControlPlane(withRunner bool) {
+func setupTestProject(createRunner bool) {
 	ctx := context.Background()
 	e2eNamespace = fmt.Sprintf("open-actions-e2e-%d", GinkgoParallelProcess())
 	installationID = 67890 + int64(GinkgoParallelProcess())
@@ -180,7 +192,7 @@ func setupControlPlane(withRunner bool) {
 			},
 		},
 	}
-	if withRunner {
+	if createRunner {
 		runnerImage := os.Getenv("RUNNER_IMAGE")
 		if runnerImage == "" {
 			runnerImage = "ghcr.io/kelos-dev/open-actions-runner:e2e"
@@ -219,7 +231,7 @@ func setupControlPlane(withRunner bool) {
 			g.Expect(condition.Status).To(Equal(metav1.ConditionTrue), condition.Message)
 		}
 	}, 120*time.Second, time.Second).Should(Succeed())
-	if withRunner {
+	if createRunner {
 		Eventually(func(g Gomega) {
 			runnerObject := &actionsv1alpha1.Runner{}
 			g.Expect(clusterClient.Get(ctx, client.ObjectKey{Namespace: e2eNamespace, Name: "runner-1"}, runnerObject)).To(Succeed())
@@ -257,21 +269,6 @@ func stop(command *exec.Cmd) {
 		_ = command.Process.Kill()
 		<-done
 	}
-}
-
-func kubectl(arguments ...string) error {
-	_, err := kubectlOutput(arguments...)
-	return err
-}
-
-func openActions(arguments ...string) error {
-	command := exec.Command(filepath.Join(repositoryRoot, "bin", "open-actions"), arguments...)
-	command.Dir = repositoryRoot
-	output, err := command.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("open-actions %s: %w: %s", strings.Join(arguments, " "), err, output)
-	}
-	return nil
 }
 
 func kubectlOutput(arguments ...string) (string, error) {
