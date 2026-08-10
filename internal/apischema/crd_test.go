@@ -90,6 +90,27 @@ func TestWorkflowRunAcceptsManagedUserOwner(t *testing.T) {
 	}
 }
 
+func TestWorkflowRunAcceptsGitHubCheckRunStatusContract(t *testing.T) {
+	crd, _ := loadCRD(t, "actions.kelos.dev_workflowruns.yaml")
+	object := loadSample(t, "actions_v1alpha1_workflowrun.yaml")
+	object["status"] = map[string]any{"source": map[string]any{"github": map[string]any{"checkRun": map[string]any{
+		"id": int64(17), "status": "completed", "conclusion": "success", "reportDigest": strings.Repeat("a", 64),
+	}}}}
+	if errs := validateObject(t, crd, object, nil); len(errs) > 0 {
+		t.Fatalf("valid GitHub check-run status was rejected: %v", errs.ToAggregate())
+	}
+	delete(object["status"].(map[string]any)["source"].(map[string]any)["github"].(map[string]any)["checkRun"].(map[string]any), "conclusion")
+	if errs := validateObject(t, crd, object, nil); len(errs) == 0 {
+		t.Fatal("completed GitHub check-run status without a conclusion was accepted")
+	}
+	checkRun := object["status"].(map[string]any)["source"].(map[string]any)["github"].(map[string]any)["checkRun"].(map[string]any)
+	checkRun["conclusion"] = "success"
+	checkRun["reportDigest"] = "invalid"
+	if errs := validateObject(t, crd, object, nil); len(errs) == 0 {
+		t.Fatal("GitHub check-run status with an invalid report digest was accepted")
+	}
+}
+
 func TestRunnerAcceptsQualifiedResourceNames(t *testing.T) {
 	crd, _ := loadCRD(t, "actions.kelos.dev_runners.yaml")
 	object := loadSample(t, "actions_v1alpha1_runner.yaml")

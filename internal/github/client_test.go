@@ -55,7 +55,7 @@ func TestInstallationAndRepositoryContents(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	installation, err := client.Installation(context.Background(), 1, 2, testPrivateKey(t), "example")
+	installation, err := client.Installation(context.Background(), 1, 2, testPrivateKey(t), "example", InstallationPermissions{ContentsRead: true})
 	if err != nil {
 		t.Fatalf("installation client: %v", err)
 	}
@@ -79,6 +79,86 @@ func TestInstallationAndRepositoryContents(t *testing.T) {
 	}
 	if resolved != strings.Repeat("b", 40) {
 		t.Errorf("resolved revision = %q", resolved)
+	}
+}
+
+func TestInstallationRequestsOnlySelectedPermissions(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		body := struct {
+			Permissions map[string]string `json:"permissions"`
+		}{}
+		if err := json.NewDecoder(request.Body).Decode(&body); err != nil {
+			http.Error(writer, "invalid request", http.StatusBadRequest)
+			return
+		}
+		if len(body.Permissions) != 1 || body.Permissions["checks"] != "write" {
+			http.Error(writer, "unexpected permissions", http.StatusBadRequest)
+			return
+		}
+		fmt.Fprint(writer, `{"token":"checks-token"}`)
+	}))
+	defer server.Close()
+	client, err := NewClient(server.URL, server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	installation, err := client.Installation(context.Background(), 1, 2, testPrivateKey(t), "example", InstallationPermissions{ChecksWrite: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if installation.Token() != "checks-token" {
+		t.Fatalf("token = %q", installation.Token())
+	}
+	if _, err := client.Installation(context.Background(), 1, 2, testPrivateKey(t), "example", InstallationPermissions{}); err == nil {
+		t.Fatal("Installation() accepted empty permissions")
+	}
+}
+
+func TestCheckRunLifecycleAndRepositoryAccess(t *testing.T) {
+	revision := strings.Repeat("a", 40)
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		switch {
+		case request.Method == http.MethodGet && request.URL.Path == "/repos/acme/example/commits/"+revision+"/check-runs":
+			if request.URL.Query().Get("app_id") != "7" || request.URL.Query().Get("filter") != "all" {
+				http.Error(writer, "unexpected query", http.StatusBadRequest)
+				return
+			}
+			fmt.Fprint(writer, `{"total_count":1,"check_runs":[{"id":11,"external_id":"run-uid","status":"queued"}]}`)
+		case request.Method == http.MethodPost && request.URL.Path == "/repos/acme/example/check-runs":
+			requestBody := CreateCheckRunRequest{}
+			if err := json.NewDecoder(request.Body).Decode(&requestBody); err != nil || requestBody.ExternalID != "other-run" || requestBody.Status != "queued" {
+				http.Error(writer, "unexpected create request", http.StatusBadRequest)
+				return
+			}
+			fmt.Fprint(writer, `{"id":12,"external_id":"other-run","status":"queued"}`)
+		case request.Method == http.MethodPatch && request.URL.Path == "/repos/acme/example/check-runs/12":
+			requestBody := UpdateCheckRunRequest{}
+			if err := json.NewDecoder(request.Body).Decode(&requestBody); err != nil || requestBody.Conclusion != "success" {
+				http.Error(writer, "unexpected update request", http.StatusBadRequest)
+				return
+			}
+			fmt.Fprint(writer, `{"id":12,"external_id":"other-run","status":"completed","conclusion":"success"}`)
+		default:
+			http.NotFound(writer, request)
+		}
+	}))
+	defer server.Close()
+	client, err := NewClient(server.URL, server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	installation := &InstallationClient{client: client, token: "token"}
+	found, err := installation.FindCheckRun(context.Background(), "acme", "example", revision, 7, "run-uid")
+	if err != nil || found == nil || found.ID != 11 {
+		t.Fatalf("FindCheckRun() = %#v, %v", found, err)
+	}
+	created, err := installation.CreateCheckRun(context.Background(), "acme", "example", CreateCheckRunRequest{Name: "CI", HeadSHA: revision, ExternalID: "other-run", Status: "queued"})
+	if err != nil || created.ID != 12 {
+		t.Fatalf("CreateCheckRun() = %#v, %v", created, err)
+	}
+	updated, err := installation.UpdateCheckRun(context.Background(), "acme", "example", created.ID, UpdateCheckRunRequest{Status: "completed", Conclusion: "success"})
+	if err != nil || updated.Conclusion != "success" {
+		t.Fatalf("UpdateCheckRun() = %#v, %v", updated, err)
 	}
 }
 

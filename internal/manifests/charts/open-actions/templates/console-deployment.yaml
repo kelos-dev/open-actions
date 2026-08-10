@@ -1,57 +1,51 @@
+{{- if .Values.console.enabled }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: open-actions-controller
+  name: open-actions-console
   namespace: {{ .Release.Namespace }}
   labels:
     app.kubernetes.io/name: open-actions
-    app.kubernetes.io/component: controller
+    app.kubernetes.io/component: console
 spec:
-  replicas: 1
+  replicas: {{ .Values.console.replicas }}
   selector:
     matchLabels:
       app.kubernetes.io/name: open-actions
-      app.kubernetes.io/component: controller
+      app.kubernetes.io/component: console
   template:
     metadata:
       labels:
         app.kubernetes.io/name: open-actions
-        app.kubernetes.io/component: controller
+        app.kubernetes.io/component: console
     spec:
-      serviceAccountName: open-actions-controller
+      serviceAccountName: open-actions-console
       securityContext:
         runAsNonRoot: true
         seccompProfile:
           type: RuntimeDefault
       containers:
-        - name: manager
-          image: "{{ .Values.controller.image.repository }}:{{ .Values.controller.image.tag }}"
-          imagePullPolicy: {{ .Values.controller.image.pullPolicy }}
+        - name: console
+          image: "{{ .Values.console.image.repository }}:{{ .Values.console.image.tag }}"
+          imagePullPolicy: {{ .Values.console.image.pullPolicy }}
           args:
-            - --leader-elect=true
-            - {{ printf "--github-api-url=%s" .Values.controller.githubAPIURL | quote }}
-            - {{ printf "--github-server-url=%s" .Values.controller.githubServerURL | quote }}
-            - {{ printf "--action-clone-base-url=%s" .Values.controller.actionCloneBaseURL | quote }}
-            {{- if .Values.console.enabled }}
-            - {{ printf "--console-url=%s" .Values.console.publicURL | quote }}
+            - "--token-file=/var/run/secrets/open-actions-console/token"
+            {{- if hasPrefix "https://" .Values.console.publicURL }}
+            - "--secure-cookie=true"
             {{- end }}
           ports:
-            - name: webhook
+            - name: http
               containerPort: 8080
-            - name: health
-              containerPort: 8081
-            - name: metrics
-              containerPort: 8082
           readinessProbe:
             httpGet:
               path: /readyz
-              port: health
+              port: http
             initialDelaySeconds: 2
             periodSeconds: 5
           livenessProbe:
             httpGet:
               path: /healthz
-              port: health
+              port: http
             initialDelaySeconds: 5
             periodSeconds: 10
           resources:
@@ -66,4 +60,16 @@ spec:
             capabilities:
               drop: [ALL]
             readOnlyRootFilesystem: true
+          volumeMounts:
+            - name: authentication
+              mountPath: /var/run/secrets/open-actions-console
+              readOnly: true
+      volumes:
+        - name: authentication
+          secret:
+            secretName: {{ default "open-actions-console-auth" .Values.console.secretName }}
+            items:
+              - key: {{ .Values.console.tokenKey | quote }}
+                path: token
       terminationGracePeriodSeconds: 10
+{{- end }}

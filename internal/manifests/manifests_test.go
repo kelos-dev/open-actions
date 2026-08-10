@@ -43,7 +43,7 @@ func TestServiceTemplate(t *testing.T) {
 			}
 			test.configure(testValues)
 
-			service := renderService(t, chart, testValues)
+			service := renderService(t, chart, "templates/service.yaml", testValues)
 			if service.Spec.Type != test.wantType {
 				t.Errorf("service type = %q, want %q", service.Spec.Type, test.wantType)
 			}
@@ -54,9 +54,32 @@ func TestServiceTemplate(t *testing.T) {
 	}
 }
 
-func renderService(t *testing.T, chart fs.FS, values map[string]any) corev1.Service {
+func TestConsoleServiceTemplate(t *testing.T) {
+	chart := Chart()
+	valuesData, err := fs.ReadFile(chart, "values.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var values map[string]any
+	if err := yaml.Unmarshal(valuesData, &values); err != nil {
+		t.Fatalf("parse values: %v", err)
+	}
+	serviceValues := values["console"].(map[string]any)["service"].(map[string]any)
+	serviceValues["type"] = "NodePort"
+	serviceValues["nodePort"] = 30083
+
+	service := renderService(t, chart, "templates/console-service.yaml", values)
+	if service.Name != "open-actions-console" || service.Spec.Type != corev1.ServiceTypeNodePort || service.Spec.Ports[0].NodePort != 30083 {
+		t.Fatalf("Console Service = %#v", service)
+	}
+	if service.Spec.Selector["app.kubernetes.io/component"] != "console" {
+		t.Fatalf("Console Service selector = %#v", service.Spec.Selector)
+	}
+}
+
+func renderService(t *testing.T, chart fs.FS, path string, values map[string]any) corev1.Service {
 	t.Helper()
-	data, err := fs.ReadFile(chart, "templates/service.yaml")
+	data, err := fs.ReadFile(chart, path)
 	if err != nil {
 		t.Fatal(err)
 	}

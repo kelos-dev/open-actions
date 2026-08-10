@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -220,6 +221,49 @@ func main() {
 	mux.HandleFunc("/repos/acme/example/contents/"+workflowPath, func(writer http.ResponseWriter, _ *http.Request) {
 		writeJSON(writer, map[string]string{"encoding": "base64", "content": base64.StdEncoding.EncodeToString([]byte(workflowData))})
 	})
+	checkRunMutex := sync.RWMutex{}
+	checkRuns := map[string]map[string]any{}
+	recordCheckRun := func(writer http.ResponseWriter, request *http.Request) {
+		body := struct {
+			DetailsURL string `json:"details_url"`
+			ExternalID string `json:"external_id"`
+			Status     string `json:"status"`
+			Conclusion string `json:"conclusion"`
+		}{}
+		if err := json.NewDecoder(request.Body).Decode(&body); err != nil || body.ExternalID == "" {
+			http.Error(writer, "invalid check run", http.StatusBadRequest)
+			return
+		}
+		result := map[string]any{
+			"id": 1, "details_url": body.DetailsURL, "external_id": body.ExternalID,
+			"status": body.Status, "conclusion": body.Conclusion,
+		}
+		checkRunMutex.Lock()
+		checkRuns[body.ExternalID] = result
+		checkRunMutex.Unlock()
+		writeJSON(writer, result)
+	}
+	mux.HandleFunc("/repos/acme/example/check-runs", func(writer http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodPost {
+			http.Error(writer, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		recordCheckRun(writer, request)
+	})
+	mux.HandleFunc("/repos/acme/example/check-runs/1", func(writer http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodPatch {
+			http.Error(writer, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		recordCheckRun(writer, request)
+	})
+	mux.HandleFunc("/repos/acme/example/commits/", func(writer http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodGet || !strings.HasSuffix(request.URL.Path, "/check-runs") {
+			http.NotFound(writer, request)
+			return
+		}
+		writeJSON(writer, map[string]any{"total_count": 0, "check_runs": []any{}})
+	})
 	for repository, data := range map[string]string{
 		"invalid-trigger": unsupportedTriggerWorkflowData,
 		"invalid-field":   unsupportedFieldWorkflowData,
@@ -235,6 +279,21 @@ func main() {
 	}
 	mux.HandleFunc("/fixture/sha", func(writer http.ResponseWriter, _ *http.Request) {
 		fmt.Fprint(writer, sha)
+	})
+	mux.HandleFunc("/fixture/check-runs/", func(writer http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodGet {
+			http.Error(writer, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		externalID := strings.TrimPrefix(request.URL.Path, "/fixture/check-runs/")
+		checkRunMutex.RLock()
+		result, found := checkRuns[externalID]
+		checkRunMutex.RUnlock()
+		if !found {
+			http.NotFound(writer, request)
+			return
+		}
+		writeJSON(writer, result)
 	})
 	mux.HandleFunc("/healthz", func(writer http.ResponseWriter, _ *http.Request) {
 		writer.WriteHeader(http.StatusOK)
