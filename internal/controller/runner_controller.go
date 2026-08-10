@@ -11,6 +11,7 @@ import (
 
 	actionsv1alpha1 "github.com/kelos-dev/open-actions/api/v1alpha1"
 	githubclient "github.com/kelos-dev/open-actions/internal/github"
+	"github.com/kelos-dev/open-actions/internal/runner"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	apiEquality "k8s.io/apimachinery/pkg/api/equality"
@@ -589,7 +590,7 @@ func (r *RunnerReconciler) buildJob(workflowJob *actionsv1alpha1.WorkflowJob, ru
 				},
 			},
 			Containers: []corev1.Container{{
-				Name:      "runner",
+				Name:      runner.ContainerName,
 				Image:     runnerObject.Spec.Execution.Image,
 				Resources: runnerResources(runnerObject.Spec.Execution.Resources),
 				SecurityContext: &corev1.SecurityContext{

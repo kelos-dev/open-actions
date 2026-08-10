@@ -120,6 +120,26 @@ Move repository workflows from `.github/workflows` to
 `.open-actions/workflows`. A webhook delivery then follows the path shown in
 [Architecture](#architecture).
 
+## Inspecting workflow runs
+
+The CLI reads workflow runs and runner logs through the Kubernetes API using the
+active kubeconfig context. It defaults to that context's namespace; use
+`--namespace` to select another namespace or `--all-namespaces` when listing
+runs.
+
+```console
+open-actions run list --namespace team-ci
+open-actions run view RUN --namespace team-ci
+open-actions run logs RUN --job JOB --namespace team-ci
+open-actions run logs RUN --job JOB --follow --namespace team-ci
+```
+
+`JOB` may be the workflow-local job ID shown by `run view` or the WorkflowJob
+resource name. An exact resource-name match takes precedence over a job ID.
+`--job` may be omitted when the run contains exactly one job.
+Completed runner logs remain available until the native Kubernetes Job is
+deleted by its retention policy.
+
 ## API reference
 
 See the [API reference](docs/reference.md) for Kubernetes resources, command-line

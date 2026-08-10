@@ -18,8 +18,8 @@ import (
 	"time"
 
 	actionsv1alpha1 "github.com/kelos-dev/open-actions/api/v1alpha1"
+	"github.com/kelos-dev/open-actions/internal/workflowstatus"
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
@@ -237,14 +237,14 @@ func (h *Handler) runDetails(writer http.ResponseWriter, request *http.Request, 
 		WorkflowName: run.Status.WorkflowName,
 		WorkflowPath: run.Spec.WorkflowPath,
 		Revision:     run.Spec.Source.GitHub.Revision.SHA,
-		Status:       workflowRunStatus(run),
+		Status:       workflowstatus.Run(run),
 	}
 	if data.WorkflowName == "" {
 		data.WorkflowName = data.WorkflowPath
 	}
 	for index := range jobs.Items {
 		job := &jobs.Items[index]
-		item := jobPageData{ID: job.Spec.JobID, Status: workflowJobStatus(job), URL: runPath(run) + "/jobs/" + url.PathEscape(job.Name)}
+		item := jobPageData{ID: job.Spec.JobID, Status: workflowstatus.Job(job), URL: runPath(run) + "/jobs/" + url.PathEscape(job.Name)}
 		if job.Status.RunnerRef != nil {
 			item.Runner = job.Status.RunnerRef.Name
 		}
@@ -267,7 +267,7 @@ func (h *Handler) jobLogs(writer http.ResponseWriter, request *http.Request, run
 	}
 	path := runPath(run)
 	h.writeHTML(writer, h.logPage, logPageData{
-		JobID: job.Spec.JobID, Status: workflowJobStatus(job), RunURL: path,
+		JobID: job.Spec.JobID, Status: workflowstatus.Job(job), RunURL: path,
 		StreamURL: path + "/jobs/" + url.PathEscape(job.Name) + "/stream",
 	})
 }
@@ -380,8 +380,7 @@ func (h *Handler) waitForPod(ctx context.Context, job *actionsv1alpha1.WorkflowJ
 		if err := h.client.Get(ctx, client.ObjectKeyFromObject(job), current); err != nil {
 			return nil, err
 		}
-		condition := meta.FindStatusCondition(current.Status.Conditions, actionsv1alpha1.WorkflowJobConditionSucceeded)
-		if condition != nil && condition.Status != metav1.ConditionUnknown {
+		if workflowstatus.JobTerminal(current) {
 			return nil, errLogsUnavailable
 		}
 		select {
@@ -392,40 +391,6 @@ func (h *Handler) waitForPod(ctx context.Context, job *actionsv1alpha1.WorkflowJ
 			heartbeat()
 		}
 	}
-}
-
-func workflowRunStatus(run *actionsv1alpha1.WorkflowRun) string {
-	condition := meta.FindStatusCondition(run.Status.Conditions, actionsv1alpha1.WorkflowRunConditionSucceeded)
-	if condition == nil {
-		return "Queued"
-	}
-	switch condition.Status {
-	case metav1.ConditionTrue:
-		return "Succeeded"
-	case metav1.ConditionFalse:
-		return "Failed"
-	default:
-		if run.Status.StartTime != nil {
-			return "Running"
-		}
-		return "Queued"
-	}
-}
-
-func workflowJobStatus(job *actionsv1alpha1.WorkflowJob) string {
-	condition := meta.FindStatusCondition(job.Status.Conditions, actionsv1alpha1.WorkflowJobConditionSucceeded)
-	if condition != nil {
-		switch condition.Status {
-		case metav1.ConditionTrue:
-			return "Succeeded"
-		case metav1.ConditionFalse:
-			return "Failed"
-		}
-	}
-	if job.Status.RunnerRef != nil {
-		return "Running"
-	}
-	return "Queued"
 }
 
 func (h *Handler) writeHTML(writer http.ResponseWriter, page *template.Template, data any) {

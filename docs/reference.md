@@ -7,6 +7,30 @@ and installation instructions.
 
 ## Command-line configuration
 
+The `open-actions` CLI uses the active kubeconfig context for Kubernetes-backed
+commands. `--kubeconfig` selects another kubeconfig file, `--context` selects a
+context, and `--namespace` overrides the context's namespace.
+
+`open-actions run list` lists WorkflowRuns in one namespace. Pass
+`--all-namespaces` to list them cluster-wide. `open-actions run view RUN` shows
+the selected run and its WorkflowJobs. `open-actions run logs RUN` prints the
+runner logs for the job selected by `--job`; the selector accepts either a
+workflow-local job ID or a WorkflowJob resource name, with an exact resource
+name taking precedence. The selector is optional for single-job runs. Pass
+`--follow` to wait for the runner Pod when necessary and continue streaming its
+logs.
+
+```console
+open-actions run list --namespace team-ci
+open-actions run view ci-abc123 --namespace team-ci
+open-actions run logs ci-abc123 --job build --follow --namespace team-ci
+```
+
+The CLI accesses these resources with the permissions of the selected
+kubeconfig user. It does not use the Console administrator token.
+
+### Controller and Console
+
 `--github-api-url` defaults to `https://api.github.com/` and may include a
 GitHub Enterprise API path such as `/api/v3`. `--github-server-url` defaults to
 `https://github.com` and supplies `github.server_url`. `--action-clone-base-url`
