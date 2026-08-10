@@ -57,6 +57,7 @@ type payload struct {
 		Mergeable      *bool  `json:"mergeable"`
 		Head           struct {
 			Ref        string `json:"ref"`
+			SHA        string `json:"sha"`
 			Repository struct {
 				ID int64 `json:"id"`
 			} `json:"repo"`
@@ -80,6 +81,7 @@ type normalizedEvent struct {
 	HeadRef    string `json:"headRef,omitempty"`
 	BaseRef    string `json:"baseRef,omitempty"`
 	ResolveRef string `json:"resolveRef,omitempty"`
+	HeadSHA    string `json:"headSHA,omitempty"`
 }
 
 func (h *GitHubHandler) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
@@ -201,11 +203,14 @@ func normalize(eventName string, event *payload) (normalizedEvent, bool, error) 
 			result.Ref = "refs/heads/" + pullRequest.Base.Ref
 		} else {
 			result.Ref = "refs/pull/" + strconv.FormatInt(pullRequest.Number, 10) + "/merge"
-			if pullRequest.MergeCommitSHA == "" {
-				if pullRequest.State != "open" {
-					return result, false, nil
+			if pullRequest.State == "open" {
+				if !validGitSHA(pullRequest.Head.SHA) {
+					return normalizedEvent{}, false, errors.New("GitHub pull request event contains an invalid head revision")
 				}
 				result.ResolveRef = result.Ref
+				result.HeadSHA = pullRequest.Head.SHA
+			} else if pullRequest.MergeCommitSHA == "" {
+				return result, false, nil
 			} else {
 				result.SHA = pullRequest.MergeCommitSHA
 			}

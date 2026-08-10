@@ -74,26 +74,29 @@ func TestProjectForInstallationUsesConfiguredOwner(t *testing.T) {
 func TestNormalizePullRequestRevisions(t *testing.T) {
 	mergeable := true
 	conflicted := false
+	headSHA := strings.Repeat("f", 40)
 	for _, tt := range []struct {
 		name        string
 		action      string
 		state       string
 		merged      bool
 		mergeable   *bool
-		sha         string
+		mergeSHA    string
 		wantSupport bool
 		wantRef     string
 		wantRefName string
+		wantSHA     string
 		wantResolve string
+		wantHeadSHA string
 		wantError   bool
 	}{
-		{name: "open mergeable", action: "synchronize", state: "open", mergeable: &mergeable, sha: strings.Repeat("a", 40), wantSupport: true, wantRef: "refs/pull/42/merge", wantRefName: "42/merge"},
-		{name: "open conflicted", action: "synchronize", state: "open", mergeable: &conflicted, sha: strings.Repeat("b", 40)},
-		{name: "open merge result unavailable", action: "opened", state: "open", mergeable: &mergeable, wantSupport: true, wantRef: "refs/pull/42/merge", wantRefName: "42/merge", wantResolve: "refs/pull/42/merge"},
-		{name: "closed unmerged", action: "closed", state: "closed", mergeable: &mergeable, sha: strings.Repeat("c", 40), wantSupport: true, wantRef: "refs/pull/42/merge", wantRefName: "42/merge"},
+		{name: "open mergeable resolves test merge revision", action: "synchronize", state: "open", mergeable: &mergeable, mergeSHA: strings.Repeat("a", 40), wantSupport: true, wantRef: "refs/pull/42/merge", wantRefName: "42/merge", wantResolve: "refs/pull/42/merge", wantHeadSHA: headSHA},
+		{name: "open conflicted", action: "synchronize", state: "open", mergeable: &conflicted, mergeSHA: strings.Repeat("b", 40)},
+		{name: "open merge result unavailable", action: "opened", state: "open", mergeable: &mergeable, wantSupport: true, wantRef: "refs/pull/42/merge", wantRefName: "42/merge", wantResolve: "refs/pull/42/merge", wantHeadSHA: headSHA},
+		{name: "closed unmerged", action: "closed", state: "closed", mergeable: &mergeable, mergeSHA: strings.Repeat("c", 40), wantSupport: true, wantRef: "refs/pull/42/merge", wantRefName: "42/merge", wantSHA: strings.Repeat("c", 40)},
 		{name: "closed unmerged without revision", action: "closed", state: "closed", mergeable: &mergeable},
-		{name: "closed merged", action: "closed", state: "closed", merged: true, mergeable: &conflicted, sha: strings.Repeat("d", 40), wantSupport: true, wantRef: "refs/heads/main", wantRefName: "main"},
-		{name: "merged payload with non-closed activity", action: "synchronize", state: "closed", merged: true, mergeable: &conflicted, sha: strings.Repeat("e", 40), wantError: true},
+		{name: "closed merged", action: "closed", state: "closed", merged: true, mergeable: &conflicted, mergeSHA: strings.Repeat("d", 40), wantSupport: true, wantRef: "refs/heads/main", wantRefName: "main", wantSHA: strings.Repeat("d", 40)},
+		{name: "merged payload with non-closed activity", action: "synchronize", state: "closed", merged: true, mergeable: &conflicted, mergeSHA: strings.Repeat("e", 40), wantError: true},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			event := &payload{Action: tt.action}
@@ -101,9 +104,10 @@ func TestNormalizePullRequestRevisions(t *testing.T) {
 			event.PullRequest.State = tt.state
 			event.PullRequest.Merged = tt.merged
 			event.PullRequest.Mergeable = tt.mergeable
-			event.PullRequest.MergeCommitSHA = tt.sha
+			event.PullRequest.MergeCommitSHA = tt.mergeSHA
 			event.Repository.ID = 1
 			event.PullRequest.Head.Ref = "feature"
+			event.PullRequest.Head.SHA = headSHA
 			event.PullRequest.Head.Repository.ID = event.Repository.ID
 			event.PullRequest.Base.Ref = "main"
 			normalized, supported, err := normalize("pull_request", event)
@@ -122,10 +126,29 @@ func TestNormalizePullRequestRevisions(t *testing.T) {
 			if !supported {
 				return
 			}
-			if normalized.Ref != tt.wantRef || githubclient.RefName(normalized.Ref) != tt.wantRefName || normalized.HeadRef != "feature" || normalized.BaseRef != "main" || normalized.SHA != tt.sha || normalized.ResolveRef != tt.wantResolve {
+			if normalized.Ref != tt.wantRef || githubclient.RefName(normalized.Ref) != tt.wantRefName || normalized.HeadRef != "feature" || normalized.BaseRef != "main" || normalized.SHA != tt.wantSHA || normalized.ResolveRef != tt.wantResolve || normalized.HeadSHA != tt.wantHeadSHA {
 				t.Errorf("normalized event = %#v", normalized)
 			}
 		})
+	}
+}
+
+func TestNormalizePullRequestRequiresValidHeadRevision(t *testing.T) {
+	mergeable := true
+	for _, headSHA := range []string{"", "not-a-sha", strings.Repeat("A", 40), zeroGitSHA} {
+		event := &payload{Action: "synchronize"}
+		event.Repository.ID = 1
+		event.PullRequest.Number = 42
+		event.PullRequest.State = "open"
+		event.PullRequest.Mergeable = &mergeable
+		event.PullRequest.Head.Ref = "feature"
+		event.PullRequest.Head.SHA = headSHA
+		event.PullRequest.Head.Repository.ID = event.Repository.ID
+		event.PullRequest.Base.Ref = "main"
+
+		if _, _, err := normalize("pull_request", event); err == nil {
+			t.Fatalf("normalize() accepted head revision %q", headSHA)
+		}
 	}
 }
 

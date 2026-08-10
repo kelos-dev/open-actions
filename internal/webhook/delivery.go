@@ -33,6 +33,7 @@ var digestEncoding = base32.StdEncoding.WithPadding(base32.NoPadding)
 const (
 	deliveryLabel          = "actions.kelos.dev/webhook-delivery"
 	deliveryDataKey        = "delivery.json"
+	deliveryRevisionKey    = "resolvedRevision"
 	deliveryStateKey       = "state"
 	deliveryMessageKey     = "message"
 	deliveryRunCountKey    = "workflowRuns"
@@ -42,6 +43,7 @@ const (
 	maxDeliveryBytes       = 900_000
 	maxWorkflowFiles       = 100
 	maxWorkflowJobs        = 1000
+	mergeRefWaitTimeout    = 2 * time.Minute
 	deliveryRetention      = 24 * time.Hour
 )
 
@@ -164,6 +166,34 @@ func missingWorkflowDirectory(err error) bool {
 	return errors.As(err, &apiError) && apiError.StatusCode == http.StatusNotFound && apiError.Message == "Not Found"
 }
 
+func missingPullRequestMergeRef(err error) bool {
+	apiError := &githubclient.APIError{}
+	return errors.As(err, &apiError) && apiError.StatusCode == http.StatusNotFound
+}
+
+func mergeRefRetryInterval(age time.Duration) time.Duration {
+	switch {
+	case age >= 30*time.Second:
+		return 15 * time.Second
+	case age >= 10*time.Second:
+		return 5 * time.Second
+	default:
+		return 2 * time.Second
+	}
+}
+
+func resolveDeliveryRevision(ctx context.Context, installation *githubclient.InstallationClient, owner, repository string, event normalizedEvent) (string, bool, error) {
+	if event.HeadSHA == "" {
+		revision, err := installation.ResolveRevision(ctx, owner, repository, event.ResolveRef)
+		return revision, err == nil, err
+	}
+	revision, ready, err := installation.ResolvePullRequestRevision(ctx, owner, repository, event.ResolveRef, event.HeadSHA)
+	if err != nil && missingPullRequestMergeRef(err) {
+		return "", false, nil
+	}
+	return revision, ready, err
+}
+
 func (r *DeliveryReconciler) Reconcile(ctx context.Context, request ctrl.Request) (ctrl.Result, error) {
 	object := &corev1.ConfigMap{}
 	if err := r.Get(ctx, request.NamespacedName, object); err != nil {
@@ -178,6 +208,12 @@ func (r *DeliveryReconciler) Reconcile(ctx context.Context, request ctrl.Request
 	delivery := queuedDelivery{}
 	if err := json.Unmarshal([]byte(object.Data[deliveryDataKey]), &delivery); err != nil {
 		return ctrl.Result{}, r.finish(ctx, object, deliveryStateFailed, 0, fmt.Sprintf("decode delivery: %v", err))
+	}
+	if revision := object.Data[deliveryRevisionKey]; revision != "" {
+		if !validGitSHA(revision) {
+			return ctrl.Result{}, r.finish(ctx, object, deliveryStateFailed, 0, "delivery contains an invalid resolved revision")
+		}
+		delivery.Event.SHA = revision
 	}
 	reader := r.APIReader
 	project := &actionsv1alpha1.Project{}
@@ -199,9 +235,23 @@ func (r *DeliveryReconciler) Reconcile(ctx context.Context, request ctrl.Request
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	if delivery.Event.ResolveRef != "" {
-		delivery.Event.SHA, err = installation.ResolveRevision(ctx, delivery.Payload.Repository.Owner.Login, delivery.Payload.Repository.Name, delivery.Event.ResolveRef)
+	if delivery.Event.ResolveRef != "" && delivery.Event.SHA == "" {
+		revision, ready, err := resolveDeliveryRevision(ctx, installation, delivery.Payload.Repository.Owner.Login, delivery.Payload.Repository.Name, delivery.Event)
 		if err != nil {
+			return ctrl.Result{}, err
+		}
+		if !ready {
+			age := r.deliveryAge(object)
+			if age >= mergeRefWaitTimeout {
+				message := fmt.Sprintf("GitHub pull request merge revision did not become ready for head %s within %s", delivery.Event.HeadSHA, mergeRefWaitTimeout)
+				return ctrl.Result{}, r.finish(ctx, object, deliveryStateFailed, 0, message)
+			}
+			retryAfter := mergeRefRetryInterval(age)
+			r.Logger.Debug("waiting for GitHub pull request merge revision", "delivery_id", delivery.DeliveryID, "head_sha", delivery.Event.HeadSHA, "retry_after", retryAfter)
+			return ctrl.Result{RequeueAfter: retryAfter}, nil
+		}
+		delivery.Event.SHA = revision
+		if err := r.persistResolvedRevision(ctx, object, delivery.Event.SHA); err != nil {
 			return ctrl.Result{}, err
 		}
 	}
@@ -322,6 +372,15 @@ func (r *DeliveryReconciler) finish(ctx context.Context, object *corev1.ConfigMa
 	return r.Patch(ctx, object, client.MergeFrom(before))
 }
 
+func (r *DeliveryReconciler) persistResolvedRevision(ctx context.Context, object *corev1.ConfigMap, revision string) error {
+	before := object.DeepCopy()
+	if object.Data == nil {
+		object.Data = map[string]string{}
+	}
+	object.Data[deliveryRevisionKey] = revision
+	return r.Patch(ctx, object, client.MergeFrom(before))
+}
+
 func (r *DeliveryReconciler) retain(ctx context.Context, object *corev1.ConfigMap) (ctrl.Result, error) {
 	finishedAt, err := time.Parse(time.RFC3339, object.Data[deliveryFinishedKey])
 	if err != nil {
@@ -342,6 +401,17 @@ func (r *DeliveryReconciler) now() time.Time {
 		return r.Now()
 	}
 	return time.Now()
+}
+
+func (r *DeliveryReconciler) deliveryAge(object *corev1.ConfigMap) time.Duration {
+	if object.CreationTimestamp.IsZero() {
+		return 0
+	}
+	age := r.now().Sub(object.CreationTimestamp.Time)
+	if age < 0 {
+		return 0
+	}
+	return age
 }
 
 func (r *DeliveryReconciler) SetupWithManager(manager ctrl.Manager) error {

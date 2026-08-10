@@ -2,10 +2,19 @@ package webhook
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
 	"crypto/sha256"
+	"crypto/x509"
+	"encoding/base64"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
+	"io"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -37,6 +46,15 @@ func TestWebhookReplayIDUsesSignedBody(t *testing.T) {
 	normalized := normalizedEvent{Name: "push", SHA: strings.Repeat("a", 40), Ref: "refs/heads/main"}
 
 	if err := handler.enqueueDelivery(context.Background(), project, event, normalized, "original-delivery", body); err != nil {
+		t.Fatal(err)
+	}
+	stored := &corev1.ConfigMap{}
+	key := client.ObjectKey{Namespace: project.Namespace, Name: webhookDeliveryName(body)}
+	if err := clusterClient.Get(context.Background(), key, stored); err != nil {
+		t.Fatal(err)
+	}
+	stored.Data[deliveryRevisionKey] = strings.Repeat("b", 40)
+	if err := clusterClient.Update(context.Background(), stored); err != nil {
 		t.Fatal(err)
 	}
 	if err := handler.enqueueDelivery(context.Background(), project, event, normalized, "replay-delivery", body); err != nil {
@@ -143,6 +161,200 @@ func TestCreateWorkflowRunReplayUsesLiveReader(t *testing.T) {
 	}
 }
 
+func TestDeliveryPinsCurrentPullRequestMergeRevision(t *testing.T) {
+	now := time.Date(2026, 8, 9, 23, 0, 0, 0, time.UTC)
+	headSHA := strings.Repeat("b", 40)
+	mergeSHA := strings.Repeat("c", 40)
+	movedMergeSHA := strings.Repeat("d", 40)
+	parentSHA := strings.Repeat("a", 40)
+	resolvedSHA := mergeSHA
+	resolveCalls := 0
+	failDiscovery := false
+	workflowData := []byte("name: CI\non: pull_request\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: make test\n")
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/app/installations/2/access_tokens":
+			fmt.Fprint(writer, `{"token":"installation-token"}`)
+		case "/repos/acme/example/commits":
+			resolveCalls++
+			fmt.Fprintf(writer, `[{"sha":%q,"parents":[{"sha":%q}]}]`, resolvedSHA, parentSHA)
+		case "/repos/acme/example/contents/.open-actions/workflows":
+			if failDiscovery {
+				failDiscovery = false
+				http.Error(writer, "temporarily unavailable", http.StatusServiceUnavailable)
+				return
+			}
+			fmt.Fprint(writer, `[{"name":"ci.yaml","path":".open-actions/workflows/ci.yaml","type":"file"}]`)
+		case "/repos/acme/example/contents/.open-actions/workflows/ci.yaml":
+			fmt.Fprintf(writer, `{"encoding":"base64","content":%q}`, base64.StdEncoding.EncodeToString(workflowData))
+		default:
+			http.NotFound(writer, request)
+		}
+	}))
+	defer server.Close()
+	clusterClient, reconciler, handler, project := newPullRequestDeliveryTest(t, server, now)
+	deliveryKey := enqueuePullRequestDelivery(t, handler, clusterClient, project, now, headSHA, []byte(`{"delivery":"current-merge-ref"}`))
+
+	result, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: deliveryKey})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.RequeueAfter != mergeRefRetryInterval(0) {
+		t.Fatalf("requeue after = %v, want %v", result.RequeueAfter, mergeRefRetryInterval(0))
+	}
+
+	parentSHA = headSHA
+	failDiscovery = true
+	if _, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: deliveryKey}); err == nil {
+		t.Fatal("reconcile succeeded during a transient discovery failure")
+	}
+	stored := &corev1.ConfigMap{}
+	if err := clusterClient.Get(context.Background(), deliveryKey, stored); err != nil {
+		t.Fatal(err)
+	}
+	if stored.Data[deliveryRevisionKey] != mergeSHA {
+		t.Fatalf("resolved revision = %q, want %q", stored.Data[deliveryRevisionKey], mergeSHA)
+	}
+
+	resolvedSHA = movedMergeSHA
+	result, err = reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: deliveryKey})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.RequeueAfter != 0 {
+		t.Fatalf("requeue after = %v, want 0", result.RequeueAfter)
+	}
+	if resolveCalls != 2 {
+		t.Fatalf("merge ref resolutions = %d, want 2", resolveCalls)
+	}
+	if err := clusterClient.Get(context.Background(), deliveryKey, stored); err != nil {
+		t.Fatal(err)
+	}
+	if stored.Data[deliveryStateKey] != deliveryStateCompleted {
+		t.Fatalf("delivery state = %q, want %q", stored.Data[deliveryStateKey], deliveryStateCompleted)
+	}
+	runs := &actionsv1alpha1.WorkflowRunList{}
+	if err := clusterClient.List(context.Background(), runs); err != nil {
+		t.Fatal(err)
+	}
+	if len(runs.Items) != 1 {
+		t.Fatalf("WorkflowRuns = %d, want 1", len(runs.Items))
+	}
+	if got := runs.Items[0].Spec.Source.GitHub.Revision.SHA; got != mergeSHA {
+		t.Fatalf("WorkflowRun revision = %q, want pinned revision %q", got, mergeSHA)
+	}
+}
+
+func TestDeliveryTimesOutWhenPullRequestMergeRefIsUnavailable(t *testing.T) {
+	now := time.Date(2026, 8, 9, 23, 0, 0, 0, time.UTC)
+	headSHA := strings.Repeat("b", 40)
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/app/installations/2/access_tokens":
+			fmt.Fprint(writer, `{"token":"installation-token"}`)
+		case "/repos/acme/example/commits":
+			http.NotFound(writer, request)
+		default:
+			http.NotFound(writer, request)
+		}
+	}))
+	defer server.Close()
+	clusterClient, reconciler, handler, project := newPullRequestDeliveryTest(t, server, now)
+	deliveryKey := enqueuePullRequestDelivery(t, handler, clusterClient, project, now, headSHA, []byte(`{"delivery":"unavailable"}`))
+
+	result, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: deliveryKey})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.RequeueAfter != mergeRefRetryInterval(0) {
+		t.Fatalf("requeue after = %v, want %v", result.RequeueAfter, mergeRefRetryInterval(0))
+	}
+	stored := &corev1.ConfigMap{}
+	if err := clusterClient.Get(context.Background(), deliveryKey, stored); err != nil {
+		t.Fatal(err)
+	}
+	if stored.Data[deliveryStateKey] != "" {
+		t.Fatalf("delivery state = %q, want pending", stored.Data[deliveryStateKey])
+	}
+
+	reconciler.Now = func() time.Time { return now.Add(mergeRefWaitTimeout) }
+	result, err = reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: deliveryKey})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.RequeueAfter != 0 {
+		t.Fatalf("requeue after = %v, want 0", result.RequeueAfter)
+	}
+	if err := clusterClient.Get(context.Background(), deliveryKey, stored); err != nil {
+		t.Fatal(err)
+	}
+	if stored.Data[deliveryStateKey] != deliveryStateFailed || !strings.Contains(stored.Data[deliveryMessageKey], headSHA) {
+		t.Fatalf("terminal delivery data = %#v", stored.Data)
+	}
+}
+
+func newPullRequestDeliveryTest(t *testing.T, server *httptest.Server, now time.Time) (client.Client, *DeliveryReconciler, *GitHubHandler, *actionsv1alpha1.Project) {
+	t.Helper()
+	githubAPI, err := githubclient.NewClient(server.URL, server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	privateKeyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(privateKey)})
+	project := &actionsv1alpha1.Project{
+		ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: "default", UID: "project-uid"},
+		Spec: actionsv1alpha1.ProjectSpec{
+			WorkflowDirectory: ".open-actions/workflows",
+			Source: actionsv1alpha1.ProjectSource{
+				Type: actionsv1alpha1.SourceTypeGitHub,
+				GitHub: &actionsv1alpha1.GitHubAppConfiguration{
+					AppID: 1, InstallationID: 2,
+					PrivateKeySecretRef: corev1.SecretKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: "github"}, Key: "private-key"},
+					WebhookSecretRef:    corev1.SecretKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: "github"}, Key: "webhook-secret"},
+				},
+			},
+		},
+	}
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "github", Namespace: project.Namespace},
+		Data:       map[string][]byte{"private-key": privateKeyPEM, "webhook-secret": []byte("secret")},
+	}
+	scheme := deliveryTestScheme(t)
+	clusterClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(project, secret).Build()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	reconciler := &DeliveryReconciler{Client: clusterClient, APIReader: clusterClient, GitHub: githubAPI, Logger: logger, Now: func() time.Time { return now }}
+	handler := &GitHubHandler{Client: clusterClient, APIReader: clusterClient}
+	return clusterClient, reconciler, handler, project
+}
+
+func enqueuePullRequestDelivery(t *testing.T, handler *GitHubHandler, clusterClient client.Client, project *actionsv1alpha1.Project, createdAt time.Time, headSHA string, body []byte) client.ObjectKey {
+	t.Helper()
+	event := &payload{}
+	event.Repository.ID = 1
+	event.Repository.Name = "example"
+	event.Repository.Owner.Login = "acme"
+	normalized := normalizedEvent{
+		Name: "pull_request", Action: "synchronize", Ref: "refs/pull/9/merge",
+		ResolveRef: "refs/pull/9/merge", HeadRef: "feature", BaseRef: "main", HeadSHA: headSHA,
+	}
+	if err := handler.enqueueDelivery(context.Background(), project, event, normalized, "delivery", body); err != nil {
+		t.Fatal(err)
+	}
+	key := client.ObjectKey{Namespace: project.Namespace, Name: webhookDeliveryName(body)}
+	object := &corev1.ConfigMap{}
+	if err := clusterClient.Get(context.Background(), key, object); err != nil {
+		t.Fatal(err)
+	}
+	object.CreationTimestamp = metav1.NewTime(createdAt)
+	if err := clusterClient.Update(context.Background(), object); err != nil {
+		t.Fatal(err)
+	}
+	return key
+}
+
 type workflowRunAlreadyExistsClient struct {
 	client.Client
 }
@@ -214,6 +426,21 @@ func TestDeliveryFanOutLimits(t *testing.T) {
 				t.Fatalf("validateDeliveryFanOut() error = %v, wantError = %v", err, tt.wantError)
 			}
 		})
+	}
+}
+
+func TestMergeRefRetryIntervalGrowsWithDeliveryAge(t *testing.T) {
+	for _, tt := range []struct {
+		age  time.Duration
+		want time.Duration
+	}{
+		{age: 0, want: 2 * time.Second},
+		{age: 10 * time.Second, want: 5 * time.Second},
+		{age: 30 * time.Second, want: 15 * time.Second},
+	} {
+		if got := mergeRefRetryInterval(tt.age); got != tt.want {
+			t.Errorf("mergeRefRetryInterval(%v) = %v, want %v", tt.age, got, tt.want)
+		}
 	}
 }
 
