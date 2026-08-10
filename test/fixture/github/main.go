@@ -39,6 +39,8 @@ jobs:
           test "$GITHUB_REF_NAME" = "main"
           test "$EXTERNAL_SETUP_GO" = "ready"
           test "$COMPOSITE_VALUE" = "from composite"
+          git status --short
+          printf 'runner workspace git works\n'
           go test ./...
           printf 'open actions e2e works\n'
 `
@@ -85,9 +87,17 @@ if (process.env.STATE_checked_out === 'true') {
 const workspace = process.env.GITHUB_WORKSPACE;
 const repository = process.env['INPUT_REPOSITORY'];
 const remote = process.env.GITHUB_SERVER_URL + '/' + repository;
-const run = (args) => childProcess.execFileSync('git', args, {stdio: 'inherit'});
+const gitEnvironment = {
+  ...process.env,
+  GIT_CONFIG_COUNT: '1',
+  GIT_CONFIG_KEY_0: 'safe.directory',
+  GIT_CONFIG_VALUE_0: workspace,
+};
+const run = (args) => childProcess.execFileSync('git', args, {
+  env: gitEnvironment,
+  stdio: 'inherit',
+});
 fs.mkdirSync(workspace, {recursive: true});
-run(['config', '--global', '--add', 'safe.directory', workspace]);
 run(['init', '--quiet', workspace]);
 run(['-C', workspace, 'remote', 'add', 'origin', remote]);
 run(['-C', workspace, 'fetch', '--quiet', '--depth=1', 'origin', process.env.GITHUB_SHA]);
