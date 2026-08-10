@@ -153,6 +153,7 @@ var _ = Describe("Runner", func() {
 		Expect(output).To(ContainSubstring("external checkout main ran"))
 		Expect(output).To(ContainSubstring("external setup-go main ran"))
 		Expect(output).To(ContainSubstring("external composite run"))
+		Expect(output).To(ContainSubstring("runner workspace git works"))
 		Expect(output).To(ContainSubstring("open actions e2e works"))
 		Expect(output).To(ContainSubstring("external marker post ran"))
 		Expect(output).To(ContainSubstring("external setup-go post ran"))

@@ -59,8 +59,17 @@ func TestRunnerBuildsOwnedJob(t *testing.T) {
 	if container.Resources.Requests.Cpu().String() != "1" {
 		t.Errorf("cpu request = %s", container.Resources.Requests.Cpu().String())
 	}
-	if strings.Join(container.Args, " ") != "--job-file=/var/run/open-actions/job.json --workspace=/workspace" {
+	if strings.Join(container.Args, " ") != "--job-file=/var/run/open-actions/job.json --workspace=/workspace/repository" {
 		t.Errorf("args = %v", container.Args)
+	}
+	workspaceMount := ""
+	for _, mount := range container.VolumeMounts {
+		if mount.Name == workspaceVolume {
+			workspaceMount = mount.MountPath
+		}
+	}
+	if workspaceMount == "" || !strings.HasPrefix(workspacePath, workspaceMount+"/") {
+		t.Fatalf("workspace path %q must be below volume mount %q", workspacePath, workspaceMount)
 	}
 	if job.Labels[actionsv1alpha1.LabelWorkflowJob] != "build" {
 		t.Errorf("workflow job label = %q", job.Labels[actionsv1alpha1.LabelWorkflowJob])

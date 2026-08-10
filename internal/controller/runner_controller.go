@@ -27,10 +27,12 @@ import (
 var errRunnerAlreadyAssigned = errors.New("runner is already assigned a WorkflowJob")
 
 const (
-	jobPlanVolume               = "open-actions-job"
-	workspaceVolume             = "open-actions-workspace"
-	jobPlanMountPath            = "/var/run/open-actions"
-	workspaceMountPath          = "/workspace"
+	jobPlanVolume            = "open-actions-job"
+	workspaceVolume          = "open-actions-workspace"
+	jobPlanMountPath         = "/var/run/open-actions"
+	workspaceVolumeMountPath = "/workspace"
+	// The repository lives below the volume root so the runner owns its Git worktree.
+	workspacePath               = workspaceVolumeMountPath + "/repository"
 	jobTTLSeconds               = int32(3600)
 	jobTimeoutSeconds           = int64(50 * 60)
 	jobStartTimeout             = 5 * time.Minute
@@ -596,7 +598,7 @@ func (r *RunnerReconciler) buildJob(workflowJob *actionsv1alpha1.WorkflowJob, ru
 						Drop: []corev1.Capability{"ALL"},
 					},
 				},
-				Args: []string{"--job-file=" + jobPlanMountPath + "/" + jobPlanKey, "--workspace=" + workspaceMountPath},
+				Args: []string{"--job-file=" + jobPlanMountPath + "/" + jobPlanKey, "--workspace=" + workspacePath},
 				Env: []corev1.EnvVar{{
 					Name: "OPEN_ACTIONS_GITHUB_TOKEN",
 					ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
@@ -606,7 +608,7 @@ func (r *RunnerReconciler) buildJob(workflowJob *actionsv1alpha1.WorkflowJob, ru
 				}},
 				VolumeMounts: []corev1.VolumeMount{
 					{Name: jobPlanVolume, MountPath: jobPlanMountPath, ReadOnly: true},
-					{Name: workspaceVolume, MountPath: workspaceMountPath},
+					{Name: workspaceVolume, MountPath: workspaceVolumeMountPath},
 				},
 			}},
 			Volumes: []corev1.Volume{
