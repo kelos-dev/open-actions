@@ -17,7 +17,10 @@ import (
 	"sync/atomic"
 )
 
-const PlanVersion = 1
+const (
+	PlanVersion   = 1
+	ContainerName = "runner"
+)
 
 type Plan struct {
 	Version      int               `json:"version"`

@@ -13,7 +13,9 @@ func TestRunShowsHelp(t *testing.T) {
 		if err := run(context.Background(), arguments, &stdout, &bytes.Buffer{}); err != nil {
 			t.Fatalf("run(%v) error = %v", arguments, err)
 		}
-		if !strings.Contains(stdout.String(), "open-actions <command>") || !strings.Contains(stdout.String(), "install") {
+		if !strings.Contains(stdout.String(), "open-actions [command]") ||
+			!strings.Contains(stdout.String(), "install") ||
+			!strings.Contains(stdout.String(), "run") {
 			t.Fatalf("run(%v) output = %q", arguments, stdout.String())
 		}
 	}
@@ -27,13 +29,13 @@ func TestRunRejectsUnknownCommand(t *testing.T) {
 }
 
 func TestRunInstallHelp(t *testing.T) {
-	var stderr bytes.Buffer
-	if err := run(context.Background(), []string{"install", "--help"}, &bytes.Buffer{}, &stderr); err != nil {
+	var stdout bytes.Buffer
+	if err := run(context.Background(), []string{"install", "--help"}, &stdout, &bytes.Buffer{}); err != nil {
 		t.Fatalf("run() error = %v", err)
 	}
-	if !strings.Contains(stderr.String(), "Usage: open-actions install [--values FILE]") ||
-		!strings.Contains(stderr.String(), "-values string") {
-		t.Fatalf("run() stderr = %q", stderr.String())
+	if !strings.Contains(stdout.String(), "open-actions install [flags]") ||
+		!strings.Contains(stdout.String(), "--values string") {
+		t.Fatalf("run() stdout = %q", stdout.String())
 	}
 }
 
