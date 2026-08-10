@@ -4,6 +4,7 @@ metadata:
   name: example-ci-m4z2c6h5t3k7w2n4r6qa
   namespace: open-actions
 spec:
+  ttlSecondsAfterFinished: 604800
   projectRef:
     name: default
   source:

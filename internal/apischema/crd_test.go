@@ -31,6 +31,39 @@ func TestWorkflowRunAcceptsGitPathCharacters(t *testing.T) {
 	}
 }
 
+func TestWorkflowRunTTLIsMutable(t *testing.T) {
+	crd, _ := loadCRD(t, "actions.kelos.dev_workflowruns.yaml")
+	original := loadSample(t, "actions_v1alpha1_workflowrun.yaml")
+	updated := loadSample(t, "actions_v1alpha1_workflowrun.yaml")
+	normalizeWorkflowRunCELIntegers(original)
+	normalizeWorkflowRunCELIntegers(updated)
+	updated["spec"].(map[string]any)["ttlSecondsAfterFinished"] = int64(3600)
+	if errs := validateObject(t, crd, updated, original); len(errs) > 0 {
+		t.Fatalf("WorkflowRun TTL update was rejected: %v", errs.ToAggregate())
+	}
+
+	retained := loadSample(t, "actions_v1alpha1_workflowrun.yaml")
+	normalizeWorkflowRunCELIntegers(retained)
+	delete(retained["spec"].(map[string]any), "ttlSecondsAfterFinished")
+	if errs := validateObject(t, crd, retained, updated); len(errs) > 0 {
+		t.Fatalf("WorkflowRun TTL removal was rejected: %v", errs.ToAggregate())
+	}
+
+	changedExecution := loadSample(t, "actions_v1alpha1_workflowrun.yaml")
+	normalizeWorkflowRunCELIntegers(changedExecution)
+	changedExecution["spec"].(map[string]any)["workflowPath"] = ".open-actions/workflows/deploy.yaml"
+	if errs := validateObject(t, crd, changedExecution, original); len(errs) == 0 {
+		t.Fatal("WorkflowRun execution update passed CEL validation")
+	}
+}
+
+func normalizeWorkflowRunCELIntegers(object map[string]any) {
+	repository := workflowRunGitHub(object)["repository"].(map[string]any)
+	if id, ok := repository["id"].(float64); ok {
+		repository["id"] = int64(id)
+	}
+}
+
 func TestWorkflowRunAcceptsGitHubEventContracts(t *testing.T) {
 	crd, _ := loadCRD(t, "actions.kelos.dev_workflowruns.yaml")
 	for _, tt := range []struct {
@@ -124,11 +157,11 @@ func TestRunnerAcceptsQualifiedResourceNames(t *testing.T) {
 
 func TestCRDConventions(t *testing.T) {
 	tests := []struct {
-		file         string
-		sample       string
-		kind         string
-		requiredSpec []string
-		immutable    bool
+		file                    string
+		sample                  string
+		kind                    string
+		requiredSpec            []string
+		hasSpecUpdateValidation bool
 	}{
 		{
 			file:         "actions.kelos.dev_projects.yaml",
@@ -143,18 +176,18 @@ func TestCRDConventions(t *testing.T) {
 			requiredSpec: []string{"execution", "projectRef", "labels"},
 		},
 		{
-			file:         "actions.kelos.dev_workflowjobs.yaml",
-			sample:       "actions_v1alpha1_workflowjob.yaml",
-			kind:         "WorkflowJob",
-			requiredSpec: []string{"jobID", "runsOn", "workflowRunRef"},
-			immutable:    true,
+			file:                    "actions.kelos.dev_workflowjobs.yaml",
+			sample:                  "actions_v1alpha1_workflowjob.yaml",
+			kind:                    "WorkflowJob",
+			requiredSpec:            []string{"jobID", "runsOn", "workflowRunRef"},
+			hasSpecUpdateValidation: true,
 		},
 		{
-			file:         "actions.kelos.dev_workflowruns.yaml",
-			sample:       "actions_v1alpha1_workflowrun.yaml",
-			kind:         "WorkflowRun",
-			requiredSpec: []string{"projectRef", "source", "workflowPath"},
-			immutable:    true,
+			file:                    "actions.kelos.dev_workflowruns.yaml",
+			sample:                  "actions_v1alpha1_workflowrun.yaml",
+			kind:                    "WorkflowRun",
+			requiredSpec:            []string{"projectRef", "source", "workflowPath"},
+			hasSpecUpdateValidation: true,
 		},
 	}
 
@@ -198,8 +231,8 @@ func TestCRDConventions(t *testing.T) {
 				t.Error("status.conditions must use type as its list key")
 			}
 
-			if tt.immutable && len(spec.XValidations) == 0 {
-				t.Error("immutable spec has no CEL validation")
+			if tt.hasSpecUpdateValidation && len(spec.XValidations) == 0 {
+				t.Error("spec update contract has no CEL validation")
 			}
 
 			if tt.kind == "Runner" {
@@ -213,6 +246,15 @@ func TestCRDConventions(t *testing.T) {
 					if resourceList.MaxProperties == nil || *resourceList.MaxProperties != 7 {
 						t.Errorf("spec.execution.resources.%s is not bounded to 7 entries", fieldName)
 					}
+				}
+			}
+			if tt.kind == "WorkflowRun" {
+				ttl := spec.Properties["ttlSecondsAfterFinished"]
+				if slices.Contains(spec.Required, "ttlSecondsAfterFinished") {
+					t.Error("spec.ttlSecondsAfterFinished is required")
+				}
+				if ttl.Format != "int32" || ttl.Minimum == nil || *ttl.Minimum != 0 || ttl.Maximum == nil || *ttl.Maximum != 2147483647 {
+					t.Errorf("spec.ttlSecondsAfterFinished schema = %#v", ttl)
 				}
 			}
 		})
@@ -400,6 +442,13 @@ func TestCRDRejectsInvalidCELValues(t *testing.T) {
 			crd:  "actions.kelos.dev_workflowruns.yaml", sample: "actions_v1alpha1_workflowrun.yaml",
 			mutate: func(object map[string]any) {
 				object["spec"].(map[string]any)["workflowPath"] = ".open-actions/workflows/ci.YAML"
+			},
+		},
+		{
+			name: "WorkflowRun negative TTL",
+			crd:  "actions.kelos.dev_workflowruns.yaml", sample: "actions_v1alpha1_workflowrun.yaml",
+			mutate: func(object map[string]any) {
+				object["spec"].(map[string]any)["ttlSecondsAfterFinished"] = int64(-1)
 			},
 		},
 		{

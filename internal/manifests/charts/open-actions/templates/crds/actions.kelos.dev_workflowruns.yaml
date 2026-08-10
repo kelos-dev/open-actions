@@ -61,7 +61,8 @@ spec:
             type: object
           spec:
             description: |-
-              WorkflowRunSpec is an immutable description of one workflow execution.
+              WorkflowRunSpec describes one workflow execution. ProjectRef, Source, and
+              WorkflowPath are immutable.
               Deleting a WorkflowRun requests cancellation of its child resources.
             properties:
               projectRef:
@@ -240,6 +241,19 @@ spec:
                 x-kubernetes-validations:
                 - message: github must be specified exactly when type is GitHub
                   rule: 'self.type == ''GitHub'' ? has(self.github) : !has(self.github)'
+              ttlSecondsAfterFinished:
+                description: |-
+                  TTLSecondsAfterFinished limits the lifetime of a WorkflowRun that has
+                  reached a terminal result. The timer starts at status.completionTime, or
+                  the terminal Succeeded condition's lastTransitionTime when completionTime
+                  is absent. Set this field to zero to make the run eligible for deletion
+                  immediately after completion. Omit it to retain the run indefinitely. This
+                  field may be changed while the run exists, but updates are not guaranteed
+                  to retain a run that is already eligible for deletion.
+                format: int32
+                maximum: 2147483647
+                minimum: 0
+                type: integer
               workflowPath:
                 description: WorkflowPath is the repository-relative path of the selected
                   workflow.
@@ -261,8 +275,9 @@ spec:
             - workflowPath
             type: object
             x-kubernetes-validations:
-            - message: spec is immutable
-              rule: self == oldSelf
+            - message: projectRef, source, and workflowPath are immutable
+              rule: self.projectRef == oldSelf.projectRef && self.source == oldSelf.source
+                && self.workflowPath == oldSelf.workflowPath
             - message: '`projectRef.name` must be specified'
               rule: size(self.projectRef.name) > 0
             - message: '`projectRef.name` must be no more than 253 characters'

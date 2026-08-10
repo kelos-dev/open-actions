@@ -60,10 +60,11 @@ type queuedDelivery struct {
 
 type DeliveryReconciler struct {
 	client.Client
-	APIReader client.Reader
-	GitHub    *githubclient.Client
-	Logger    *slog.Logger
-	Now       func() time.Time
+	APIReader                          client.Reader
+	GitHub                             *githubclient.Client
+	Logger                             *slog.Logger
+	WorkflowRunTTLSecondsAfterFinished *int32
+	Now                                func() time.Time
 }
 
 func (h *GitHubHandler) enqueueDelivery(ctx context.Context, project *actionsv1alpha1.Project, event *payload, normalized normalizedEvent, deliveryID string, signedBody []byte) error {
@@ -332,7 +333,8 @@ func (r *DeliveryReconciler) createWorkflowRun(ctx context.Context, project *act
 	desired := &actionsv1alpha1.WorkflowRun{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: project.Namespace},
 		Spec: actionsv1alpha1.WorkflowRunSpec{
-			ProjectRef: corev1.LocalObjectReference{Name: project.Name},
+			ProjectRef:              corev1.LocalObjectReference{Name: project.Name},
+			TTLSecondsAfterFinished: r.WorkflowRunTTLSecondsAfterFinished,
 			Source: actionsv1alpha1.WorkflowRunSource{
 				Type: actionsv1alpha1.SourceTypeGitHub,
 				GitHub: &actionsv1alpha1.GitHubWorkflowRunSource{
@@ -369,7 +371,11 @@ func (r *DeliveryReconciler) createWorkflowRun(ctx context.Context, project *act
 }
 
 func matchingWorkflowRun(existing, desired *actionsv1alpha1.WorkflowRun) error {
-	if apiequality.Semantic.DeepEqual(existing.Spec, desired.Spec) {
+	existingSpec := existing.Spec.DeepCopy()
+	desiredSpec := desired.Spec.DeepCopy()
+	existingSpec.TTLSecondsAfterFinished = nil
+	desiredSpec.TTLSecondsAfterFinished = nil
+	if apiequality.Semantic.DeepEqual(existingSpec, desiredSpec) {
 		return nil
 	}
 	return apierrors.NewConflict(

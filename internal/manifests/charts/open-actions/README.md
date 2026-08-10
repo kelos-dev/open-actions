@@ -22,6 +22,14 @@ read-only access to those resources. Set `console.enabled=false` to omit the
 Console. Set `console.secretName` to mount an externally managed Secret from the
 release namespace instead; `console.tokenKey` selects its token key.
 
+Generated WorkflowRuns omit `spec.ttlSecondsAfterFinished` by default and are
+retained indefinitely. Set `controller.workflowRunTTLSecondsAfterFinished` to
+populate that field on new runs. For example, `604800` retains each new run for
+seven days after completion; `0` makes a run eligible for deletion immediately
+after completion. Changing the chart value does not alter existing runs.
+Deleting an expired WorkflowRun also deletes its owned WorkflowJobs and execution
+resources.
+
 ## Values
 
 | Value | Default | Description |
@@ -32,6 +40,7 @@ release namespace instead; `console.tokenKey` selects its token key.
 | `controller.githubAPIURL` | `https://api.github.com/` | Base URL for the GitHub API |
 | `controller.githubServerURL` | `https://github.com` | GitHub web-server URL exposed to workflows |
 | `controller.actionCloneBaseURL` | `https://github.com` | Base URL used to clone external action repositories |
+| `controller.workflowRunTTLSecondsAfterFinished` | `null` | Default `spec.ttlSecondsAfterFinished` for generated WorkflowRuns; `null` retains them indefinitely |
 | `console.enabled` | `true` | Deploy the Open Actions Console |
 | `console.replicas` | `1` | Console replica count |
 | `console.publicURL` | `http://localhost:8080` | Public Console URL used by GitHub Check Run links |

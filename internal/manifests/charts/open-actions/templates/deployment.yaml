@@ -32,6 +32,9 @@ spec:
             - {{ printf "--github-api-url=%s" .Values.controller.githubAPIURL | quote }}
             - {{ printf "--github-server-url=%s" .Values.controller.githubServerURL | quote }}
             - {{ printf "--action-clone-base-url=%s" .Values.controller.actionCloneBaseURL | quote }}
+            {{- if ne .Values.controller.workflowRunTTLSecondsAfterFinished nil }}
+            - {{ printf "--workflow-run-ttl-seconds-after-finished=%d" (int64 .Values.controller.workflowRunTTLSecondsAfterFinished) | quote }}
+            {{- end }}
             {{- if .Values.console.enabled }}
             - {{ printf "--console-url=%s" .Values.console.publicURL | quote }}
             {{- end }}

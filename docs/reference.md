@@ -176,8 +176,10 @@ caches, and artifacts are not supported. General expressions outside the
 supported concurrency and composite-action contexts are rejected during
 planning or execution and are never interpreted as literal values.
 `WorkflowJob` resources are not retried or reassigned when a Runner is removed.
-Native Jobs and their Pod logs are deleted one hour after completion; Open
-Actions does not archive logs.
+Native Jobs and their Pod logs are deleted one hour after completion. Completed
+WorkflowRuns are retained indefinitely unless `spec.ttlSecondsAfterFinished` is
+set. When that TTL expires, the WorkflowRun and any remaining owned resources
+are deleted. Open Actions does not archive logs.
 
 ## Webhook API
 
