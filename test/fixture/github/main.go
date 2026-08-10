@@ -31,6 +31,9 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
+      - uses: helm/kind-action@v1
+        with:
+          cluster_name: kind
       - uses: actions/composite@v1
         with:
           message: from composite
@@ -39,6 +42,7 @@ jobs:
           test "$GITHUB_REPOSITORY" = "acme/example"
           test "$GITHUB_REF_NAME" = "main"
           test "$EXTERNAL_SETUP_GO" = "ready"
+          test "$KIND_ACTION_RUNTIME" = "24"
           test "$COMPOSITE_VALUE" = "from composite"
           git status --short
           printf 'runner workspace git works\n'
@@ -122,6 +126,10 @@ const setupGoScript = `const childProcess = require('child_process');
 const fs = require('fs');
 const path = require('path');
 
+if (process.versions.node.split('.')[0] !== '20') {
+  throw new Error('setup-go fixture did not run with Node 20');
+}
+
 if (process.env.STATE_setup === 'true') {
   console.log('external setup-go post ran');
   process.exit(0);
@@ -136,6 +144,102 @@ fs.appendFileSync(process.env.GITHUB_ENV, 'EXTERNAL_SETUP_GO=ready\n');
 fs.appendFileSync(process.env.GITHUB_PATH, '/usr/local/go/bin\n');
 fs.appendFileSync(process.env.GITHUB_STATE, 'setup=true\n');
 console.log('external setup-go main ran');
+`
+
+const kindActionMetadata = `name: "Kind Cluster"
+description: "Create a kind (Kubernetes IN Docker) cluster"
+author: "The Helm authors"
+branding:
+  color: blue
+  icon: box
+inputs:
+  version:
+    description: "The kind version to use (default: v0.31.0)"
+    required: false
+    default: "v0.31.0"
+  config:
+    description: "The path to the kind config file"
+    required: false
+  kubeconfig:
+    description: "The path to the kubeconfig config file"
+    required: false
+  node_image:
+    description: "The Docker image for the cluster nodes"
+    required: false
+  cluster_name:
+    description: "The name of the cluster to create (default: chart-testing)"
+    required: false
+    default: "chart-testing"
+  wait:
+    description: "The duration to wait for the control plane to become ready (default: 60s)"
+    required: false
+    default: "60s"
+  verbosity:
+    description: "The verbosity level for kind (default: 0)"
+    default: "0"
+    required: false
+  kubectl_version:
+    description: "The kubectl version to use (default: v1.35.0)"
+    required: false
+    default: "v1.35.0"
+  registry:
+    description: "Whether to configure an insecure local registry (default: false)"
+    required: false
+    default: "false"
+  registry_image:
+    description: "The registry image to use (default: registry:2)"
+    required: false
+    default: "registry:2"
+  registry_name:
+    description: "The registry name to use (default: kind-registry)"
+    required: false
+    default: "kind-registry"
+  registry_port:
+    description: "The local port used to bind the registry (default: 5000)"
+    required: false
+    default: "5000"
+  registry_enable_delete:
+    description: "Enable delete operations (default: false)"
+    required: false
+    default: "false"
+  install_only:
+    description: "Skips cluster creation, only install kind (default: false)"
+    default: "false"
+    required: false
+  ignore_failed_clean:
+    description: "Whether to ignore the post-delete the cluster (default: false)"
+    default: "false"
+    required: false
+  cloud_provider:
+    description: "Whether to use cloud provider loadbalancer (default: false)"
+    required: false
+    default: "false"
+runs:
+  using: "node24"
+  main: "main.js"
+  post: "cleanup.js"
+`
+
+const kindActionScript = `const fs = require('fs');
+
+if (process.versions.node.split('.')[0] !== '24') {
+  throw new Error('kind-action fixture did not run with Node 24');
+}
+if (process.env['INPUT_CLUSTER_NAME'] !== 'kind') {
+  throw new Error('kind-action fixture did not receive its input');
+}
+fs.appendFileSync(process.env.GITHUB_ENV, 'KIND_ACTION_RUNTIME=24\n');
+fs.appendFileSync(process.env.GITHUB_STATE, 'kind_cluster=created\n');
+console.log('external kind-action main ran');
+`
+
+const kindActionCleanupScript = `if (process.versions.node.split('.')[0] !== '24') {
+  throw new Error('kind-action cleanup did not run with Node 24');
+}
+if (process.env.STATE_kind_cluster !== 'created') {
+  throw new Error('kind-action cleanup did not receive action state');
+}
+console.log('external kind-action post ran');
 `
 
 const markerMetadata = `name: Marker fixture
@@ -204,6 +308,7 @@ func main() {
 	}
 	mux.Handle("/acme/", gitBackend)
 	mux.Handle("/actions/", gitBackend)
+	mux.Handle("/helm/", gitBackend)
 	mux.HandleFunc("/app/installations/", func(writer http.ResponseWriter, request *http.Request) {
 		if request.Method != http.MethodPost {
 			http.Error(writer, "method not allowed", http.StatusMethodNotAllowed)
@@ -326,6 +431,13 @@ func createRepositories(dataDirectory string) (string, error) {
 	if _, err := createRepository(dataDirectory, "actions", "setup-go", "v5", map[string]string{
 		"action.yml":    setupGoMetadata,
 		"dist/index.js": setupGoScript,
+	}); err != nil {
+		return "", err
+	}
+	if _, err := createRepository(dataDirectory, "helm", "kind-action", "v1", map[string]string{
+		"action.yml": kindActionMetadata,
+		"main.js":    kindActionScript,
+		"cleanup.js": kindActionCleanupScript,
 	}); err != nil {
 		return "", err
 	}

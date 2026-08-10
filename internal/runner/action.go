@@ -53,6 +53,7 @@ type actionInvocation struct {
 	reference  actionref.Reference
 	directory  string
 	definition actionDefinition
+	executable string
 	inputs     map[string]string
 	state      map[string]string
 	outputs    map[string]string
@@ -96,7 +97,7 @@ func (r *actionResolver) prepare(ctx context.Context, step Step, plan *Plan, tok
 		return nil, fmt.Errorf("load action %s: %w", step.Uses, err)
 	}
 	switch definition.Runs.Using {
-	case "node20":
+	case "node20", "node24":
 		if definition.Runs.Main == "" {
 			return nil, fmt.Errorf("action %s does not define runs.main", step.Uses)
 		}
@@ -277,7 +278,7 @@ func (e *Executor) runJavaScriptHook(ctx context.Context, invocation *actionInvo
 			actionEnvironment = setEnvironment(actionEnvironment, "STATE_"+name, value)
 		}
 	}
-	executionError := e.executeCommand(ctx, "node", []string{entrypointPath}, workspace, actionEnvironment)
+	executionError := e.executeCommand(ctx, invocation.executable, []string{entrypointPath}, workspace, actionEnvironment)
 	updates, commandError := files.read()
 	if commandError != nil {
 		return errors.Join(executionError, commandError)
@@ -301,7 +302,12 @@ func (e *Executor) executeAction(ctx context.Context, state *executionState, ste
 	}
 	e.logger.Info("prepared external action", "action", step.Uses, "runtime", invocation.definition.Runs.Using)
 	switch invocation.definition.Runs.Using {
-	case "node20":
+	case "node20", "node24":
+		executable, err := actionRuntimeExecutable(invocation.definition.Runs.Using, e.environment)
+		if err != nil {
+			return nil, fmt.Errorf("action %s: %w", step.Uses, err)
+		}
+		invocation.executable = executable
 		if invocation.definition.Runs.Post != "" {
 			state.posts = append(state.posts, invocation)
 		}
@@ -317,6 +323,28 @@ func (e *Executor) executeAction(ctx context.Context, state *executionState, ste
 	default:
 		return nil, fmt.Errorf("action %s uses unsupported runtime %q", step.Uses, invocation.definition.Runs.Using)
 	}
+}
+
+func actionRuntimeExecutable(runtime string, environment []string) (string, error) {
+	executable := "node"
+	if runtime == "node24" {
+		executable = "node24"
+	}
+	for _, directory := range filepath.SplitList(environmentValue(environment, "PATH")) {
+		if directory == "" {
+			directory = "."
+		}
+		path := filepath.Join(directory, executable)
+		info, err := os.Stat(path)
+		if err == nil && !info.IsDir() && info.Mode()&0o111 != 0 {
+			absolutePath, err := filepath.Abs(path)
+			if err != nil {
+				return "", fmt.Errorf("resolve %s action runtime executable %q: %w", runtime, executable, err)
+			}
+			return absolutePath, nil
+		}
+	}
+	return "", fmt.Errorf("%s action runtime is unavailable: executable %q was not found in PATH", runtime, executable)
 }
 
 func matchesPreCondition(condition string) bool {

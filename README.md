@@ -16,8 +16,8 @@ The supported execution subset includes:
 - workflow concurrency groups and `cancel-in-progress`
 - runner-label scheduling for independent jobs using Kubernetes `Runner` and
   `WorkflowJob` resources
-- external `owner/repository[/path]@ref` JavaScript and composite actions,
-  including nested external actions
+- external `owner/repository[/path]@ref` Node 20, Node 24, and composite
+  actions, including nested external actions
 - action inputs, pre/main/post hooks, and environment, PATH, and state file commands
 - composite run and uses steps, step outputs, and composite outputs
 - Bash `run` steps

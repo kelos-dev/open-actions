@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
@@ -12,6 +13,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/kelos-dev/open-actions/internal/actionref"
 )
@@ -168,43 +170,159 @@ func TestExecuteExternalJavaScriptAction(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git is not installed")
 	}
-	if _, err := exec.LookPath("node"); err != nil {
+	nodePath, err := exec.LookPath("node")
+	if err != nil {
 		t.Skip("node is not installed")
 	}
-	repositories := t.TempDir()
-	createActionRepository(t, repositories, "actions", "example", "v1", map[string]string{
-		"action.yml": `name: External fixture
+	for _, runtime := range []string{"node20", "node24"} {
+		t.Run(runtime, func(t *testing.T) {
+			environment := os.Environ()
+			executable := "node"
+			if runtime == "node24" {
+				environment = environmentWithNode24(t, nodePath)
+				executable = "node24"
+			}
+			overrideDirectory := t.TempDir()
+			if err := os.WriteFile(filepath.Join(overrideDirectory, executable), []byte("#!/bin/sh\nexit 99\n"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			repositories := t.TempDir()
+			createActionRepository(t, repositories, "actions", "example", "v1", map[string]string{
+				"action.yml": fmt.Sprintf(`name: External fixture
 inputs:
   message:
     required: true
 runs:
-  using: node20
-  main: index.js
-  post: index.js
+  using: %s
+  pre: pre.js
+  pre-if: success()
+  main: main.js
+  post: post.js
+  post-if: success()
+`, runtime),
+				"pre.js": `const fs = require('fs');
+fs.appendFileSync(process.env.GITHUB_ENV, 'PRE_VALUE=ready\n');
+fs.appendFileSync(process.env.GITHUB_PATH, '/external/bin\n');
+fs.appendFileSync(process.env.GITHUB_STATE, 'pre_marker=saved\n');
+console.log('external pre ran');
 `,
-		"index.js": `const fs = require('fs');
-if (process.env.STATE_marker === 'saved') {
-  console.log('external post ran');
-} else {
-  fs.appendFileSync(process.env.GITHUB_ENV, 'ACTION_VALUE<<EOF\n' + process.env['INPUT_MESSAGE'] + '\nEOF\n');
-  fs.appendFileSync(process.env.GITHUB_PATH, '/external/bin\n');
-  fs.appendFileSync(process.env.GITHUB_STATE, 'marker=saved\n');
+				"main.js": `const fs = require('fs');
+if (process.env.PRE_VALUE !== 'ready' || !process.env.PATH.startsWith('/external/bin:')) {
+  throw new Error('pre command files were not applied');
 }
+fs.appendFileSync(process.env.GITHUB_ENV, 'ACTION_VALUE<<EOF\n' + process.env['INPUT_MESSAGE'] + '\nEOF\n');
+fs.appendFileSync(process.env.GITHUB_OUTPUT, 'value=' + process.env['INPUT_MESSAGE'] + '\n');
+fs.appendFileSync(process.env.GITHUB_STATE, 'main_marker=saved\n');
+console.log('::add-mask::runtime-secret');
+console.log('runtime-secret');
 `,
-	})
-	plan := testPlan()
-	plan.Repository.ActionCloneBaseURL = "file://" + repositories
-	plan.Steps = []Step{
-		{Uses: "actions/example@v1", With: map[string]string{"message": "external action ran"}},
-		{Run: `test "$ACTION_VALUE" = "external action ran" && case "$PATH" in /external/bin:*) ;; *) exit 1 ;; esac`},
+				"post.js": `if (process.env.STATE_pre_marker !== 'saved' || process.env.STATE_main_marker !== 'saved') {
+  throw new Error('action state was not preserved');
+}
+console.log('external post ran');
+`,
+			})
+			plan := testPlan()
+			plan.Repository.ActionCloneBaseURL = "file://" + repositories
+			plan.Steps = []Step{
+				{Run: `printf '%s\n' "$RUNTIME_OVERRIDE" >> "$GITHUB_PATH"`, Env: map[string]string{"RUNTIME_OVERRIDE": overrideDirectory}},
+				{Uses: "actions/example@v1", With: map[string]string{"message": "external action ran"}},
+				{Run: `test "$ACTION_VALUE" = "external action ran" && case "$PATH" in /external/bin:*) ;; *) exit 1 ;; esac`},
+			}
+			var output bytes.Buffer
+			executor := testExecutorWithEnvironment(t, environment, &output, &output)
+			if err := executor.Execute(context.Background(), plan, t.TempDir()); err != nil {
+				t.Fatalf("execute external action: %v: %s", err, output.String())
+			}
+			if !strings.Contains(output.String(), "external pre ran") || !strings.Contains(output.String(), "external post ran") {
+				t.Errorf("lifecycle output was not recorded: %s", output.String())
+			}
+			if strings.Contains(output.String(), "runtime-secret") || !strings.Contains(output.String(), "***") {
+				t.Errorf("action output was not masked: %s", output.String())
+			}
+		})
 	}
-	var output bytes.Buffer
-	executor := testExecutor(t, &output, &output)
-	if err := executor.Execute(context.Background(), plan, t.TempDir()); err != nil {
-		t.Fatalf("execute external action: %v: %s", err, output.String())
+}
+
+func TestJavaScriptActionCancellation(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git is not installed")
 	}
-	if !strings.Contains(output.String(), "external post ran") {
-		t.Errorf("post output was not recorded: %s", output.String())
+	nodePath, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node is not installed")
+	}
+	for _, runtime := range []string{"node20", "node24"} {
+		t.Run(runtime, func(t *testing.T) {
+			environment := os.Environ()
+			if runtime == "node24" {
+				environment = environmentWithNode24(t, nodePath)
+			}
+			repositories := t.TempDir()
+			createActionRepository(t, repositories, "actions", "waiting", "v1", map[string]string{
+				"action.yml": fmt.Sprintf("name: Waiting fixture\nruns:\n  using: %s\n  main: index.js\n", runtime),
+				"index.js":   `require('fs').writeFileSync(process.env.GITHUB_WORKSPACE + '/started', ''); setInterval(() => {}, 1000);`,
+			})
+			plan := testPlan()
+			plan.Repository.ActionCloneBaseURL = "file://" + repositories
+			plan.Steps = []Step{{Uses: "actions/waiting@v1"}}
+			workspace := t.TempDir()
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			result := make(chan error, 1)
+			executor := testExecutorWithEnvironment(t, environment, io.Discard, io.Discard)
+			go func() {
+				result <- executor.Execute(ctx, plan, workspace)
+			}()
+			deadline := time.Now().Add(5 * time.Second)
+			for {
+				if _, err := os.Stat(filepath.Join(workspace, "started")); err == nil {
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatal("JavaScript action did not start")
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+			cancel()
+			select {
+			case err := <-result:
+				if err == nil {
+					t.Fatal("canceled JavaScript action succeeded")
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("canceled JavaScript action did not stop")
+			}
+		})
+	}
+}
+
+func TestActionRuntimeExecutableReportsUnavailableRuntime(t *testing.T) {
+	for runtime, executable := range map[string]string{"node20": "node", "node24": "node24"} {
+		t.Run(runtime, func(t *testing.T) {
+			_, err := actionRuntimeExecutable(runtime, []string{"PATH=" + t.TempDir()})
+			if err == nil || !strings.Contains(err.Error(), runtime+" action runtime is unavailable") || !strings.Contains(err.Error(), fmt.Sprintf("%q", executable)) {
+				t.Fatalf("actionRuntimeExecutable() error = %v", err)
+			}
+		})
+	}
+}
+
+func TestActionRuntimeExecutableReturnsAbsolutePath(t *testing.T) {
+	directory, err := os.MkdirTemp(".", "runtime-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(directory) })
+	if err := os.WriteFile(filepath.Join(directory, "node"), nil, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	path, err := actionRuntimeExecutable("node20", []string{"PATH=" + filepath.Base(directory)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !filepath.IsAbs(path) {
+		t.Fatalf("actionRuntimeExecutable() = %q, want an absolute path", path)
 	}
 }
 
@@ -584,10 +702,15 @@ func testPlan() *Plan {
 
 func testExecutor(t *testing.T, stdout, stderr io.Writer) *Executor {
 	t.Helper()
+	return testExecutorWithEnvironment(t, os.Environ(), stdout, stderr)
+}
+
+func testExecutorWithEnvironment(t *testing.T, environment []string, stdout, stderr io.Writer) *Executor {
+	t.Helper()
 	executor, err := NewExecutor(ExecutorConfig{
 		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
 		GitHubToken: "installation-token",
-		Environment: os.Environ(),
+		Environment: environment,
 		Stdout:      stdout,
 		Stderr:      stderr,
 	})
@@ -595,6 +718,15 @@ func testExecutor(t *testing.T, stdout, stderr io.Writer) *Executor {
 		t.Fatal(err)
 	}
 	return executor
+}
+
+func environmentWithNode24(t *testing.T, nodePath string) []string {
+	t.Helper()
+	directory := t.TempDir()
+	if err := os.Symlink(nodePath, filepath.Join(directory, "node24")); err != nil {
+		t.Fatal(err)
+	}
+	return setEnvironment(os.Environ(), "PATH", directory+string(os.PathListSeparator)+os.Getenv("PATH"))
 }
 
 func createActionRepository(t *testing.T, root, owner, name, tag string, files map[string]string) {
