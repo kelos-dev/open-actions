@@ -42,7 +42,7 @@ func TestJobPlanCoversSupportedSteps(t *testing.T) {
 			GitHub: &actionsv1alpha1.GitHubWorkflowRunSource{
 				Repository: actionsv1alpha1.GitHubRepository{ID: 1, Owner: "example", Name: "project"},
 				Event:      actionsv1alpha1.GitHubEvent{Name: "push", DeliveryID: "delivery"},
-				Revision:   actionsv1alpha1.GitRevision{SHA: strings.Repeat("a", 40), Ref: "refs/heads/main"},
+				Revision:   actionsv1alpha1.GitRevision{SHA: strings.Repeat("a", 40), Ref: "refs/heads/main", BaseRef: "target"},
 			},
 		},
 	}}
@@ -58,7 +58,7 @@ func TestJobPlanCoversSupportedSteps(t *testing.T) {
 	if plan.Repository.ServerURL != "https://github.com" || plan.Repository.APIURL != "https://api.github.com" || plan.Repository.ActionCloneBaseURL != "https://github.com/git" {
 		t.Errorf("repository endpoints = %#v", plan.Repository)
 	}
-	if plan.Version != runner.PlanVersion || plan.Repository.ID != 1 || plan.Event.DeliveryID != "delivery" {
+	if plan.Version != runner.PlanVersion || plan.Repository.ID != 1 || plan.Event.DeliveryID != "delivery" || plan.Revision.BaseRef != "target" {
 		t.Errorf("plan identity = %#v", plan)
 	}
 	if len(plan.Steps) != 3 {
@@ -72,12 +72,12 @@ func TestPlanWorkflowJobsSetsDisplayNames(t *testing.T) {
 		Type: actionsv1alpha1.SourceTypeGitHub,
 		GitHub: &actionsv1alpha1.GitHubWorkflowRunSource{
 			Repository: actionsv1alpha1.GitHubRepository{ID: 1},
-			Event:      actionsv1alpha1.GitHubEvent{Name: "push", DeliveryID: "delivery"},
-			Revision:   actionsv1alpha1.GitRevision{SHA: strings.Repeat("a", 40), Ref: "refs/heads/main"},
+			Event:      actionsv1alpha1.GitHubEvent{Name: "pull_request", Action: "synchronize", DeliveryID: "delivery"},
+			Revision:   actionsv1alpha1.GitRevision{SHA: strings.Repeat("a", 40), Ref: "refs/pull/1/merge", HeadRef: "feature", BaseRef: "main"},
 		},
 	}}}
 	definition := &workflow.Definition{Name: "CI", Jobs: map[string]workflow.Job{
-		"build": {Name: "Build and test", RunsOn: workflow.StringList{"ubuntu-latest"}},
+		"build": {Name: "Build ${{ github.base_ref }}", RunsOn: workflow.StringList{"ubuntu-latest"}},
 		"lint":  {RunsOn: workflow.StringList{"ubuntu-latest"}},
 	}}
 
@@ -88,11 +88,21 @@ func TestPlanWorkflowJobsSetsDisplayNames(t *testing.T) {
 	if len(planned) != 2 {
 		t.Fatalf("planned jobs = %d, want 2", len(planned))
 	}
-	if planned[0].id != "build" || planned[0].displayName != "Build and test" {
+	if planned[0].id != "build" || planned[0].displayName != "Build main" {
 		t.Errorf("build job = %#v", planned[0])
 	}
 	if planned[1].id != "lint" || planned[1].displayName != "lint" {
 		t.Errorf("lint job = %#v", planned[1])
+	}
+}
+
+func TestWorkflowEventIncludesRevisionValues(t *testing.T) {
+	event := workflowEvent(&actionsv1alpha1.GitHubWorkflowRunSource{
+		Event:    actionsv1alpha1.GitHubEvent{Name: "push", Action: "created"},
+		Revision: actionsv1alpha1.GitRevision{Ref: "refs/heads/main", HeadRef: "feature", BaseRef: "target"},
+	})
+	if event.Name != "push" || event.Action != "created" || event.Ref != "refs/heads/main" || event.RefName != "main" || event.HeadRef != "feature" || event.BaseRef != "target" {
+		t.Fatalf("workflow event = %#v", event)
 	}
 }
 

@@ -11,6 +11,8 @@ import (
 	"strings"
 
 	"github.com/kelos-dev/open-actions/internal/actionref"
+	workflowexpression "github.com/kelos-dev/open-actions/internal/expression"
+	"github.com/kelos-dev/open-actions/internal/workflow"
 )
 
 const (
@@ -79,7 +81,7 @@ func validateComposite(definition actionDefinition) error {
 	return nil
 }
 
-func (e *Executor) runComposite(ctx context.Context, state *executionState, invocation *actionInvocation, depth int) (map[string]string, error) {
+func (e *Executor) runComposite(ctx context.Context, state *executionState, invocation *actionInvocation, depth int, cancelled bool) (map[string]string, error) {
 	if depth > maxCompositeDepth {
 		return nil, fmt.Errorf("composite action nesting exceeds %d levels", maxCompositeDepth)
 	}
@@ -100,17 +102,31 @@ func (e *Executor) runComposite(ctx context.Context, state *executionState, invo
 	compositeFailed := false
 	var compositeError error
 	for index, rawStep := range invocation.definition.Runs.Steps {
-		runStep, err := compositeCondition(rawStep.If, !compositeFailed, compositeContext)
+		cancelled = cancelled || ctx.Err() != nil
+		runStep, err := compositeCondition(rawStep.If, rawStep.Env, compositeFailed, cancelled, compositeContext)
 		if err != nil {
 			return nil, fmt.Errorf("composite step %d condition: %w", index+1, err)
 		}
 		if !runStep {
 			continue
 		}
-		step, continueOnError, err := resolveCompositeStep(rawStep, compositeContext)
+		stepEnvironment, err := resolveCompositeMap(rawStep.Env, compositeContext)
+		if err != nil {
+			return nil, fmt.Errorf("composite step %d environment: %w", index+1, err)
+		}
+		stepContext := compositeContextWithEnvironment(compositeContext, stepEnvironment)
+		step, continueOnError, err := resolveCompositeStep(rawStep, stepEnvironment, stepContext)
 		if err != nil {
 			return nil, fmt.Errorf("composite step %d: %w", index+1, err)
 		}
+		stepBytes, err := resolvedStepBytes(step)
+		if err != nil {
+			return nil, fmt.Errorf("composite step %d: %w", index+1, err)
+		}
+		if state.resolvedContent+stepBytes > workflow.MaxJobContentBytes {
+			return nil, fmt.Errorf("composite step %d: evaluated job configuration exceeds %d bytes", index+1, workflow.MaxJobContentBytes)
+		}
+		state.resolvedContent += stepBytes
 		step.Env = mergeEnvironment(invocation.step.Env, step.Env)
 		name := step.Name
 		if name == "" {
@@ -121,10 +137,12 @@ func (e *Executor) runComposite(ctx context.Context, state *executionState, invo
 		}
 		e.logger.Info("starting composite step", "action", invocation.step.Uses, "step", index+1, "name", name)
 		var outputs map[string]string
+		cancelledBeforeCommand := ctx.Err() != nil
+		commandContext := executionContext(ctx)
 		if step.Uses != "" {
-			outputs, err = e.executeAction(ctx, state, step, depth)
+			outputs, err = e.executeAction(commandContext, state, step, depth, cancelled)
 		} else {
-			outputs, err = e.runCompositeScript(ctx, state, invocation, step)
+			outputs, err = e.runCompositeScript(commandContext, state, invocation, step)
 		}
 		if rawStep.ID != "" && outputs != nil {
 			compositeContext.stepOutput[rawStep.ID] = outputs
@@ -134,7 +152,10 @@ func (e *Executor) runComposite(ctx context.Context, state *executionState, invo
 				e.logger.Warn("composite step failed with continue-on-error", "action", invocation.step.Uses, "step", index+1, "name", name, "error", e.masker.mask(err.Error()))
 				continue
 			}
-			compositeFailed = true
+			cancelledDuringCommand := !cancelledBeforeCommand && ctx.Err() != nil
+			if !cancelledDuringCommand {
+				compositeFailed = true
+			}
 			compositeError = errors.Join(compositeError, fmt.Errorf("composite step %d (%s): %w", index+1, name, err))
 			continue
 		}
@@ -185,30 +206,39 @@ func (e *Executor) runCompositeScript(ctx context.Context, state *executionState
 	return updates.outputs, executionError
 }
 
-func resolveCompositeStep(step compositeStep, compositeContext *compositeContext) (Step, bool, error) {
+func resolveCompositeStep(step compositeStep, environment map[string]string, compositeContext *compositeContext) (Step, bool, error) {
 	resolved := Step{Name: step.Name, Uses: step.Uses, Run: step.Run, WorkingDirectory: step.WorkingDirectory}
 	var err error
-	for field, value := range map[string]*string{
-		"name": &resolved.Name, "uses": &resolved.Uses, "run": &resolved.Run, "working-directory": &resolved.WorkingDirectory,
+	for _, field := range []struct {
+		name   string
+		target *string
+	}{
+		{name: "name", target: &resolved.Name},
+		{name: "uses", target: &resolved.Uses},
+		{name: "run", target: &resolved.Run},
+		{name: "working-directory", target: &resolved.WorkingDirectory},
 	} {
-		*value, err = resolveCompositeExpressions(*value, compositeContext)
+		*field.target, err = resolveCompositeExpressions(*field.target, compositeContext)
 		if err != nil {
-			return Step{}, false, fmt.Errorf("resolve %s: %w", field, err)
+			return Step{}, false, fmt.Errorf("resolve %s: %w", field.name, err)
 		}
 	}
 	resolved.With, err = resolveCompositeMap(step.With, compositeContext)
 	if err != nil {
 		return Step{}, false, fmt.Errorf("resolve with: %w", err)
 	}
-	resolved.Env, err = resolveCompositeMap(step.Env, compositeContext)
-	if err != nil {
-		return Step{}, false, fmt.Errorf("resolve env: %w", err)
-	}
+	resolved.Env = environment
 	continueOnError, err := resolveCompositeBoolean(step.ContinueOnError, compositeContext)
 	if err != nil {
 		return Step{}, false, fmt.Errorf("resolve continue-on-error: %w", err)
 	}
 	return resolved, continueOnError, nil
+}
+
+func compositeContextWithEnvironment(base *compositeContext, environment map[string]string) *compositeContext {
+	result := *base
+	result.scopedEnvironment = mergeEnvironment(base.scopedEnvironment, environment)
+	return &result
 }
 
 func resolveCompositeMap(values map[string]any, compositeContext *compositeContext) (map[string]string, error) {
@@ -224,6 +254,9 @@ func resolveCompositeMap(values map[string]any, compositeContext *compositeConte
 		value, err = resolveCompositeExpressions(value, compositeContext)
 		if err != nil {
 			return nil, fmt.Errorf("value %q: %w", name, err)
+		}
+		if len(value) > workflow.MaxMapValueBytes {
+			return nil, fmt.Errorf("value %q exceeds %d evaluated bytes", name, workflow.MaxMapValueBytes)
 		}
 		result[name] = value
 	}
@@ -247,101 +280,36 @@ func resolveCompositeBoolean(value any, compositeContext *compositeContext) (boo
 	}
 	boolean, err := strconv.ParseBool(strings.TrimSpace(text))
 	if err != nil {
-		return false, fmt.Errorf("value %q must evaluate to a boolean", text)
+		return false, errors.New("value must evaluate to a boolean")
 	}
 	return boolean, nil
 }
 
-func compositeCondition(value string, successful bool, compositeContext *compositeContext) (bool, error) {
-	condition := strings.TrimSpace(value)
-	if strings.HasPrefix(condition, "${{") && strings.HasSuffix(condition, "}}") {
-		condition = strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(condition, "${{"), "}}"))
+func compositeCondition(value string, environment map[string]any, failed, cancelled bool, compositeContext *compositeContext) (bool, error) {
+	if strings.TrimSpace(value) == "" {
+		return !failed && !cancelled, nil
 	}
-	switch condition {
-	case "", "success()":
-		return successful, nil
-	case "always()":
-		return true, nil
-	case "failure()":
-		return !successful, nil
-	case "true":
-		return true, nil
-	case "false":
-		return false, nil
-	}
-	resolved, err := resolveCompositeExpression(condition, compositeContext)
-	if err != nil {
-		return false, err
-	}
-	boolean, err := strconv.ParseBool(strings.TrimSpace(resolved))
-	if err != nil {
-		return false, fmt.Errorf("condition %q must evaluate to a boolean", value)
-	}
-	return boolean, nil
+	status := workflowStepStatus(failed, cancelled)
+	context := compositeExpressionContext(compositeContext, compositeConditionAvailability, &status)
+	baseEnvironment := context.Values["env"].(map[string]any)
+	context.Values["env"] = workflowexpression.DeferredObject(func(name string) (any, bool, error) {
+		if rawValue, found := anyMapValue(environment, name); found {
+			input, err := inputString(rawValue)
+			if err != nil {
+				return nil, true, err
+			}
+			resolved, err := resolveCompositeExpressions(input, compositeContext)
+			return resolved, true, err
+		}
+		resolved, found := anyMapValue(baseEnvironment, name)
+		return resolved, found, nil
+	})
+	return evaluateCondition(value, context, status.Success)
 }
 
 func resolveCompositeExpressions(value string, compositeContext *compositeContext) (string, error) {
-	var expressionError error
-	result := compositeExpressionPattern.ReplaceAllStringFunc(value, func(match string) string {
-		expression := strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(match, "${{"), "}}"))
-		resolved, err := resolveCompositeExpression(expression, compositeContext)
-		if err != nil {
-			expressionError = err
-			return ""
-		}
-		return resolved
-	})
-	if expressionError != nil {
-		return "", expressionError
-	}
-	if strings.Contains(result, "${{") {
-		return "", fmt.Errorf("invalid composite expression in %q", value)
-	}
-	return result, nil
-}
-
-func resolveCompositeExpression(expression string, compositeContext *compositeContext) (string, error) {
-	if name, found := strings.CutPrefix(expression, "inputs."); found {
-		return compositeContext.inputs[strings.ToLower(name)], nil
-	}
-	if rest, found := strings.CutPrefix(expression, "steps."); found {
-		id, output, found := strings.Cut(rest, ".outputs.")
-		if !found || id == "" || output == "" {
-			return "", fmt.Errorf("invalid steps expression %q", expression)
-		}
-		return compositeContext.stepOutput[id][output], nil
-	}
-	switch expression {
-	case "github.action_path":
-		return compositeContext.actionPath, nil
-	case "github.workspace":
-		return compositeContext.state.workspace, nil
-	case "github.repository":
-		return compositeContext.state.plan.Repository.Owner + "/" + compositeContext.state.plan.Repository.Name, nil
-	case "github.sha":
-		return compositeContext.state.plan.Revision.SHA, nil
-	case "github.ref":
-		return compositeContext.state.plan.Revision.Ref, nil
-	case "github.ref_name":
-		return compositeContext.state.plan.Revision.RefName, nil
-	case "github.head_ref":
-		return compositeContext.state.plan.Revision.HeadRef, nil
-	case "github.event_name":
-		return compositeContext.state.plan.Event.Name, nil
-	case "github.workflow":
-		return compositeContext.state.plan.WorkflowName, nil
-	case "runner.os":
-		return environmentValue(compositeContext.state.environment, "RUNNER_OS"), nil
-	case "runner.arch":
-		return environmentValue(compositeContext.state.environment, "RUNNER_ARCH"), nil
-	case "runner.temp":
-		return environmentValue(compositeContext.state.environment, "RUNNER_TEMP"), nil
-	}
-	if name, found := strings.CutPrefix(expression, "env."); found {
-		environment := appendEnvironment(append([]string(nil), compositeContext.state.environment...), compositeContext.scopedEnvironment)
-		return environmentValue(environment, name), nil
-	}
-	return "", fmt.Errorf("unsupported composite expression %q", expression)
+	context := compositeExpressionContext(compositeContext, compositeAvailability, nil)
+	return resolveExpressionString(value, context)
 }
 
 func applyEnvironmentUpdates(environment *[]string, updates commandUpdates) {
@@ -380,6 +348,5 @@ func compositeKey(invocation *actionInvocation) string {
 }
 
 var (
-	compositeExpressionPattern = regexp.MustCompile(`\$\{\{[^{}]+}}`)
-	compositeStepIDPattern     = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_-]*$`)
+	compositeStepIDPattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_-]*$`)
 )

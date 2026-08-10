@@ -22,4 +22,5 @@ spec:
         sha: 0123456789abcdef0123456789abcdef01234567
         ref: refs/pull/42/merge
         headRef: feature-branch
+        baseRef: main
   workflowPath: .open-actions/workflows/ci.yaml

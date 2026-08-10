@@ -72,6 +72,7 @@ type WorkflowRunSource struct {
 // GitHubWorkflowRunSource identifies the GitHub content and delivery that
 // requested a WorkflowRun.
 // +kubebuilder:validation:XValidation:rule="self.event.name == 'pull_request' ? has(self.revision.headRef) : !has(self.revision.headRef)",message="revision.headRef must be specified exactly for pull_request events"
+// +kubebuilder:validation:XValidation:rule="!has(self.revision.baseRef) || self.event.name in ['pull_request', 'merge_group']",message="revision.baseRef may be specified only for pull_request and merge_group events"
 // +kubebuilder:validation:XValidation:rule="self.event.name != 'push' || self.revision.ref.startsWith('refs/heads/') || self.revision.ref.startsWith('refs/tags/')",message="push revision.ref must identify a branch or tag"
 // +kubebuilder:validation:XValidation:rule="self.event.name != 'pull_request' || self.revision.ref.matches('^refs/pull/[1-9][0-9]*/merge$') || (self.event.action == 'closed' && self.revision.ref.startsWith('refs/heads/'))",message="pull_request revision.ref must identify its merge ref, or its base branch when merged and closed"
 // +kubebuilder:validation:XValidation:rule="self.event.name != 'merge_group' || self.revision.ref.startsWith('refs/heads/gh-readonly-queue/')",message="merge_group revision.ref must identify a merge queue branch"
@@ -166,6 +167,15 @@ type GitRevision struct {
 	// +kubebuilder:validation:XValidation:rule="!self.startsWith('/') && !self.startsWith('.') && !self.startsWith('refs/') && !self.endsWith('/') && !self.contains('//') && !self.contains('..') && !self.contains('/.') && !self.endsWith('.') && !self.contains('.lock/') && !self.endsWith('.lock') && !self.contains('@{') && !self.matches('^[0-9A-Fa-f]{40}$')",message="must be a well-formed GitHub branch name"
 	// +optional
 	HeadRef string `json:"headRef,omitempty"`
+
+	// BaseRef is the target branch name for pull request and merge group events,
+	// when applicable.
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=255
+	// +kubebuilder:validation:Pattern=`^[^\x00-\x20\x7f~^:?*\[\\]+$`
+	// +kubebuilder:validation:XValidation:rule="!self.startsWith('/') && !self.startsWith('.') && !self.startsWith('refs/') && !self.endsWith('/') && !self.contains('//') && !self.contains('..') && !self.contains('/.') && !self.endsWith('.') && !self.contains('.lock/') && !self.endsWith('.lock') && !self.contains('@{') && !self.matches('^[0-9A-Fa-f]{40}$')",message="must be a well-formed GitHub branch name"
+	// +optional
+	BaseRef string `json:"baseRef,omitempty"`
 }
 
 // WorkflowRunJobStatus summarizes native child Jobs without embedding a list

@@ -508,7 +508,22 @@ func TestCRDRejectsInvalidCELValues(t *testing.T) {
 				event := github["event"].(map[string]any)
 				event["name"] = "push"
 				delete(event, "action")
-				github["revision"].(map[string]any)["ref"] = "refs/heads/main"
+				revision := github["revision"].(map[string]any)
+				revision["ref"] = "refs/heads/main"
+				delete(revision, "baseRef")
+			},
+		},
+		{
+			name: "WorkflowRun push with base branch",
+			crd:  "actions.kelos.dev_workflowruns.yaml", sample: "actions_v1alpha1_workflowrun.yaml",
+			mutate: func(object map[string]any) {
+				github := workflowRunGitHub(object)
+				event := github["event"].(map[string]any)
+				event["name"] = "push"
+				delete(event, "action")
+				revision := github["revision"].(map[string]any)
+				revision["ref"] = "refs/heads/main"
+				delete(revision, "headRef")
 			},
 		},
 		{
@@ -537,6 +552,13 @@ func TestCRDRejectsInvalidCELValues(t *testing.T) {
 			crd:  "actions.kelos.dev_workflowruns.yaml", sample: "actions_v1alpha1_workflowrun.yaml",
 			mutate: func(object map[string]any) {
 				workflowRunGitHub(object)["revision"].(map[string]any)["headRef"] = strings.Repeat("a", 40)
+			},
+		},
+		{
+			name: "WorkflowRun malformed base branch",
+			crd:  "actions.kelos.dev_workflowruns.yaml", sample: "actions_v1alpha1_workflowrun.yaml",
+			mutate: func(object map[string]any) {
+				workflowRunGitHub(object)["revision"].(map[string]any)["baseRef"] = "main..backup"
 			},
 		},
 		{

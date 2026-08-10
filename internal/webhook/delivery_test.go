@@ -263,6 +263,9 @@ func TestDeliveryPinsCurrentPullRequestMergeRevision(t *testing.T) {
 	if got := runs.Items[0].Spec.Source.GitHub.Revision.SHA; got != mergeSHA {
 		t.Fatalf("WorkflowRun revision = %q, want pinned revision %q", got, mergeSHA)
 	}
+	if got := runs.Items[0].Spec.Source.GitHub.Revision.BaseRef; got != "main" {
+		t.Fatalf("WorkflowRun base ref = %q, want main", got)
+	}
 }
 
 func TestDeliveryTimesOutWhenPullRequestMergeRefIsUnavailable(t *testing.T) {

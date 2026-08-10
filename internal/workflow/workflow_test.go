@@ -6,6 +6,8 @@ import (
 	"slices"
 	"strings"
 	"testing"
+
+	workflowexpression "github.com/kelos-dev/open-actions/internal/expression"
 )
 
 func TestParseCIWorkflow(t *testing.T) {
@@ -179,22 +181,21 @@ func TestEvaluateConcurrencyUsesRefNameFallback(t *testing.T) {
 	}
 }
 
-func TestEvaluateConcurrencyRejectsUnavailableHeadRef(t *testing.T) {
-	for _, tt := range []struct {
-		name  string
-		group string
-		event Event
-	}{
-		{name: "push", group: "${{ github.head_ref }}", event: Event{Name: "push", RefName: "main"}},
-		{name: "prefixed push", group: "deploy-${{ github.head_ref }}", event: Event{Name: "push", RefName: "main"}},
-		{name: "merge group", group: "${{ github.head_ref }}", event: Event{Name: "merge_group", RefName: "gh-readonly-queue/main/pr-1"}},
-	} {
-		t.Run(tt.name, func(t *testing.T) {
-			definition := &Definition{Name: "CI", Concurrency: Concurrency{Group: tt.group}}
-			if _, _, err := EvaluateConcurrency(definition, tt.event); err == nil {
-				t.Fatal("EvaluateConcurrency() accepted unavailable github.head_ref")
-			}
-		})
+func TestEvaluateConcurrencyUsesEmptyStringForMissingProperty(t *testing.T) {
+	definition := &Definition{Name: "CI", Concurrency: Concurrency{Group: "deploy-${{ github.head_ref }}"}}
+	group, _, err := EvaluateConcurrency(definition, Event{Name: "push", RefName: "main"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if group != "deploy-" {
+		t.Fatalf("group = %q, want deploy-", group)
+	}
+}
+
+func TestEvaluateConcurrencyRejectsEmptyEvaluatedGroup(t *testing.T) {
+	definition := &Definition{Name: "CI", Concurrency: Concurrency{Group: "${{ github.head_ref }}"}}
+	if _, _, err := EvaluateConcurrency(definition, Event{Name: "push", RefName: "main"}); err == nil {
+		t.Fatal("EvaluateConcurrency() accepted an empty evaluated group")
 	}
 }
 
@@ -217,6 +218,41 @@ func TestParseAcceptsRunsOnLabels(t *testing.T) {
 	got := []string(definition.Jobs["build"].RunsOn)
 	if !slices.Equal(got, want) {
 		t.Errorf("runs-on = %v, want %v", got, want)
+	}
+}
+
+func TestEvaluateJobResolvesPlanningExpressions(t *testing.T) {
+	job := Job{
+		Name:   "Build ${{ github.ref_name }}",
+		RunsOn: StringList{"${{ github.ref_name == 'main' && 'Ubuntu-Latest' || 'self-hosted' }}"},
+	}
+	main, err := EvaluateJob("build", job, workflowexpression.Context{
+		Availability: workflowexpression.NewAvailability("github"),
+		Values:       map[string]any{"github": map[string]any{"ref_name": "main"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	feature, err := EvaluateJob("build", job, workflowexpression.Context{
+		Availability: workflowexpression.NewAvailability("github"),
+		Values:       map[string]any{"github": map[string]any{"ref_name": "feature"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if main.Name != "Build main" || len(main.RunsOn) != 1 || main.RunsOn[0] != "ubuntu-latest" {
+		t.Fatalf("main job = %#v", main)
+	}
+	if feature.Name != "Build feature" || len(feature.RunsOn) != 1 || feature.RunsOn[0] != "self-hosted" {
+		t.Fatalf("feature job = %#v", feature)
+	}
+}
+
+func TestEvaluateJobRejectsUnavailablePlanningContext(t *testing.T) {
+	job := Job{RunsOn: StringList{"${{ matrix.arch }}"}}
+	_, err := EvaluateJob("build", job, workflowexpression.Context{Availability: workflowexpression.NewAvailability("github")})
+	if err == nil || !strings.Contains(err.Error(), `context "matrix" is unavailable`) {
+		t.Fatalf("error = %v, want unavailable matrix context", err)
 	}
 }
 
@@ -288,7 +324,7 @@ func TestParseRejectsUnknownField(t *testing.T) {
 	}
 }
 
-func TestParseRejectsUnsupportedWorkflowExpressions(t *testing.T) {
+func TestParseAcceptsWorkflowExpressions(t *testing.T) {
 	tests := []struct {
 		name string
 		job  string
@@ -298,12 +334,40 @@ func TestParseRejectsUnsupportedWorkflowExpressions(t *testing.T) {
 		{name: "action input", job: "    steps:\n      - uses: actions/example@v1\n        with:\n          value: '${{ github.sha }}'\n"},
 		{name: "run script", job: "    steps:\n      - run: 'echo ${{ github.sha }}'\n"},
 		{name: "working directory", job: "    steps:\n      - run: echo test\n        working-directory: '${{ github.workspace }}'\n"},
+		{name: "step condition", job: "    steps:\n      - run: echo test\n        if: github.ref_name == 'main'\n"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			data := []byte("name: CI\non: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n" + tt.job)
-			if _, err := Parse(data); err == nil {
-				t.Fatal("Parse() accepted an unsupported workflow expression")
+			if _, err := Parse(data); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestParseRejectsInvalidOrUnavailableWorkflowExpressions(t *testing.T) {
+	tests := []struct {
+		name string
+		data string
+	}{
+		{
+			name: "unclosed expression",
+			data: "name: CI\non: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: 'echo ${{ github.sha'\n",
+		},
+		{
+			name: "secret in condition",
+			data: "name: CI\non: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo test\n        if: secrets.TOKEN\n",
+		},
+		{
+			name: "secret in concurrency",
+			data: "name: CI\non: push\nconcurrency: '${{ secrets.TOKEN }}'\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo test\n",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if _, err := Parse([]byte(tt.data)); err == nil {
+				t.Fatal("Parse() accepted an invalid workflow expression")
 			}
 		})
 	}
@@ -411,10 +475,12 @@ func TestParseEnforcesWorkflowConfigurationBounds(t *testing.T) {
 	}{
 		{name: "workflow bytes", data: strings.Repeat("x", maxWorkflowBytes+1)},
 		{name: "steps", data: base + strings.Repeat("      - run: true\n", maxSteps+1)},
-		{name: "run script", data: base + "      - run: " + strings.Repeat("x", maxRunScriptBytes+1) + "\n"},
-		{name: "working directory", data: base + "      - run: true\n        working-directory: " + strings.Repeat("x", maxWorkingDirectoryLength+1) + "\n"},
-		{name: "step name", data: base + "      - name: " + strings.Repeat("x", maxStepNameLength+1) + "\n        run: true\n"},
+		{name: "run script", data: base + "      - run: " + strings.Repeat("x", MaxRunScriptBytes+1) + "\n"},
+		{name: "working directory", data: base + "      - run: true\n        working-directory: " + strings.Repeat("x", MaxWorkingDirectoryLength+1) + "\n"},
+		{name: "step name", data: base + "      - name: " + strings.Repeat("x", MaxStepNameLength+1) + "\n        run: true\n"},
+		{name: "condition", data: base + "      - if: ${{ '" + strings.Repeat("x", MaxConditionBytes+1) + "' }}\n        run: true\n"},
 		{name: "aggregate job content", data: base + "      - run: " + strings.Repeat("x", 60_000) + "\n      - run: " + strings.Repeat("x", 60_000) + "\n"},
+		{name: "condition aggregate content", data: base + "      - if: ${{ '" + strings.Repeat("x", 50_000) + "' }}\n        run: " + strings.Repeat("x", 60_000) + "\n"},
 		{name: "branch patterns", data: workflowWithBranchPatterns(maxBranchPatterns + 1)},
 		{name: "environment entries", data: workflowWithEnvironment(maxMapEntries + 1)},
 	}

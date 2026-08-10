@@ -1,0 +1,267 @@
+package runner
+
+import (
+	"fmt"
+	"strings"
+	"unicode/utf8"
+
+	workflowexpression "github.com/kelos-dev/open-actions/internal/expression"
+	"github.com/kelos-dev/open-actions/internal/workflow"
+)
+
+var (
+	runnerJobAvailability          = workflowexpression.NewAvailability("github")
+	runnerStepAvailability         = workflowexpression.NewAvailability("github", "runner", "env")
+	runnerConditionAvailability    = workflowexpression.NewAvailability("github", "runner", "env").WithStatusFunctions()
+	compositeAvailability          = workflowexpression.NewAvailability("github", "runner", "env", "inputs", "steps")
+	compositeConditionAvailability = workflowexpression.NewAvailability("github", "runner", "env", "inputs", "steps").WithStatusFunctions()
+)
+
+func resolveJobEnvironment(values map[string]string, plan *Plan, environment []string, token string) (map[string]string, error) {
+	return resolveExpressionMap(values, expressionContext(plan, environment, "", nil, runnerJobAvailability, nil, token))
+}
+
+func resolveActionDefaultExpression(input string, plan *Plan, environment []string, token string) (string, error) {
+	context := expressionContext(plan, environment, "", nil, runnerJobAvailability, nil, token)
+	return resolveExpressionString(input, context)
+}
+
+func resolveWorkflowStepEnvironment(step Step, state *executionState) (map[string]string, error) {
+	context := expressionContext(state.plan, state.environment, "", nil, runnerStepAvailability, nil, state.githubToken)
+	return resolveExpressionMap(step.Env, context)
+}
+
+func resolveWorkflowStep(step Step, environment map[string]string, state *executionState) (Step, error) {
+	stepEnvironment := appendEnvironment(append([]string(nil), state.environment...), environment)
+	context := expressionContext(state.plan, stepEnvironment, "", nil, runnerStepAvailability, nil, state.githubToken)
+	resolved := step
+	var err error
+	for _, field := range []struct {
+		name   string
+		target *string
+	}{
+		{name: "name", target: &resolved.Name},
+		{name: "run", target: &resolved.Run},
+		{name: "working-directory", target: &resolved.WorkingDirectory},
+	} {
+		*field.target, err = resolveExpressionString(*field.target, context)
+		if err != nil {
+			return Step{}, fmt.Errorf("resolve %s: %w", field.name, err)
+		}
+	}
+	resolved.With, err = resolveExpressionMap(step.With, context)
+	if err != nil {
+		return Step{}, fmt.Errorf("resolve with: %w", err)
+	}
+	resolved.Env = environment
+	return resolved, nil
+}
+
+func workflowStepCondition(input string, environment map[string]string, status workflowexpression.Status, state *executionState) (bool, error) {
+	if strings.TrimSpace(input) == "" {
+		return status.Success, nil
+	}
+	context := expressionContext(state.plan, state.environment, "", nil, runnerConditionAvailability, &status, state.githubToken)
+	environmentContext := expressionContext(state.plan, state.environment, "", nil, runnerStepAvailability, nil, state.githubToken)
+	baseEnvironment := context.Values["env"].(map[string]any)
+	context.Values["env"] = workflowexpression.DeferredObject(func(name string) (any, bool, error) {
+		if input, found := stringMapValue(environment, name); found {
+			resolved, err := resolveMapExpression(input, environmentContext)
+			return resolved, true, err
+		}
+		value, found := anyMapValue(baseEnvironment, name)
+		return value, found, nil
+	})
+	return evaluateCondition(input, context, status.Success)
+}
+
+func compositeExpressionContext(compositeContext *compositeContext, availability workflowexpression.Availability, status *workflowexpression.Status) workflowexpression.Context {
+	environment := appendEnvironment(append([]string(nil), compositeContext.state.environment...), compositeContext.scopedEnvironment)
+	steps := make(map[string]any, len(compositeContext.stepOutput))
+	for id, outputs := range compositeContext.stepOutput {
+		steps[id] = map[string]any{"outputs": outputs}
+	}
+	values := map[string]any{
+		"inputs": compositeContext.inputs,
+		"steps":  steps,
+	}
+	return expressionContext(compositeContext.state.plan, environment, compositeContext.actionPath, values, availability, status, compositeContext.state.githubToken)
+}
+
+func expressionContext(plan *Plan, environment []string, actionPath string, extra map[string]any, availability workflowexpression.Availability, status *workflowexpression.Status, token string) workflowexpression.Context {
+	github := map[string]any{
+		"workflow":   plan.WorkflowName,
+		"event_name": plan.Event.Name,
+		"event":      githubExpressionEvent(plan),
+		"repository": plan.Repository.Owner + "/" + plan.Repository.Name,
+		"sha":        plan.Revision.SHA,
+		"ref":        plan.Revision.Ref,
+		"ref_name":   plan.Revision.RefName,
+		"head_ref":   plan.Revision.HeadRef,
+		"base_ref":   plan.Revision.BaseRef,
+		"workspace":  environmentValue(environment, "GITHUB_WORKSPACE"),
+		"server_url": strings.TrimSuffix(plan.Repository.ServerURL, "/"),
+		"api_url":    strings.TrimSuffix(plan.Repository.APIURL, "/"),
+		"token":      workflowexpression.Secret(token),
+	}
+	if actionPath != "" {
+		github["action_path"] = actionPath
+	}
+	values := map[string]any{
+		"github": github,
+		"runner": map[string]any{
+			"os":         environmentValue(environment, "RUNNER_OS"),
+			"arch":       environmentValue(environment, "RUNNER_ARCH"),
+			"temp":       environmentValue(environment, "RUNNER_TEMP"),
+			"tool_cache": environmentValue(environment, "RUNNER_TOOL_CACHE"),
+		},
+		"env": environmentContext(environment),
+	}
+	for name, value := range extra {
+		values[name] = value
+	}
+	return workflowexpression.Context{Availability: availability, Values: values, Status: status}
+}
+
+func githubExpressionEvent(plan *Plan) map[string]any {
+	result := map[string]any{"action": plan.Event.Action}
+	switch plan.Event.Name {
+	case "push":
+		result["after"] = plan.Revision.SHA
+		result["ref"] = plan.Revision.Ref
+	case "pull_request":
+		result["pull_request"] = map[string]any{
+			"merge_commit_sha": plan.Revision.SHA,
+			"head":             map[string]any{"ref": plan.Revision.HeadRef},
+		}
+	case "merge_group":
+		result["merge_group"] = map[string]any{
+			"head_sha": plan.Revision.SHA,
+			"head_ref": plan.Revision.Ref,
+		}
+	}
+	return result
+}
+
+func environmentContext(environment []string) map[string]any {
+	result := make(map[string]any, len(environment))
+	for _, entry := range environment {
+		name, value, found := strings.Cut(entry, "=")
+		if found {
+			result[name] = value
+		}
+	}
+	return result
+}
+
+func stringMapValue(values map[string]string, name string) (string, bool) {
+	if value, found := values[name]; found {
+		return value, true
+	}
+	for candidate, value := range values {
+		if strings.EqualFold(candidate, name) {
+			return value, true
+		}
+	}
+	return "", false
+}
+
+func anyMapValue(values map[string]any, name string) (any, bool) {
+	if value, found := values[name]; found {
+		return value, true
+	}
+	for candidate, value := range values {
+		if strings.EqualFold(candidate, name) {
+			return value, true
+		}
+	}
+	return nil, false
+}
+
+func resolveExpressionMap(values map[string]string, context workflowexpression.Context) (map[string]string, error) {
+	if len(values) == 0 {
+		return nil, nil
+	}
+	result := make(map[string]string, len(values))
+	for name, input := range values {
+		resolved, err := resolveMapExpression(input, context)
+		if err != nil {
+			return nil, fmt.Errorf("value %q: %w", name, err)
+		}
+		result[name] = resolved
+	}
+	return result, nil
+}
+
+func resolveMapExpression(input string, context workflowexpression.Context) (string, error) {
+	resolved, err := resolveExpressionString(input, context)
+	if err != nil {
+		return "", err
+	}
+	if len(resolved) > workflow.MaxMapValueBytes {
+		return "", fmt.Errorf("evaluated value exceeds %d bytes", workflow.MaxMapValueBytes)
+	}
+	return resolved, nil
+}
+
+func resolvedMapBytes(field string, values map[string]string) (int, error) {
+	total := 0
+	for name, value := range values {
+		if len(value) > workflow.MaxMapValueBytes {
+			return 0, fmt.Errorf("%s value %q exceeds %d bytes", field, name, workflow.MaxMapValueBytes)
+		}
+		total += len(name) + len(value)
+	}
+	return total, nil
+}
+
+func resolvedStepBytes(step Step) (int, error) {
+	if utf8.RuneCountInString(step.Name) > workflow.MaxStepNameLength {
+		return 0, fmt.Errorf("evaluated name exceeds %d characters", workflow.MaxStepNameLength)
+	}
+	if utf8.RuneCountInString(step.Uses) > workflow.MaxActionReferenceLength {
+		return 0, fmt.Errorf("evaluated action reference exceeds %d characters", workflow.MaxActionReferenceLength)
+	}
+	if len(step.Run) > workflow.MaxRunScriptBytes {
+		return 0, fmt.Errorf("evaluated run script exceeds %d bytes", workflow.MaxRunScriptBytes)
+	}
+	if utf8.RuneCountInString(step.WorkingDirectory) > workflow.MaxWorkingDirectoryLength {
+		return 0, fmt.Errorf("evaluated working-directory exceeds %d characters", workflow.MaxWorkingDirectoryLength)
+	}
+	withBytes, err := resolvedMapBytes("evaluated with", step.With)
+	if err != nil {
+		return 0, err
+	}
+	environmentBytes, err := resolvedMapBytes("evaluated environment", step.Env)
+	if err != nil {
+		return 0, err
+	}
+	return len(step.Name) + len(step.Uses) + len(step.Run) + len(step.WorkingDirectory) + len(step.If) + withBytes + environmentBytes, nil
+}
+
+func resolveExpressionString(input string, context workflowexpression.Context) (string, error) {
+	program, err := workflowexpression.Parse(input)
+	if err != nil {
+		return "", err
+	}
+	result, err := program.Evaluate(context)
+	if err != nil {
+		return "", err
+	}
+	return result.String()
+}
+
+func evaluateCondition(input string, context workflowexpression.Context, successful bool) (bool, error) {
+	program, err := workflowexpression.ParseCondition(input)
+	if err != nil {
+		return false, err
+	}
+	if !program.UsesStatusFunction() && !successful {
+		return false, nil
+	}
+	result, err := program.Evaluate(context)
+	if err != nil {
+		return false, err
+	}
+	return result.Bool(), nil
+}

@@ -15,11 +15,15 @@ import (
 	"runtime"
 	"strings"
 	"sync/atomic"
+
+	"github.com/kelos-dev/open-actions/internal/expression"
+	"github.com/kelos-dev/open-actions/internal/workflow"
 )
 
 const (
-	PlanVersion   = 1
-	ContainerName = "runner"
+	minimumPlanVersion = 1
+	PlanVersion        = 2
+	ContainerName      = "runner"
 )
 
 type Plan struct {
@@ -53,6 +57,7 @@ type Revision struct {
 	Ref     string `json:"ref"`
 	RefName string `json:"refName"`
 	HeadRef string `json:"headRef,omitempty"`
+	BaseRef string `json:"baseRef,omitempty"`
 }
 
 type Step struct {
@@ -62,6 +67,7 @@ type Step struct {
 	WorkingDirectory string            `json:"workingDirectory,omitempty"`
 	With             map[string]string `json:"with,omitempty"`
 	Env              map[string]string `json:"env,omitempty"`
+	If               string            `json:"if,omitempty"`
 }
 
 type ExecutorConfig struct {
@@ -87,9 +93,11 @@ type executionState struct {
 	workspace          string
 	temporaryDirectory string
 	environment        []string
+	githubToken        string
 	resolver           *actionResolver
 	posts              []*actionInvocation
 	compositeStack     map[string]bool
+	resolvedContent    int
 }
 
 func NewExecutor(config ExecutorConfig) (*Executor, error) {
@@ -122,7 +130,7 @@ func LoadPlan(path string) (*Plan, error) {
 	if err := decoder.Decode(&struct{}{}); err != io.EOF {
 		return nil, errors.New("decode job plan: trailing JSON value")
 	}
-	if plan.Version != PlanVersion {
+	if plan.Version < minimumPlanVersion || plan.Version > PlanVersion {
 		return nil, fmt.Errorf("unsupported job plan version %d", plan.Version)
 	}
 	if plan.Repository.ID < 1 || plan.Repository.Owner == "" || plan.Repository.Name == "" || plan.Repository.ServerURL == "" || plan.Repository.APIURL == "" || plan.Repository.ActionCloneBaseURL == "" || plan.Event.Name == "" || plan.Event.DeliveryID == "" || plan.Revision.SHA == "" || plan.Revision.Ref == "" || plan.Revision.RefName == "" || plan.WorkflowName == "" || plan.JobID == "" || len(plan.Steps) == 0 {
@@ -166,6 +174,7 @@ func (e *Executor) executePlan(ctx context.Context, plan *Plan, workspace string
 		"CI=true",
 		"GITHUB_ACTIONS=true",
 		"GITHUB_API_URL="+strings.TrimSuffix(plan.Repository.APIURL, "/"),
+		"GITHUB_BASE_REF="+plan.Revision.BaseRef,
 		"GITHUB_EVENT_ACTION="+plan.Event.Action,
 		"GITHUB_EVENT_NAME="+plan.Event.Name,
 		"GITHUB_EVENT_PATH="+eventPath,
@@ -183,35 +192,107 @@ func (e *Executor) executePlan(ctx context.Context, plan *Plan, workspace string
 		"RUNNER_TEMP="+filepath.Join(temporaryDirectory, "temp"),
 		"RUNNER_TOOL_CACHE="+filepath.Join(temporaryDirectory, "tool-cache"),
 	)
-	environment = appendEnvironment(environment, plan.Env)
+	jobEnvironment, err := resolveJobEnvironment(plan.Env, plan, environment, e.githubToken)
+	if err != nil {
+		return fmt.Errorf("resolve job environment: %w", err)
+	}
+	jobContentBytes, err := resolvedMapBytes("evaluated job environment", jobEnvironment)
+	if err != nil {
+		return err
+	}
+	if jobContentBytes > workflow.MaxJobContentBytes {
+		return fmt.Errorf("evaluated job configuration exceeds %d bytes", workflow.MaxJobContentBytes)
+	}
+	environment = appendEnvironment(environment, jobEnvironment)
 	state := &executionState{
 		plan:               plan,
 		workspace:          workspace,
 		temporaryDirectory: temporaryDirectory,
 		environment:        environment,
+		githubToken:        e.githubToken,
 		resolver:           newActionResolver(plan.Repository.ActionCloneBaseURL, filepath.Join(temporaryDirectory, "actions"), environment, e.executeCommand),
 		compositeStack:     map[string]bool{},
+		resolvedContent:    jobContentBytes,
 	}
 
-	for index, step := range plan.Steps {
+	failed := false
+	var executionErrors error
+	for index, rawStep := range plan.Steps {
+		status := workflowStepStatus(failed, ctx.Err() != nil)
+		runStep, err := workflowStepCondition(rawStep.If, rawStep.Env, status, state)
+		if err != nil {
+			executionErrors = errors.Join(executionErrors, fmt.Errorf("step %d condition: %w", index+1, err))
+			failed = true
+			continue
+		}
+		if !runStep {
+			e.logger.Info("skipping workflow step", "job", plan.JobID, "step", index+1, "name", rawStep.Name)
+			continue
+		}
+		stepEnvironment, err := resolveWorkflowStepEnvironment(rawStep, state)
+		if err != nil {
+			executionErrors = errors.Join(executionErrors, fmt.Errorf("step %d resolve env: %w", index+1, err))
+			failed = true
+			continue
+		}
+		step, err := resolveWorkflowStep(rawStep, stepEnvironment, state)
+		if err != nil {
+			executionErrors = errors.Join(executionErrors, fmt.Errorf("step %d: %w", index+1, err))
+			failed = true
+			continue
+		}
+		stepBytes, err := resolvedStepBytes(step)
+		if err != nil {
+			executionErrors = errors.Join(executionErrors, fmt.Errorf("step %d: %w", index+1, err))
+			failed = true
+			continue
+		}
+		if state.resolvedContent+stepBytes > workflow.MaxJobContentBytes {
+			executionErrors = errors.Join(executionErrors, fmt.Errorf("step %d: evaluated job configuration exceeds %d bytes", index+1, workflow.MaxJobContentBytes))
+			failed = true
+			continue
+		}
+		state.resolvedContent += stepBytes
 		name := step.Name
 		if name == "" {
 			name = step.Uses
 		}
 		e.logger.Info("starting workflow step", "job", plan.JobID, "step", index+1, "name", name)
 		var stepError error
+		cancelledBeforeCommand := ctx.Err() != nil
+		stepContext := executionContext(ctx)
 		if step.Uses == "" {
-			stepError = e.runScript(ctx, state, step)
+			stepError = e.runScript(stepContext, state, step)
 		} else {
-			_, stepError = e.executeAction(ctx, state, step, 0)
+			_, stepError = e.executeAction(stepContext, state, step, 0, cancelledBeforeCommand)
 		}
 		if stepError != nil {
 			stepError = fmt.Errorf("step %d (%s): %w", index+1, name, stepError)
-			return errors.Join(stepError, e.runPostActions(ctx, state, false))
+			executionErrors = errors.Join(executionErrors, stepError)
+			cancelledDuringCommand := !cancelledBeforeCommand && ctx.Err() != nil
+			if !cancelledDuringCommand {
+				failed = true
+			}
+			continue
 		}
 		e.logger.Info("completed workflow step", "job", plan.JobID, "step", index+1, "name", name)
 	}
-	return e.runPostActions(ctx, state, true)
+	if ctx.Err() != nil {
+		executionErrors = errors.Join(executionErrors, ctx.Err())
+	}
+	status := workflowStepStatus(failed, ctx.Err() != nil)
+	return errors.Join(executionErrors, e.runPostActions(executionContext(ctx), state, status))
+}
+
+func executionContext(ctx context.Context) context.Context {
+	if ctx.Err() == nil {
+		return ctx
+	}
+	return context.WithoutCancel(ctx)
+}
+
+func workflowStepStatus(failed, cancelled bool) expression.Status {
+	return expression.Status{Success: !failed && !cancelled, Failure: failed, Cancelled: cancelled}
 }
 
 func githubEventDocument(plan *Plan) ([]byte, error) {
@@ -249,17 +330,18 @@ func githubEventDocument(plan *Plan) ([]byte, error) {
 	return append(data, '\n'), nil
 }
 
-func (e *Executor) runPostActions(ctx context.Context, state *executionState, success bool) error {
+func (e *Executor) runPostActions(ctx context.Context, state *executionState, status expression.Status) error {
 	var result error
 	for index := len(state.posts) - 1; index >= 0; index-- {
 		invocation := state.posts[index]
-		if !matchesPostCondition(invocation.definition.Runs.PostIf, success) {
+		if !matchesPostCondition(invocation.definition.Runs.PostIf, status) {
 			continue
 		}
 		e.logger.Info("starting post action", "action", invocation.step.Uses)
 		if err := e.runJavaScriptHook(ctx, invocation, "post", invocation.definition.Runs.Post, state.temporaryDirectory, state.workspace, &state.environment); err != nil {
 			result = errors.Join(result, fmt.Errorf("post action %s: %w", invocation.step.Uses, err))
-			success = false
+			status.Success = false
+			status.Failure = true
 		}
 	}
 	return result
@@ -369,14 +451,14 @@ func runnerArchitecture() string {
 	}
 }
 
-func matchesPostCondition(condition string, success bool) bool {
+func matchesPostCondition(condition string, status expression.Status) bool {
 	switch strings.TrimSpace(condition) {
 	case "", "always()":
 		return true
 	case "success()":
-		return success
+		return status.Success
 	case "failure()":
-		return !success
+		return status.Failure
 	default:
 		return false
 	}

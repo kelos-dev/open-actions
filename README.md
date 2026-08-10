@@ -22,6 +22,8 @@ The supported execution subset includes:
 - composite run and uses steps, step outputs, and composite outputs
 - Bash `run` steps
 - job and step environment variables and working directories
+- typed expressions and string interpolation in concurrency, job planning,
+  workflow steps, and composite actions
 - GitHub Check Runs linked to authenticated Console run and job pages
 - live runner logs in the Console while the native Kubernetes Job is retained
 
