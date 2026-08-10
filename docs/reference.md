@@ -160,10 +160,14 @@ bounded during workflow validation.
 
 ### Execution constraints
 
-External actions must use the `node20` JavaScript runtime and be available from
-the configured GitHub server, or use the composite runtime with Bash run steps
-and external action references. Composite expressions cover inputs, step
-outputs, selected GitHub and runner values, and environment variables.
+External actions must use the `node20`, `node24`, or composite runtime and be
+available from the configured GitHub server. The default runner image pins Node
+20.20.2 for `node20` actions and Node 24.19.0 for `node24` actions. Custom runner
+images must provide the Node 20 executable as `node` and the Node 24 executable
+as `node24` on `PATH`; execution fails before the first lifecycle hook when the
+declared runtime is unavailable. Composite actions support Bash run steps and
+external action references. Composite expressions cover inputs, step outputs,
+selected GitHub and runner values, and environment variables.
 
 `GITHUB_EVENT_PATH` contains a bounded normalized document with repository
 identity and the selected push, pull-request, or merge-group revision fields.
