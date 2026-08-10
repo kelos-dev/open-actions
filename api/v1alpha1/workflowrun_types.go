@@ -17,9 +17,10 @@ const (
 // GitHubEventName identifies a supported GitHub webhook event.
 type GitHubEventName string
 
-// WorkflowRunSpec is an immutable description of one workflow execution.
+// WorkflowRunSpec describes one workflow execution. ProjectRef, Source, and
+// WorkflowPath are immutable.
 // Deleting a WorkflowRun requests cancellation of its child resources.
-// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="spec is immutable"
+// +kubebuilder:validation:XValidation:rule="self.projectRef == oldSelf.projectRef && self.source == oldSelf.source && self.workflowPath == oldSelf.workflowPath",message="projectRef, source, and workflowPath are immutable"
 // +kubebuilder:validation:XValidation:rule="size(self.projectRef.name) > 0",message="`projectRef.name` must be specified"
 // +kubebuilder:validation:XValidation:rule="size(self.projectRef.name) <= 253",message="`projectRef.name` must be no more than 253 characters"
 // +kubebuilder:validation:XValidation:rule="self.projectRef.name.matches('^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?([.][a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?)*$')",message="`projectRef.name` must be a DNS subdomain"
@@ -40,6 +41,18 @@ type WorkflowRunSpec struct {
 	// +kubebuilder:validation:XValidation:rule="!self.startsWith('../') && !self.contains('/../')",message="must not contain '..' path segments"
 	// +required
 	WorkflowPath string `json:"workflowPath"`
+
+	// TTLSecondsAfterFinished limits the lifetime of a WorkflowRun that has
+	// reached a terminal result. The timer starts at status.completionTime, or
+	// the terminal Succeeded condition's lastTransitionTime when completionTime
+	// is absent. Set this field to zero to make the run eligible for deletion
+	// immediately after completion. Omit it to retain the run indefinitely. This
+	// field may be changed while the run exists, but updates are not guaranteed
+	// to retain a run that is already eligible for deletion.
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=2147483647
+	// +optional
+	TTLSecondsAfterFinished *int32 `json:"ttlSecondsAfterFinished,omitempty"`
 }
 
 // WorkflowRunSource is a discriminated union of supported workflow event

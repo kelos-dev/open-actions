@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strconv"
 	"sync/atomic"
 	"time"
 
@@ -79,6 +80,16 @@ func runManager(arguments []string) error {
 	githubServerURL := flags.String("github-server-url", "https://github.com", "GitHub web-server URL exposed to workflows")
 	actionCloneBaseURL := flags.String("action-clone-base-url", "https://github.com", "Base URL used to clone external action repositories")
 	consoleURL := flags.String("console-url", "", "Public URL for the Open Actions Console")
+	var workflowRunTTLSecondsAfterFinished *int32
+	flags.Func("workflow-run-ttl-seconds-after-finished", "Default spec.ttlSecondsAfterFinished for generated WorkflowRuns; omit the flag to retain them indefinitely", func(value string) error {
+		seconds, err := strconv.ParseInt(value, 10, 32)
+		if err != nil || seconds < 0 {
+			return fmt.Errorf("must be an integer between 0 and %d", int64(1<<31-1))
+		}
+		parsed := int32(seconds)
+		workflowRunTTLSecondsAfterFinished = &parsed
+		return nil
+	})
 	leaderElection := flags.Bool("leader-elect", false, "Use leader election for the controller manager")
 	if err := flags.Parse(arguments); err != nil {
 		return err
@@ -155,10 +166,11 @@ func runManager(arguments []string) error {
 		return fmt.Errorf("configure Runner controller: %w", err)
 	}
 	if err := (&githubwebhook.DeliveryReconciler{
-		Client:    controllerManager.GetClient(),
-		APIReader: controllerManager.GetAPIReader(),
-		GitHub:    github,
-		Logger:    logger,
+		Client:                             controllerManager.GetClient(),
+		APIReader:                          controllerManager.GetAPIReader(),
+		GitHub:                             github,
+		Logger:                             logger,
+		WorkflowRunTTLSecondsAfterFinished: workflowRunTTLSecondsAfterFinished,
 	}).SetupWithManager(controllerManager); err != nil {
 		return fmt.Errorf("configure webhook delivery controller: %w", err)
 	}

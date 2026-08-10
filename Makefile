@@ -50,6 +50,11 @@ verify:
 	$(HELM) template open-actions $(CHART_DIR) --namespace open-actions-system >/dev/null
 	$(HELM) template open-actions $(CHART_DIR) --namespace open-actions-system --values config/e2e/values.yaml >/dev/null
 	$(HELM) template open-actions $(CHART_DIR) --namespace open-actions-system --set console.publicURL=https://actions.example >/dev/null
+	$(HELM) template open-actions $(CHART_DIR) --namespace open-actions-system --set controller.workflowRunTTLSecondsAfterFinished=604800 >/dev/null
+	@if $(HELM) template open-actions $(CHART_DIR) --namespace open-actions-system --set controller.workflowRunTTLSecondsAfterFinished=-1 >/dev/null 2>&1; then \
+		echo "Helm accepted a negative WorkflowRun TTL" >&2; \
+		exit 1; \
+	fi
 	$(HELM) template open-actions $(CHART_DIR) --namespace open-actions-system --set console.secretName=open-actions-console-auth >/dev/null
 	$(HELM) template open-actions $(CHART_DIR) --namespace open-actions-system --set console.enabled=false >/dev/null
 	@if $(HELM) template open-actions $(CHART_DIR) --namespace open-actions-system --set console.publicURL= >/dev/null 2>&1; then \

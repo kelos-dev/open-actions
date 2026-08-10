@@ -7,7 +7,7 @@
     "controller": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["image", "githubAPIURL", "githubServerURL", "actionCloneBaseURL"],
+      "required": ["image", "githubAPIURL", "githubServerURL", "actionCloneBaseURL", "workflowRunTTLSecondsAfterFinished"],
       "properties": {
         "image": {
           "type": "object",
@@ -24,7 +24,8 @@
         },
         "githubAPIURL": {"type": "string", "minLength": 1, "maxLength": 2048},
         "githubServerURL": {"type": "string", "minLength": 1, "maxLength": 2048},
-        "actionCloneBaseURL": {"type": "string", "minLength": 1, "maxLength": 2048}
+        "actionCloneBaseURL": {"type": "string", "minLength": 1, "maxLength": 2048},
+        "workflowRunTTLSecondsAfterFinished": {"type": ["integer", "null"], "minimum": 0, "maximum": 2147483647}
       }
     },
     "console": {

@@ -85,14 +85,34 @@ func TestCreateWorkflowRunIsIdempotent(t *testing.T) {
 	event.Repository.Name = "example"
 	normalized := normalizedEvent{Name: "push", SHA: strings.Repeat("a", 40), Ref: "refs/heads/main"}
 	delivery := &queuedDelivery{Payload: *event, Event: normalized, ReplayID: "replay", DeliveryID: "delivery"}
+	ttl := int32(604800)
 
 	clusterClient := fake.NewClientBuilder().WithScheme(scheme).Build()
-	reconciler := &DeliveryReconciler{Client: clusterClient, APIReader: clusterClient}
+	reconciler := &DeliveryReconciler{Client: clusterClient, APIReader: clusterClient, WorkflowRunTTLSecondsAfterFinished: &ttl}
 	if err := reconciler.createWorkflowRun(context.Background(), project, delivery, ".open-actions/workflows/ci.yaml"); err != nil {
+		t.Fatal(err)
+	}
+	run := &actionsv1alpha1.WorkflowRun{}
+	runKey := client.ObjectKey{Namespace: project.Namespace, Name: workflowRunName(".open-actions/workflows/ci.yaml", string(project.UID), delivery.ReplayID)}
+	if err := clusterClient.Get(context.Background(), runKey, run); err != nil {
+		t.Fatal(err)
+	}
+	if run.Spec.TTLSecondsAfterFinished == nil || *run.Spec.TTLSecondsAfterFinished != ttl {
+		t.Fatalf("WorkflowRun TTL = %v, want %d", run.Spec.TTLSecondsAfterFinished, ttl)
+	}
+	updatedTTL := int32(3600)
+	run.Spec.TTLSecondsAfterFinished = &updatedTTL
+	if err := clusterClient.Update(context.Background(), run); err != nil {
 		t.Fatal(err)
 	}
 	if err := reconciler.createWorkflowRun(context.Background(), project, delivery, ".open-actions/workflows/ci.yaml"); err != nil {
 		t.Fatalf("matching replay failed: %v", err)
+	}
+	if err := clusterClient.Get(context.Background(), runKey, run); err != nil {
+		t.Fatal(err)
+	}
+	if run.Spec.TTLSecondsAfterFinished == nil || *run.Spec.TTLSecondsAfterFinished != updatedTTL {
+		t.Fatalf("replayed WorkflowRun TTL = %v, want %d", run.Spec.TTLSecondsAfterFinished, updatedTTL)
 	}
 
 	workflowPath := ".open-actions/workflows/deploy.yaml"

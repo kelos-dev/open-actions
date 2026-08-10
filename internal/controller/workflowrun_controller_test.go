@@ -241,6 +241,124 @@ func TestWorkflowRunCheckReportMapsLifecycle(t *testing.T) {
 	}
 }
 
+func TestCompletedWorkflowRunTTL(t *testing.T) {
+	now := time.Date(2026, time.August, 10, 12, 0, 0, 0, time.UTC)
+	completedAt := metav1.NewTime(now.Add(-2 * time.Hour))
+	tests := []struct {
+		name       string
+		ttl        *int32
+		completion *metav1.Time
+		transition metav1.Time
+		wantExists bool
+		wantAfter  time.Duration
+	}{
+		{name: "omitted", completion: &completedAt, wantExists: true},
+		{name: "zero", ttl: pointerTo(int32(0)), completion: &completedAt},
+		{name: "retained", ttl: pointerTo(int32(3 * 60 * 60)), completion: &completedAt, transition: completedAt, wantExists: true, wantAfter: time.Hour},
+		{name: "expired", ttl: pointerTo(int32(60 * 60)), completion: &completedAt, transition: completedAt},
+		{name: "condition transition fallback", ttl: pointerTo(int32(60 * 60)), transition: completedAt},
+		{name: "future completion", ttl: pointerTo(int32(60 * 60)), completion: pointerTo(metav1.NewTime(now.Add(time.Hour))), transition: completedAt, wantExists: true, wantAfter: time.Hour},
+		{name: "future completion with zero TTL", ttl: pointerTo(int32(0)), completion: pointerTo(metav1.NewTime(now.Add(time.Hour))), transition: completedAt, wantExists: true, wantAfter: time.Second},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			scheme := runtime.NewScheme()
+			if err := actionsv1alpha1.AddToScheme(scheme); err != nil {
+				t.Fatal(err)
+			}
+			run := &actionsv1alpha1.WorkflowRun{
+				ObjectMeta: metav1.ObjectMeta{Name: "ci", Namespace: "default"},
+				Spec:       actionsv1alpha1.WorkflowRunSpec{TTLSecondsAfterFinished: test.ttl},
+				Status: actionsv1alpha1.WorkflowRunStatus{
+					CompletionTime: test.completion,
+					Conditions: []metav1.Condition{{
+						Type: actionsv1alpha1.WorkflowRunConditionSucceeded, Status: metav1.ConditionTrue,
+						Reason: "JobsSucceeded", LastTransitionTime: test.transition,
+					}},
+				},
+			}
+			clusterClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(run).Build()
+			writeClient := &recordingDeleteClient{Client: clusterClient}
+			reconciler := &WorkflowRunReconciler{Client: writeClient, APIReader: clusterClient, Now: func() time.Time { return now }}
+			storedBefore := &actionsv1alpha1.WorkflowRun{}
+			if err := clusterClient.Get(context.Background(), client.ObjectKeyFromObject(run), storedBefore); err != nil {
+				t.Fatal(err)
+			}
+
+			result, err := reconciler.reconcileCompletedWorkflowRunTTL(context.Background(), run)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if result.RequeueAfter != test.wantAfter {
+				t.Errorf("requeue after = %s, want %s", result.RequeueAfter, test.wantAfter)
+			}
+			stored := &actionsv1alpha1.WorkflowRun{}
+			err = clusterClient.Get(context.Background(), client.ObjectKeyFromObject(run), stored)
+			if test.wantExists && err != nil {
+				t.Fatalf("retained WorkflowRun lookup failed: %v", err)
+			}
+			if !test.wantExists && !apierrors.IsNotFound(err) {
+				t.Fatalf("expired WorkflowRun lookup error = %v, want not found", err)
+			}
+			if !test.wantExists {
+				if writeClient.deleteOptions == nil || writeClient.deleteOptions.Preconditions == nil || writeClient.deleteOptions.Preconditions.ResourceVersion == nil {
+					t.Fatal("expired WorkflowRun delete has no resourceVersion precondition")
+				}
+				if got := *writeClient.deleteOptions.Preconditions.ResourceVersion; got != storedBefore.ResourceVersion {
+					t.Errorf("delete resourceVersion precondition = %q, want %q", got, storedBefore.ResourceVersion)
+				}
+			}
+		})
+	}
+}
+
+func TestCompletedWorkflowRunTTLUsesCurrentSpecBeforeDeleting(t *testing.T) {
+	now := time.Date(2026, time.August, 10, 12, 0, 0, 0, time.UTC)
+	completedAt := metav1.NewTime(now.Add(-2 * time.Hour))
+	expiredTTL := int32(time.Hour / time.Second)
+	extendedTTL := int32(3 * time.Hour / time.Second)
+	cachedRun := &actionsv1alpha1.WorkflowRun{
+		ObjectMeta: metav1.ObjectMeta{Name: "ci", Namespace: "default"},
+		Spec:       actionsv1alpha1.WorkflowRunSpec{TTLSecondsAfterFinished: &expiredTTL},
+		Status: actionsv1alpha1.WorkflowRunStatus{
+			CompletionTime: &completedAt,
+			Conditions: []metav1.Condition{{
+				Type: actionsv1alpha1.WorkflowRunConditionSucceeded, Status: metav1.ConditionTrue,
+				Reason: "JobsSucceeded", LastTransitionTime: completedAt,
+			}},
+		},
+	}
+	currentRun := cachedRun.DeepCopy()
+	currentRun.Spec.TTLSecondsAfterFinished = &extendedTTL
+	scheme := runtime.NewScheme()
+	if err := actionsv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	clusterClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(currentRun).Build()
+	reconciler := &WorkflowRunReconciler{Client: clusterClient, APIReader: clusterClient, Now: func() time.Time { return now }}
+
+	result, err := reconciler.reconcileCompletedWorkflowRunTTL(context.Background(), cachedRun)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.RequeueAfter != time.Hour {
+		t.Errorf("requeue after = %s, want %s", result.RequeueAfter, time.Hour)
+	}
+	if err := clusterClient.Get(context.Background(), client.ObjectKeyFromObject(currentRun), &actionsv1alpha1.WorkflowRun{}); err != nil {
+		t.Fatalf("WorkflowRun with extended TTL was deleted: %v", err)
+	}
+}
+
+type recordingDeleteClient struct {
+	client.Client
+	deleteOptions *client.DeleteOptions
+}
+
+func (c *recordingDeleteClient) Delete(ctx context.Context, object client.Object, options ...client.DeleteOption) error {
+	c.deleteOptions = (&client.DeleteOptions{}).ApplyOptions(options)
+	return c.Client.Delete(ctx, object, options...)
+}
+
 func TestConcurrencyWaitsForOlderUnevaluatedRun(t *testing.T) {
 	older := concurrencyRun("older", "older", 1, time.Unix(1, 0), "", nil)
 	current := concurrencyRun("current", "current", 1, time.Unix(2, 0), "", nil)

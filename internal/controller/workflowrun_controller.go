@@ -66,6 +66,7 @@ type WorkflowRunReconciler struct {
 	GitHubServerURL    string
 	ActionCloneBaseURL string
 	ConsoleURL         string
+	Now                func() time.Time
 }
 
 func (r *WorkflowRunReconciler) Reconcile(ctx context.Context, request ctrl.Request) (ctrl.Result, error) {
@@ -89,7 +90,7 @@ func (r *WorkflowRunReconciler) Reconcile(ctx context.Context, request ctrl.Requ
 		return result, errors.Join(reportError, reconcileError)
 	}
 	if reportError != nil {
-		if result.Requeue || result.RequeueAfter > 0 {
+		if !terminalRun(run) && (result.Requeue || result.RequeueAfter > 0) {
 			ctrl.LoggerFrom(ctx).Error(reportError, "GitHub Check reporting failed while workflow reconciliation is pending")
 			return result, nil
 		}
@@ -104,7 +105,7 @@ func (r *WorkflowRunReconciler) githubCheckEnabled(run *actionsv1alpha1.Workflow
 
 func (r *WorkflowRunReconciler) reconcileWorkflowRun(ctx context.Context, run *actionsv1alpha1.WorkflowRun) (ctrl.Result, error) {
 	if terminalRun(run) {
-		return ctrl.Result{}, nil
+		return r.reconcileCompletedWorkflowRunTTL(ctx, run)
 	}
 	planned := meta.FindStatusCondition(run.Status.Conditions, actionsv1alpha1.WorkflowRunConditionPlanned)
 	if planned != nil && planned.Status == metav1.ConditionTrue {
@@ -180,6 +181,66 @@ func (r *WorkflowRunReconciler) reconcileWorkflowRun(ctx context.Context, run *a
 		return r.waitingForConcurrency(ctx, run, definition.Name, concurrencyGroup, jobCount, cancelInProgress)
 	}
 	return r.observeWorkflowJobs(ctx, run, definition.Name, concurrencyGroup, jobCount)
+}
+
+func (r *WorkflowRunReconciler) reconcileCompletedWorkflowRunTTL(ctx context.Context, run *actionsv1alpha1.WorkflowRun) (ctrl.Result, error) {
+	remaining, configured := r.workflowRunTTLRemaining(run)
+	if !configured {
+		return ctrl.Result{}, nil
+	}
+	if remaining > 0 {
+		return ctrl.Result{RequeueAfter: remaining}, nil
+	}
+
+	current := &actionsv1alpha1.WorkflowRun{}
+	if err := r.APIReader.Get(ctx, client.ObjectKeyFromObject(run), current); err != nil {
+		return ctrl.Result{}, client.IgnoreNotFound(err)
+	}
+	remaining, configured = r.workflowRunTTLRemaining(current)
+	if !configured {
+		return ctrl.Result{}, nil
+	}
+	if remaining > 0 {
+		return ctrl.Result{RequeueAfter: remaining}, nil
+	}
+
+	completedAt := current.Status.CompletionTime
+	if completedAt == nil {
+		condition := meta.FindStatusCondition(current.Status.Conditions, actionsv1alpha1.WorkflowRunConditionSucceeded)
+		completedAt = &condition.LastTransitionTime
+	}
+	ctrl.LoggerFrom(ctx).Info("Deleting completed WorkflowRun after its TTL expired", "completion_time", completedAt.Time, "ttl_seconds_after_finished", *current.Spec.TTLSecondsAfterFinished)
+	policy := metav1.DeletePropagationBackground
+	resourceVersion := current.ResourceVersion
+	return ctrl.Result{}, client.IgnoreNotFound(r.Delete(ctx, current, &client.DeleteOptions{
+		Preconditions:     &metav1.Preconditions{ResourceVersion: &resourceVersion},
+		PropagationPolicy: &policy,
+	}))
+}
+
+func (r *WorkflowRunReconciler) workflowRunTTLRemaining(run *actionsv1alpha1.WorkflowRun) (time.Duration, bool) {
+	if run.Spec.TTLSecondsAfterFinished == nil || !terminalRun(run) {
+		return 0, false
+	}
+	retention := time.Duration(*run.Spec.TTLSecondsAfterFinished) * time.Second
+	completedAt := run.Status.CompletionTime
+	if completedAt == nil {
+		condition := meta.FindStatusCondition(run.Status.Conditions, actionsv1alpha1.WorkflowRunConditionSucceeded)
+		completedAt = &condition.LastTransitionTime
+	}
+	remaining := retention - r.now().Sub(completedAt.Time)
+	if remaining > retention {
+		// Poll at least once per second when completionTime is ahead of this controller's clock.
+		remaining = max(retention, time.Second)
+	}
+	return remaining, true
+}
+
+func (r *WorkflowRunReconciler) now() time.Time {
+	if r.Now != nil {
+		return r.Now()
+	}
+	return time.Now()
 }
 
 type checkRunReport struct {

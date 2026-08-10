@@ -21,6 +21,8 @@ func TestRunManagerRejectsInvalidEndpointURLs(t *testing.T) {
 		{name: "action clone base URL", arguments: []string{"--action-clone-base-url=https://github.example?token=secret"}, want: "action clone base URL must not include a query"},
 		{name: "Console URL scheme", arguments: []string{"--console-url=git://actions.example"}, want: "Console URL must use http or https"},
 		{name: "Console URL", arguments: []string{"--console-url=https://actions.example/open-actions"}, want: "Console URL must not include a path"},
+		{name: "negative WorkflowRun TTL", arguments: []string{"--workflow-run-ttl-seconds-after-finished=-1"}, want: "must be an integer between"},
+		{name: "excessive WorkflowRun TTL", arguments: []string{"--workflow-run-ttl-seconds-after-finished=2147483648"}, want: "must be an integer between"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			err := runManager(tt.arguments)

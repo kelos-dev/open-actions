@@ -11,6 +11,7 @@ import (
 	. "github.com/onsi/gomega"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
@@ -22,7 +23,7 @@ var _ = Describe("Runner", func() {
 		setupTestProject(true)
 	})
 
-	It("claims a typed WorkflowRun job and executes it in an owned native Job", func() {
+	It("executes a typed WorkflowRun and deletes its owned resources after its TTL expires", func() {
 		ctx := context.Background()
 		run := &actionsv1alpha1.WorkflowRun{
 			ObjectMeta: metav1.ObjectMeta{Name: "runner-execution", Namespace: e2eNamespace},
@@ -147,6 +148,7 @@ var _ = Describe("Runner", func() {
 		})
 		Expect(err).NotTo(HaveOccurred())
 		Expect(pods.Items).To(HaveLen(1))
+		podName := pods.Items[0].Name
 		logs, err := clientset.CoreV1().Pods(e2eNamespace).GetLogs(pods.Items[0].Name, &corev1.PodLogOptions{}).DoRaw(ctx)
 		Expect(err).NotTo(HaveOccurred())
 		output := string(logs)
@@ -158,6 +160,30 @@ var _ = Describe("Runner", func() {
 		Expect(output).To(ContainSubstring("external marker post ran"))
 		Expect(output).To(ContainSubstring("external setup-go post ran"))
 		Expect(output).To(ContainSubstring("external checkout post ran"))
+
+		By("setting the completed WorkflowRun TTL to zero")
+		Eventually(func() error {
+			stored := &actionsv1alpha1.WorkflowRun{}
+			if err := clusterClient.Get(ctx, client.ObjectKeyFromObject(run), stored); err != nil {
+				return err
+			}
+			ttl := int32(0)
+			stored.Spec.TTLSecondsAfterFinished = &ttl
+			return clusterClient.Update(ctx, stored)
+		}, 30*time.Second, time.Second).Should(Succeed())
+
+		Eventually(func() bool {
+			err := clusterClient.Get(ctx, client.ObjectKeyFromObject(run), &actionsv1alpha1.WorkflowRun{})
+			return apierrors.IsNotFound(err)
+		}, 60*time.Second, time.Second).Should(BeTrue())
+		Eventually(func(g Gomega) {
+			err := clusterClient.Get(ctx, client.ObjectKey{Namespace: e2eNamespace, Name: workflowJobName}, &actionsv1alpha1.WorkflowJob{})
+			g.Expect(apierrors.IsNotFound(err)).To(BeTrue())
+			err = clusterClient.Get(ctx, client.ObjectKey{Namespace: e2eNamespace, Name: jobName}, &batchv1.Job{})
+			g.Expect(apierrors.IsNotFound(err)).To(BeTrue())
+			err = clusterClient.Get(ctx, client.ObjectKey{Namespace: e2eNamespace, Name: podName}, &corev1.Pod{})
+			g.Expect(apierrors.IsNotFound(err)).To(BeTrue())
+		}, 60*time.Second, time.Second).Should(Succeed())
 	})
 })
 
