@@ -111,7 +111,7 @@ func (r *actionResolver) prepare(ctx context.Context, step Step, plan *Plan, tok
 	default:
 		return nil, fmt.Errorf("action %s uses unsupported runtime %q", step.Uses, definition.Runs.Using)
 	}
-	inputs, err := actionInputs(definition.Inputs, step.With, plan, token)
+	inputs, err := actionInputs(definition.Inputs, step.With, plan, r.environment, token)
 	if err != nil {
 		return nil, fmt.Errorf("configure action %s: %w", step.Uses, err)
 	}
@@ -182,7 +182,7 @@ func loadActionDefinition(directory string) (actionDefinition, error) {
 	return definition, nil
 }
 
-func actionInputs(definitions map[string]actionInput, supplied map[string]string, plan *Plan, token string) (map[string]string, error) {
+func actionInputs(definitions map[string]actionInput, supplied map[string]string, plan *Plan, environment []string, token string) (map[string]string, error) {
 	result := make(map[string]string, len(definitions)+len(supplied))
 	definitionNames := make(map[string]string, len(definitions))
 	for name, definition := range definitions {
@@ -196,7 +196,7 @@ func actionInputs(definitions map[string]actionInput, supplied map[string]string
 			if err != nil {
 				return nil, fmt.Errorf("input %q default: %w", name, err)
 			}
-			resolved, err := resolveActionDefault(value, plan, token)
+			resolved, err := resolveActionDefault(value, plan, environment, token)
 			if err != nil {
 				return nil, fmt.Errorf("input %q default: %w", name, err)
 			}
@@ -226,25 +226,8 @@ func inputString(value any) (string, error) {
 	}
 }
 
-func resolveActionDefault(value string, plan *Plan, token string) (string, error) {
-	switch strings.TrimSpace(value) {
-	case "${{ github.repository }}":
-		return plan.Repository.Owner + "/" + plan.Repository.Name, nil
-	case "${{ github.token }}":
-		return token, nil
-	case "${{ github.server_url }}":
-		return strings.TrimSuffix(plan.Repository.ServerURL, "/"), nil
-	case "${{ github.server_url == 'https://github.com' && github.token || '' }}":
-		if strings.TrimSuffix(plan.Repository.ServerURL, "/") == "https://github.com" {
-			return token, nil
-		}
-		return "", nil
-	default:
-		if strings.Contains(value, "${{") {
-			return "", fmt.Errorf("unsupported expression %q", value)
-		}
-		return value, nil
-	}
+func resolveActionDefault(value string, plan *Plan, environment []string, token string) (string, error) {
+	return resolveActionDefaultExpression(value, plan, environment, token)
 }
 
 func (e *Executor) runJavaScriptHook(ctx context.Context, invocation *actionInvocation, hook, entrypoint, temporaryDirectory, workspace string, environment *[]string) error {
@@ -295,7 +278,7 @@ func (e *Executor) runJavaScriptHook(ctx context.Context, invocation *actionInvo
 	return executionError
 }
 
-func (e *Executor) executeAction(ctx context.Context, state *executionState, step Step, depth int) (map[string]string, error) {
+func (e *Executor) executeAction(ctx context.Context, state *executionState, step Step, depth int, cancelled bool) (map[string]string, error) {
 	invocation, err := state.resolver.prepare(ctx, step, state.plan, e.githubToken)
 	if err != nil {
 		return nil, err
@@ -319,7 +302,7 @@ func (e *Executor) executeAction(ctx context.Context, state *executionState, ste
 		}
 		return invocation.outputs, nil
 	case "composite":
-		return e.runComposite(ctx, state, invocation, depth+1)
+		return e.runComposite(ctx, state, invocation, depth+1, cancelled)
 	default:
 		return nil, fmt.Errorf("action %s uses unsupported runtime %q", step.Uses, invocation.definition.Runs.Using)
 	}

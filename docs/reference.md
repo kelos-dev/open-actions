@@ -144,6 +144,48 @@ Workflow files must define a non-empty `name` of at most 256 characters.
 Unsupported workflow fields and action reference forms are rejected during
 planning. Unsupported action runtimes fail explicitly during execution.
 
+### Expressions
+
+Open Actions parses expression templates independently from YAML. A value made
+up of one `${{ ... }}` expression keeps its boolean, number, null, or string
+type. Expressions embedded in other text are converted to strings without
+discarding the surrounding literal text. Missing object properties evaluate to
+an empty string. Malformed delimiters, unknown functions, unavailable contexts,
+and unsupported syntax fail explicitly.
+
+The supported grammar includes null, boolean, number, and single-quoted string
+literals; property and index access; parentheses; `!`, comparisons, `&&`, and
+`||`; and the `contains`, `format`, and `startsWith` functions. Comparisons and
+string conversions follow GitHub Actions coercion rules. `&&` and `||` return a
+selected operand and short-circuit, which supports fallback expressions and
+the conventional `condition && value || fallback` form. Conditions also
+support `success`, `always`, `failure`, and `cancelled` where status is
+available. Each expression is limited to 256 syntax nodes and 64 nesting
+levels. Format expansion and interpolated template output are limited to 100,000
+bytes during evaluation.
+
+Contexts are restricted by evaluation phase. An allowed context still fails at
+evaluation when the corresponding execution feature has not supplied it.
+
+| Phase | Allowed contexts and functions | Currently supplied |
+| --- | --- | --- |
+| Workflow concurrency | `github`, `inputs`, `vars` | `github` |
+| Job name and runner labels | `github`, `needs`, `strategy`, `matrix`, `vars`, `inputs` | `github` |
+| Job environment | `github`, `needs`, `strategy`, `matrix`, `vars`, `secrets`, `inputs` | `github` |
+| Workflow step name, run script, working directory, environment, and inputs | `github`, `needs`, `strategy`, `matrix`, `job`, `runner`, `env`, `vars`, `secrets`, `steps`, `inputs` | `github`, `runner`, `env` |
+| Workflow step condition | Step contexts except `secrets`, plus status functions | `github`, `runner`, `env`, and status functions |
+| Composite step fields and outputs | `github`, `runner`, `env`, `inputs`, `steps` | All listed contexts |
+| Composite step condition | Composite contexts and status functions | All listed contexts and functions |
+| Action input default | `github` | `github` |
+
+Dependency outputs, matrix expansion, workflow input loading, and repository
+secret and variable sources remain separate execution features. Values derived
+from `github.token` or the `secrets` context are marked sensitive through
+interpolation and function calls, and evaluation diagnostics do not include
+resolved values. The runner maps interrupt and termination signals to cancelled
+status, separately from failure, so eligible workflow and composite cleanup
+steps can run during pod termination.
+
 ### Concurrency
 
 Concurrency groups are case-insensitive and scoped by Project and repository.
@@ -152,8 +194,11 @@ the existing waiting run. When `cancel-in-progress` is `true`, it also cancels
 the executing run. A run waits for an older run in the same repository until
 that run has evaluated its workflow concurrency configuration.
 
-Concurrency expressions reject unavailable context and empty evaluated groups.
-Use `github.head_ref || github.ref_name` for workflows that need a ref fallback.
+Concurrency expressions reject unavailable contexts and empty evaluated
+groups. Event properties that do not exist evaluate to an empty string. Use
+`github.head_ref || github.ref_name` for workflows that need a ref fallback.
+Pull request and merge group target branches are available as
+`github.base_ref`.
 
 ### Trigger matching
 
@@ -177,10 +222,12 @@ Workflow definitions must satisfy these limits:
 - A job may contain at most 100 steps and 100,000 bytes of aggregate planned
   content.
 - A run script may contain at most 65,536 bytes.
+- A step condition may contain at most 65,536 bytes.
 - Each `env` or `with` map may contain at most 100 entries.
 
 Names, branch patterns, action references, paths, map keys, and values are also
-bounded during workflow validation.
+bounded during workflow validation. Field and aggregate content limits are
+reapplied after expression evaluation before a step executes.
 
 ### Execution constraints
 
@@ -198,11 +245,16 @@ identity and the selected push, pull-request, or merge-group revision fields.
 Actions that require other fields from GitHub's raw webhook payload are not
 supported.
 
+The controller emits job-plan version 2, and the runner accepts versions 1 and
+2. When a release changes the job-plan version, update every Runner
+`spec.execution.image` to an image that accepts both the installed and target
+controller versions before upgrading the controller.
+
 Docker and local actions, private cross-repository action authentication, job
-dependencies, matrices, service containers, general expression evaluation,
-caches, and artifacts are not supported. General expressions outside the
-supported concurrency and composite-action contexts are rejected during
-planning or execution and are never interpreted as literal values.
+dependencies, matrices, service containers, repository secret and variable
+sources, caches, and artifacts are not supported. Expressions outside the
+documented fields and runtime contexts are rejected during planning or
+execution and are never interpreted as literal values.
 `WorkflowJob` resources are not retried or reassigned when a Runner is removed.
 Native Jobs and their Pod logs are deleted one hour after completion. Completed
 WorkflowRuns are retained indefinitely unless `spec.ttlSecondsAfterFinished` is

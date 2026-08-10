@@ -6,19 +6,23 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 
 	"github.com/kelos-dev/open-actions/internal/runner"
 )
 
 func main() {
-	if err := run(os.Args[1:]); err != nil {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	if err := run(ctx, os.Args[1:]); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
 }
 
-func run(arguments []string) error {
+func run(ctx context.Context, arguments []string) error {
 	flags := flag.NewFlagSet("open-actions-runner", flag.ContinueOnError)
 	jobFile := flags.String("job-file", "/var/run/open-actions/job.json", "Path to the workflow job plan")
 	workspace := flags.String("workspace", "/workspace", "Path to the job workspace")
@@ -40,7 +44,7 @@ func run(arguments []string) error {
 	if err != nil {
 		return err
 	}
-	return executor.Execute(context.Background(), plan, *workspace)
+	return executor.Execute(ctx, plan, *workspace)
 }
 
 func withoutEnvironmentVariable(environment []string, name string) []string {

@@ -13,6 +13,7 @@ import (
 	"time"
 
 	actionsv1alpha1 "github.com/kelos-dev/open-actions/api/v1alpha1"
+	workflowexpression "github.com/kelos-dev/open-actions/internal/expression"
 	githubclient "github.com/kelos-dev/open-actions/internal/github"
 	"github.com/kelos-dev/open-actions/internal/runner"
 	"github.com/kelos-dev/open-actions/internal/workflow"
@@ -156,9 +157,7 @@ func (r *WorkflowRunReconciler) reconcileWorkflowRun(ctx context.Context, run *a
 	if err != nil {
 		return r.planningFailed(ctx, run, "WorkflowInvalid", err, planningFailureTerminal)
 	}
-	concurrencyGroup, cancelInProgress, err := workflow.EvaluateConcurrency(definition, workflow.Event{
-		Name: string(githubSource.Event.Name), Action: githubSource.Event.Action, RefName: githubclient.RefName(githubSource.Revision.Ref), HeadRef: githubSource.Revision.HeadRef,
-	})
+	concurrencyGroup, cancelInProgress, err := workflow.EvaluateConcurrency(definition, workflowEvent(githubSource))
 	if err != nil {
 		return r.planningFailed(ctx, run, "WorkflowInvalid", err, planningFailureTerminal)
 	}
@@ -504,7 +503,10 @@ func (r *WorkflowRunReconciler) planWorkflowJobs(run *actionsv1alpha1.WorkflowRu
 	sort.Strings(jobIDs)
 	plannedJobs := make([]plannedWorkflowJob, 0, len(jobIDs))
 	for _, id := range jobIDs {
-		definitionJob := definition.Jobs[id]
+		definitionJob, err := workflow.EvaluateJob(id, definition.Jobs[id], r.jobExpressionContext(run, definition.Name))
+		if err != nil {
+			return nil, err
+		}
 		displayName := definitionJob.Name
 		if displayName == "" {
 			displayName = id
@@ -523,6 +525,39 @@ func (r *WorkflowRunReconciler) planWorkflowJobs(run *actionsv1alpha1.WorkflowRu
 		plannedJobs = append(plannedJobs, plannedWorkflowJob{id: id, displayName: displayName, runsOn: append([]string(nil), definitionJob.RunsOn...), plan: string(data)})
 	}
 	return plannedJobs, nil
+}
+
+func workflowEvent(source *actionsv1alpha1.GitHubWorkflowRunSource) workflow.Event {
+	return workflow.Event{
+		Name:    string(source.Event.Name),
+		Action:  source.Event.Action,
+		Ref:     source.Revision.Ref,
+		RefName: githubclient.RefName(source.Revision.Ref),
+		HeadRef: source.Revision.HeadRef,
+		BaseRef: source.Revision.BaseRef,
+	}
+}
+
+func (r *WorkflowRunReconciler) jobExpressionContext(run *actionsv1alpha1.WorkflowRun, workflowName string) workflowexpression.Context {
+	githubSource := run.Spec.Source.GitHub
+	return workflowexpression.Context{
+		Availability: workflowexpression.NewAvailability("github"),
+		Values: map[string]any{
+			"github": map[string]any{
+				"workflow":   workflowName,
+				"event_name": string(githubSource.Event.Name),
+				"event":      map[string]any{"action": githubSource.Event.Action},
+				"repository": githubSource.Repository.Owner + "/" + githubSource.Repository.Name,
+				"sha":        githubSource.Revision.SHA,
+				"ref":        githubSource.Revision.Ref,
+				"ref_name":   githubclient.RefName(githubSource.Revision.Ref),
+				"head_ref":   githubSource.Revision.HeadRef,
+				"base_ref":   githubSource.Revision.BaseRef,
+				"server_url": strings.TrimSuffix(r.GitHubServerURL, "/"),
+				"api_url":    strings.TrimSuffix(r.GitHubAPIBase, "/"),
+			},
+		},
+	}
 }
 
 func workflowJobIdentityMatches(existing, desired *actionsv1alpha1.WorkflowJob, run *actionsv1alpha1.WorkflowRun) bool {
@@ -606,6 +641,7 @@ func (r *WorkflowRunReconciler) jobPlan(run *actionsv1alpha1.WorkflowRun, workfl
 			WorkingDirectory: step.WorkingDirectory,
 			With:             with,
 			Env:              environment,
+			If:               step.If,
 		})
 	}
 	return &runner.Plan{
@@ -629,6 +665,7 @@ func (r *WorkflowRunReconciler) jobPlan(run *actionsv1alpha1.WorkflowRun, workfl
 			Ref:     githubSource.Revision.Ref,
 			RefName: githubclient.RefName(githubSource.Revision.Ref),
 			HeadRef: githubSource.Revision.HeadRef,
+			BaseRef: githubSource.Revision.BaseRef,
 		},
 		JobID: id,
 		Env:   jobEnv,

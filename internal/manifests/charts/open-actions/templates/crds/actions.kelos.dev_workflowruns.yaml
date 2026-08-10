@@ -169,6 +169,22 @@ spec:
                         description: Revision identifies the repository content executed
                           by the run.
                         properties:
+                          baseRef:
+                            description: |-
+                              BaseRef is the target branch name for pull request and merge group events,
+                              when applicable.
+                            maxLength: 255
+                            minLength: 1
+                            pattern: ^[^\x00-\x20\x7f~^:?*\[\\]+$
+                            type: string
+                            x-kubernetes-validations:
+                            - message: must be a well-formed GitHub branch name
+                              rule: '!self.startsWith(''/'') && !self.startsWith(''.'')
+                                && !self.startsWith(''refs/'') && !self.endsWith(''/'')
+                                && !self.contains(''//'') && !self.contains(''..'')
+                                && !self.contains(''/.'') && !self.endsWith(''.'')
+                                && !self.contains(''.lock/'') && !self.endsWith(''.lock'')
+                                && !self.contains(''@{'') && !self.matches(''^[0-9A-Fa-f]{40}$'')'
                           headRef:
                             description: HeadRef is the pull request source branch
                               name, when applicable.
@@ -220,6 +236,10 @@ spec:
                         events
                       rule: 'self.event.name == ''pull_request'' ? has(self.revision.headRef)
                         : !has(self.revision.headRef)'
+                    - message: revision.baseRef may be specified only for pull_request
+                        and merge_group events
+                      rule: '!has(self.revision.baseRef) || self.event.name in [''pull_request'',
+                        ''merge_group'']'
                     - message: push revision.ref must identify a branch or tag
                       rule: self.event.name != 'push' || self.revision.ref.startsWith('refs/heads/')
                         || self.revision.ref.startsWith('refs/tags/')

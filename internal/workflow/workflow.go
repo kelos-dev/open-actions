@@ -9,6 +9,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/kelos-dev/open-actions/internal/actionref"
+	"github.com/kelos-dev/open-actions/internal/expression"
 	"gopkg.in/yaml.v3"
 )
 
@@ -21,14 +22,15 @@ const (
 	maxJobNameLength          = 256
 	maxRunnerLabels           = 16
 	maxSteps                  = 100
-	maxStepNameLength         = 256
-	maxActionReferenceLength  = 512
-	maxRunScriptBytes         = 65_536
-	maxWorkingDirectoryLength = 512
+	MaxStepNameLength         = 256
+	MaxActionReferenceLength  = 512
+	MaxRunScriptBytes         = 65_536
+	MaxWorkingDirectoryLength = 512
+	MaxConditionBytes         = 65_536
 	maxMapEntries             = 100
 	maxMapKeyLength           = 256
-	maxMapValueBytes          = 65_536
-	maxJobContentBytes        = 100_000
+	MaxMapValueBytes          = 65_536
+	MaxJobContentBytes        = 100_000
 	maxBranchPatterns         = 256
 	maxBranchPatternLength    = 256
 	maxActivityTypes          = 64
@@ -91,6 +93,14 @@ type Event struct {
 	BaseRef string
 }
 
+var (
+	workflowConcurrencyAvailability = expression.NewAvailability("github", "inputs", "vars")
+	jobNameAvailability             = expression.NewAvailability("github", "needs", "strategy", "matrix", "vars", "inputs")
+	jobEnvironmentAvailability      = expression.NewAvailability("github", "needs", "strategy", "matrix", "vars", "secrets", "inputs")
+	stepAvailability                = expression.NewAvailability("github", "needs", "strategy", "matrix", "job", "runner", "env", "vars", "secrets", "steps", "inputs")
+	stepConditionAvailability       = expression.NewAvailability("github", "needs", "strategy", "matrix", "job", "runner", "env", "vars", "steps", "inputs").WithStatusFunctions()
+)
+
 func Parse(data []byte) (*Definition, error) {
 	if len(data) > maxWorkflowBytes {
 		return nil, fmt.Errorf("workflow exceeds %d bytes", maxWorkflowBytes)
@@ -118,6 +128,11 @@ func Parse(data []byte) (*Definition, error) {
 	}
 	if definition.Concurrency.configured && definition.Concurrency.Group == "" {
 		return nil, fmt.Errorf("workflow concurrency group must not be empty")
+	}
+	if definition.Concurrency.Group != "" {
+		if err := validateTemplate("workflow concurrency group", definition.Concurrency.Group, workflowConcurrencyAvailability); err != nil {
+			return nil, err
+		}
 	}
 	if err := validateTrigger(definition.On); err != nil {
 		return nil, err
@@ -147,8 +162,8 @@ func validateJob(id string, job *Job) error {
 	if utf8.RuneCountInString(job.Name) > maxJobNameLength {
 		return fmt.Errorf("job %q name exceeds %d characters", id, maxJobNameLength)
 	}
-	if containsExpression(job.Name) {
-		return fmt.Errorf("job %q name uses an unsupported expression", id)
+	if err := validateTemplate(fmt.Sprintf("job %q name", id), job.Name, jobNameAvailability); err != nil {
+		return err
 	}
 	if len(job.RunsOn) == 0 {
 		return fmt.Errorf("job %q must define runs-on", id)
@@ -163,6 +178,12 @@ func validateJob(id string, job *Job) error {
 		}
 		if len(label) > 128 {
 			return fmt.Errorf("job %q contains a runs-on label longer than 128 characters", id)
+		}
+		if containsExpression(label) {
+			if err := validateTemplate(fmt.Sprintf("job %q runs-on label", id), label, jobNameAvailability); err != nil {
+				return err
+			}
+			continue
 		}
 		if !runnerLabelPattern.MatchString(label) {
 			return fmt.Errorf("job %q contains invalid runs-on label %q", id, label)
@@ -187,40 +208,40 @@ func validateJob(id string, job *Job) error {
 		return fmt.Errorf("job %q defines %d steps; maximum is %d", id, len(job.Steps), maxSteps)
 	}
 	contentBytes := len(job.Name)
-	envBytes, err := validateEnvironmentMap(fmt.Sprintf("job %q env", id), job.Env)
+	envBytes, err := validateEnvironmentMap(fmt.Sprintf("job %q env", id), job.Env, jobEnvironmentAvailability)
 	if err != nil {
 		return err
 	}
 	contentBytes += envBytes
 	for i, step := range job.Steps {
-		if utf8.RuneCountInString(step.Name) > maxStepNameLength {
-			return fmt.Errorf("job %q step %d name exceeds %d characters", id, i+1, maxStepNameLength)
+		if utf8.RuneCountInString(step.Name) > MaxStepNameLength {
+			return fmt.Errorf("job %q step %d name exceeds %d characters", id, i+1, MaxStepNameLength)
 		}
-		if containsExpression(step.Name) {
-			return fmt.Errorf("job %q step %d name uses an unsupported expression", id, i+1)
+		if err := validateTemplate(fmt.Sprintf("job %q step %d name", id, i+1), step.Name, stepAvailability); err != nil {
+			return err
 		}
 		if (step.Uses == "") == (step.Run == "") {
 			return fmt.Errorf("job %q step %d must define exactly one of uses or run", id, i+1)
 		}
 		if step.Uses != "" {
-			if utf8.RuneCountInString(step.Uses) > maxActionReferenceLength {
-				return fmt.Errorf("job %q step %d action reference exceeds %d characters", id, i+1, maxActionReferenceLength)
+			if utf8.RuneCountInString(step.Uses) > MaxActionReferenceLength {
+				return fmt.Errorf("job %q step %d action reference exceeds %d characters", id, i+1, MaxActionReferenceLength)
 			}
 			if _, err := actionref.Parse(step.Uses); err != nil {
 				return fmt.Errorf("job %q step %d: %w", id, i+1, err)
 			}
 		}
-		if len(step.Run) > maxRunScriptBytes {
-			return fmt.Errorf("job %q step %d run script exceeds %d bytes", id, i+1, maxRunScriptBytes)
+		if len(step.Run) > MaxRunScriptBytes {
+			return fmt.Errorf("job %q step %d run script exceeds %d bytes", id, i+1, MaxRunScriptBytes)
 		}
-		if containsExpression(step.Run) {
-			return fmt.Errorf("job %q step %d run script uses an unsupported expression", id, i+1)
+		if err := validateTemplate(fmt.Sprintf("job %q step %d run script", id, i+1), step.Run, stepAvailability); err != nil {
+			return err
 		}
-		if utf8.RuneCountInString(step.WorkingDirectory) > maxWorkingDirectoryLength {
-			return fmt.Errorf("job %q step %d working-directory exceeds %d characters", id, i+1, maxWorkingDirectoryLength)
+		if utf8.RuneCountInString(step.WorkingDirectory) > MaxWorkingDirectoryLength {
+			return fmt.Errorf("job %q step %d working-directory exceeds %d characters", id, i+1, MaxWorkingDirectoryLength)
 		}
-		if containsExpression(step.WorkingDirectory) {
-			return fmt.Errorf("job %q step %d working-directory uses an unsupported expression", id, i+1)
+		if err := validateTemplate(fmt.Sprintf("job %q step %d working-directory", id, i+1), step.WorkingDirectory, stepAvailability); err != nil {
+			return err
 		}
 		if step.Shell != "" && step.Shell != "bash" {
 			return fmt.Errorf("job %q step %d uses unsupported shell %q", id, i+1, step.Shell)
@@ -232,31 +253,40 @@ func validateJob(id string, job *Job) error {
 			return fmt.Errorf("job %q step %d configures with on a run step", id, i+1)
 		}
 		if step.If != "" {
-			return fmt.Errorf("job %q step %d uses unsupported if", id, i+1)
+			if len(step.If) > MaxConditionBytes {
+				return fmt.Errorf("job %q step %d if exceeds %d bytes", id, i+1, MaxConditionBytes)
+			}
+			condition, err := expression.ParseCondition(step.If)
+			if err != nil {
+				return fmt.Errorf("job %q step %d if: %w", id, i+1, err)
+			}
+			if err := condition.Validate(stepConditionAvailability); err != nil {
+				return fmt.Errorf("job %q step %d if: %w", id, i+1, err)
+			}
 		}
-		withBytes, err := validateScalarMap(fmt.Sprintf("job %q step %d with", id, i+1), step.With)
+		withBytes, err := validateScalarMap(fmt.Sprintf("job %q step %d with", id, i+1), step.With, stepAvailability)
 		if err != nil {
 			return err
 		}
-		stepEnvBytes, err := validateEnvironmentMap(fmt.Sprintf("job %q step %d env", id, i+1), step.Env)
+		stepEnvBytes, err := validateEnvironmentMap(fmt.Sprintf("job %q step %d env", id, i+1), step.Env, stepAvailability)
 		if err != nil {
 			return err
 		}
-		contentBytes += len(step.Name) + len(step.Uses) + len(step.Run) + len(step.WorkingDirectory) + withBytes + stepEnvBytes
+		contentBytes += len(step.Name) + len(step.Uses) + len(step.Run) + len(step.WorkingDirectory) + len(step.If) + withBytes + stepEnvBytes
 	}
-	if contentBytes > maxJobContentBytes {
-		return fmt.Errorf("job %q configuration exceeds %d bytes", id, maxJobContentBytes)
+	if contentBytes > MaxJobContentBytes {
+		return fmt.Errorf("job %q configuration exceeds %d bytes", id, MaxJobContentBytes)
 	}
 	return nil
 }
 
-func validateEnvironmentMap(field string, values map[string]any) (int, error) {
+func validateEnvironmentMap(field string, values map[string]any, availability expression.Availability) (int, error) {
 	for name := range values {
 		if reservedEnvironmentName(name) {
 			return 0, fmt.Errorf("%s contains reserved variable %q", field, name)
 		}
 	}
-	return validateScalarMap(field, values)
+	return validateScalarMap(field, values, availability)
 }
 
 func reservedEnvironmentName(name string) bool {
@@ -264,7 +294,7 @@ func reservedEnvironmentName(name string) bool {
 	return strings.HasPrefix(name, "GITHUB_") || strings.HasPrefix(name, "RUNNER_")
 }
 
-func validateScalarMap(field string, values map[string]any) (int, error) {
+func validateScalarMap(field string, values map[string]any, availability expression.Availability) (int, error) {
 	if len(values) > maxMapEntries {
 		return 0, fmt.Errorf("%s defines %d entries; maximum is %d", field, len(values), maxMapEntries)
 	}
@@ -277,11 +307,11 @@ func validateScalarMap(field string, values map[string]any) (int, error) {
 		if !ok {
 			return 0, fmt.Errorf("%s value %q must be a scalar", field, key)
 		}
-		if containsExpression(scalar) {
-			return 0, fmt.Errorf("%s value %q uses an unsupported expression", field, key)
+		if err := validateTemplate(fmt.Sprintf("%s value %q", field, key), scalar, availability); err != nil {
+			return 0, err
 		}
-		if len(scalar) > maxMapValueBytes {
-			return 0, fmt.Errorf("%s value %q exceeds %d bytes", field, key, maxMapValueBytes)
+		if len(scalar) > MaxMapValueBytes {
+			return 0, fmt.Errorf("%s value %q exceeds %d bytes", field, key, MaxMapValueBytes)
 		}
 		total += len(key) + len(scalar)
 	}
@@ -290,6 +320,17 @@ func validateScalarMap(field string, values map[string]any) (int, error) {
 
 func containsExpression(value string) bool {
 	return strings.Contains(value, "${{")
+}
+
+func validateTemplate(field, input string, availability expression.Availability) error {
+	program, err := expression.Parse(input)
+	if err != nil {
+		return fmt.Errorf("%s: %w", field, err)
+	}
+	if err := program.Validate(availability); err != nil {
+		return fmt.Errorf("%s: %w", field, err)
+	}
+	return nil
 }
 
 func scalarString(value any) (string, bool) {
@@ -303,53 +344,80 @@ func scalarString(value any) (string, bool) {
 	}
 }
 
+// EvaluateJob resolves fields needed before a WorkflowJob can be created.
+func EvaluateJob(id string, job Job, context expression.Context) (Job, error) {
+	name, err := expression.Parse(job.Name)
+	if err != nil {
+		return Job{}, fmt.Errorf("job %q name: %w", id, err)
+	}
+	resolvedName, err := name.Evaluate(context)
+	if err != nil {
+		return Job{}, fmt.Errorf("job %q name: %w", id, err)
+	}
+	job.Name, err = resolvedName.String()
+	if err != nil {
+		return Job{}, fmt.Errorf("job %q name: %w", id, err)
+	}
+	if utf8.RuneCountInString(job.Name) > maxJobNameLength {
+		return Job{}, fmt.Errorf("job %q evaluated name exceeds %d characters", id, maxJobNameLength)
+	}
+
+	job.RunsOn = append(StringList(nil), job.RunsOn...)
+	labels := make(map[string]struct{}, len(job.RunsOn))
+	for index, input := range job.RunsOn {
+		program, err := expression.Parse(input)
+		if err != nil {
+			return Job{}, fmt.Errorf("job %q runs-on label: %w", id, err)
+		}
+		result, err := program.Evaluate(context)
+		if err != nil {
+			return Job{}, fmt.Errorf("job %q runs-on label: %w", id, err)
+		}
+		label, err := result.String()
+		if err != nil {
+			return Job{}, fmt.Errorf("job %q runs-on label: %w", id, err)
+		}
+		if label == "" || len(label) > 128 || !runnerLabelPattern.MatchString(label) {
+			return Job{}, fmt.Errorf("job %q evaluated an invalid runs-on label", id)
+		}
+		label = lowerASCII(label)
+		if _, found := labels[label]; found {
+			return Job{}, fmt.Errorf("job %q repeats evaluated runs-on label %q", id, label)
+		}
+		labels[label] = struct{}{}
+		job.RunsOn[index] = label
+	}
+	return job, nil
+}
+
 func EvaluateConcurrency(definition *Definition, event Event) (string, bool, error) {
 	if definition.Concurrency.Group == "" {
 		return "", false, nil
 	}
-	var evaluationError error
-	unavailable := func(name string) string {
-		if evaluationError == nil {
-			evaluationError = fmt.Errorf("concurrency context %q is unavailable for this event", name)
-		}
-		return ""
+	program, err := expression.Parse(definition.Concurrency.Group)
+	if err != nil {
+		return "", false, fmt.Errorf("parse concurrency group: %w", err)
 	}
-	group := expressionPattern.ReplaceAllStringFunc(definition.Concurrency.Group, func(match string) string {
-		expression := strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(match, "${{"), "}}"))
-		switch expression {
-		case "github.workflow":
-			if definition.Name == "" {
-				return unavailable("github.workflow")
-			}
-			return definition.Name
-		case "github.head_ref || github.ref_name":
-			if event.HeadRef != "" {
-				return event.HeadRef
-			}
-			if event.RefName == "" {
-				return unavailable("github.head_ref || github.ref_name")
-			}
-			return event.RefName
-		case "github.head_ref":
-			if event.HeadRef == "" {
-				return unavailable("github.head_ref")
-			}
-			return event.HeadRef
-		case "github.ref_name":
-			if event.RefName == "" {
-				return unavailable("github.ref_name")
-			}
-			return event.RefName
-		default:
-			evaluationError = fmt.Errorf("unsupported concurrency expression %q", expression)
-			return ""
-		}
+	result, err := program.Evaluate(expression.Context{
+		Availability: expression.NewAvailability("github"),
+		Values: map[string]any{
+			"github": map[string]any{
+				"workflow":   definition.Name,
+				"event_name": event.Name,
+				"event":      map[string]any{"action": event.Action},
+				"ref":        event.Ref,
+				"ref_name":   event.RefName,
+				"head_ref":   event.HeadRef,
+				"base_ref":   event.BaseRef,
+			},
+		},
 	})
-	if evaluationError != nil {
-		return "", false, evaluationError
+	if err != nil {
+		return "", false, fmt.Errorf("evaluate concurrency group: %w", err)
 	}
-	if strings.Contains(group, "${{") {
-		return "", false, fmt.Errorf("invalid concurrency expression %q", definition.Concurrency.Group)
+	group, err := result.String()
+	if err != nil {
+		return "", false, fmt.Errorf("evaluate concurrency group: %w", err)
 	}
 	if group == "" {
 		return "", false, fmt.Errorf("evaluated concurrency group must not be empty")
@@ -360,7 +428,6 @@ func EvaluateConcurrency(definition *Definition, event Event) (string, bool, err
 	return group, definition.Concurrency.CancelInProgress, nil
 }
 
-var expressionPattern = regexp.MustCompile(`\$\{\{[^{}]+}}`)
 var jobIDPattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_-]*$`)
 var runnerLabelPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
 

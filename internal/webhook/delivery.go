@@ -344,7 +344,7 @@ func (r *DeliveryReconciler) createWorkflowRun(ctx context.Context, project *act
 						Action:     delivery.Event.Action,
 						DeliveryID: delivery.DeliveryID,
 					},
-					Revision: actionsv1alpha1.GitRevision{SHA: delivery.Event.SHA, Ref: delivery.Event.Ref, HeadRef: delivery.Event.HeadRef},
+					Revision: actionsv1alpha1.GitRevision{SHA: delivery.Event.SHA, Ref: delivery.Event.Ref, HeadRef: delivery.Event.HeadRef, BaseRef: delivery.Event.BaseRef},
 				},
 			},
 			WorkflowPath: workflowPath,
