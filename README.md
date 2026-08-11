@@ -12,30 +12,12 @@ Actions and run on self-hosted infrastructure.
 
 Kubernetes 1.29 or newer is required.
 
-The supported execution subset includes:
-
-- webhook, manual, scheduled, chained, and reusable-workflow trigger declarations used by kelos
-- workflow concurrency groups and `cancel-in-progress`
-- runner-label scheduling for independent jobs using Kubernetes `Runner` and
-  `WorkflowJob` resources
-- external `owner/repository[/path]@ref` Node 20, Node 24, and composite
-  actions, including nested external actions
-- action inputs, pre/main/post hooks, and environment, PATH, and state file commands
-- composite run and uses steps, step outputs, and composite outputs
-- `::command::` and `##[command]` workflow commands, including problem matcher annotations
-- Bash `run` steps
-- optional job-scoped Docker daemons for Docker-dependent steps and Node actions,
-  including the default `helm/kind-action` cluster workflow
-- job and step environment variables and working directories
-- typed expressions and string interpolation in concurrency, job planning,
-  workflow steps, and composite actions
-- GitHub Check Runs linked to authenticated Console run and job pages
-- GitHub-style live runner logs with collapsible groups, annotations, debug
-  filtering, and timestamps while the native Kubernetes Job is retained
-
-Unsupported workflow fields and action reference forms are rejected during
-planning. Unsupported action runtimes fail explicitly in the runner so a
-workflow is never silently executed with different semantics.
+Open Actions supports event, manual, and scheduled triggers; independent jobs
+selected by runner labels; Bash steps; Node 20, Node 24, and composite actions;
+expressions and concurrency; optional job-scoped Docker; GitHub Check Runs; and
+live logs. See the [Workflow API](docs/reference.md#workflow-api) for the exact
+supported syntax and execution constraints. Unsupported workflows fail
+explicitly rather than run with different semantics.
 
 ## Architecture
 
