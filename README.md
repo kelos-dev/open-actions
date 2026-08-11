@@ -43,11 +43,12 @@ The `open-actions-controller` accepts GitHub webhooks, discovers workflows, and
 creates `WorkflowRun` and `WorkflowJob` resources. It assigns queued jobs to
 matching `Runner` resources, which execute the workflow steps in Kubernetes
 Jobs. The controller also reports WorkflowRun state through GitHub Check Runs.
-The `open-actions-console` serves authenticated run and job pages and streams
-runner Pod logs. The runner interprets GitHub Actions workflow commands and
-problem matchers, while the Console presents groups, commands, annotations,
-masked action inputs and outputs, debug messages, and post actions. A `Project`
-defines the execution domain and its GitHub App integration.
+The `open-actions-console` serves an authenticated cluster-wide run overview,
+run and job pages, and runner Pod logs. The runner interprets GitHub Actions
+workflow commands and problem matchers, while the Console presents groups,
+commands, annotations, masked action inputs and outputs, debug messages, and
+post actions. A `Project` defines the execution domain and its GitHub App
+integration.
 
 ## Installation
 

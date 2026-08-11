@@ -41,7 +41,9 @@ GitHub Check Runs. The Console serves HTTP on `--bind-address` (default
 through HTTPS. The Helm chart configures both authentication flags from its
 configured Secret and `console.publicURL`.
 
-The Console presents runner output as line-oriented GitHub Actions logs. It
+The Console landing page lists up to 100 WorkflowRuns across all namespaces,
+newest first, and links to each run's details and jobs. The Console presents
+runner output as line-oriented GitHub Actions logs. It
 supports `group` and `endgroup`, debug and annotation commands, command lines,
 escaped command data and properties, and `stop-commands` markers. It also shows
 action input and output names without persisting their values and groups post
