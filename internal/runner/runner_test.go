@@ -1435,6 +1435,63 @@ func TestExecutorSeparatesUnterminatedChildOutputFromRunnerRecords(t *testing.T)
 	}
 }
 
+func TestExecutorLogsFailedWorkflowStep(t *testing.T) {
+	var output bytes.Buffer
+	executor, err := NewExecutor(ExecutorConfig{
+		Logger:      slog.New(slog.NewJSONHandler(&output, nil)),
+		GitHubToken: "installation-token",
+		Environment: os.Environ(),
+		Stdout:      &output,
+		Stderr:      &output,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan := testPlan()
+	plan.Steps = []Step{{Name: "Fail", Run: "exit 1"}}
+	if err := executor.Execute(context.Background(), plan, t.TempDir()); err == nil {
+		t.Fatal("Execute() succeeded")
+	}
+	if !strings.Contains(output.String(), `"msg":"failed workflow step","open_actions_runner":true,"job":"test","step":1,"name":"Fail"`) {
+		t.Fatalf("runner output has no failed step event: %s", output.String())
+	}
+}
+
+func TestExecutorLogsCancelledWorkflowStep(t *testing.T) {
+	workspace := t.TempDir()
+	var output bytes.Buffer
+	executor, err := NewExecutor(ExecutorConfig{
+		Logger:      slog.New(slog.NewJSONHandler(&output, nil)),
+		GitHubToken: "installation-token",
+		Environment: os.Environ(),
+		Stdout:      &output,
+		Stderr:      &output,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan := testPlan()
+	plan.Steps = []Step{{Name: "Wait", Run: "touch started; exec sleep 30"}}
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		result <- executor.Execute(ctx, plan, workspace)
+	}()
+	waitForFile(t, filepath.Join(workspace, "started"), "workflow step did not start")
+	cancel()
+	select {
+	case err := <-result:
+		if err == nil {
+			t.Fatal("Execute() succeeded")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("cancelled workflow step did not stop")
+	}
+	if !strings.Contains(output.String(), `"msg":"cancelled workflow step","open_actions_runner":true,"job":"test","step":1,"name":"Wait"`) {
+		t.Fatalf("runner output has no cancelled step event: %s", output.String())
+	}
+}
+
 func TestWorkflowCommandWriterRejectsOversizedCommandsWithoutExposingThem(t *testing.T) {
 	var output bytes.Buffer
 	masker := newOutputMasker()
