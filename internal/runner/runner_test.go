@@ -52,6 +52,34 @@ func TestExecuteRunSteps(t *testing.T) {
 	}
 }
 
+func TestExecuteResolvesProblemMatchersFromWorkspace(t *testing.T) {
+	workspace := t.TempDir()
+	matcherDirectory := filepath.Join(workspace, ".github")
+	if err := os.MkdirAll(matcherDirectory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	matcher := `{"problemMatcher":[{"owner":"test","pattern":{"regexp":"^(.+):(\\d+): (.*)$","file":1,"line":2,"message":3}}]}`
+	if err := os.WriteFile(filepath.Join(matcherDirectory, "matcher.json"), []byte(matcher), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(workspace, "subdir"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	plan := testPlan()
+	plan.Steps = []Step{{
+		Run:              `printf '%s\n' '::add-matcher::.github/matcher.json' 'source.go:7: broken'`,
+		WorkingDirectory: "subdir",
+	}}
+	var output bytes.Buffer
+	executor := testExecutor(t, &output, &output)
+	if err := executor.Execute(context.Background(), plan, workspace); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	if !strings.Contains(output.String(), "::error file=source.go,line=7::broken") {
+		t.Fatalf("output has no matcher annotation: %q", output.String())
+	}
+}
+
 func TestExecuteEvaluatesWorkflowExpressions(t *testing.T) {
 	workspace := t.TempDir()
 	plan := testPlan()
@@ -422,8 +450,9 @@ if (process.env.PRE_VALUE !== 'ready' || !process.env.PATH.startsWith('/external
   throw new Error('pre command files were not applied');
 }
 fs.appendFileSync(process.env.GITHUB_ENV, 'ACTION_VALUE<<EOF\n' + process.env['INPUT_MESSAGE'] + '\nEOF\n');
-fs.appendFileSync(process.env.GITHUB_OUTPUT, 'value=' + process.env['INPUT_MESSAGE'] + '\n');
+fs.appendFileSync(process.env.GITHUB_OUTPUT, 'modern=' + process.env['INPUT_MESSAGE'] + '\n');
 fs.appendFileSync(process.env.GITHUB_STATE, 'main_marker=saved\n');
+console.log('::set-output name=command::command output');
 console.log('::add-mask::runtime-secret');
 console.log('runtime-secret');
 `,
@@ -441,7 +470,16 @@ console.log('external post ran');
 				{Run: `test "$ACTION_VALUE" = "external action ran" && case "$PATH" in /external/bin:*) ;; *) exit 1 ;; esac`},
 			}
 			var output bytes.Buffer
-			executor := testExecutorWithEnvironment(t, environment, &output, &output)
+			executor, err := NewExecutor(ExecutorConfig{
+				Logger:      slog.New(slog.NewJSONHandler(&output, nil)),
+				GitHubToken: "installation-token",
+				Environment: environment,
+				Stdout:      &output,
+				Stderr:      &output,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
 			if err := executor.Execute(context.Background(), plan, t.TempDir()); err != nil {
 				t.Fatalf("execute external action: %v: %s", err, output.String())
 			}
@@ -450,6 +488,19 @@ console.log('external post ran');
 			}
 			if strings.Contains(output.String(), "runtime-secret") || !strings.Contains(output.String(), "***") {
 				t.Errorf("action output was not masked: %s", output.String())
+			}
+			for _, expected := range []string{
+				`"msg":"workflow step input","open_actions_runner":true,"name":"message"`,
+				`"msg":"workflow step output","open_actions_runner":true,"name":"command"`,
+				`"msg":"workflow step output","open_actions_runner":true,"name":"modern"`,
+				`"msg":"completed post action","open_actions_runner":true,"action":"actions/example@v1"`,
+			} {
+				if !strings.Contains(output.String(), expected) {
+					t.Errorf("runner output does not contain %q: %s", expected, output.String())
+				}
+			}
+			if strings.Contains(output.String(), "::set-output") {
+				t.Errorf("output command was exposed: %s", output.String())
 			}
 		})
 	}
@@ -803,25 +854,348 @@ func TestReservedEnvironmentVariablesCannotBeOverwritten(t *testing.T) {
 	}
 }
 
-func TestOutputMaskerHandlesAddMaskCommand(t *testing.T) {
-	var output bytes.Buffer
-	masker := newOutputMasker("initial-secret")
-	writer := masker.writer(&output)
-	_, err := writer.Write([]byte("initial-secret\n::add-mask::dynamic%25secret\ndynamic%secret\n"))
+func TestWorkflowCommandWriterAppliesSafeCommandsAndIgnoresEnvironmentCommands(t *testing.T) {
+	files, err := newCommandFiles(t.TempDir(), "bracket")
 	if err != nil {
+		t.Fatal(err)
+	}
+	var output bytes.Buffer
+	masker := newOutputMasker()
+	writer := newWorkflowCommandState().writer(masker, masker.writer(&output), &files, t.TempDir())
+	commands := strings.Join([]string{
+		"##[set-output name=result;description=value%3Bpart%5D]first%3Bsecond%5Dthird",
+		"::save-state name=phase::ready",
+		"dependency output ##[set-env name=LD_PRELOAD]/tmp/attack.so",
+		"  ::add-path::/attacker/bin",
+		"ordinary output",
+	}, "\n") + "\n"
+	if _, err := writer.Write([]byte(commands)); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.flush(); err != nil {
+		t.Fatal(err)
+	}
+	updates, err := files.read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updates.outputs["result"] != "first;second]third" || updates.state["phase"] != "ready" {
+		t.Fatalf("updates = %#v", updates)
+	}
+	if len(updates.environment) != 0 || len(updates.paths) != 0 {
+		t.Fatalf("insecure environment updates were applied: %#v", updates)
+	}
+	if output.String() != "ordinary output\n" {
+		t.Fatalf("output = %q", output.String())
+	}
+}
+
+func TestWorkflowCommandWriterAppliesProblemMatchers(t *testing.T) {
+	workspace := t.TempDir()
+	matcherDirectory := filepath.Join(workspace, ".github")
+	if err := os.MkdirAll(matcherDirectory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	matcherPath := filepath.Join(matcherDirectory, "matcher.json")
+	matcher := `{"problemMatcher":[{"owner":"go","pattern":{"regexp":"^(.+\\.go):(\\d+):(\\d+): (.*)$","file":1,"line":2,"column":3,"message":4}},{"owner":"multi","severity":"warning","pattern":[{"regexp":"^BEGIN (.+)$","file":1},{"regexp":"^MESSAGE (.+)$","message":1,"loop":true}]}]}`
+	if err := os.WriteFile(matcherPath, []byte(matcher), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var output bytes.Buffer
+	masker := newOutputMasker()
+	writer := newWorkflowCommandState().writer(masker, masker.writer(&output), nil, workspace)
+	lines := strings.Join([]string{
+		"##[add-matcher].github/matcher.json",
+		"internal/runner/runner.go:12:3: compile failed",
+		"BEGIN internal/runner/action.go",
+		"MESSAGE multiline failure",
+		"MESSAGE another failure",
+		"::remove-matcher owner=go::",
+		"internal/runner/runner.go:13:4: not annotated",
+	}, "\n") + "\n"
+	if _, err := writer.Write([]byte(lines)); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.flush(); err != nil {
+		t.Fatal(err)
+	}
+	got := output.String()
+	if !strings.Contains(got, "::error file=internal/runner/runner.go,line=12,col=3::compile failed\n") {
+		t.Fatalf("output has no matcher annotation: %q", got)
+	}
+	if !strings.Contains(got, "::warning file=internal/runner/action.go::multiline failure\n") {
+		t.Fatalf("output has no multiline matcher annotation: %q", got)
+	}
+	if !strings.Contains(got, "::warning file=internal/runner/action.go::another failure\n") {
+		t.Fatalf("output has no looped matcher annotation: %q", got)
+	}
+	if strings.Contains(got, "add-matcher") || strings.Contains(got, "remove-matcher") || strings.Contains(got, "line=13") {
+		t.Fatalf("output contains an internal or removed matcher command: %q", got)
+	}
+}
+
+func TestProblemMatcherSupportsGitHubRegularExpressions(t *testing.T) {
+	matcher, err := compileProblemMatcher(problemMatcher{
+		Owner: "compatible",
+		Patterns: []problemPattern{{
+			Regexp:  `(?<=prefix )([a-z]+): \1$`,
+			Message: 1,
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	match, found, err := matcher.match("prefix failure: failure")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !found || match.message != "failure" {
+		t.Fatalf("match = %#v, found = %t", match, found)
+	}
+}
+
+func TestWorkflowCommandWriterDisablesProblemMatcherAfterMatchError(t *testing.T) {
+	matcher, err := compileProblemMatcher(problemMatcher{
+		Owner: "slow",
+		Patterns: []problemPattern{{
+			Regexp:  `(.+)*\?`,
+			Message: 1,
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	matcher.patterns[0].MatchTimeout = -time.Second
+	state := newWorkflowCommandState()
+	state.matchers[matcher.definition.Owner] = matcher
+	var output bytes.Buffer
+	masker := newOutputMasker()
+	writer := state.writer(masker, masker.writer(&output), nil, t.TempDir())
+	if _, err := writer.Write([]byte("Do you think you found the problem string!\nordinary output\n")); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.flush(); err != nil {
+		t.Fatal(err)
+	}
+	if _, found := state.matchers[matcher.definition.Owner]; found {
+		t.Fatal("problem matcher remained registered after a match error")
+	}
+	want := "Do you think you found the problem string!\n::warning::Problem matcher \"slow\" was disabled after a regular expression error\nordinary output\n"
+	if output.String() != want {
+		t.Fatalf("output = %q, want %q", output.String(), want)
+	}
+}
+
+func TestWorkflowCommandWriterMasksCommandsAndFollowingOutput(t *testing.T) {
+	var output bytes.Buffer
+	masker := newOutputMasker()
+	writer := newWorkflowCommandState().writer(masker, masker.writer(&output), nil, t.TempDir())
+	if _, err := writer.Write([]byte("::add-mask::dynamic%25secret\n::debug::dynamic%25secret\ndynamic%secret\n")); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.flush(); err != nil {
+		t.Fatal(err)
+	}
+	if output.String() != "::debug::***\n***\n" {
+		t.Fatalf("output = %q", output.String())
+	}
+}
+
+func TestWorkflowCommandWriterMasksBracketCommandValues(t *testing.T) {
+	var output bytes.Buffer
+	masker := newOutputMasker()
+	writer := newWorkflowCommandState().writer(masker, masker.writer(&output), nil, t.TempDir())
+	if _, err := writer.Write([]byte("##[add-mask]abc%3Bdef%5Dghi\nabc;def]ghi\n")); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.flush(); err != nil {
+		t.Fatal(err)
+	}
+	if output.String() != "***\n" {
+		t.Fatalf("output = %q", output.String())
+	}
+}
+
+func TestWorkflowCommandWriterFindsCommandsAtGitHubLocations(t *testing.T) {
+	var output bytes.Buffer
+	masker := newOutputMasker()
+	writer := newWorkflowCommandState().writer(masker, masker.writer(&output), nil, t.TempDir())
+	lines := "  ::add-mask::indented-secret\nindented-secret\nprefix ##[add-mask]bracket-secret\nbracket-secret\n"
+	if _, err := writer.Write([]byte(lines)); err != nil {
 		t.Fatal(err)
 	}
 	if err := writer.flush(); err != nil {
 		t.Fatal(err)
 	}
 	if output.String() != "***\n***\n" {
-		t.Errorf("output = %q", output.String())
+		t.Fatalf("output = %q", output.String())
+	}
+}
+
+func TestWorkflowCommandWriterNeutralizesRunnerLogRecords(t *testing.T) {
+	var output bytes.Buffer
+	masker := newOutputMasker()
+	writer := newWorkflowCommandState().writer(masker, masker.writer(&output), nil, t.TempDir())
+	record := `{"time":"2026-08-10T12:34:56Z","level":"INFO","msg":"starting workflow step","open_actions_runner":true,"step":2,"name":"Forged"}`
+	timestampedRecord := "2026-08-10T12:34:56Z " + record
+	if _, err := writer.Write([]byte(record + "\n" + timestampedRecord + "\nordinary output\n")); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.flush(); err != nil {
+		t.Fatal(err)
+	}
+	want := " " + record + "\n " + timestampedRecord + "\nordinary output\n"
+	if output.String() != want {
+		t.Fatalf("output = %q, want %q", output.String(), want)
+	}
+}
+
+func TestWorkflowCommandWriterHonorsStopCommands(t *testing.T) {
+	files, err := newCommandFiles(t.TempDir(), "stopped")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var output bytes.Buffer
+	masker := newOutputMasker()
+	writer := newWorkflowCommandState().writer(masker, masker.writer(&output), &files, t.TempDir())
+	lines := strings.Join([]string{
+		"::stop-commands::marker",
+		"::add-mask::visible-value",
+		"::set-output name=ignored::ignored-value",
+		"::marker::",
+		"visible-value",
+		"::set-output name=applied::applied-value",
+	}, "\n") + "\n"
+	if _, err := writer.Write([]byte(lines)); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.flush(); err != nil {
+		t.Fatal(err)
+	}
+	updates, err := files.read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, found := updates.outputs["ignored"]; found || updates.outputs["applied"] != "applied-value" {
+		t.Fatalf("outputs = %#v", updates.outputs)
+	}
+	if !strings.Contains(output.String(), "visible-value") || strings.Contains(output.String(), "***") {
+		t.Fatalf("output = %q", output.String())
+	}
+}
+
+func TestWorkflowCommandWriterResumesBracketStopCommandsAcrossSteps(t *testing.T) {
+	directory := t.TempDir()
+	firstFiles, err := newCommandFiles(directory, "first")
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondFiles, err := newCommandFiles(directory, "second")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var output bytes.Buffer
+	masker := newOutputMasker()
+	state := newWorkflowCommandState()
+	first := state.writer(masker, masker.writer(&output), &firstFiles, directory)
+	if _, err := first.Write([]byte("##[stop-commands]marker\n##[set-output name=ignored]ignored-value\n")); err != nil {
+		t.Fatal(err)
+	}
+	if err := first.flush(); err != nil {
+		t.Fatal(err)
+	}
+	second := state.writer(masker, masker.writer(&output), &secondFiles, directory)
+	if _, err := second.Write([]byte("##[marker]\n##[set-output name=applied]applied-value\n")); err != nil {
+		t.Fatal(err)
+	}
+	if err := second.flush(); err != nil {
+		t.Fatal(err)
+	}
+	firstUpdates, err := firstFiles.read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondUpdates, err := secondFiles.read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, found := firstUpdates.outputs["ignored"]; found || secondUpdates.outputs["applied"] != "applied-value" {
+		t.Fatalf("first outputs = %#v, second outputs = %#v", firstUpdates.outputs, secondUpdates.outputs)
+	}
+}
+
+func TestExecutorSeparatesUnterminatedChildOutputFromRunnerRecords(t *testing.T) {
+	var output bytes.Buffer
+	executor, err := NewExecutor(ExecutorConfig{
+		Logger:      slog.New(slog.NewJSONHandler(&output, nil)),
+		GitHubToken: "installation-token",
+		Environment: os.Environ(),
+		Stdout:      &output,
+		Stderr:      io.Discard,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan := testPlan()
+	plan.Steps = []Step{{Run: "printf hello"}}
+	if err := executor.Execute(context.Background(), plan, t.TempDir()); err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimSuffix(output.String(), "\n"), "\n")
+	foundOutput := false
+	foundCompletion := false
+	for _, line := range lines {
+		if line == "hello" {
+			foundOutput = true
+			continue
+		}
+		record := map[string]any{}
+		if json.Unmarshal([]byte(line), &record) == nil && record["msg"] == "completed workflow step" && record[runnerLogMarker] == true {
+			foundCompletion = true
+		}
+	}
+	if !foundOutput || !foundCompletion || strings.Contains(output.String(), "hello{") {
+		t.Fatalf("runner output has ambiguous records: %q", output.String())
+	}
+}
+
+func TestWorkflowCommandWriterRejectsOversizedCommandsWithoutExposingThem(t *testing.T) {
+	var output bytes.Buffer
+	masker := newOutputMasker()
+	writer := newWorkflowCommandState().writer(masker, masker.writer(&output), nil, t.TempDir())
+	value := strings.Repeat("s", maxWorkflowCommandBytes)
+	if _, err := writer.Write([]byte("::add-mask::" + value + "\n")); err == nil {
+		t.Fatal("oversized workflow command was accepted")
+	}
+	if output.Len() != 0 {
+		t.Fatalf("oversized workflow command was exposed: %q", output.String())
+	}
+}
+
+func TestWorkflowCommandWriterStreamsOversizedUnknownCommandPrefixes(t *testing.T) {
+	for _, prefix := range []string{"::diagnostic::", "##[diagnostic]"} {
+		t.Run(prefix, func(t *testing.T) {
+			var output bytes.Buffer
+			masker := newOutputMasker()
+			writer := newWorkflowCommandState().writer(masker, masker.writer(&output), nil, t.TempDir())
+			line := prefix + strings.Repeat("x", maxWorkflowCommandBytes)
+			if _, err := writer.Write([]byte(line + "\n")); err != nil {
+				t.Fatal(err)
+			}
+			if err := writer.flush(); err != nil {
+				t.Fatal(err)
+			}
+			if output.String() != line+"\n" {
+				t.Fatalf("output length = %d, want %d", output.Len(), len(line)+1)
+			}
+		})
 	}
 }
 
 func TestOutputMaskerMasksEachLineOfMultilineAddMask(t *testing.T) {
 	var output bytes.Buffer
-	writer := newOutputMasker().writer(&output)
+	masker := newOutputMasker()
+	writer := newWorkflowCommandState().writer(masker, masker.writer(&output), nil, t.TempDir())
 	if _, err := writer.Write([]byte("::add-mask::first%0Asecond%0Dthird\nfirst\nsecond\nthird\n")); err != nil {
 		t.Fatal(err)
 	}
@@ -833,7 +1207,7 @@ func TestOutputMaskerMasksEachLineOfMultilineAddMask(t *testing.T) {
 	}
 }
 
-func TestOutputMaskerPreservesPartialCommandPrefixes(t *testing.T) {
+func TestOutputMaskerPreservesOrdinaryPrefixes(t *testing.T) {
 	var output bytes.Buffer
 	writer := newOutputMasker().writer(&output)
 	if _, err := writer.Write([]byte(":\n::add")); err != nil {
@@ -874,15 +1248,30 @@ func TestOutputMaskerStreamsLongLinesAndMasksAcrossWrites(t *testing.T) {
 
 func TestExecutorMasksFatalErrors(t *testing.T) {
 	executor := testExecutor(t, io.Discard, io.Discard)
-	commandWriter := executor.masker.writer(io.Discard)
-	if _, err := commandWriter.Write([]byte("::add-mask::dynamic-secret\n")); err != nil {
-		t.Fatal(err)
-	}
+	executor.masker.add("dynamic-secret")
 	plan := testPlan()
 	plan.Steps = []Step{{Run: "true", WorkingDirectory: "../dynamic-secret"}}
 	err := executor.Execute(context.Background(), plan, t.TempDir())
 	if err == nil || strings.Contains(err.Error(), "dynamic-secret") || !strings.Contains(err.Error(), "***") {
 		t.Fatalf("fatal error = %v", err)
+	}
+}
+
+func TestExecutorDoesNotLogCommandValues(t *testing.T) {
+	var logs bytes.Buffer
+	executor, err := NewExecutor(ExecutorConfig{
+		Logger:      slog.New(slog.NewJSONHandler(&logs, nil)),
+		GitHubToken: "installation-token",
+		Environment: os.Environ(),
+		Stdout:      io.Discard,
+		Stderr:      io.Discard,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	executor.logCommandNames("workflow step input", map[string]string{"token": "unregistered-secret"})
+	if strings.Contains(logs.String(), "unregistered-secret") || strings.Contains(logs.String(), `"value"`) || !strings.Contains(logs.String(), `"name":"token"`) {
+		t.Fatalf("command name log = %s", logs.String())
 	}
 }
 
@@ -917,6 +1306,11 @@ func TestExecutorMasksContinueOnErrorWarnings(t *testing.T) {
 	}
 	if strings.Contains(logs.String(), "installation-token") || !strings.Contains(logs.String(), "***") {
 		t.Fatalf("warning log = %s", logs.String())
+	}
+	warning := strings.Index(logs.String(), `"msg":"composite step failed with continue-on-error"`)
+	completion := strings.Index(logs.String(), `"msg":"completed composite step"`)
+	if warning < 0 || completion < warning {
+		t.Fatalf("composite step was not closed after its warning: %s", logs.String())
 	}
 }
 

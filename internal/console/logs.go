@@ -30,5 +30,5 @@ func (s *kubernetesLogSource) ListPods(ctx context.Context, namespace, selector 
 }
 
 func (s *kubernetesLogSource) Stream(ctx context.Context, namespace, name string) (io.ReadCloser, error) {
-	return s.client.CoreV1().Pods(namespace).GetLogs(name, &corev1.PodLogOptions{Container: runner.ContainerName, Follow: true}).Stream(ctx)
+	return s.client.CoreV1().Pods(namespace).GetLogs(name, &corev1.PodLogOptions{Container: runner.ContainerName, Follow: true, Timestamps: true}).Stream(ctx)
 }

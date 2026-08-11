@@ -3,6 +3,7 @@ module github.com/kelos-dev/open-actions
 go 1.25.0
 
 require (
+	github.com/dlclark/regexp2/v2 v2.6.0
 	github.com/onsi/ginkgo/v2 v2.32.0
 	github.com/onsi/gomega v1.42.1
 	github.com/spf13/cobra v1.10.0

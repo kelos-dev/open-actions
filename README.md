@@ -20,12 +20,14 @@ The supported execution subset includes:
   actions, including nested external actions
 - action inputs, pre/main/post hooks, and environment, PATH, and state file commands
 - composite run and uses steps, step outputs, and composite outputs
+- `::command::` and `##[command]` workflow commands, including problem matcher annotations
 - Bash `run` steps
 - job and step environment variables and working directories
 - typed expressions and string interpolation in concurrency, job planning,
   workflow steps, and composite actions
 - GitHub Check Runs linked to authenticated Console run and job pages
-- live runner logs in the Console while the native Kubernetes Job is retained
+- GitHub-style live runner logs with collapsible groups, annotations, debug
+  filtering, and timestamps while the native Kubernetes Job is retained
 
 Unsupported workflow fields and action reference forms are rejected during
 planning. Unsupported action runtimes fail explicitly in the runner so a
@@ -39,9 +41,11 @@ The `open-actions-controller` accepts GitHub webhooks, discovers workflows, and
 creates `WorkflowRun` and `WorkflowJob` resources. It assigns queued jobs to
 matching `Runner` resources, which execute the workflow steps in Kubernetes
 Jobs. The controller also reports WorkflowRun state through GitHub Check Runs.
-The `open-actions-console` serves authenticated run and job pages and
-streams runner Pod logs. A `Project` defines the execution domain and its GitHub
-App integration.
+The `open-actions-console` serves authenticated run and job pages and streams
+runner Pod logs. The runner interprets GitHub Actions workflow commands and
+problem matchers, while the Console presents groups, commands, annotations,
+masked action inputs and outputs, debug messages, and post actions. A `Project`
+defines the execution domain and its GitHub App integration.
 
 ## Installation
 

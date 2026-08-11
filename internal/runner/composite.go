@@ -150,14 +150,13 @@ func (e *Executor) runComposite(ctx context.Context, state *executionState, invo
 		if err != nil {
 			if continueOnError {
 				e.logger.Warn("composite step failed with continue-on-error", "action", invocation.step.Uses, "step", index+1, "name", name, "error", e.masker.mask(err.Error()))
-				continue
+			} else {
+				cancelledDuringCommand := !cancelledBeforeCommand && ctx.Err() != nil
+				if !cancelledDuringCommand {
+					compositeFailed = true
+				}
+				compositeError = errors.Join(compositeError, fmt.Errorf("composite step %d (%s): %w", index+1, name, err))
 			}
-			cancelledDuringCommand := !cancelledBeforeCommand && ctx.Err() != nil
-			if !cancelledDuringCommand {
-				compositeFailed = true
-			}
-			compositeError = errors.Join(compositeError, fmt.Errorf("composite step %d (%s): %w", index+1, name, err))
-			continue
 		}
 		e.logger.Info("completed composite step", "action", invocation.step.Uses, "step", index+1, "name", name)
 	}
@@ -197,12 +196,13 @@ func (e *Executor) runCompositeScript(ctx context.Context, state *executionState
 	environment = setEnvironment(environment, "GITHUB_ACTION_PATH", invocation.directory)
 	environment = setEnvironment(environment, "GITHUB_ACTION_REPOSITORY", invocation.reference.Owner+"/"+invocation.reference.Repository)
 	environment = files.environmentVariables(environment)
-	executionError := e.executeCommand(ctx, "/usr/bin/env", []string{"bash", "-e", "-o", "pipefail", "-c", step.Run}, directory, environment)
+	executionError := e.executeCommandWithFiles(ctx, "/usr/bin/env", []string{"bash", "-e", "-o", "pipefail", "-c", step.Run}, directory, environment, &files, state.workspace)
 	updates, commandError := files.read()
 	if commandError != nil {
 		return nil, errors.Join(executionError, commandError)
 	}
 	applyEnvironmentUpdates(&state.environment, updates)
+	e.logCommandNames("workflow step output", updates.outputs)
 	return updates.outputs, executionError
 }
 

@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"sync/atomic"
 
@@ -25,6 +26,8 @@ const (
 	PlanVersion        = 2
 	ContainerName      = "runner"
 )
+
+const runnerLogMarker = "open_actions_runner"
 
 type Plan struct {
 	Version      int               `json:"version"`
@@ -85,6 +88,7 @@ type Executor struct {
 	stdout      io.Writer
 	stderr      io.Writer
 	masker      *outputMasker
+	commands    *workflowCommandState
 	commandID   atomic.Uint64
 }
 
@@ -107,12 +111,13 @@ func NewExecutor(config ExecutorConfig) (*Executor, error) {
 	masker := newOutputMasker(config.GitHubToken)
 	masker.add(base64.StdEncoding.EncodeToString([]byte("x-access-token:" + config.GitHubToken)))
 	return &Executor{
-		logger:      config.Logger,
+		logger:      config.Logger.With(runnerLogMarker, true),
 		githubToken: config.GitHubToken,
 		environment: append([]string(nil), config.Environment...),
 		stdout:      config.Stdout,
 		stderr:      config.Stderr,
 		masker:      masker,
+		commands:    newWorkflowCommandState(),
 	}, nil
 }
 
@@ -338,7 +343,9 @@ func (e *Executor) runPostActions(ctx context.Context, state *executionState, st
 			continue
 		}
 		e.logger.Info("starting post action", "action", invocation.step.Uses)
-		if err := e.runJavaScriptHook(ctx, invocation, "post", invocation.definition.Runs.Post, state.temporaryDirectory, state.workspace, &state.environment); err != nil {
+		err := e.runJavaScriptHook(ctx, invocation, "post", invocation.definition.Runs.Post, state.temporaryDirectory, state.workspace, &state.environment)
+		e.logger.Info("completed post action", "action", invocation.step.Uses)
+		if err != nil {
 			result = errors.Join(result, fmt.Errorf("post action %s: %w", invocation.step.Uses, err))
 			status.Success = false
 			status.Failure = true
@@ -358,20 +365,36 @@ func (e *Executor) runScript(ctx context.Context, state *executionState, step St
 	}
 	environment := appendEnvironment(append([]string(nil), state.environment...), step.Env)
 	environment = files.environmentVariables(environment)
-	executionError := e.executeCommand(ctx, "/usr/bin/env", []string{"bash", "-e", "-o", "pipefail", "-c", step.Run}, directory, environment)
+	executionError := e.executeCommandWithFiles(ctx, "/usr/bin/env", []string{"bash", "-e", "-o", "pipefail", "-c", step.Run}, directory, environment, &files, state.workspace)
 	updates, commandError := files.read()
 	if commandError != nil {
 		return errors.Join(executionError, commandError)
 	}
 	applyEnvironmentUpdates(&state.environment, updates)
+	e.logCommandNames("workflow step output", updates.outputs)
 	return executionError
 }
 
 func (e *Executor) executeCommand(ctx context.Context, name string, args []string, directory string, environment []string) error {
-	stdout := e.masker.writer(e.stdout)
-	stderr := e.masker.writer(e.stderr)
+	return e.executeCommandWithFiles(ctx, name, args, directory, environment, nil, directory)
+}
+
+func (e *Executor) executeCommandWithFiles(ctx context.Context, name string, args []string, directory string, environment []string, files *commandFiles, workspace string) error {
+	stdout := e.commands.writer(e.masker, e.masker.writer(e.stdout), files, workspace)
+	stderr := e.commands.writer(e.masker, e.masker.writer(e.stderr), files, workspace)
 	err := execute(ctx, name, args, directory, environment, stdout, stderr)
 	return errors.Join(err, stdout.flush(), stderr.flush())
+}
+
+func (e *Executor) logCommandNames(message string, values map[string]string) {
+	names := make([]string, 0, len(values))
+	for name := range values {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		e.logger.Info(message, "name", name)
+	}
 }
 
 func execute(ctx context.Context, name string, args []string, directory string, environment []string, stdout, stderr io.Writer) error {
