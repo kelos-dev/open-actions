@@ -10,5 +10,6 @@ const (
 	AnnotationWorkflowJobID          = "actions.kelos.dev/workflow-job-id"
 	AnnotationWorkflowJobDisplayName = "actions.kelos.dev/workflow-job-display-name"
 	AnnotationRunnerName             = "actions.kelos.dev/runner-name"
+	AnnotationRunnerResultVersion    = "actions.kelos.dev/runner-result-version"
 	AnnotationProjectName            = "actions.kelos.dev/project-name"
 )

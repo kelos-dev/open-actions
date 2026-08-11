@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -52,6 +53,111 @@ func TestExecuteRunSteps(t *testing.T) {
 	}
 }
 
+func TestExecuteExposesRunStepOutputs(t *testing.T) {
+	plan := testPlan()
+	plan.Outputs = map[string]string{
+		"missing":     "${{ steps.producer.outputs.missing }}",
+		"multiline":   "${{ steps.producer.outputs.multiline }}",
+		"overwritten": "${{ steps.producer.outputs.value }}",
+		"skipped":     "${{ steps.skipped.outputs.value }}",
+	}
+	plan.Steps = []Step{
+		{
+			ID:  "producer",
+			Run: `printf '%s\n' 'value=first' 'value=second' 'multiline<<EOF' 'first line' 'second line' 'EOF' >> "$GITHUB_OUTPUT"`,
+		},
+		{ID: "skipped", If: "false", Run: `echo 'value=unavailable' >> "$GITHUB_OUTPUT"`},
+		{
+			Env: map[string]string{
+				"MISSING":     "${{ steps.producer.outputs.missing }}",
+				"MULTILINE":   "${{ steps.producer.outputs.multiline }}",
+				"OVERWRITTEN": "${{ steps.producer.outputs.value }}",
+				"SKIPPED":     "${{ steps.skipped.outputs.value }}",
+			},
+			Run: `test -z "$MISSING" && test "$MULTILINE" = $'first line\nsecond line' && test "$OVERWRITTEN" = second && test -z "$SKIPPED"`,
+		},
+	}
+	result, err := testExecutor(t, io.Discard, io.Discard).ExecuteResult(context.Background(), plan, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]string{"missing": "", "multiline": "first line\nsecond line", "overwritten": "second", "skipped": ""}
+	if !maps.Equal(result.Outputs, want) {
+		t.Fatalf("outputs = %#v, want %#v", result.Outputs, want)
+	}
+}
+
+func TestExecuteKeepsOutputsFromFailedSteps(t *testing.T) {
+	plan := testPlan()
+	plan.Outputs = map[string]string{"value": "${{ steps.failed.outputs.value }}"}
+	plan.Steps = []Step{
+		{ID: "failed", Run: `echo 'value=available' >> "$GITHUB_OUTPUT"; exit 1`},
+		{If: "always()", Run: `test '${{ steps.failed.outputs.value }}' = available`},
+	}
+	result, err := testExecutor(t, io.Discard, io.Discard).ExecuteResult(context.Background(), plan, t.TempDir())
+	if err == nil {
+		t.Fatal("ExecuteResult() succeeded after a failed step")
+	}
+	if result.Outputs["value"] != "available" {
+		t.Fatalf("outputs = %#v", result.Outputs)
+	}
+}
+
+func TestExecuteKeepsOutputsFromFailedCompositeActions(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git is not installed")
+	}
+	repositories := t.TempDir()
+	createActionRepository(t, repositories, "actions", "failed-output", "v1", map[string]string{
+		"action.yml": `name: Failed output fixture
+outputs:
+  result:
+    value: ${{ steps.failed.outputs.value }}
+runs:
+  using: composite
+  steps:
+    - id: failed
+      run: echo 'value=available' >> "$GITHUB_OUTPUT"; exit 1
+      shell: bash
+`,
+	})
+	plan := testPlan()
+	plan.Repository.ActionCloneBaseURL = "file://" + repositories
+	plan.Outputs = map[string]string{"value": "${{ steps.failed.outputs.result }}"}
+	plan.Steps = []Step{
+		{ID: "failed", Uses: "actions/failed-output@v1"},
+		{If: "always()", Run: `test '${{ steps.failed.outputs.result }}' = available`},
+	}
+	result, err := testExecutor(t, io.Discard, io.Discard).ExecuteResult(context.Background(), plan, t.TempDir())
+	if err == nil {
+		t.Fatal("ExecuteResult() succeeded after a failed composite action")
+	}
+	if result.Outputs["value"] != "available" {
+		t.Fatalf("outputs = %#v", result.Outputs)
+	}
+}
+
+func TestExecuteOmitsSecretDerivedJobOutputs(t *testing.T) {
+	plan := testPlan()
+	plan.Outputs = map[string]string{"secret": "prefix-${{ steps.secret.outputs.value }}"}
+	plan.Steps = []Step{{
+		ID:  "secret",
+		Env: map[string]string{"TOKEN": "${{ github.token }}"},
+		Run: `printf 'value=%s\n' "$TOKEN" >> "$GITHUB_OUTPUT"`,
+	}}
+	var logs bytes.Buffer
+	result, err := testExecutor(t, &logs, &logs).ExecuteResult(context.Background(), plan, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, found := result.Outputs["secret"]; found {
+		t.Fatalf("secret output was persisted: %#v", result.Outputs)
+	}
+	if strings.Contains(logs.String(), "installation-token") {
+		t.Fatalf("secret output was logged: %s", logs.String())
+	}
+}
+
 func TestExecuteResolvesProblemMatchersFromWorkspace(t *testing.T) {
 	workspace := t.TempDir()
 	matcherDirectory := filepath.Join(workspace, ".github")
@@ -85,6 +191,7 @@ func TestExecuteEvaluatesWorkflowExpressions(t *testing.T) {
 	plan := testPlan()
 	plan.Matrix = map[string]any{"arch": "arm64"}
 	plan.Env = map[string]string{"ARCH": "${{ matrix.arch }}", "BRANCH": "${{ github.ref_name }}", "JOB_TOKEN": "${{ github.token }}"}
+	plan.Outputs = map[string]string{"image": "${{ matrix.arch }}-${{ steps.build.outputs.image }}"}
 	plan.Steps = []Step{
 		{
 			Name: "skipped",
@@ -93,6 +200,7 @@ func TestExecuteEvaluatesWorkflowExpressions(t *testing.T) {
 			Env:  map[string]string{"TOKEN": "${{ secrets.TOKEN }}"},
 		},
 		{
+			ID:   "build",
 			Name: "write ${{ github.ref_name }} result",
 			If:   "env.TARGET == 'main'",
 			Env: map[string]string{
@@ -100,12 +208,16 @@ func TestExecuteEvaluatesWorkflowExpressions(t *testing.T) {
 				"STEP_TOKEN": "${{ github.token }}",
 				"TARGET":     "main",
 			},
-			Run: "test \"$JOB_TOKEN\" = installation-token && test \"$STEP_TOKEN\" = installation-token && printf '%s/%s/${{ github.sha }}/${{ env.TARGET }}/${{ matrix.arch }}' \"$BRANCH\" \"$REPOSITORY\" > result",
+			Run: "test \"$JOB_TOKEN\" = installation-token && test \"$STEP_TOKEN\" = installation-token && printf '%s/%s/${{ github.sha }}/${{ env.TARGET }}/${{ matrix.arch }}' \"$BRANCH\" \"$REPOSITORY\" > result && echo 'image=ready' >> \"$GITHUB_OUTPUT\"",
 		},
 	}
 	executor := testExecutor(t, io.Discard, io.Discard)
-	if err := executor.Execute(context.Background(), plan, workspace); err != nil {
+	executionResult, err := executor.ExecuteResult(context.Background(), plan, workspace)
+	if err != nil {
 		t.Fatal(err)
+	}
+	if executionResult.Outputs["image"] != "arm64-ready" {
+		t.Fatalf("job outputs = %#v", executionResult.Outputs)
 	}
 	if _, err := os.Stat(filepath.Join(workspace, "skipped")); !os.IsNotExist(err) {
 		t.Fatalf("skipped step created a file: %v", err)
@@ -623,9 +735,10 @@ console.log('external post ran');
 			})
 			plan := testPlan()
 			plan.Repository.ActionCloneBaseURL = "file://" + repositories
+			plan.Outputs = map[string]string{"action": "${{ steps.external.outputs.modern }}"}
 			plan.Steps = []Step{
 				{Run: `printf '%s\n' "$RUNTIME_OVERRIDE" >> "$GITHUB_PATH"`, Env: map[string]string{"RUNTIME_OVERRIDE": overrideDirectory}},
-				{Uses: "actions/example@v1", With: map[string]string{"message": "external action ran"}},
+				{ID: "external", Uses: "actions/example@v1", With: map[string]string{"message": "external action ran"}},
 				{Run: `test "$ACTION_VALUE" = "external action ran" && case "$PATH" in /external/bin:*) ;; *) exit 1 ;; esac`},
 			}
 			var output bytes.Buffer
@@ -639,8 +752,12 @@ console.log('external post ran');
 			if err != nil {
 				t.Fatal(err)
 			}
-			if err := executor.Execute(context.Background(), plan, t.TempDir()); err != nil {
+			result, err := executor.ExecuteResult(context.Background(), plan, t.TempDir())
+			if err != nil {
 				t.Fatalf("execute external action: %v: %s", err, output.String())
+			}
+			if result.Outputs["action"] != "external action ran" {
+				t.Errorf("action outputs = %#v", result.Outputs)
 			}
 			if !strings.Contains(output.String(), "external pre ran") || !strings.Contains(output.String(), "external post ran") {
 				t.Errorf("lifecycle output was not recorded: %s", output.String())

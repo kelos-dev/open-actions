@@ -160,9 +160,6 @@ func (e *Executor) runComposite(ctx context.Context, state *executionState, invo
 		}
 		e.logger.Info("completed composite step", "action", invocation.step.Uses, "step", index+1, "name", name)
 	}
-	if compositeError != nil {
-		return nil, compositeError
-	}
 	outputs := map[string]string{}
 	for name, definition := range invocation.definition.Outputs {
 		if definition.Value == nil {
@@ -171,15 +168,15 @@ func (e *Executor) runComposite(ctx context.Context, state *executionState, invo
 		}
 		value, err := inputString(definition.Value)
 		if err != nil {
-			return nil, fmt.Errorf("composite output %q: %w", name, err)
+			return outputs, errors.Join(compositeError, fmt.Errorf("composite output %q: %w", name, err))
 		}
 		value, err = resolveCompositeExpressions(value, compositeContext)
 		if err != nil {
-			return nil, fmt.Errorf("composite output %q: %w", name, err)
+			return outputs, errors.Join(compositeError, fmt.Errorf("composite output %q: %w", name, err))
 		}
 		outputs[name] = value
 	}
-	return outputs, nil
+	return outputs, compositeError
 }
 
 func (e *Executor) runCompositeScript(ctx context.Context, state *executionState, invocation *actionInvocation, step Step) (map[string]string, error) {

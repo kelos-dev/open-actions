@@ -300,7 +300,7 @@ func (e *Executor) executeAction(ctx context.Context, state *executionState, ste
 			return nil, err
 		}
 		if err := e.runJavaScriptHook(ctx, invocation, "main", invocation.definition.Runs.Main, state.temporaryDirectory, state.workspace, &state.environment); err != nil {
-			return nil, err
+			return invocation.outputs, err
 		}
 		outputs = invocation.outputs
 	case "composite":
@@ -309,7 +309,7 @@ func (e *Executor) executeAction(ctx context.Context, state *executionState, ste
 		return nil, fmt.Errorf("action %s uses unsupported runtime %q", step.Uses, invocation.definition.Runs.Using)
 	}
 	if err != nil {
-		return nil, err
+		return outputs, err
 	}
 	e.logCommandNames("workflow step output", outputs)
 	return outputs, nil

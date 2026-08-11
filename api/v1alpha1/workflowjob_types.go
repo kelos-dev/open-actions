@@ -102,6 +102,14 @@ type WorkflowJobStatus struct {
 	// +optional
 	CompletionTime *metav1.Time `json:"completionTime,omitempty"`
 
+	// Outputs contains the non-secret outputs declared by the workflow job.
+	// The controller records them only after execution reaches a terminal result.
+	// +kubebuilder:validation:MaxProperties=100
+	// +kubebuilder:validation:XValidation:rule="self.all(k, size(k) <= 256 && k.matches('^[A-Za-z_][A-Za-z0-9_-]*$'))",message="output names must be workflow identifiers no more than 256 characters"
+	// +kubebuilder:validation:XValidation:rule="self.all(k, size(self[k]) <= 4096)",message="output values must be no more than 4096 characters"
+	// +optional
+	Outputs map[string]string `json:"outputs,omitempty"`
+
 	// Conditions describe Runner assignment and the terminal result. Scheduled
 	// is true after the scheduler assigns status.runnerRef. Known condition types
 	// are Scheduled and Succeeded.

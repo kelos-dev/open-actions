@@ -29,6 +29,7 @@ const (
 	maxJobNameLength          = 256
 	maxRunnerLabels           = 16
 	maxSteps                  = 100
+	MaxStepIDLength           = 256
 	MaxStepNameLength         = 256
 	MaxActionReferenceLength  = 512
 	MaxRunScriptBytes         = 65_536
@@ -123,6 +124,7 @@ type Job struct {
 	Name      string         `yaml:"name"`
 	RunsOn    StringList     `yaml:"runs-on"`
 	Needs     StringList     `yaml:"needs"`
+	Outputs   map[string]any `yaml:"outputs"`
 	Steps     []Step         `yaml:"steps"`
 	Strategy  Strategy       `yaml:"strategy"`
 	Container yaml.Node      `yaml:"container"`
@@ -139,6 +141,7 @@ type Strategy struct {
 }
 
 type Step struct {
+	ID               string         `yaml:"id"`
 	Name             string         `yaml:"name"`
 	Uses             string         `yaml:"uses"`
 	Run              string         `yaml:"run"`
@@ -335,7 +338,23 @@ func validateJob(id string, job *Job) error {
 		return err
 	}
 	contentBytes += envBytes
+	outputBytes, err := validateJobOutputs(id, job.Outputs)
+	if err != nil {
+		return err
+	}
+	contentBytes += outputBytes
+	stepIDs := map[string]struct{}{}
 	for i, step := range job.Steps {
+		if utf8.RuneCountInString(step.ID) > MaxStepIDLength || (step.ID != "" && !jobIDPattern.MatchString(step.ID)) {
+			return fmt.Errorf("job %q step %d has invalid id %q", id, i+1, step.ID)
+		}
+		if step.ID != "" {
+			canonicalID := lowerASCII(step.ID)
+			if _, found := stepIDs[canonicalID]; found {
+				return fmt.Errorf("job %q step id %q is duplicated", id, step.ID)
+			}
+			stepIDs[canonicalID] = struct{}{}
+		}
 		if utf8.RuneCountInString(step.Name) > MaxStepNameLength {
 			return fmt.Errorf("job %q step %d name exceeds %d characters", id, i+1, MaxStepNameLength)
 		}
@@ -394,7 +413,7 @@ func validateJob(id string, job *Job) error {
 		if err != nil {
 			return err
 		}
-		contentBytes += len(step.Name) + len(step.Uses) + len(step.Run) + len(step.WorkingDirectory) + len(step.If) + withBytes + stepEnvBytes
+		contentBytes += len(step.ID) + len(step.Name) + len(step.Uses) + len(step.Run) + len(step.WorkingDirectory) + len(step.If) + withBytes + stepEnvBytes
 	}
 	if contentBytes > MaxJobContentBytes {
 		return fmt.Errorf("job %q configuration exceeds %d bytes", id, MaxJobContentBytes)
@@ -467,6 +486,20 @@ func MatrixCombinations(strategy Strategy) []map[string]any {
 		combinations = next
 	}
 	return combinations
+}
+
+func validateJobOutputs(jobID string, outputs map[string]any) (int, error) {
+	field := fmt.Sprintf("job %q outputs", jobID)
+	bytes, err := validateScalarMap(field, outputs, stepAvailability)
+	if err != nil {
+		return 0, err
+	}
+	for name := range outputs {
+		if !jobIDPattern.MatchString(name) {
+			return 0, fmt.Errorf("%s contains invalid output name %q", field, name)
+		}
+	}
+	return bytes, nil
 }
 
 func validateEnvironmentMap(field string, values map[string]any, availability expression.Availability) (int, error) {

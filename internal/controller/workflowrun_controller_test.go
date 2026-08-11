@@ -46,10 +46,10 @@ func TestJobPlanCoversSupportedSteps(t *testing.T) {
 			},
 		},
 	}}
-	job := workflow.Job{RunsOn: workflow.StringList{"ubuntu-latest"}, Steps: []workflow.Step{
+	job := workflow.Job{RunsOn: workflow.StringList{"ubuntu-latest"}, Outputs: map[string]any{"artifact": "${{ steps.build.outputs.value }}"}, Steps: []workflow.Step{
 		{Uses: "actions/checkout@v4"},
 		{Uses: "actions/setup-go@v5", With: map[string]any{"go-version-file": "go.mod"}},
-		{Name: "Build", Run: "make build"},
+		{ID: "build", Name: "Build", Run: "make build"},
 	}}
 	plan, err := reconciler.jobPlan(run, "CI", "build", job, nil, map[string]any{"enabled": false, "retries": float64(2)})
 	if err != nil {
@@ -66,6 +66,9 @@ func TestJobPlanCoversSupportedSteps(t *testing.T) {
 	}
 	if len(plan.Steps) != 3 {
 		t.Errorf("steps = %d", len(plan.Steps))
+	}
+	if plan.Steps[2].ID != "build" || plan.Outputs["artifact"] == "" {
+		t.Errorf("output plan = %#v", plan)
 	}
 }
 
@@ -86,7 +89,7 @@ func TestPlanWorkflowJobsSetsDisplayNames(t *testing.T) {
 		},
 	}}}
 	definition := &workflow.Definition{Name: "CI", Jobs: map[string]workflow.Job{
-		"build": {Name: "Build ${{ github.base_ref }} PR ${{ github.event.pull_request.number }} from ${{ github.event.pull_request.head.repo.full_name }} at ${{ github.event.pull_request.merge_commit_sha }} for ${{ inputs.environment }} (${{ github.event.inputs.environment }})", RunsOn: workflow.StringList{"ubuntu-latest"}},
+		"build": {Name: "Build ${{ github.base_ref }} PR ${{ github.event.pull_request.number }} from ${{ github.event.pull_request.head.repo.full_name }} at ${{ github.event.pull_request.merge_commit_sha }} for ${{ inputs.environment }} (${{ github.event.inputs.environment }})", RunsOn: workflow.StringList{"ubuntu-latest"}, Outputs: map[string]any{"artifact": "ready"}},
 		"lint":  {RunsOn: workflow.StringList{"ubuntu-latest"}},
 	}}
 
@@ -97,7 +100,7 @@ func TestPlanWorkflowJobsSetsDisplayNames(t *testing.T) {
 	if len(planned) != 2 {
 		t.Fatalf("planned jobs = %d, want 2", len(planned))
 	}
-	if planned[0].id != "build" || planned[0].displayName != "Build main PR 7 from contributor/project at "+strings.Repeat("a", 40)+" for staging (staging)" {
+	if planned[0].id != "build" || planned[0].displayName != "Build main PR 7 from contributor/project at "+strings.Repeat("a", 40)+" for staging (staging)" || planned[0].resultVersion != jobResultVersion {
 		t.Errorf("build job = %#v", planned[0])
 	}
 	plan := &runner.Plan{}
@@ -107,7 +110,7 @@ func TestPlanWorkflowJobsSetsDisplayNames(t *testing.T) {
 	if plan.Event.PullRequest == nil || plan.Event.PullRequest.Number != 7 || plan.Event.PullRequest.HeadRepository.Owner != "contributor" || plan.Event.PullRequest.HeadSHA != strings.Repeat("b", 40) {
 		t.Fatalf("plan pull request = %#v", plan.Event.PullRequest)
 	}
-	if planned[1].id != "lint" || planned[1].displayName != "lint" {
+	if planned[1].id != "lint" || planned[1].displayName != "lint" || planned[1].resultVersion != "" {
 		t.Errorf("lint job = %#v", planned[1])
 	}
 }
@@ -243,7 +246,7 @@ func TestPlanWorkflowJobsExpandsArchitectureMatrix(t *testing.T) {
 			Revision:   actionsv1alpha1.GitRevision{SHA: strings.Repeat("a", 40), Ref: "refs/heads/main"},
 		},
 	}}}
-	definition, err := workflow.Parse([]byte("name: Release\non: push\njobs:\n  build-images:\n    strategy:\n      max-parallel: 1\n      matrix:\n        arch: [amd64, arm64]\n    runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}\n    steps:\n      - run: make image IMAGE_PLATFORMS=linux/${{ matrix.arch }}\n"))
+	definition, err := workflow.Parse([]byte("name: Release\non: push\njobs:\n  build-images:\n    strategy:\n      max-parallel: 1\n      matrix:\n        arch: [amd64, arm64]\n    runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}\n    outputs:\n      image: ${{ matrix.arch }}-${{ steps.build.outputs.image }}\n    steps:\n      - id: build\n        run: make image IMAGE_PLATFORMS=linux/${{ matrix.arch }}\n"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -257,7 +260,7 @@ func TestPlanWorkflowJobsExpandsArchitectureMatrix(t *testing.T) {
 	}
 	for index, arch := range []string{"amd64", "arm64"} {
 		job := planned[index]
-		if job.id != fmt.Sprintf("build-images-matrix-%d", index+1) || job.matrix == nil || job.matrix.LogicalJobID != "build-images" || job.matrix.Values["arch"] != arch || job.matrix.MaxParallel != 1 {
+		if job.id != fmt.Sprintf("build-images-matrix-%d", index+1) || job.matrix == nil || job.matrix.LogicalJobID != "build-images" || job.matrix.Values["arch"] != arch || job.matrix.MaxParallel != 1 || job.resultVersion != jobResultVersion {
 			t.Errorf("planned job %d = %#v", index, job)
 		}
 		wantRunner := "ubuntu-latest"
@@ -271,7 +274,7 @@ func TestPlanWorkflowJobsExpandsArchitectureMatrix(t *testing.T) {
 		if err := json.Unmarshal([]byte(job.plan), plan); err != nil {
 			t.Fatal(err)
 		}
-		if plan.JobID != "build-images" || plan.Matrix["arch"] != arch {
+		if plan.JobID != "build-images" || plan.Matrix["arch"] != arch || plan.Outputs["image"] != "${{ matrix.arch }}-${{ steps.build.outputs.image }}" {
 			t.Errorf("plan for %s = %#v", arch, plan)
 		}
 	}
@@ -998,7 +1001,7 @@ func TestEnsureWorkflowJobsCreatesReadableNames(t *testing.T) {
 	reconciler := &WorkflowRunReconciler{Client: clusterClient, APIReader: clusterClient}
 
 	if err := reconciler.ensureWorkflowJobs(context.Background(), run, project, []plannedWorkflowJob{{
-		id: "build", displayName: "Build and test", runsOn: []string{"linux"}, plan: "{}",
+		id: "build", displayName: "Build and test", runsOn: []string{"linux"}, plan: "{}", resultVersion: jobResultVersion,
 	}}); err != nil {
 		t.Fatal(err)
 	}
@@ -1012,6 +1015,9 @@ func TestEnsureWorkflowJobsCreatesReadableNames(t *testing.T) {
 	job := &jobs.Items[0]
 	if job.Name != workflowJobName(run.Name, "build") || job.Spec.DisplayName != "Build and test" {
 		t.Errorf("WorkflowJob = %#v", job)
+	}
+	if job.Annotations[actionsv1alpha1.AnnotationRunnerResultVersion] != jobResultVersion {
+		t.Errorf("runner result version = %q", job.Annotations[actionsv1alpha1.AnnotationRunnerResultVersion])
 	}
 }
 

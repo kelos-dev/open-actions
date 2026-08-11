@@ -8,6 +8,8 @@ import (
 	"strings"
 )
 
+const maxOutputCommandFileBytes = 1 << 20
+
 type commandFiles struct {
 	environment string
 	output      string
@@ -50,6 +52,13 @@ func (f commandFiles) read() (commandUpdates, error) {
 	state, err := readKeyValueFile(f.state)
 	if err != nil {
 		return commandUpdates{}, fmt.Errorf("read GITHUB_STATE: %w", err)
+	}
+	outputInfo, err := os.Stat(f.output)
+	if err != nil {
+		return commandUpdates{}, fmt.Errorf("read GITHUB_OUTPUT: %w", err)
+	}
+	if outputInfo.Size() > maxOutputCommandFileBytes {
+		return commandUpdates{}, fmt.Errorf("read GITHUB_OUTPUT: file exceeds %d bytes", maxOutputCommandFileBytes)
 	}
 	outputs, err := readKeyValueFile(f.output)
 	if err != nil {

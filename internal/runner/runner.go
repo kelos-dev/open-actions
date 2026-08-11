@@ -23,7 +23,7 @@ import (
 
 const (
 	minimumPlanVersion = 1
-	PlanVersion        = 3
+	PlanVersion        = 4
 	ContainerName      = "runner"
 )
 
@@ -39,6 +39,7 @@ type Plan struct {
 	JobID        string            `json:"jobID"`
 	Matrix       map[string]any    `json:"matrix,omitempty"`
 	Env          map[string]string `json:"env,omitempty"`
+	Outputs      map[string]string `json:"outputs,omitempty"`
 	Steps        []Step            `json:"steps"`
 }
 
@@ -106,6 +107,7 @@ type Revision struct {
 }
 
 type Step struct {
+	ID               string            `json:"id,omitempty"`
 	Name             string            `json:"name,omitempty"`
 	Uses             string            `json:"uses,omitempty"`
 	Run              string            `json:"run,omitempty"`
@@ -143,6 +145,7 @@ type executionState struct {
 	resolver           *actionResolver
 	posts              []*actionInvocation
 	compositeStack     map[string]bool
+	stepOutputs        map[string]map[string]any
 	resolvedContent    int
 }
 
@@ -203,34 +206,40 @@ func validEventDeliveryID(event Event) bool {
 }
 
 func (e *Executor) Execute(ctx context.Context, plan *Plan, workspace string) error {
-	err := e.executePlan(ctx, plan, workspace)
-	if err == nil {
-		return nil
-	}
-	return errors.New(e.masker.mask(err.Error()))
+	_, err := e.ExecuteResult(ctx, plan, workspace)
+	return err
 }
 
-func (e *Executor) executePlan(ctx context.Context, plan *Plan, workspace string) error {
+func (e *Executor) ExecuteResult(ctx context.Context, plan *Plan, workspace string) (Result, error) {
+	result, err := e.executePlan(ctx, plan, workspace)
+	if err == nil {
+		return result, nil
+	}
+	return result, errors.New(e.masker.mask(err.Error()))
+}
+
+func (e *Executor) executePlan(ctx context.Context, plan *Plan, workspace string) (Result, error) {
+	emptyResult := Result{Version: ResultVersion}
 	if err := os.MkdirAll(workspace, 0o755); err != nil {
-		return fmt.Errorf("create workspace: %w", err)
+		return emptyResult, fmt.Errorf("create workspace: %w", err)
 	}
 	temporaryDirectory, err := os.MkdirTemp("", "open-actions-runner-")
 	if err != nil {
-		return fmt.Errorf("create runner temporary directory: %w", err)
+		return emptyResult, fmt.Errorf("create runner temporary directory: %w", err)
 	}
 	defer os.RemoveAll(temporaryDirectory)
 	for _, directory := range []string{"actions", "commands", "tool-cache", "temp"} {
 		if err := os.MkdirAll(filepath.Join(temporaryDirectory, directory), 0o755); err != nil {
-			return fmt.Errorf("create runner directory: %w", err)
+			return emptyResult, fmt.Errorf("create runner directory: %w", err)
 		}
 	}
 	eventPath := filepath.Join(temporaryDirectory, "event.json")
 	eventDocument, err := githubEventDocument(plan)
 	if err != nil {
-		return err
+		return emptyResult, err
 	}
 	if err := os.WriteFile(eventPath, eventDocument, 0o600); err != nil {
-		return fmt.Errorf("create event file: %w", err)
+		return emptyResult, fmt.Errorf("create event file: %w", err)
 	}
 
 	environment := append(append([]string(nil), e.environment...),
@@ -257,14 +266,14 @@ func (e *Executor) executePlan(ctx context.Context, plan *Plan, workspace string
 	)
 	jobEnvironment, err := resolveJobEnvironment(plan.Env, plan, environment, e.githubToken)
 	if err != nil {
-		return fmt.Errorf("resolve job environment: %w", err)
+		return emptyResult, fmt.Errorf("resolve job environment: %w", err)
 	}
 	jobContentBytes, err := resolvedMapBytes("evaluated job environment", jobEnvironment)
 	if err != nil {
-		return err
+		return emptyResult, err
 	}
 	if jobContentBytes > workflow.MaxJobContentBytes {
-		return fmt.Errorf("evaluated job configuration exceeds %d bytes", workflow.MaxJobContentBytes)
+		return emptyResult, fmt.Errorf("evaluated job configuration exceeds %d bytes", workflow.MaxJobContentBytes)
 	}
 	environment = appendEnvironment(environment, jobEnvironment)
 	state := &executionState{
@@ -275,6 +284,7 @@ func (e *Executor) executePlan(ctx context.Context, plan *Plan, workspace string
 		githubToken:        e.githubToken,
 		resolver:           newActionResolver(plan.Repository.ActionCloneBaseURL, filepath.Join(temporaryDirectory, "actions"), environment, e.executeCommand),
 		compositeStack:     map[string]bool{},
+		stepOutputs:        map[string]map[string]any{},
 		resolvedContent:    jobContentBytes,
 	}
 
@@ -321,13 +331,17 @@ func (e *Executor) executePlan(ctx context.Context, plan *Plan, workspace string
 			name = step.Uses
 		}
 		e.logger.Info("starting workflow step", "job", plan.JobID, "step", index+1, "name", name)
+		var outputs map[string]string
 		var stepError error
 		cancelledBeforeCommand := ctx.Err() != nil
 		stepContext := executionContext(ctx)
 		if step.Uses == "" {
-			stepError = e.runScript(stepContext, state, step)
+			outputs, stepError = e.runScript(stepContext, state, step)
 		} else {
-			_, stepError = e.executeAction(stepContext, state, step, 0, cancelledBeforeCommand)
+			outputs, stepError = e.executeAction(stepContext, state, step, 0, cancelledBeforeCommand)
+		}
+		if rawStep.ID != "" {
+			e.recordWorkflowStepOutputs(state, rawStep.ID, outputs)
 		}
 		if stepError != nil {
 			stepError = fmt.Errorf("step %d (%s): %w", index+1, name, stepError)
@@ -344,7 +358,10 @@ func (e *Executor) executePlan(ctx context.Context, plan *Plan, workspace string
 		executionErrors = errors.Join(executionErrors, ctx.Err())
 	}
 	status := workflowStepStatus(failed, ctx.Err() != nil)
-	return errors.Join(executionErrors, e.runPostActions(executionContext(ctx), state, status))
+	postError := e.runPostActions(executionContext(ctx), state, status)
+	outputs, outputError := e.resolveJobOutputs(state)
+	result, resultError := NewResult(outputs)
+	return result, errors.Join(executionErrors, postError, outputError, resultError)
 }
 
 func executionContext(ctx context.Context) context.Context {
@@ -505,25 +522,65 @@ func (e *Executor) runPostActions(ctx context.Context, state *executionState, st
 	return result
 }
 
-func (e *Executor) runScript(ctx context.Context, state *executionState, step Step) error {
+func (e *Executor) runScript(ctx context.Context, state *executionState, step Step) (map[string]string, error) {
 	directory, err := withinDirectory(state.workspace, step.WorkingDirectory)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	files, err := newCommandFiles(filepath.Join(state.temporaryDirectory, "commands"), fmt.Sprintf("%d-step", e.commandID.Add(1)))
 	if err != nil {
-		return err
+		return nil, err
 	}
 	environment := appendEnvironment(append([]string(nil), state.environment...), step.Env)
 	environment = files.environmentVariables(environment)
 	executionError := e.executeCommandWithFiles(ctx, "/usr/bin/env", []string{"bash", "-e", "-o", "pipefail", "-c", step.Run}, directory, environment, &files, state.workspace)
 	updates, commandError := files.read()
 	if commandError != nil {
-		return errors.Join(executionError, commandError)
+		return nil, errors.Join(executionError, commandError)
 	}
 	applyEnvironmentUpdates(&state.environment, updates)
 	e.logCommandNames("workflow step output", updates.outputs)
-	return executionError
+	return updates.outputs, executionError
+}
+
+func (e *Executor) recordWorkflowStepOutputs(state *executionState, id string, outputs map[string]string) {
+	values := make(map[string]any, len(outputs))
+	for name, value := range outputs {
+		if e.masker.contains(value) {
+			values[name] = expression.Secret(value)
+		} else {
+			values[name] = value
+		}
+	}
+	state.stepOutputs[id] = map[string]any{"outputs": values}
+}
+
+func (e *Executor) resolveJobOutputs(state *executionState) (map[string]string, error) {
+	if len(state.plan.Outputs) == 0 {
+		return nil, nil
+	}
+	context := workflowExpressionContext(state, state.environment, runnerStepAvailability, nil)
+	outputs := make(map[string]string, len(state.plan.Outputs))
+	for name, input := range state.plan.Outputs {
+		program, err := expression.Parse(input)
+		if err != nil {
+			return nil, fmt.Errorf("job output %q: %w", name, err)
+		}
+		resolved, err := program.Evaluate(context)
+		if err != nil {
+			return nil, fmt.Errorf("job output %q: %w", name, err)
+		}
+		value, err := resolved.String()
+		if err != nil {
+			return nil, fmt.Errorf("job output %q: %w", name, err)
+		}
+		if resolved.Secret || e.masker.contains(value) {
+			e.logger.Warn("skipping secret-derived job output", "job", state.plan.JobID, "name", name)
+			continue
+		}
+		outputs[name] = value
+	}
+	return outputs, nil
 }
 
 func (e *Executor) executeCommand(ctx context.Context, name string, args []string, directory string, environment []string) error {

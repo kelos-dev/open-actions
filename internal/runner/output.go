@@ -94,6 +94,17 @@ func (m *outputMasker) mask(value string) string {
 	return value
 }
 
+func (m *outputMasker) contains(value string) bool {
+	m.mutex.RLock()
+	defer m.mutex.RUnlock()
+	for _, secret := range m.masks {
+		if strings.Contains(value, string(secret)) {
+			return true
+		}
+	}
+	return false
+}
+
 func (w *maskingWriter) Write(data []byte) (int, error) {
 	w.mutex.Lock()
 	defer w.mutex.Unlock()

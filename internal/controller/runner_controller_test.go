@@ -10,6 +10,7 @@ import (
 	"time"
 
 	actionsv1alpha1 "github.com/kelos-dev/open-actions/api/v1alpha1"
+	"github.com/kelos-dev/open-actions/internal/runner"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -42,10 +43,11 @@ func TestRunnerBuildsOwnedJob(t *testing.T) {
 	}
 	workflowJob := &actionsv1alpha1.WorkflowJob{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      "ci-build",
-			Namespace: "default",
-			UID:       types.UID("workflow-job-uid"),
-			Labels:    map[string]string{actionsv1alpha1.LabelWorkflowJob: "build"},
+			Name:        "ci-build",
+			Namespace:   "default",
+			UID:         types.UID("workflow-job-uid"),
+			Labels:      map[string]string{actionsv1alpha1.LabelWorkflowJob: "build"},
+			Annotations: map[string]string{actionsv1alpha1.AnnotationRunnerResultVersion: jobResultVersion},
 		},
 		Spec: actionsv1alpha1.WorkflowJobSpec{JobID: "build", DisplayName: "Build and test"},
 	}
@@ -60,8 +62,11 @@ func TestRunnerBuildsOwnedJob(t *testing.T) {
 	if container.Resources.Requests.Cpu().String() != "1" {
 		t.Errorf("cpu request = %s", container.Resources.Requests.Cpu().String())
 	}
-	if strings.Join(container.Args, " ") != "--job-file=/var/run/open-actions/job.json --workspace=/workspace/repository" {
+	if strings.Join(container.Args, " ") != "--job-file=/var/run/open-actions/job.json --result-file=/dev/termination-log --workspace=/workspace/repository" {
 		t.Errorf("args = %v", container.Args)
+	}
+	if container.TerminationMessagePath != jobResultPath || container.TerminationMessagePolicy != corev1.TerminationMessageReadFile {
+		t.Errorf("termination message = %q, policy = %q", container.TerminationMessagePath, container.TerminationMessagePolicy)
 	}
 	workspaceMount := ""
 	for _, mount := range container.VolumeMounts {
@@ -78,6 +83,9 @@ func TestRunnerBuildsOwnedJob(t *testing.T) {
 	if job.Annotations[actionsv1alpha1.AnnotationWorkflowJobDisplayName] != "Build and test" ||
 		job.Spec.Template.Annotations[actionsv1alpha1.AnnotationWorkflowJobDisplayName] != "Build and test" {
 		t.Errorf("workflow job display name annotations = job %q, pod %q", job.Annotations[actionsv1alpha1.AnnotationWorkflowJobDisplayName], job.Spec.Template.Annotations[actionsv1alpha1.AnnotationWorkflowJobDisplayName])
+	}
+	if job.Annotations[actionsv1alpha1.AnnotationRunnerResultVersion] != jobResultVersion || job.Spec.Template.Annotations[actionsv1alpha1.AnnotationRunnerResultVersion] != jobResultVersion {
+		t.Errorf("runner result annotations = job %q, pod %q", job.Annotations[actionsv1alpha1.AnnotationRunnerResultVersion], job.Spec.Template.Annotations[actionsv1alpha1.AnnotationRunnerResultVersion])
 	}
 	if len(job.OwnerReferences) != 1 || job.OwnerReferences[0].UID != workflowJob.UID {
 		t.Errorf("owner references = %#v", job.OwnerReferences)
@@ -518,7 +526,7 @@ func TestTerminalWorkflowJobStatusIsDurableBeforeCredentialCleanup(t *testing.T)
 		Status:     actionsv1alpha1.WorkflowJobStatus{RunnerRef: &corev1.LocalObjectReference{Name: "runner"}},
 	}
 	nativeJob := &batchv1.Job{
-		ObjectMeta: metav1.ObjectMeta{Name: workflowJob.Name, Namespace: workflowJob.Namespace},
+		ObjectMeta: metav1.ObjectMeta{Name: workflowJob.Name, Namespace: workflowJob.Namespace, UID: types.UID("native-job-uid"), Annotations: map[string]string{actionsv1alpha1.AnnotationRunnerResultVersion: jobResultVersion}},
 		Status: batchv1.JobStatus{Conditions: []batchv1.JobCondition{{
 			Type: batchv1.JobComplete, Status: corev1.ConditionTrue,
 		}}},
@@ -526,11 +534,31 @@ func TestTerminalWorkflowJobStatusIsDurableBeforeCredentialCleanup(t *testing.T)
 	if err := controllerutil.SetControllerReference(workflowJob, nativeJob, scheme); err != nil {
 		t.Fatal(err)
 	}
+	resultData, err := runner.EncodeResult(runner.Result{Version: runner.ResultVersion, Outputs: map[string]string{"artifact": "ready"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "build-pod",
+			Namespace: workflowJob.Namespace,
+			Labels:    map[string]string{actionsv1alpha1.LabelWorkflowJobUID: string(workflowJob.UID)},
+		},
+		Status: corev1.PodStatus{ContainerStatuses: []corev1.ContainerStatus{{
+			Name: runner.ContainerName,
+			State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
+				Message: string(resultData),
+			}},
+		}}},
+	}
+	if err := controllerutil.SetControllerReference(nativeJob, pod, scheme); err != nil {
+		t.Fatal(err)
+	}
 	authSecret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: childName(workflowJob.Name, "auth"), Namespace: workflowJob.Namespace}}
 	clusterClient := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithStatusSubresource(&actionsv1alpha1.WorkflowJob{}, &batchv1.Job{}).
-		WithObjects(workflowJob, nativeJob, authSecret).
+		WithObjects(workflowJob, nativeJob, pod, authSecret).
 		Build()
 	reconciler := &RunnerReconciler{Client: clusterClient, APIReader: clusterClient}
 	found, terminal, err := reconciler.observeNativeJob(context.Background(), workflowJob)
@@ -544,12 +572,181 @@ func TestTerminalWorkflowJobStatusIsDurableBeforeCredentialCleanup(t *testing.T)
 	if !terminalWorkflowJob(stored) {
 		t.Fatal("WorkflowJob terminal result was not persisted before credential cleanup")
 	}
+	if stored.Status.Outputs["artifact"] != "ready" {
+		t.Fatalf("WorkflowJob outputs = %#v", stored.Status.Outputs)
+	}
 	storedNativeJob := &batchv1.Job{}
 	if err := clusterClient.Get(context.Background(), client.ObjectKeyFromObject(nativeJob), storedNativeJob); err != nil {
 		t.Fatal(err)
 	}
 	if storedNativeJob.Spec.TTLSecondsAfterFinished != nil {
 		t.Fatal("native Job TTL started before credential cleanup completed")
+	}
+}
+
+func TestSuccessfulNativeJobRequiresRunnerResult(t *testing.T) {
+	scheme := runnerTestScheme(t)
+	workflowJob := &actionsv1alpha1.WorkflowJob{
+		TypeMeta:   metav1.TypeMeta{APIVersion: actionsv1alpha1.GroupVersion.String(), Kind: "WorkflowJob"},
+		ObjectMeta: metav1.ObjectMeta{Name: "build", Namespace: "default", UID: types.UID("workflow-job-uid")},
+		Status:     actionsv1alpha1.WorkflowJobStatus{RunnerRef: &corev1.LocalObjectReference{Name: "runner"}},
+	}
+	nativeJob := &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{Name: workflowJob.Name, Namespace: workflowJob.Namespace, UID: types.UID("native-job-uid"), Annotations: map[string]string{actionsv1alpha1.AnnotationRunnerResultVersion: jobResultVersion}},
+		Status: batchv1.JobStatus{Conditions: []batchv1.JobCondition{{
+			Type: batchv1.JobComplete, Status: corev1.ConditionTrue,
+		}}},
+	}
+	if err := controllerutil.SetControllerReference(workflowJob, nativeJob, scheme); err != nil {
+		t.Fatal(err)
+	}
+	clusterClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&actionsv1alpha1.WorkflowJob{}, &batchv1.Job{}).
+		WithObjects(workflowJob, nativeJob).
+		Build()
+	reconciler := &RunnerReconciler{Client: clusterClient, APIReader: clusterClient}
+	found, terminal, err := reconciler.observeNativeJob(context.Background(), workflowJob)
+	if err != nil || !found || !terminal {
+		t.Fatalf("observeNativeJob() = found %t, terminal %t, error %v", found, terminal, err)
+	}
+	stored := &actionsv1alpha1.WorkflowJob{}
+	if err := clusterClient.Get(context.Background(), client.ObjectKeyFromObject(workflowJob), stored); err != nil {
+		t.Fatal(err)
+	}
+	condition := meta.FindStatusCondition(stored.Status.Conditions, actionsv1alpha1.WorkflowJobConditionSucceeded)
+	if condition == nil || condition.Status != metav1.ConditionFalse || condition.Reason != "JobResultInvalid" {
+		t.Fatalf("succeeded condition = %#v", condition)
+	}
+}
+
+func TestRunnerResultReadErrorIsRetried(t *testing.T) {
+	scheme := runnerTestScheme(t)
+	workflowJob := &actionsv1alpha1.WorkflowJob{
+		TypeMeta:   metav1.TypeMeta{APIVersion: actionsv1alpha1.GroupVersion.String(), Kind: "WorkflowJob"},
+		ObjectMeta: metav1.ObjectMeta{Name: "build", Namespace: "default", UID: types.UID("workflow-job-uid")},
+		Status:     actionsv1alpha1.WorkflowJobStatus{RunnerRef: &corev1.LocalObjectReference{Name: "runner"}},
+	}
+	nativeJob := &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{Name: workflowJob.Name, Namespace: workflowJob.Namespace, UID: types.UID("native-job-uid"), Annotations: map[string]string{actionsv1alpha1.AnnotationRunnerResultVersion: jobResultVersion}},
+		Status: batchv1.JobStatus{Conditions: []batchv1.JobCondition{{
+			Type: batchv1.JobComplete, Status: corev1.ConditionTrue,
+		}}},
+	}
+	if err := controllerutil.SetControllerReference(workflowJob, nativeJob, scheme); err != nil {
+		t.Fatal(err)
+	}
+	clusterClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&actionsv1alpha1.WorkflowJob{}, &batchv1.Job{}).
+		WithObjects(workflowJob, nativeJob).
+		Build()
+	readError := errors.New("temporary Pod list failure")
+	reconciler := &RunnerReconciler{Client: clusterClient, APIReader: &podListErrorReader{Reader: clusterClient, err: readError}}
+	found, terminal, err := reconciler.observeNativeJob(context.Background(), workflowJob)
+	if !found || !terminal || !errors.Is(err, readError) {
+		t.Fatalf("observeNativeJob() = found %t, terminal %t, error %v", found, terminal, err)
+	}
+	stored := &actionsv1alpha1.WorkflowJob{}
+	if err := clusterClient.Get(context.Background(), client.ObjectKeyFromObject(workflowJob), stored); err != nil {
+		t.Fatal(err)
+	}
+	if terminalWorkflowJob(stored) {
+		t.Fatalf("WorkflowJob became terminal after a transient read error: %#v", stored.Status.Conditions)
+	}
+}
+
+func TestFailedNativeJobPersistsRunnerOutputs(t *testing.T) {
+	scheme := runnerTestScheme(t)
+	workflowJob := &actionsv1alpha1.WorkflowJob{
+		TypeMeta:   metav1.TypeMeta{APIVersion: actionsv1alpha1.GroupVersion.String(), Kind: "WorkflowJob"},
+		ObjectMeta: metav1.ObjectMeta{Name: "build", Namespace: "default", UID: types.UID("workflow-job-uid")},
+		Status:     actionsv1alpha1.WorkflowJobStatus{RunnerRef: &corev1.LocalObjectReference{Name: "runner"}},
+	}
+	nativeJob := &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{Name: workflowJob.Name, Namespace: workflowJob.Namespace, UID: types.UID("native-job-uid"), Annotations: map[string]string{actionsv1alpha1.AnnotationRunnerResultVersion: jobResultVersion}},
+		Status: batchv1.JobStatus{Conditions: []batchv1.JobCondition{{
+			Type: batchv1.JobFailed, Status: corev1.ConditionTrue,
+		}}},
+	}
+	if err := controllerutil.SetControllerReference(workflowJob, nativeJob, scheme); err != nil {
+		t.Fatal(err)
+	}
+	resultData, err := runner.EncodeResult(runner.Result{Version: runner.ResultVersion, Outputs: map[string]string{"artifact": "available"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "build-pod", Namespace: workflowJob.Namespace, Labels: map[string]string{actionsv1alpha1.LabelWorkflowJobUID: string(workflowJob.UID)}},
+		Status: corev1.PodStatus{ContainerStatuses: []corev1.ContainerStatus{{
+			Name: runner.ContainerName,
+			State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
+				Message: string(resultData),
+			}},
+		}}},
+	}
+	if err := controllerutil.SetControllerReference(nativeJob, pod, scheme); err != nil {
+		t.Fatal(err)
+	}
+	clusterClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&actionsv1alpha1.WorkflowJob{}, &batchv1.Job{}).
+		WithObjects(workflowJob, nativeJob, pod).
+		Build()
+	reconciler := &RunnerReconciler{Client: clusterClient, APIReader: clusterClient}
+	found, terminal, err := reconciler.observeNativeJob(context.Background(), workflowJob)
+	if err != nil || !found || !terminal {
+		t.Fatalf("observeNativeJob() = found %t, terminal %t, error %v", found, terminal, err)
+	}
+	stored := &actionsv1alpha1.WorkflowJob{}
+	if err := clusterClient.Get(context.Background(), client.ObjectKeyFromObject(workflowJob), stored); err != nil {
+		t.Fatal(err)
+	}
+	condition := meta.FindStatusCondition(stored.Status.Conditions, actionsv1alpha1.WorkflowJobConditionSucceeded)
+	if condition == nil || condition.Status != metav1.ConditionFalse || condition.Reason != "JobFailed" {
+		t.Fatalf("succeeded condition = %#v", condition)
+	}
+	if stored.Status.Outputs["artifact"] != "available" {
+		t.Fatalf("WorkflowJob outputs = %#v", stored.Status.Outputs)
+	}
+}
+
+func TestNativeJobWithoutResultVersionSucceedsWithoutOutputs(t *testing.T) {
+	scheme := runnerTestScheme(t)
+	workflowJob := &actionsv1alpha1.WorkflowJob{
+		TypeMeta:   metav1.TypeMeta{APIVersion: actionsv1alpha1.GroupVersion.String(), Kind: "WorkflowJob"},
+		ObjectMeta: metav1.ObjectMeta{Name: "build", Namespace: "default", UID: types.UID("workflow-job-uid")},
+		Status:     actionsv1alpha1.WorkflowJobStatus{RunnerRef: &corev1.LocalObjectReference{Name: "runner"}},
+	}
+	nativeJob := &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{Name: workflowJob.Name, Namespace: workflowJob.Namespace, UID: types.UID("native-job-uid")},
+		Status: batchv1.JobStatus{Conditions: []batchv1.JobCondition{{
+			Type: batchv1.JobComplete, Status: corev1.ConditionTrue,
+		}}},
+	}
+	if err := controllerutil.SetControllerReference(workflowJob, nativeJob, scheme); err != nil {
+		t.Fatal(err)
+	}
+	clusterClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&actionsv1alpha1.WorkflowJob{}, &batchv1.Job{}).
+		WithObjects(workflowJob, nativeJob).
+		Build()
+	reconciler := &RunnerReconciler{Client: clusterClient, APIReader: clusterClient}
+	found, terminal, err := reconciler.observeNativeJob(context.Background(), workflowJob)
+	if err != nil || !found || !terminal {
+		t.Fatalf("observeNativeJob() = found %t, terminal %t, error %v", found, terminal, err)
+	}
+	stored := &actionsv1alpha1.WorkflowJob{}
+	if err := clusterClient.Get(context.Background(), client.ObjectKeyFromObject(workflowJob), stored); err != nil {
+		t.Fatal(err)
+	}
+	condition := meta.FindStatusCondition(stored.Status.Conditions, actionsv1alpha1.WorkflowJobConditionSucceeded)
+	if condition == nil || condition.Status != metav1.ConditionTrue || condition.Reason != "JobSucceeded" {
+		t.Fatalf("succeeded condition = %#v", condition)
+	}
+	if stored.Status.Outputs != nil {
+		t.Fatalf("WorkflowJob outputs = %#v", stored.Status.Outputs)
 	}
 }
 
@@ -1093,4 +1290,16 @@ func runnerTestScheme(t *testing.T) *runtime.Scheme {
 		t.Fatal(err)
 	}
 	return scheme
+}
+
+type podListErrorReader struct {
+	client.Reader
+	err error
+}
+
+func (r *podListErrorReader) List(ctx context.Context, list client.ObjectList, options ...client.ListOption) error {
+	if _, ok := list.(*corev1.PodList); ok {
+		return r.err
+	}
+	return r.Reader.List(ctx, list, options...)
 }
