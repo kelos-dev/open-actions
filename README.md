@@ -1,12 +1,12 @@
 # Open Actions
 
-Open Actions is a Kubernetes-native, self-hosted control plane for high-volume
-automation workloads. It is built for teams whose CI demand is growing faster
-than a hosted scheduler can comfortably handle: source events trigger supported
-workflows, while Open Actions schedules their jobs in the team's own Kubernetes
-cluster. GitHub webhooks are the first source integration. Workflow planning,
-scheduling, and execution belong to Open Actions and run on self-hosted
-infrastructure.
+Open Actions is an open, Kubernetes-native alternative to GitHub Actions. It is
+a self-hosted control plane for high-volume automation workloads, built for
+teams whose CI demand is growing faster than a hosted scheduler can comfortably
+handle. Source events trigger supported workflows, while Open Actions schedules
+their jobs in the team's own Kubernetes cluster. GitHub webhooks are the first
+source integration. Workflow planning, scheduling, and execution belong to Open
+Actions and run on self-hosted infrastructure.
 
 Kubernetes 1.29 or newer is required.
 
