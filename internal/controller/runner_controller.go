@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strconv"
 	"time"
 
 	actionsv1alpha1 "github.com/kelos-dev/open-actions/api/v1alpha1"
@@ -25,7 +26,10 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
-var errRunnerAlreadyAssigned = errors.New("runner is already assigned a WorkflowJob")
+var (
+	errRunnerAlreadyAssigned = errors.New("runner is already assigned a WorkflowJob")
+	jobResultVersion         = strconv.Itoa(runner.ResultVersion)
+)
 
 const (
 	jobPlanVolume            = "open-actions-job"
@@ -34,6 +38,7 @@ const (
 	dockerStorageVolume      = "open-actions-docker-storage"
 	jobPlanMountPath         = "/var/run/open-actions"
 	workspaceVolumeMountPath = "/workspace"
+	jobResultPath            = "/dev/termination-log"
 	dockerSocketDirectory    = "/var/run/open-actions-docker"
 	dockerSocketPath         = dockerSocketDirectory + "/docker.sock"
 	dockerHost               = "unix://" + dockerSocketPath
@@ -441,7 +446,7 @@ func (r *RunnerReconciler) executeWorkflowJob(ctx context.Context, runnerObject 
 		}
 		return false, err
 	}
-	return false, r.updateWorkflowJobStatus(ctx, workflowJob, nativeJob)
+	return false, r.updateWorkflowJobStatus(ctx, workflowJob, nativeJob, nil, false)
 }
 
 func (r *RunnerReconciler) workflowJobCancellationRequested(ctx context.Context, workflowJob *actionsv1alpha1.WorkflowJob, run *actionsv1alpha1.WorkflowRun) (bool, error) {
@@ -492,7 +497,20 @@ func (r *RunnerReconciler) observeNativeJob(ctx context.Context, workflowJob *ac
 		return false, false, fmt.Errorf("native Job %q is not controlled by WorkflowJob %q", nativeJob.Name, workflowJob.Name)
 	}
 	terminal := jobTerminal(nativeJob)
-	if err := r.updateWorkflowJobStatus(ctx, workflowJob, nativeJob); err != nil {
+	var executionResult *runner.Result
+	var resultInvalid bool
+	if terminal {
+		if nativeJob.Annotations[actionsv1alpha1.AnnotationRunnerResultVersion] == jobResultVersion {
+			var err error
+			executionResult, resultInvalid, err = r.workflowJobResult(ctx, workflowJob, nativeJob)
+			if err != nil {
+				return true, terminal, err
+			}
+		} else {
+			executionResult = &runner.Result{Version: runner.ResultVersion}
+		}
+	}
+	if err := r.updateWorkflowJobStatus(ctx, workflowJob, nativeJob, executionResult, resultInvalid); err != nil {
 		return true, terminal, err
 	}
 	if terminal {
@@ -501,6 +519,33 @@ func (r *RunnerReconciler) observeNativeJob(ctx context.Context, workflowJob *ac
 		}
 	}
 	return true, terminal, nil
+}
+
+func (r *RunnerReconciler) workflowJobResult(ctx context.Context, workflowJob *actionsv1alpha1.WorkflowJob, nativeJob *batchv1.Job) (*runner.Result, bool, error) {
+	pods := &corev1.PodList{}
+	if err := r.APIReader.List(ctx, pods, client.InNamespace(workflowJob.Namespace), client.MatchingLabels{
+		actionsv1alpha1.LabelWorkflowJobUID: string(workflowJob.UID),
+	}); err != nil {
+		return nil, false, fmt.Errorf("list Pods for WorkflowJob %q: %w", workflowJob.Name, err)
+	}
+	for index := range pods.Items {
+		pod := &pods.Items[index]
+		owner := metav1.GetControllerOf(pod)
+		if owner == nil || owner.UID != nativeJob.UID {
+			continue
+		}
+		for _, container := range pod.Status.ContainerStatuses {
+			if container.Name != runner.ContainerName || container.State.Terminated == nil {
+				continue
+			}
+			result, err := runner.DecodeResult([]byte(container.State.Terminated.Message))
+			if err != nil {
+				return nil, true, nil
+			}
+			return &result, false, nil
+		}
+	}
+	return nil, true, nil
 }
 
 func workflowJobStarted(workflowJob *actionsv1alpha1.WorkflowJob) bool {
@@ -618,6 +663,9 @@ func (r *RunnerReconciler) buildJob(workflowJob *actionsv1alpha1.WorkflowJob, ru
 		actionsv1alpha1.AnnotationWorkflowJobID: workflowJob.Spec.JobID,
 		actionsv1alpha1.AnnotationRunnerName:    runnerObject.Name,
 	}
+	if resultVersion := workflowJob.Annotations[actionsv1alpha1.AnnotationRunnerResultVersion]; resultVersion != "" {
+		annotations[actionsv1alpha1.AnnotationRunnerResultVersion] = resultVersion
+	}
 	if workflowJob.Spec.DisplayName != "" {
 		annotations[actionsv1alpha1.AnnotationWorkflowJobDisplayName] = workflowJob.Spec.DisplayName
 	}
@@ -643,7 +691,9 @@ func (r *RunnerReconciler) buildJob(workflowJob *actionsv1alpha1.WorkflowJob, ru
 						Drop: []corev1.Capability{"ALL"},
 					},
 				},
-				Args: []string{"--job-file=" + jobPlanMountPath + "/" + jobPlanKey, "--workspace=" + workspacePath},
+				Args:                     []string{"--job-file=" + jobPlanMountPath + "/" + jobPlanKey, "--result-file=" + jobResultPath, "--workspace=" + workspacePath},
+				TerminationMessagePath:   jobResultPath,
+				TerminationMessagePolicy: corev1.TerminationMessageReadFile,
 				Env: []corev1.EnvVar{{
 					Name: "OPEN_ACTIONS_GITHUB_TOKEN",
 					ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
@@ -732,7 +782,7 @@ func runnerResources(resources *actionsv1alpha1.RunnerResources) corev1.Resource
 	}
 }
 
-func (r *RunnerReconciler) updateWorkflowJobStatus(ctx context.Context, workflowJob *actionsv1alpha1.WorkflowJob, nativeJob *batchv1.Job) error {
+func (r *RunnerReconciler) updateWorkflowJobStatus(ctx context.Context, workflowJob *actionsv1alpha1.WorkflowJob, nativeJob *batchv1.Job, executionResult *runner.Result, resultInvalid bool) error {
 	before := workflowJob.Status.DeepCopy()
 	if err := setWorkflowJobScheduled(workflowJob); err != nil {
 		return err
@@ -743,9 +793,17 @@ func (r *RunnerReconciler) updateWorkflowJobStatus(ctx context.Context, workflow
 	switch jobResult(nativeJob) {
 	case metav1.ConditionTrue:
 		workflowJob.Status.CompletionTime = completionTime(nativeJob)
-		meta.SetStatusCondition(&workflowJob.Status.Conditions, metav1.Condition{Type: actionsv1alpha1.WorkflowJobConditionSucceeded, Status: metav1.ConditionTrue, ObservedGeneration: workflowJob.Generation, Reason: "JobSucceeded", Message: "The workflow job succeeded"})
+		if resultInvalid || executionResult == nil {
+			meta.SetStatusCondition(&workflowJob.Status.Conditions, metav1.Condition{Type: actionsv1alpha1.WorkflowJobConditionSucceeded, Status: metav1.ConditionFalse, ObservedGeneration: workflowJob.Generation, Reason: "JobResultInvalid", Message: "The workflow job completed without valid output metadata"})
+		} else {
+			workflowJob.Status.Outputs = copyStringMap(executionResult.Outputs)
+			meta.SetStatusCondition(&workflowJob.Status.Conditions, metav1.Condition{Type: actionsv1alpha1.WorkflowJobConditionSucceeded, Status: metav1.ConditionTrue, ObservedGeneration: workflowJob.Generation, Reason: "JobSucceeded", Message: "The workflow job succeeded"})
+		}
 	case metav1.ConditionFalse:
 		workflowJob.Status.CompletionTime = completionTime(nativeJob)
+		if !resultInvalid && executionResult != nil {
+			workflowJob.Status.Outputs = copyStringMap(executionResult.Outputs)
+		}
 		meta.SetStatusCondition(&workflowJob.Status.Conditions, metav1.Condition{Type: actionsv1alpha1.WorkflowJobConditionSucceeded, Status: metav1.ConditionFalse, ObservedGeneration: workflowJob.Generation, Reason: "JobFailed", Message: "The workflow job failed"})
 	default:
 		meta.SetStatusCondition(&workflowJob.Status.Conditions, metav1.Condition{Type: actionsv1alpha1.WorkflowJobConditionSucceeded, Status: metav1.ConditionUnknown, ObservedGeneration: workflowJob.Generation, Reason: "JobRunning", Message: "The workflow job is running"})
@@ -754,6 +812,17 @@ func (r *RunnerReconciler) updateWorkflowJobStatus(ctx context.Context, workflow
 		return nil
 	}
 	return r.Status().Update(ctx, workflowJob)
+}
+
+func copyStringMap(values map[string]string) map[string]string {
+	if len(values) == 0 {
+		return nil
+	}
+	result := make(map[string]string, len(values))
+	for name, value := range values {
+		result[name] = value
+	}
+	return result
 }
 
 func (r *RunnerReconciler) failAssignedWorkflowJob(ctx context.Context, workflowJob *actionsv1alpha1.WorkflowJob, reason, message string) error {

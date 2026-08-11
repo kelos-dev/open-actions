@@ -673,6 +673,44 @@ func TestParseAcceptsGitHubJobID(t *testing.T) {
 	}
 }
 
+func TestParseAcceptsStepIDsAndJobOutputs(t *testing.T) {
+	definition, err := Parse([]byte("name: CI\non: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    outputs:\n      artifact: '${{ steps._Build-1.outputs.value }}'\n    steps:\n      - id: _Build-1\n        run: echo value=ready >> \"$GITHUB_OUTPUT\"\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	job := definition.Jobs["build"]
+	if job.Steps[0].ID != "_Build-1" || job.Outputs["artifact"] == nil {
+		t.Fatalf("parsed job = %#v", job)
+	}
+}
+
+func TestParseRejectsInvalidOrDuplicateStepIDs(t *testing.T) {
+	for _, steps := range []string{
+		"      - id: 1build\n        run: true\n",
+		"      - id: build.test\n        run: true\n",
+		"      - id: Build\n        run: true\n      - id: build\n        run: true\n",
+		"      - id: " + strings.Repeat("a", MaxStepIDLength+1) + "\n        run: true\n",
+	} {
+		data := "name: CI\non: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n" + steps
+		if _, err := Parse([]byte(data)); err == nil {
+			t.Fatalf("Parse() accepted invalid steps:\n%s", steps)
+		}
+	}
+}
+
+func TestParseRejectsInvalidJobOutputs(t *testing.T) {
+	for _, outputs := range []string{
+		"      1value: ready\n",
+		"      value: [not, scalar]\n",
+		"      value: '${{ unknown.value }}'\n",
+	} {
+		data := "name: CI\non: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    outputs:\n" + outputs + "    steps:\n      - run: true\n"
+		if _, err := Parse([]byte(data)); err == nil {
+			t.Fatalf("Parse() accepted invalid outputs:\n%s", outputs)
+		}
+	}
+}
+
 func TestParseRejectsInvalidJobID(t *testing.T) {
 	for _, id := range []string{"1build", "build.test", strings.Repeat("a", maxJobIDLength+1)} {
 		data := fmt.Sprintf("name: CI\non: push\njobs:\n  %s:\n    runs-on: ubuntu-latest\n    steps:\n      - run: make test\n", id)

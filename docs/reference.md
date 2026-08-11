@@ -101,7 +101,10 @@ execution, while `headSHA` identifies the pull request commit used for check
 reporting. A Runner's `spec.projectRef` is
 immutable, and changes to `spec.execution` apply only to Kubernetes Jobs created
 afterward. A `WorkflowJob` spec is immutable, and `status.runnerRef` identifies
-its one-time Runner assignment.
+its one-time Runner assignment. After execution, `status.outputs` contains the
+non-secret outputs declared by that workflow job. The controller copies these
+values from the completed runner Pod before allowing native Job cleanup, so
+they remain available after controller restarts and Pod deletion.
 
 Runner labels are canonical lowercase ASCII in Kubernetes resources. Workflow
 `runs-on` labels use the same representation. Each Runner is one reusable
@@ -171,7 +174,7 @@ The resources expose these condition contracts:
 | `WorkflowJob` | `Scheduled` | `False` | `ProjectRecreated` |
 | `WorkflowJob` | `Succeeded` | `Unknown` | `JobRunning` |
 | `WorkflowJob` | `Succeeded` | `True` | `JobSucceeded` |
-| `WorkflowJob` | `Succeeded` | `False` | `JobFailed`, `PlanUnavailable`, `JobStartFailed`, `ExecutionStateLost`, `ProjectRecreated` |
+| `WorkflowJob` | `Succeeded` | `False` | `JobFailed`, `JobResultInvalid`, `PlanUnavailable`, `JobStartFailed`, `ExecutionStateLost`, `ProjectRecreated` |
 
 `Project/Configured` covers local Secret availability, private-key parsing, and
 installation uniqueness. It does not assert remote GitHub App or installation
@@ -193,7 +196,10 @@ and assigned runner name remain available through
 the user-facing `jobs.<id>.name` value, or the job ID when no name is
 configured. Queued jobs record their project name in the
 `actions.kelos.dev/project-name` annotation so a recreated project can be
-distinguished from the original object.
+distinguished from the original object. Workflow jobs that declare outputs,
+and their native Jobs and Pods, carry the
+`actions.kelos.dev/runner-result-version` annotation. Its value identifies the
+runner result format required to complete that job.
 
 Webhook-created WorkflowRuns use the workflow filename followed by a stable
 20-character digest of the project, delivery replay, and workflow path.
@@ -237,19 +243,42 @@ evaluation when the corresponding execution feature has not supplied it.
 | Workflow concurrency | `github`, `inputs`, `vars` | `github`, `inputs` |
 | Job name and runner labels | `github`, `needs`, `strategy`, `matrix`, `vars`, `inputs` | `github`, `inputs`, and `matrix` for matrix jobs |
 | Job environment | `github`, `needs`, `strategy`, `matrix`, `vars`, `secrets`, `inputs` | `github`, `inputs`, and `matrix` for matrix jobs |
-| Workflow step name, run script, working directory, environment, and inputs | `github`, `needs`, `strategy`, `matrix`, `job`, `runner`, `env`, `vars`, `secrets`, `steps`, `inputs` | `github`, `matrix`, `runner`, `env`, `inputs` |
-| Workflow step condition | Step contexts except `secrets`, plus status functions | `github`, `matrix`, `runner`, `env`, `inputs`, and status functions |
+| Workflow step name, run script, working directory, environment, and inputs | `github`, `needs`, `strategy`, `matrix`, `job`, `runner`, `env`, `vars`, `secrets`, `steps`, `inputs` | `github`, `matrix`, `runner`, `env`, `inputs`, `steps` |
+| Workflow step condition | Step contexts except `secrets`, plus status functions | `github`, `matrix`, `runner`, `env`, `inputs`, `steps`, and status functions |
+| Job outputs | Workflow step contexts | `github`, `matrix`, `runner`, `env`, `inputs`, `steps` |
 | Composite step fields and outputs | `github`, `runner`, `env`, `inputs`, `steps` | All listed contexts |
 | Composite step condition | Composite contexts and status functions | All listed contexts and functions |
 | Action input default | `github` | `github` |
 
-Dependency outputs and repository secret and variable sources remain separate
-execution features. Values derived
+Dependency scheduling and its `needs` context, and repository secret and
+variable sources remain separate execution features. Values derived
 from `github.token` or the `secrets` context are marked sensitive through
 interpolation and function calls, and evaluation diagnostics do not include
 resolved values. The runner maps interrupt and termination signals to cancelled
 status, separately from failure, so eligible workflow and composite cleanup
 steps can run during pod termination.
+
+### Step and job outputs
+
+A workflow step `id` must start with a letter or `_`, may contain letters,
+digits, `-`, and `_`, and is limited to 256 characters. IDs must be unique
+within a job without regard to ASCII case. Run steps and external actions may
+write single-line or heredoc-style multiline values to `GITHUB_OUTPUT`.
+Each step's output command file is limited to 1 MiB. Repeated names use the last
+value. Once the step finishes, later steps can read those values through
+`steps.<id>.outputs.<name>`; missing and skipped-step outputs evaluate to an
+empty string.
+
+`jobs.<id>.outputs` is evaluated after workflow steps and post actions finish,
+including when a step failed. Output names use the same identifier syntax.
+Values that are derived from an expression secret or contain a registered mask
+are omitted from runner logs, the result document, and `WorkflowJob.status`.
+The complete versioned job result is limited to 4 KiB and 100 outputs. Exceeding
+that bound fails the job without persisting a partial result. A successful job
+that declares outputs finishes with reason `JobResultInvalid` when its runner
+result is missing or malformed. Jobs without declared outputs do not require
+runner result metadata. Dependency jobs cannot consume these values until
+dependency graph scheduling supplies the `needs` context.
 
 ### Concurrency
 
@@ -396,6 +425,8 @@ Workflow definitions must satisfy these limits:
   contain at most 1,024 characters.
 - A job may contain at most 100 steps and 100,000 bytes of aggregate planned
   content.
+- A completed job result may contain at most 100 outputs and 4 KiB of encoded
+  output metadata.
 - A run script may contain at most 65,536 bytes.
 - A step condition may contain at most 65,536 bytes.
 - Each `env` or `with` map may contain at most 100 entries.
@@ -425,10 +456,13 @@ reusable inputs, the selected cron expression, and revision fields used by the
 supported event. Actions that require other fields from GitHub's raw webhook
 payload are not supported.
 
-The controller emits job-plan version 3, and the runner accepts versions 1
-through 3. When a release changes the job-plan version, update every Runner
+The controller emits job-plan version 4, and the runner accepts versions 1
+through 4. When a release changes the job-plan version, update every Runner
 `spec.execution.image` to an image that accepts both the installed and target
-controller versions before upgrading the controller.
+controller versions before upgrading the controller. The received job-plan
+version also determines the runner result version. A runner that accepts more
+than one plan version must emit the result version assigned to that plan, not
+always the latest result version supported by the runner binary.
 
 Docker and local actions, private cross-repository action authentication, job
 dependencies, matrix `include` and `exclude`, strategy `fail-fast`, service

@@ -546,6 +546,15 @@ func TestCRDConventions(t *testing.T) {
 					t.Error("spec.execution.docker.image is not required")
 				}
 			}
+			if tt.kind == "WorkflowJob" {
+				outputs := status.Properties["outputs"]
+				if outputs.MaxProperties == nil || *outputs.MaxProperties != 100 {
+					t.Error("status.outputs is not bounded to 100 entries")
+				}
+				if len(outputs.XValidations) != 2 {
+					t.Errorf("status.outputs validation rules = %d, want 2", len(outputs.XValidations))
+				}
+			}
 			if tt.kind == "WorkflowRun" {
 				ttl := spec.Properties["ttlSecondsAfterFinished"]
 				if slices.Contains(spec.Required, "ttlSecondsAfterFinished") {
@@ -726,6 +735,20 @@ func TestCRDRejectsInvalidCELValues(t *testing.T) {
 			crd:  "actions.kelos.dev_workflowjobs.yaml", sample: "actions_v1alpha1_workflowjob.yaml",
 			mutate: func(object map[string]any) {
 				object["spec"].(map[string]any)["runsOn"] = []any{"Línux"}
+			},
+		},
+		{
+			name: "WorkflowJob output with invalid name",
+			crd:  "actions.kelos.dev_workflowjobs.yaml", sample: "actions_v1alpha1_workflowjob.yaml",
+			mutate: func(object map[string]any) {
+				object["status"] = map[string]any{"outputs": map[string]any{"invalid.name": "value"}}
+			},
+		},
+		{
+			name: "WorkflowJob output exceeding value bound",
+			crd:  "actions.kelos.dev_workflowjobs.yaml", sample: "actions_v1alpha1_workflowjob.yaml",
+			mutate: func(object map[string]any) {
+				object["status"] = map[string]any{"outputs": map[string]any{"value": strings.Repeat("x", 4097)}}
 			},
 		},
 		{

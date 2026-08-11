@@ -462,11 +462,12 @@ func workflowRunConsoleURL(baseURL string, run *actionsv1alpha1.WorkflowRun) str
 }
 
 type plannedWorkflowJob struct {
-	id          string
-	displayName string
-	runsOn      []string
-	matrix      *actionsv1alpha1.WorkflowJobMatrix
-	plan        string
+	id            string
+	displayName   string
+	runsOn        []string
+	matrix        *actionsv1alpha1.WorkflowJobMatrix
+	plan          string
+	resultVersion string
 }
 
 func (r *WorkflowRunReconciler) ensureWorkflowJobs(ctx context.Context, run *actionsv1alpha1.WorkflowRun, project *actionsv1alpha1.Project, plannedJobs []plannedWorkflowJob) error {
@@ -486,12 +487,16 @@ func (r *WorkflowRunReconciler) ensureWorkflowJobs(ctx context.Context, run *act
 	for _, item := range plannedJobs {
 		id := item.id
 		labels := workflowJobLabels(run, project, id)
+		annotations := map[string]string{actionsv1alpha1.AnnotationProjectName: project.Name}
+		if item.resultVersion != "" {
+			annotations[actionsv1alpha1.AnnotationRunnerResultVersion] = item.resultVersion
+		}
 		workflowJob := &actionsv1alpha1.WorkflowJob{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:        workflowJobName(run.Name, id),
 				Namespace:   run.Namespace,
 				Labels:      labels,
-				Annotations: map[string]string{actionsv1alpha1.AnnotationProjectName: project.Name},
+				Annotations: annotations,
 			},
 			Spec: actionsv1alpha1.WorkflowJobSpec{
 				WorkflowRunRef: corev1.LocalObjectReference{Name: run.Name},
@@ -591,8 +596,12 @@ func (r *WorkflowRunReconciler) planWorkflowJobs(run *actionsv1alpha1.WorkflowRu
 			if len(data) > maxJobPlanBytes {
 				return nil, fmt.Errorf("job plan for %q exceeds %d bytes", expandedID, maxJobPlanBytes)
 			}
+			resultVersion := ""
+			if len(resolvedJob.Outputs) > 0 {
+				resultVersion = jobResultVersion
+			}
 			plannedJobs = append(plannedJobs, plannedWorkflowJob{
-				id: expandedID, displayName: displayName, runsOn: append([]string(nil), resolvedJob.RunsOn...), matrix: matrixSpec, plan: string(data),
+				id: expandedID, displayName: displayName, runsOn: append([]string(nil), resolvedJob.RunsOn...), matrix: matrixSpec, plan: string(data), resultVersion: resultVersion,
 			})
 		}
 	}
@@ -883,6 +892,10 @@ func (r *WorkflowRunReconciler) jobPlan(run *actionsv1alpha1.WorkflowRun, workfl
 	if err != nil {
 		return nil, fmt.Errorf("job %q env: %w", id, err)
 	}
+	outputs, err := stringMap(job.Outputs)
+	if err != nil {
+		return nil, fmt.Errorf("job %q outputs: %w", id, err)
+	}
 	steps := make([]runner.Step, 0, len(job.Steps))
 	for index, step := range job.Steps {
 		with, err := stringMap(step.With)
@@ -894,6 +907,7 @@ func (r *WorkflowRunReconciler) jobPlan(run *actionsv1alpha1.WorkflowRun, workfl
 			return nil, fmt.Errorf("job %q step %d env: %w", id, index+1, err)
 		}
 		steps = append(steps, runner.Step{
+			ID:               step.ID,
 			Name:             step.Name,
 			Uses:             step.Uses,
 			Run:              step.Run,
@@ -933,10 +947,11 @@ func (r *WorkflowRunReconciler) jobPlan(run *actionsv1alpha1.WorkflowRun, workfl
 			HeadRef: headRef,
 			BaseRef: baseRef,
 		},
-		JobID:  id,
-		Matrix: matrix,
-		Env:    jobEnv,
-		Steps:  steps,
+		JobID:   id,
+		Matrix:  matrix,
+		Env:     jobEnv,
+		Outputs: outputs,
+		Steps:   steps,
 	}, nil
 }
 

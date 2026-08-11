@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -25,6 +26,7 @@ func main() {
 func run(ctx context.Context, arguments []string) error {
 	flags := flag.NewFlagSet("open-actions-runner", flag.ContinueOnError)
 	jobFile := flags.String("job-file", "/var/run/open-actions/job.json", "Path to the workflow job plan")
+	resultFile := flags.String("result-file", "/dev/termination-log", "Path used to report the workflow job result")
 	workspace := flags.String("workspace", "/workspace", "Path to the job workspace")
 	if err := flags.Parse(arguments); err != nil {
 		return err
@@ -44,7 +46,14 @@ func run(ctx context.Context, arguments []string) error {
 	if err != nil {
 		return err
 	}
-	return executor.Execute(ctx, plan, *workspace)
+	result, executionError := executor.ExecuteResult(ctx, plan, *workspace)
+	resultData, resultError := runner.EncodeResult(result)
+	if resultError == nil {
+		if err := os.WriteFile(*resultFile, resultData, 0o600); err != nil {
+			resultError = fmt.Errorf("write workflow job result: %w", err)
+		}
+	}
+	return errors.Join(executionError, resultError)
 }
 
 func withoutEnvironmentVariable(environment []string, name string) []string {

@@ -238,6 +238,20 @@ spec:
                   controller.
                 format: int64
                 type: integer
+              outputs:
+                additionalProperties:
+                  type: string
+                description: |-
+                  Outputs contains the non-secret outputs declared by the workflow job.
+                  The controller records them only after execution reaches a terminal result.
+                maxProperties: 100
+                type: object
+                x-kubernetes-validations:
+                - message: output names must be workflow identifiers no more than
+                    256 characters
+                  rule: self.all(k, size(k) <= 256 && k.matches('^[A-Za-z_][A-Za-z0-9_-]*$'))
+                - message: output values must be no more than 4096 characters
+                  rule: self.all(k, size(self[k]) <= 4096)
               runnerRef:
                 description: |-
                   RunnerRef identifies the Runner assigned by the scheduler in the same

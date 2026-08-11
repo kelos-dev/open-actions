@@ -11,8 +11,8 @@ import (
 
 var (
 	runnerJobAvailability          = workflowexpression.NewAvailability("github", "matrix", "inputs")
-	runnerStepAvailability         = workflowexpression.NewAvailability("github", "matrix", "runner", "env", "inputs")
-	runnerConditionAvailability    = workflowexpression.NewAvailability("github", "matrix", "runner", "env", "inputs").WithStatusFunctions()
+	runnerStepAvailability         = workflowexpression.NewAvailability("github", "matrix", "runner", "env", "inputs", "steps")
+	runnerConditionAvailability    = workflowexpression.NewAvailability("github", "matrix", "runner", "env", "inputs", "steps").WithStatusFunctions()
 	compositeAvailability          = workflowexpression.NewAvailability("github", "runner", "env", "inputs", "steps")
 	compositeConditionAvailability = workflowexpression.NewAvailability("github", "runner", "env", "inputs", "steps").WithStatusFunctions()
 )
@@ -27,13 +27,13 @@ func resolveActionDefaultExpression(input string, plan *Plan, environment []stri
 }
 
 func resolveWorkflowStepEnvironment(step Step, state *executionState) (map[string]string, error) {
-	context := expressionContext(state.plan, state.environment, "", nil, runnerStepAvailability, nil, state.githubToken)
+	context := workflowExpressionContext(state, state.environment, runnerStepAvailability, nil)
 	return resolveExpressionMap(step.Env, context)
 }
 
 func resolveWorkflowStep(step Step, environment map[string]string, state *executionState) (Step, error) {
 	stepEnvironment := appendEnvironment(append([]string(nil), state.environment...), environment)
-	context := expressionContext(state.plan, stepEnvironment, "", nil, runnerStepAvailability, nil, state.githubToken)
+	context := workflowExpressionContext(state, stepEnvironment, runnerStepAvailability, nil)
 	resolved := step
 	var err error
 	for _, field := range []struct {
@@ -61,8 +61,8 @@ func workflowStepCondition(input string, environment map[string]string, status w
 	if strings.TrimSpace(input) == "" {
 		return status.Success, nil
 	}
-	context := expressionContext(state.plan, state.environment, "", nil, runnerConditionAvailability, &status, state.githubToken)
-	environmentContext := expressionContext(state.plan, state.environment, "", nil, runnerStepAvailability, nil, state.githubToken)
+	context := workflowExpressionContext(state, state.environment, runnerConditionAvailability, &status)
+	environmentContext := workflowExpressionContext(state, state.environment, runnerStepAvailability, nil)
 	baseEnvironment := context.Values["env"].(map[string]any)
 	context.Values["env"] = workflowexpression.DeferredObject(func(name string) (any, bool, error) {
 		if input, found := stringMapValue(environment, name); found {
@@ -73,6 +73,11 @@ func workflowStepCondition(input string, environment map[string]string, status w
 		return value, found, nil
 	})
 	return evaluateCondition(input, context, status.Success)
+}
+
+func workflowExpressionContext(state *executionState, environment []string, availability workflowexpression.Availability, status *workflowexpression.Status) workflowexpression.Context {
+	values := map[string]any{"steps": state.stepOutputs}
+	return expressionContext(state.plan, environment, "", values, availability, status, state.githubToken)
 }
 
 func compositeExpressionContext(compositeContext *compositeContext, availability workflowexpression.Availability, status *workflowexpression.Status) workflowexpression.Context {
