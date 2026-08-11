@@ -35,6 +35,33 @@ const loginPageTemplate = `<!doctype html>
 </body>
 </html>`
 
+const mainPageTemplate = `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Workflow runs · Open Actions</title>
+  <style>
+    :root{color-scheme:dark;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#0d1117;color:#f0f6fc}*{box-sizing:border-box}body{margin:0;background:#0d1117;color:#f0f6fc;font-size:14px}a{color:#58a6ff;text-decoration:none}a:hover{text-decoration:underline}.topbar{height:64px;display:flex;align-items:center;padding:0 24px;border-bottom:1px solid #21262d;background:#010409}.brand{display:flex;align-items:center;gap:10px;color:#f0f6fc;font-weight:600}.brand:hover{text-decoration:none}.brand-mark{display:grid;place-items:center;width:30px;height:30px;border:1px solid #30363d;border-radius:7px;color:#58a6ff;font-size:12px;font-weight:800}.page{width:min(1180px,100%);margin:0 auto;padding:32px 32px 56px}.page-heading{display:flex;align-items:flex-end;justify-content:space-between;gap:24px;margin-bottom:20px}.page-heading h1{margin:0 0 6px;font-size:24px;font-weight:600;letter-spacing:-.01em}.page-heading p{margin:0;color:#8b949e}.count{min-width:20px;padding:2px 8px;border-radius:20px;background:#30363d;color:#c9d1d9;font-size:12px;text-align:center}.runs{overflow:hidden;border:1px solid #30363d;border-radius:6px}.run{display:grid;grid-template-columns:minmax(280px,1fr) minmax(150px,.55fr) 130px 170px;align-items:center;gap:20px;min-height:76px;padding:14px 16px;border-bottom:1px solid #21262d}.run:last-child{border-bottom:0}.run:hover{background:#161b2266}.run-link{display:flex;align-items:center;gap:12px;min-width:0;color:#f0f6fc}.run-link:hover{color:#58a6ff;text-decoration:none}.status-mark{display:grid;place-items:center;flex:0 0 auto;width:20px;height:20px;border:2px solid currentColor;border-radius:50%;font-size:11px;font-weight:800}.status-mark.succeeded{color:#3fb950}.status-mark.failed{color:#f85149}.status-mark.running{color:#d29922;border-style:dashed}.status-mark.queued{color:#8b949e}.status-mark.succeeded::after{content:"✓"}.status-mark.failed::after{content:"×"}.status-mark.queued::after{content:"·"}.run-name{min-width:0}.run-name strong,.run-name small{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.run-name small{margin-top:4px;color:#8b949e;font-weight:400}.revision{min-width:0;color:#c9d1d9}.revision span{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.revision code{display:inline-block;margin-top:4px;color:#8b949e;font:12px ui-monospace,SFMono-Regular,Consolas,monospace}.detail{color:#8b949e;font-size:13px}.status{color:#c9d1d9}.status small{display:block;margin-top:4px;color:#8b949e}.time{display:block;margin-top:4px}.empty{padding:52px 24px;text-align:center}.empty strong{display:block;margin-bottom:6px;font-size:16px}.empty span{color:#8b949e}@media(max-width:800px){.topbar{padding:0 16px}.page{padding:24px 16px 40px}.page-heading{align-items:flex-start}.run{grid-template-columns:minmax(0,1fr) auto}.run .revision,.run .event{display:none}.run .status{text-align:right}}
+  </style>
+</head>
+<body>
+  <nav class="topbar" aria-label="Global"><a class="brand" href="/"><span class="brand-mark" aria-hidden="true">OA</span><span>Open Actions</span></a></nav>
+  <main class="page">
+    <header class="page-heading"><div><h1>Workflow runs</h1><p>Workflow activity across all namespaces{{if .Truncated}} · Showing {{.Limit}} most recent runs{{end}}</p></div><span class="count" aria-label="Workflow run count">{{len .Runs}}</span></header>
+    <section class="runs" aria-label="Workflow runs">
+      {{range .Runs}}<article class="run">
+        <a class="run-link" href="{{.URL}}"><span class="status-mark {{.StatusClass}}" aria-hidden="true"></span><span class="run-name"><strong>{{.WorkflowName}}</strong><small>{{.Repository}} · {{.Namespace}}/{{.Project}}</small></span></a>
+        <div class="revision"><span>{{if .RefName}}{{.RefName}}{{else}}—{{end}}</span><code title="{{.Revision}}">{{.ShortRevision}}</code></div>
+        <div class="detail event">{{.Event}}</div>
+        <div class="detail status"><span>{{.Status}}</span>{{if .Duration}}<small>{{.Duration}}</small>{{end}}{{if .Created}}<time class="time" data-time="{{.Created}}">{{.Created}}</time>{{end}}</div>
+      </article>{{else}}<div class="empty"><strong>No workflow runs</strong><span>Runs will appear here when a configured project receives a supported event.</span></div>{{end}}
+    </section>
+  </main>
+  <script>for(const element of document.querySelectorAll('[data-time]')){const date=new Date(element.dataset.time);if(!Number.isNaN(date.valueOf()))element.textContent=new Intl.DateTimeFormat(undefined,{dateStyle:'medium',timeStyle:'short'}).format(date)}</script>
+</body>
+</html>`
+
 const runPageTemplate = `<!doctype html>
 <html lang="en">
 <head>
@@ -46,7 +73,7 @@ const runPageTemplate = `<!doctype html>
   </style>
 </head>
 <body>
-  <nav class="topbar" aria-label="Global"><a class="brand" href="{{.RunURL}}"><span class="brand-mark" aria-hidden="true">OA</span><span>Open Actions</span></a></nav>
+  <nav class="topbar" aria-label="Global"><a class="brand" href="/"><span class="brand-mark" aria-hidden="true">OA</span><span>Open Actions</span></a></nav>
   <main class="page">
     <div class="breadcrumbs"><strong>{{.Repository}}</strong><span>/</span><span>Actions</span><span>/</span><span>{{.WorkflowName}}</span></div>
     <div class="run-heading">
@@ -82,7 +109,7 @@ const logPageTemplate = `<!doctype html>
   </style>
 </head>
 <body data-stream-url="{{.StreamURL}}">
-  <nav class="topbar" aria-label="Global"><a class="brand" href="{{.RunURL}}"><span class="brand-mark" aria-hidden="true">OA</span><span>Open Actions</span></a></nav>
+  <nav class="topbar" aria-label="Global"><a class="brand" href="/"><span class="brand-mark" aria-hidden="true">OA</span><span>Open Actions</span></a></nav>
   <main class="page">
     <div class="breadcrumbs"><strong>{{.Repository}}</strong><span>/</span><span>Actions</span><span>/</span><a href="{{.RunURL}}">{{.WorkflowName}}</a></div>
     <div class="layout">

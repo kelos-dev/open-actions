@@ -2,17 +2,21 @@ package console
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	actionsv1alpha1 "github.com/kelos-dev/open-actions/api/v1alpha1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 )
@@ -86,6 +90,78 @@ func TestConsoleAuthenticatesWithStaticTokenAndStreamsLogs(t *testing.T) {
 	handler.ServeHTTP(streamResponse, streamRequest)
 	if streamResponse.Code != http.StatusOK || !strings.Contains(streamResponse.Body.String(), "event: log") || !strings.Contains(streamResponse.Body.String(), "build output") {
 		t.Fatalf("log stream = %d, %q", streamResponse.Code, streamResponse.Body.String())
+	}
+}
+
+func TestConsoleMainPageListsWorkflowRunsNewestFirst(t *testing.T) {
+	handler := newTestHandler(t, false)
+
+	unauthenticated := httptest.NewRecorder()
+	handler.ServeHTTP(unauthenticated, httptest.NewRequest(http.MethodGet, "/", nil))
+	if unauthenticated.Code != http.StatusFound || unauthenticated.Header().Get("Location") != "/login?next=%2F" {
+		t.Fatalf("unauthenticated response = %d, %q", unauthenticated.Code, unauthenticated.Header().Get("Location"))
+	}
+
+	request := httptest.NewRequest(http.MethodGet, "/", nil)
+	request.Header.Set("Authorization", "Bearer "+testConsoleToken)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	body := response.Body.String()
+	if response.Code != http.StatusOK || !strings.Contains(body, "Workflow runs") || !strings.Contains(body, `href="/runs/default/ci"`) || !strings.Contains(body, "acme/example") || !strings.Contains(body, "default/project") {
+		t.Fatalf("main page = %d, %q", response.Code, body)
+	}
+	newer := strings.Index(body, "<strong>Lint</strong>")
+	older := strings.Index(body, "<strong>CI</strong>")
+	if newer == -1 || older == -1 || newer >= older {
+		t.Fatalf("main page is not newest first: %s", body)
+	}
+}
+
+func TestConsoleMainPageLimitsWorkflowRuns(t *testing.T) {
+	handler := newTestHandler(t, false)
+	clusterClient, ok := handler.client.(client.Client)
+	if !ok {
+		t.Fatal("test Console reader is not a client")
+	}
+	base := &actionsv1alpha1.WorkflowRun{}
+	if err := clusterClient.Get(context.Background(), client.ObjectKey{Namespace: "default", Name: "ci"}, base); err != nil {
+		t.Fatal(err)
+	}
+	oldestName := ""
+	for index := 0; index < mainPageRunLimit-1; index++ {
+		run := base.DeepCopy()
+		run.Name = fmt.Sprintf("older-%03d", index)
+		run.UID = types.UID(run.Name)
+		run.ResourceVersion = ""
+		run.CreationTimestamp = metav1.NewTime(time.Date(2026, 8, 10, 11, 0, 0, 0, time.UTC).Add(-time.Duration(index) * time.Minute))
+		run.Status.WorkflowName = run.Name
+		if err := clusterClient.Create(context.Background(), run); err != nil {
+			t.Fatal(err)
+		}
+		oldestName = run.Name
+	}
+
+	request := httptest.NewRequest(http.MethodGet, "/", nil)
+	request.Header.Set("Authorization", "Bearer "+testConsoleToken)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	body := response.Body.String()
+	if response.Code != http.StatusOK || !strings.Contains(body, `aria-label="Workflow run count">100</span>`) || !strings.Contains(body, "Showing 100 most recent runs") {
+		t.Fatalf("main page = %d, %q", response.Code, body)
+	}
+	if strings.Contains(body, oldestName) {
+		t.Fatalf("main page contains truncated WorkflowRun %q", oldestName)
+	}
+}
+
+func TestConsoleRedirectsAuthenticatedLoginToMainPage(t *testing.T) {
+	handler := newTestHandler(t, false)
+	request := httptest.NewRequest(http.MethodGet, "/login", nil)
+	request.Header.Set("Authorization", "Bearer "+testConsoleToken)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusFound || response.Header().Get("Location") != "/" {
+		t.Fatalf("response = %d, %q", response.Code, response.Header().Get("Location"))
 	}
 }
 
@@ -179,6 +255,9 @@ func TestSafeNextRejectsExternalURLs(t *testing.T) {
 	if next := safeNext("/runs/default/ci?tab=logs"); next != "/runs/default/ci?tab=logs" {
 		t.Fatalf("safeNext() = %q", next)
 	}
+	if next := safeNext("/"); next != "/" {
+		t.Fatalf("safeNext() = %q", next)
+	}
 }
 
 func newTestHandler(t *testing.T, secureCookie bool) *Handler {
@@ -192,12 +271,13 @@ func newTestHandler(t *testing.T, secureCookie bool) *Handler {
 	}
 	run := &actionsv1alpha1.WorkflowRun{
 		TypeMeta:   metav1.TypeMeta{APIVersion: actionsv1alpha1.GroupVersion.String(), Kind: "WorkflowRun"},
-		ObjectMeta: metav1.ObjectMeta{Name: "ci", Namespace: "default", UID: "run-uid"},
+		ObjectMeta: metav1.ObjectMeta{Name: "ci", Namespace: "default", UID: "run-uid", CreationTimestamp: metav1.NewTime(time.Date(2026, 8, 10, 12, 0, 0, 0, time.UTC))},
 		Spec: actionsv1alpha1.WorkflowRunSpec{
 			ProjectRef: corev1.LocalObjectReference{Name: "project"}, WorkflowPath: ".open-actions/workflows/ci.yaml",
 			Source: actionsv1alpha1.WorkflowRunSource{Type: actionsv1alpha1.SourceTypeGitHub, GitHub: &actionsv1alpha1.GitHubWorkflowRunSource{
 				Repository: actionsv1alpha1.GitHubRepository{ID: 123, Owner: "acme", Name: "example"},
-				Revision:   actionsv1alpha1.GitRevision{SHA: strings.Repeat("a", 40)},
+				Event:      actionsv1alpha1.GitHubEvent{Name: actionsv1alpha1.GitHubEventNamePush, DeliveryID: "delivery-id"},
+				Revision:   actionsv1alpha1.GitRevision{SHA: strings.Repeat("a", 40), Ref: "refs/heads/main"},
 			}},
 		},
 		Status: actionsv1alpha1.WorkflowRunStatus{WorkflowName: "CI"},
@@ -210,8 +290,13 @@ func newTestHandler(t *testing.T, secureCookie bool) *Handler {
 	if err := controllerutil.SetControllerReference(run, job, scheme); err != nil {
 		t.Fatal(err)
 	}
+	newerRun := run.DeepCopy()
+	newerRun.Name = "lint"
+	newerRun.UID = "lint-run-uid"
+	newerRun.CreationTimestamp = metav1.NewTime(time.Date(2026, 8, 10, 13, 0, 0, 0, time.UTC))
+	newerRun.Status.WorkflowName = "Lint"
 	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "build", Namespace: "default", Labels: map[string]string{actionsv1alpha1.LabelWorkflowJobUID: string(job.UID)}}}
-	clusterClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(run, job).Build()
+	clusterClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(run, newerRun, job).Build()
 	handler, err := New(Config{
 		Client: clusterClient, Logs: &testLogSource{pod: pod, logs: "build output\n"}, Token: testConsoleToken,
 		SecureCookie: secureCookie, Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),

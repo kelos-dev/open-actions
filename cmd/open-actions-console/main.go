@@ -74,6 +74,7 @@ func runConsole(ctx context.Context, arguments []string) error {
 	mux.Handle("/api/login", handler)
 	mux.HandleFunc("/healthz", healthy)
 	mux.HandleFunc("/readyz", healthy)
+	mux.Handle("/", handler)
 	server := &http.Server{
 		Addr:              *bindAddress,
 		Handler:           mux,

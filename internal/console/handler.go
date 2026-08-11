@@ -32,6 +32,7 @@ const (
 	sessionLifetime   = 7 * 24 * time.Hour
 	streamHeartbeat   = 15 * time.Second
 	maxLogLineBytes   = 256 << 10
+	mainPageRunLimit  = 100
 )
 
 var errLogsUnavailable = errors.New("logs are no longer available")
@@ -45,7 +46,7 @@ type Config struct {
 	Logger       *slog.Logger
 }
 
-// Handler serves authenticated workflow run details and logs.
+// Handler serves an authenticated workflow run overview, details, and logs.
 type Handler struct {
 	client       client.Reader
 	logs         LogSource
@@ -54,12 +55,35 @@ type Handler struct {
 	secureCookie bool
 	logger       *slog.Logger
 	loginPage    *template.Template
+	mainPage     *template.Template
 	runPage      *template.Template
 	logPage      *template.Template
 }
 
 type loginRequest struct {
 	Token string `json:"token"`
+}
+
+type mainPageData struct {
+	Runs      []mainRunPageData
+	Limit     int
+	Truncated bool
+}
+
+type mainRunPageData struct {
+	URL           string
+	Repository    string
+	WorkflowName  string
+	Namespace     string
+	Project       string
+	Event         string
+	RefName       string
+	Revision      string
+	ShortRevision string
+	Status        string
+	StatusClass   string
+	Created       string
+	Duration      string
 }
 
 type runPageData struct {
@@ -122,6 +146,10 @@ func New(config Config) (*Handler, error) {
 	if err != nil {
 		return nil, err
 	}
+	mainPage, err := template.New("main").Parse(mainPageTemplate)
+	if err != nil {
+		return nil, err
+	}
 	runPage, err := template.New("run").Parse(runPageTemplate)
 	if err != nil {
 		return nil, err
@@ -134,7 +162,7 @@ func New(config Config) (*Handler, error) {
 	return &Handler{
 		client: config.Client, logs: config.Logs, tokenDigest: tokenDigest,
 		sessionValue: sessionValue(config.Token), secureCookie: config.SecureCookie, logger: config.Logger,
-		loginPage: loginPage, runPage: runPage, logPage: logPage,
+		loginPage: loginPage, mainPage: mainPage, runPage: runPage, logPage: logPage,
 	}, nil
 }
 
@@ -158,6 +186,10 @@ func (h *Handler) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	}
 	if !h.authenticated(request) {
 		http.Redirect(writer, request, "/login?next="+url.QueryEscape(request.URL.RequestURI()), http.StatusFound)
+		return
+	}
+	if request.URL.Path == "/" {
+		h.main(writer, request)
 		return
 	}
 	parts := splitPath(request.URL.Path)
@@ -200,10 +232,12 @@ func (h *Handler) serveLoginPage(writer http.ResponseWriter, request *http.Reque
 		return
 	}
 	if h.authenticated(request) {
-		if next := safeNext(request.URL.Query().Get("next")); next != "" {
-			http.Redirect(writer, request, next, http.StatusFound)
-			return
+		next := safeNext(request.URL.Query().Get("next"))
+		if next == "" {
+			next = "/"
 		}
+		http.Redirect(writer, request, next, http.StatusFound)
+		return
 	}
 	h.writeHTML(writer, h.loginPage, nil)
 }
@@ -240,6 +274,65 @@ func (h *Handler) authenticated(request *http.Request) bool {
 func (h *Handler) validToken(token string) bool {
 	digest := sha256.Sum256([]byte(token))
 	return hmac.Equal(digest[:], h.tokenDigest[:])
+}
+
+func (h *Handler) main(writer http.ResponseWriter, request *http.Request) {
+	data, err := h.loadMainPageData(request.Context())
+	if err != nil {
+		h.writeResolutionError(writer, request, err)
+		return
+	}
+	h.writeHTML(writer, h.mainPage, data)
+}
+
+func (h *Handler) loadMainPageData(ctx context.Context) (mainPageData, error) {
+	runs := &actionsv1alpha1.WorkflowRunList{}
+	if err := h.client.List(ctx, runs); err != nil {
+		return mainPageData{}, fmt.Errorf("load workflow runs: %w", err)
+	}
+	sort.SliceStable(runs.Items, func(left, right int) bool {
+		leftRun := &runs.Items[left]
+		rightRun := &runs.Items[right]
+		if leftRun.CreationTimestamp.Equal(&rightRun.CreationTimestamp) {
+			if leftRun.Namespace == rightRun.Namespace {
+				return leftRun.Name < rightRun.Name
+			}
+			return leftRun.Namespace < rightRun.Namespace
+		}
+		return leftRun.CreationTimestamp.After(rightRun.CreationTimestamp.Time)
+	})
+	data := mainPageData{Limit: mainPageRunLimit}
+	for index := range runs.Items {
+		run := &runs.Items[index]
+		if run.Spec.Source.Type != actionsv1alpha1.SourceTypeGitHub || run.Spec.Source.GitHub == nil {
+			continue
+		}
+		if len(data.Runs) == mainPageRunLimit {
+			data.Truncated = true
+			break
+		}
+		workflowName := run.Status.WorkflowName
+		if workflowName == "" {
+			workflowName = run.Spec.WorkflowPath
+		}
+		status := workflowstatus.Run(run)
+		refName := run.Spec.Source.GitHub.Revision.HeadRef
+		if refName == "" {
+			refName = shortRef(run.Spec.Source.GitHub.Revision.Ref)
+		}
+		item := mainRunPageData{
+			URL: runPath(run), Repository: run.Spec.Source.GitHub.Repository.Owner + "/" + run.Spec.Source.GitHub.Repository.Name,
+			WorkflowName: workflowName, Namespace: run.Namespace, Project: run.Spec.ProjectRef.Name,
+			Event: strings.ReplaceAll(string(run.Spec.Source.GitHub.Event.Name), "_", " "), RefName: refName,
+			Revision: run.Spec.Source.GitHub.Revision.SHA, ShortRevision: shortRevision(run.Spec.Source.GitHub.Revision.SHA),
+			Status: status, StatusClass: statusClass(status), Duration: elapsedTime(run.Status.StartTime, run.Status.CompletionTime),
+		}
+		if !run.CreationTimestamp.IsZero() {
+			item.Created = run.CreationTimestamp.UTC().Format(time.RFC3339)
+		}
+		data.Runs = append(data.Runs, item)
+	}
+	return data, nil
 }
 
 func (h *Handler) runDetails(writer http.ResponseWriter, request *http.Request, run *actionsv1alpha1.WorkflowRun) {
@@ -547,7 +640,7 @@ func splitPath(value string) []string {
 
 func safeNext(value string) string {
 	parsed, err := url.Parse(value)
-	if err != nil || parsed.IsAbs() || parsed.Host != "" || !strings.HasPrefix(parsed.Path, "/runs/") {
+	if err != nil || parsed.IsAbs() || parsed.Host != "" || (parsed.Path != "/" && !strings.HasPrefix(parsed.Path, "/runs/")) {
 		return ""
 	}
 	return value

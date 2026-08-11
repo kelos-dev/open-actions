@@ -111,6 +111,11 @@ var _ = Describe("Console", func() {
 
 		webClient := authenticateConsole(run)
 		runPath := "/runs/" + url.PathEscape(run.Namespace) + "/" + url.PathEscape(run.Name)
+		mainPage := getConsolePage(webClient, consoleURL+"/", http.StatusOK)
+		Expect(mainPage).To(ContainSubstring("Workflow runs"))
+		Expect(mainPage).To(ContainSubstring(`href="` + runPath + `"`))
+		Expect(mainPage).To(ContainSubstring("Fixture CI"))
+		Expect(mainPage).To(ContainSubstring("acme/example"))
 		runPage := getConsolePage(webClient, consoleURL+runPath, http.StatusOK)
 		Expect(runPage).To(ContainSubstring("Fixture CI"))
 		Expect(runPage).To(ContainSubstring("acme/example"))
