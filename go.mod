@@ -6,6 +6,7 @@ require (
 	github.com/dlclark/regexp2/v2 v2.6.0
 	github.com/onsi/ginkgo/v2 v2.32.0
 	github.com/onsi/gomega v1.42.1
+	github.com/robfig/cron/v3 v3.0.1
 	github.com/spf13/cobra v1.10.0
 	gopkg.in/yaml.v3 v3.0.1
 	k8s.io/api v0.35.1

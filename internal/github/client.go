@@ -47,6 +47,16 @@ type Content struct {
 	Type string `json:"type"`
 }
 
+type Repository struct {
+	ID            int64     `json:"id"`
+	Name          string    `json:"name"`
+	DefaultBranch string    `json:"default_branch"`
+	PushedAt      time.Time `json:"pushed_at"`
+	Owner         struct {
+		Login string `json:"login"`
+	} `json:"owner"`
+}
+
 type repositoryCommit struct {
 	SHA     string `json:"sha"`
 	Parents []struct {
@@ -166,6 +176,14 @@ func (c *Client) Installation(ctx context.Context, appID, installationID int64, 
 	if repository == "" {
 		return nil, errors.New("repository must be specified for an installation token")
 	}
+	return c.installation(ctx, appID, installationID, privateKey, []string{repository}, permissions)
+}
+
+func (c *Client) InstallationForAllRepositories(ctx context.Context, appID, installationID int64, privateKey []byte, permissions InstallationPermissions) (*InstallationClient, error) {
+	return c.installation(ctx, appID, installationID, privateKey, nil, permissions)
+}
+
+func (c *Client) installation(ctx context.Context, appID, installationID int64, privateKey []byte, repositories []string, permissions InstallationPermissions) (*InstallationClient, error) {
 	tokenPermissions := map[string]string{}
 	if permissions.ContentsRead {
 		tokenPermissions["contents"] = "read"
@@ -188,9 +206,9 @@ func (c *Client) Installation(ctx context.Context, appID, installationID int64, 
 	response := struct {
 		Token string `json:"token"`
 	}{}
-	tokenRequest := map[string]any{
-		"repositories": []string{repository},
-		"permissions":  tokenPermissions,
+	tokenRequest := map[string]any{"permissions": tokenPermissions}
+	if len(repositories) > 0 {
+		tokenRequest["repositories"] = repositories
 	}
 	if err := c.doJSONWithBody(ctx, http.MethodPost, requestPath, jwt, tokenRequest, &response); err != nil {
 		return nil, fmt.Errorf("create installation access token: %w", err)
@@ -203,6 +221,31 @@ func (c *Client) Installation(ctx context.Context, appID, installationID int64, 
 
 func (c *InstallationClient) Token() string {
 	return c.token
+}
+
+func (c *InstallationClient) ListRepositories(ctx context.Context, limit int) ([]Repository, error) {
+	if limit < 1 {
+		return nil, errors.New("repository list limit must be positive")
+	}
+	const perPage = 100
+	repositories := make([]Repository, 0, min(limit, perPage))
+	for page := 1; ; page++ {
+		response := struct {
+			TotalCount   int          `json:"total_count"`
+			Repositories []Repository `json:"repositories"`
+		}{}
+		query := url.Values{"page": []string{strconv.Itoa(page)}, "per_page": []string{strconv.Itoa(perPage)}}
+		if err := c.client.doJSONWithQuery(ctx, http.MethodGet, "installation/repositories", query, c.token, &response); err != nil {
+			return nil, fmt.Errorf("list installation repositories: %w", err)
+		}
+		repositories = append(repositories, response.Repositories...)
+		if len(repositories) >= limit {
+			return repositories[:limit], nil
+		}
+		if len(response.Repositories) == 0 || len(repositories) >= response.TotalCount {
+			return repositories, nil
+		}
+	}
 }
 
 func (c *InstallationClient) ListDirectory(ctx context.Context, owner, repository, directory, revision string) ([]Content, error) {

@@ -23,7 +23,7 @@ import (
 
 const (
 	minimumPlanVersion = 1
-	PlanVersion        = 2
+	PlanVersion        = 3
 	ContainerName      = "runner"
 )
 
@@ -34,6 +34,7 @@ type Plan struct {
 	Repository   Repository        `json:"repository"`
 	Event        Event             `json:"event"`
 	Revision     Revision          `json:"revision"`
+	Inputs       map[string]any    `json:"inputs,omitempty"`
 	WorkflowName string            `json:"workflowName"`
 	JobID        string            `json:"jobID"`
 	Env          map[string]string `json:"env,omitempty"`
@@ -50,9 +51,49 @@ type Repository struct {
 }
 
 type Event struct {
-	Name       string `json:"name"`
-	Action     string `json:"action,omitempty"`
-	DeliveryID string `json:"deliveryID"`
+	Name        string            `json:"name"`
+	Action      string            `json:"action,omitempty"`
+	DeliveryID  string            `json:"deliveryID,omitempty"`
+	Schedule    string            `json:"schedule,omitempty"`
+	PullRequest *PullRequest      `json:"pullRequest,omitempty"`
+	WorkflowRun *WorkflowRunEvent `json:"workflowRun,omitempty"`
+	Issue       *IssueEvent       `json:"issue,omitempty"`
+	Comment     *CommentEvent     `json:"comment,omitempty"`
+	Review      *ReviewEvent      `json:"review,omitempty"`
+}
+
+type PullRequest struct {
+	Number         int64           `json:"number"`
+	Body           string          `json:"body"`
+	HTMLURL        string          `json:"htmlURL"`
+	HeadRepository EventRepository `json:"headRepository"`
+	HeadRef        string          `json:"headRef"`
+	HeadSHA        string          `json:"headSHA"`
+	BaseRef        string          `json:"baseRef"`
+}
+
+type WorkflowRunEvent struct {
+	Conclusion string `json:"conclusion,omitempty"`
+	HeadSHA    string `json:"headSHA"`
+}
+
+type IssueEvent struct {
+	Number int64  `json:"number"`
+	Body   string `json:"body"`
+}
+
+type CommentEvent struct {
+	Body string `json:"body"`
+}
+
+type ReviewEvent struct {
+	Body string `json:"body"`
+}
+
+type EventRepository struct {
+	ID    int64  `json:"id"`
+	Owner string `json:"owner"`
+	Name  string `json:"name"`
 }
 
 type Revision struct {
@@ -138,10 +179,26 @@ func LoadPlan(path string) (*Plan, error) {
 	if plan.Version < minimumPlanVersion || plan.Version > PlanVersion {
 		return nil, fmt.Errorf("unsupported job plan version %d", plan.Version)
 	}
-	if plan.Repository.ID < 1 || plan.Repository.Owner == "" || plan.Repository.Name == "" || plan.Repository.ServerURL == "" || plan.Repository.APIURL == "" || plan.Repository.ActionCloneBaseURL == "" || plan.Event.Name == "" || plan.Event.DeliveryID == "" || plan.Revision.SHA == "" || plan.Revision.Ref == "" || plan.Revision.RefName == "" || plan.WorkflowName == "" || plan.JobID == "" || len(plan.Steps) == 0 {
+	if plan.Repository.ID < 1 || plan.Repository.Owner == "" || plan.Repository.Name == "" || plan.Repository.ServerURL == "" || plan.Repository.APIURL == "" || plan.Repository.ActionCloneBaseURL == "" || plan.Event.Name == "" || !validEventDeliveryID(plan.Event) || !validInputValues(plan.Inputs) || plan.Revision.SHA == "" || plan.Revision.Ref == "" || plan.Revision.RefName == "" || plan.WorkflowName == "" || plan.JobID == "" || len(plan.Steps) == 0 {
 		return nil, errors.New("job plan is incomplete")
 	}
 	return plan, nil
+}
+
+func validInputValues(inputs map[string]any) bool {
+	for _, value := range inputs {
+		switch value.(type) {
+		case string, bool, float64:
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+func validEventDeliveryID(event Event) bool {
+	synthetic := event.Name == "workflow_dispatch" || event.Name == "schedule" || event.Name == "workflow_call"
+	return synthetic == (event.DeliveryID == "")
 }
 
 func (e *Executor) Execute(ctx context.Context, plan *Plan, workspace string) error {
@@ -179,11 +236,11 @@ func (e *Executor) executePlan(ctx context.Context, plan *Plan, workspace string
 		"CI=true",
 		"GITHUB_ACTIONS=true",
 		"GITHUB_API_URL="+strings.TrimSuffix(plan.Repository.APIURL, "/"),
-		"GITHUB_BASE_REF="+plan.Revision.BaseRef,
+		"GITHUB_BASE_REF="+planPullRequestRefs(plan).base,
 		"GITHUB_EVENT_ACTION="+plan.Event.Action,
 		"GITHUB_EVENT_NAME="+plan.Event.Name,
 		"GITHUB_EVENT_PATH="+eventPath,
-		"GITHUB_HEAD_REF="+plan.Revision.HeadRef,
+		"GITHUB_HEAD_REF="+planPullRequestRefs(plan).head,
 		"GITHUB_JOB="+plan.JobID,
 		"GITHUB_REF="+plan.Revision.Ref,
 		"GITHUB_REF_NAME="+plan.Revision.RefName,
@@ -311,20 +368,49 @@ func githubEventDocument(plan *Plan) ([]byte, error) {
 	if plan.Event.Action != "" {
 		document["action"] = plan.Event.Action
 	}
+	if len(plan.Inputs) > 0 {
+		document["inputs"] = eventInputValues(plan.Inputs)
+	}
+	if plan.Event.Schedule != "" {
+		document["schedule"] = plan.Event.Schedule
+	}
 	switch plan.Event.Name {
 	case "push":
 		document["after"] = plan.Revision.SHA
 		document["ref"] = plan.Revision.Ref
-	case "pull_request":
-		document["pull_request"] = map[string]any{
-			"merge_commit_sha": plan.Revision.SHA,
-			"head":             map[string]string{"ref": plan.Revision.HeadRef},
+	case "pull_request", "pull_request_target":
+		if pullRequest := githubPullRequestEvent(plan); pullRequest != nil {
+			document["pull_request"] = pullRequest
 		}
 	case "merge_group":
 		document["merge_group"] = map[string]string{
 			"head_sha": plan.Revision.SHA,
 			"head_ref": plan.Revision.Ref,
 		}
+	case "workflow_run":
+		if plan.Event.WorkflowRun != nil {
+			document["workflow_run"] = map[string]any{"conclusion": plan.Event.WorkflowRun.Conclusion, "head_sha": plan.Event.WorkflowRun.HeadSHA}
+		}
+	case "issues":
+		addIssueEvent(document, plan.Event)
+	case "issue_comment":
+		addIssueEvent(document, plan.Event)
+		addCommentEvent(document, plan.Event)
+	case "pull_request_review_comment":
+		if pullRequest := githubPullRequestEvent(plan); pullRequest != nil {
+			document["pull_request"] = pullRequest
+		}
+		addCommentEvent(document, plan.Event)
+	case "pull_request_review":
+		if pullRequest := githubPullRequestEvent(plan); pullRequest != nil {
+			document["pull_request"] = pullRequest
+		}
+		if plan.Event.Review != nil {
+			document["review"] = map[string]any{"body": plan.Event.Review.Body}
+		}
+	case "release":
+		document["release"] = map[string]any{"tag_name": plan.Revision.RefName}
+	case "workflow_dispatch", "schedule", "workflow_call":
 	default:
 		return nil, fmt.Errorf("create event file: unsupported event %q", plan.Event.Name)
 	}
@@ -333,6 +419,70 @@ func githubEventDocument(plan *Plan) ([]byte, error) {
 		return nil, fmt.Errorf("create event file: %w", err)
 	}
 	return append(data, '\n'), nil
+}
+
+func addIssueEvent(document map[string]any, event Event) {
+	if event.Issue != nil {
+		document["issue"] = map[string]any{"number": event.Issue.Number, "body": event.Issue.Body}
+	}
+}
+
+func addCommentEvent(document map[string]any, event Event) {
+	if event.Comment != nil {
+		document["comment"] = map[string]any{"body": event.Comment.Body}
+	}
+}
+
+func githubPullRequestEvent(plan *Plan) map[string]any {
+	if plan.Event.PullRequest == nil {
+		if plan.Event.Name == "pull_request" {
+			return map[string]any{
+				"merge_commit_sha": plan.Revision.SHA,
+				"head":             map[string]any{"ref": plan.Revision.HeadRef},
+				"base":             map[string]any{"ref": plan.Revision.BaseRef},
+			}
+		}
+		return nil
+	}
+	pullRequest := map[string]any{
+		"number": plan.Event.PullRequest.Number, "body": plan.Event.PullRequest.Body, "html_url": plan.Event.PullRequest.HTMLURL,
+		"merge_ref": fmt.Sprintf("refs/pull/%d/merge", plan.Event.PullRequest.Number),
+		"head": map[string]any{
+			"ref": plan.Event.PullRequest.HeadRef,
+			"sha": plan.Event.PullRequest.HeadSHA,
+			"repo": map[string]any{
+				"id":        plan.Event.PullRequest.HeadRepository.ID,
+				"name":      plan.Event.PullRequest.HeadRepository.Name,
+				"full_name": plan.Event.PullRequest.HeadRepository.Owner + "/" + plan.Event.PullRequest.HeadRepository.Name,
+				"owner":     map[string]any{"login": plan.Event.PullRequest.HeadRepository.Owner},
+			},
+		},
+		"base": map[string]any{"ref": plan.Event.PullRequest.BaseRef},
+	}
+	if plan.Event.Name == "pull_request" {
+		pullRequest["merge_commit_sha"] = plan.Revision.SHA
+	}
+	return pullRequest
+}
+
+func eventInputValues(inputs map[string]any) map[string]string {
+	values := make(map[string]string, len(inputs))
+	for name, value := range inputs {
+		values[name] = fmt.Sprint(value)
+	}
+	return values
+}
+
+type pullRequestRefs struct {
+	head string
+	base string
+}
+
+func planPullRequestRefs(plan *Plan) pullRequestRefs {
+	if plan.Event.Name == "pull_request_target" && plan.Event.PullRequest != nil {
+		return pullRequestRefs{head: plan.Event.PullRequest.HeadRef, base: plan.Event.PullRequest.BaseRef}
+	}
+	return pullRequestRefs{head: plan.Revision.HeadRef, base: plan.Revision.BaseRef}
 }
 
 func (e *Executor) runPostActions(ctx context.Context, state *executionState, status expression.Status) error {

@@ -147,6 +147,12 @@ func runManager(arguments []string) error {
 	if err := (&controller.ProjectReconciler{Client: controllerManager.GetClient(), APIReader: controllerManager.GetAPIReader()}).SetupWithManager(controllerManager); err != nil {
 		return fmt.Errorf("configure Project controller: %w", err)
 	}
+	if err := (&controller.ScheduleReconciler{
+		Client: controllerManager.GetClient(), APIReader: controllerManager.GetAPIReader(), GitHub: github, Logger: logger,
+		WorkflowRunTTLSecondsAfterFinished: workflowRunTTLSecondsAfterFinished,
+	}).SetupWithManager(controllerManager); err != nil {
+		return fmt.Errorf("configure workflow schedule controller: %w", err)
+	}
 	if err := (&controller.WorkflowRunReconciler{
 		Client:             controllerManager.GetClient(),
 		APIReader:          controllerManager.GetAPIReader(),

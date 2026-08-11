@@ -91,16 +91,18 @@ func TestNormalizePullRequestRevisions(t *testing.T) {
 		wantError   bool
 	}{
 		{name: "open mergeable resolves test merge revision", action: "synchronize", state: "open", mergeable: &mergeable, mergeSHA: strings.Repeat("a", 40), wantSupport: true, wantRef: "refs/pull/42/merge", wantRefName: "42/merge", wantResolve: "refs/pull/42/merge", wantHeadSHA: headSHA},
-		{name: "open conflicted", action: "synchronize", state: "open", mergeable: &conflicted, mergeSHA: strings.Repeat("b", 40)},
+		{name: "open conflicted runs trusted workflow", action: "synchronize", state: "open", mergeable: &conflicted, mergeSHA: strings.Repeat("b", 40), wantSupport: true, wantRef: "refs/pull/42/merge", wantRefName: "42/merge"},
 		{name: "open merge result unavailable", action: "opened", state: "open", mergeable: &mergeable, wantSupport: true, wantRef: "refs/pull/42/merge", wantRefName: "42/merge", wantResolve: "refs/pull/42/merge", wantHeadSHA: headSHA},
 		{name: "closed unmerged", action: "closed", state: "closed", mergeable: &mergeable, mergeSHA: strings.Repeat("c", 40), wantSupport: true, wantRef: "refs/pull/42/merge", wantRefName: "42/merge", wantSHA: strings.Repeat("c", 40)},
-		{name: "closed unmerged without revision", action: "closed", state: "closed", mergeable: &mergeable},
+		{name: "closed unmerged without revision runs trusted workflow", action: "closed", state: "closed", mergeable: &mergeable, wantSupport: true, wantRef: "refs/pull/42/merge", wantRefName: "42/merge"},
 		{name: "closed merged", action: "closed", state: "closed", merged: true, mergeable: &conflicted, mergeSHA: strings.Repeat("d", 40), wantSupport: true, wantRef: "refs/heads/main", wantRefName: "main", wantSHA: strings.Repeat("d", 40)},
 		{name: "merged payload with non-closed activity", action: "synchronize", state: "closed", merged: true, mergeable: &conflicted, mergeSHA: strings.Repeat("e", 40), wantError: true},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			event := &payload{Action: tt.action}
 			event.PullRequest.Number = 42
+			event.PullRequest.Body = "Pull request body"
+			event.PullRequest.HTMLURL = "https://github.com/acme/example/pull/42"
 			event.PullRequest.State = tt.state
 			event.PullRequest.Merged = tt.merged
 			event.PullRequest.Mergeable = tt.mergeable
@@ -109,7 +111,10 @@ func TestNormalizePullRequestRevisions(t *testing.T) {
 			event.PullRequest.Head.Ref = "feature"
 			event.PullRequest.Head.SHA = headSHA
 			event.PullRequest.Head.Repository.ID = event.Repository.ID
+			event.PullRequest.Head.Repository.Owner.Login = "acme"
+			event.PullRequest.Head.Repository.Name = "example"
 			event.PullRequest.Base.Ref = "main"
+			event.PullRequest.Base.SHA = strings.Repeat("9", 40)
 			normalized, supported, err := normalize("pull_request", event)
 			if tt.wantError {
 				if err == nil {
@@ -129,26 +134,63 @@ func TestNormalizePullRequestRevisions(t *testing.T) {
 			if normalized.Ref != tt.wantRef || githubclient.RefName(normalized.Ref) != tt.wantRefName || normalized.HeadRef != "feature" || normalized.BaseRef != "main" || normalized.SHA != tt.wantSHA || normalized.ResolveRef != tt.wantResolve || normalized.HeadSHA != tt.wantHeadSHA {
 				t.Errorf("normalized event = %#v", normalized)
 			}
+			if normalized.PullRequest == nil || normalized.PullRequest.Number != 42 || normalized.PullRequest.Body != "Pull request body" || normalized.PullRequest.HTMLURL != "https://github.com/acme/example/pull/42" || normalized.PullRequest.HeadRef != "feature" || normalized.PullRequest.HeadSHA != headSHA || normalized.PullRequest.BaseRef != "main" || normalized.PullRequest.BaseSHA != strings.Repeat("9", 40) || normalized.PullRequest.HeadRepository.Owner != "acme" || normalized.PullRequest.HeadRepository.Name != "example" {
+				t.Errorf("normalized pull request = %#v", normalized.PullRequest)
+			}
 		})
 	}
 }
 
-func TestNormalizePullRequestRequiresValidHeadRevision(t *testing.T) {
+func TestNormalizePullRequestRequiresValidRevisions(t *testing.T) {
 	mergeable := true
-	for _, headSHA := range []string{"", "not-a-sha", strings.Repeat("A", 40), zeroGitSHA} {
-		event := &payload{Action: "synchronize"}
-		event.Repository.ID = 1
-		event.PullRequest.Number = 42
-		event.PullRequest.State = "open"
-		event.PullRequest.Mergeable = &mergeable
-		event.PullRequest.Head.Ref = "feature"
-		event.PullRequest.Head.SHA = headSHA
-		event.PullRequest.Head.Repository.ID = event.Repository.ID
-		event.PullRequest.Base.Ref = "main"
+	validSHA := strings.Repeat("9", 40)
+	for _, field := range []struct {
+		name string
+		set  func(*payload, string)
+	}{
+		{name: "head", set: func(event *payload, value string) { event.PullRequest.Head.SHA = value }},
+		{name: "base", set: func(event *payload, value string) { event.PullRequest.Base.SHA = value }},
+	} {
+		for _, revision := range []string{"", "not-a-sha", strings.Repeat("A", 40), zeroGitSHA} {
+			event := &payload{Action: "synchronize"}
+			event.Repository.ID = 1
+			event.PullRequest.Number = 42
+			event.PullRequest.HTMLURL = "https://github.com/acme/example/pull/42"
+			event.PullRequest.State = "open"
+			event.PullRequest.Mergeable = &mergeable
+			event.PullRequest.Head.Ref = "feature"
+			event.PullRequest.Head.SHA = validSHA
+			event.PullRequest.Head.Repository.ID = event.Repository.ID
+			event.PullRequest.Head.Repository.Owner.Login = "acme"
+			event.PullRequest.Head.Repository.Name = "example"
+			event.PullRequest.Base.Ref = "main"
+			event.PullRequest.Base.SHA = validSHA
+			field.set(event, revision)
 
-		if _, _, err := normalize("pull_request", event); err == nil {
-			t.Fatalf("normalize() accepted head revision %q", headSHA)
+			if _, _, err := normalize("pull_request", event); err == nil {
+				t.Fatalf("normalize() accepted %s revision %q", field.name, revision)
+			}
 		}
+	}
+}
+
+func TestNormalizeSkipsPullRequestEventsWithoutHeadRepository(t *testing.T) {
+	for _, eventName := range []string{"pull_request", "pull_request_review", "pull_request_review_comment"} {
+		t.Run(eventName, func(t *testing.T) {
+			event := &payload{Action: "synchronize"}
+			event.Repository.ID = 1
+			event.Repository.DefaultBranch = "main"
+			event.PullRequest.Number = 42
+			event.PullRequest.HTMLURL = "https://github.com/acme/example/pull/42"
+			event.PullRequest.State = "open"
+			event.PullRequest.Head.Ref = "feature"
+			event.PullRequest.Head.SHA = strings.Repeat("a", 40)
+			event.PullRequest.Base.Ref = "main"
+			_, supported, err := normalize(eventName, event)
+			if err != nil || supported {
+				t.Fatalf("normalize(%q) supported = %v, error = %v", eventName, supported, err)
+			}
+		})
 	}
 }
 
@@ -174,25 +216,181 @@ func TestNormalizeMergeGroupActions(t *testing.T) {
 	}
 }
 
-func TestNormalizeRejectsUntrustedPullRequestHeads(t *testing.T) {
+func TestNormalizeRemainingWebhookEvents(t *testing.T) {
+	base := func() *payload {
+		event := &payload{}
+		event.Repository.DefaultBranch = "main"
+		return event
+	}
+	for _, eventName := range []string{"issues", "issue_comment"} {
+		event := base()
+		event.Action = "opened"
+		event.Issue.Number = 17
+		event.Issue.Body = "Issue body"
+		if eventName == "issue_comment" {
+			event.Action = "created"
+			event.Comment.Body = "/kind bug"
+		}
+		normalized, supported, err := normalize(eventName, event)
+		if err != nil || !supported || normalized.Ref != "refs/heads/main" || normalized.ResolveRef != "main" || normalized.Issue == nil || normalized.Issue.Number != 17 || normalized.Issue.Body != "Issue body" || (eventName == "issue_comment" && (normalized.Comment == nil || normalized.Comment.Body != "/kind bug")) {
+			t.Fatalf("normalize(%q) = %#v, supported %v, error %v", eventName, normalized, supported, err)
+		}
+	}
+
+	workflowRun := base()
+	workflowRun.Action = "completed"
+	workflowRun.WorkflowRun.Name = "Release"
+	workflowRun.WorkflowRun.HeadBranch = "main"
+	workflowRun.WorkflowRun.HeadSHA = strings.Repeat("a", 40)
+	workflowRun.WorkflowRun.Conclusion = "success"
+	normalized, supported, err := normalize("workflow_run", workflowRun)
+	if err != nil || !supported || normalized.WorkflowName != "Release" || normalized.BaseRef != "main" || normalized.ResolveRef != "main" || normalized.WorkflowRun == nil || normalized.WorkflowRun.Conclusion != "success" || normalized.WorkflowRun.HeadSHA != strings.Repeat("a", 40) {
+		t.Fatalf("workflow_run normalized = %#v, supported %v, error %v", normalized, supported, err)
+	}
+
+	release := base()
+	release.Action = "published"
+	release.Release.TagName = "v1.2.3"
+	normalized, supported, err = normalize("release", release)
+	if err != nil || !supported || normalized.Ref != "refs/tags/v1.2.3" || normalized.ResolveRef != "refs/tags/v1.2.3" {
+		t.Fatalf("release normalized = %#v, supported %v, error %v", normalized, supported, err)
+	}
+	release.Release.Draft = true
+	if _, supported, err := normalize("release", release); err != nil || supported {
+		t.Fatalf("draft release supported = %v, error = %v", supported, err)
+	}
+}
+
+func TestNormalizeSkipsUnsupportedActivityTypes(t *testing.T) {
+	event := &payload{Action: "future_activity"}
+	event.Repository.DefaultBranch = "main"
+	event.Issue.Number = 17
+	_, supported, err := normalize("issues", event)
+	if err != nil || supported {
+		t.Fatalf("unsupported activity supported = %v, error = %v", supported, err)
+	}
+}
+
+func TestNormalizeRejectsOversizedEventMetadata(t *testing.T) {
+	base := func() *payload {
+		event := &payload{}
+		event.Repository.DefaultBranch = "main"
+		return event
+	}
+	for _, tt := range []struct {
+		name      string
+		eventName string
+		mutate    func(*payload)
+	}{
+		{
+			name: "issue body", eventName: "issues",
+			mutate: func(event *payload) {
+				event.Action = "opened"
+				event.Issue.Number = 17
+				event.Issue.Body = strings.Repeat("x", maxEventBodyLength+1)
+			},
+		},
+		{
+			name: "release tag", eventName: "release",
+			mutate: func(event *payload) {
+				event.Action = "published"
+				event.Release.TagName = strings.Repeat("x", maxEventTagNameLength+1)
+			},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			event := base()
+			tt.mutate(event)
+			if _, _, err := normalize(tt.eventName, event); err == nil {
+				t.Fatal("normalize() accepted oversized event metadata")
+			}
+		})
+	}
+}
+
+func TestNormalizePullRequestReviewEventsUseDefaultBranch(t *testing.T) {
+	for _, tt := range []struct {
+		name   string
+		action string
+	}{
+		{name: "pull_request_review", action: "submitted"},
+		{name: "pull_request_review_comment", action: "created"},
+	} {
+		event := &payload{Action: tt.action}
+		event.Repository.ID = 1
+		event.Repository.DefaultBranch = "main"
+		event.PullRequest.Number = 42
+		event.PullRequest.Body = "Pull request body"
+		event.PullRequest.HTMLURL = "https://github.com/acme/example/pull/42"
+		event.PullRequest.Head.Ref = "fork-feature"
+		event.PullRequest.Head.SHA = strings.Repeat("a", 40)
+		event.PullRequest.Head.Repository.ID = 2
+		event.PullRequest.Head.Repository.Owner.Login = "contributor"
+		event.PullRequest.Head.Repository.Name = "example"
+		event.PullRequest.Base.Ref = "main"
+		event.PullRequest.Base.SHA = strings.Repeat("b", 40)
+		event.Comment.Body = "/kind bug"
+		event.Review.Body = "/priority important-soon"
+		normalized, supported, err := normalize(tt.name, event)
+		if err != nil || !supported || normalized.Ref != "refs/heads/main" || normalized.ResolveRef != "main" || normalized.HeadSHA != "" || normalized.HeadRef != "" || normalized.SHA != "" || normalized.PullRequest == nil || normalized.PullRequest.Number != 42 || normalized.PullRequest.Body != "Pull request body" || normalized.PullRequest.HTMLURL != "https://github.com/acme/example/pull/42" {
+			t.Fatalf("normalize(%q) = %#v, supported %v, error %v", tt.name, normalized, supported, err)
+		}
+		if tt.name == "pull_request_review" && (normalized.Review == nil || normalized.Review.Body != "/priority important-soon") {
+			t.Fatalf("normalized review = %#v", normalized.Review)
+		}
+		if tt.name == "pull_request_review_comment" && (normalized.Comment == nil || normalized.Comment.Body != "/kind bug") {
+			t.Fatalf("normalized comment = %#v", normalized.Comment)
+		}
+	}
+}
+
+func TestDeliveryEventsUsePullRequestBaseBranch(t *testing.T) {
+	baseSHA := strings.Repeat("b", 40)
+	event := normalizedEvent{
+		Name: "pull_request", Action: "synchronize", Fork: true,
+		Ref: "refs/pull/42/merge", HeadRef: "feature", BaseRef: "release",
+		PullRequest: &normalizedPullRequest{
+			Number: 42, Body: "Pull request body", HTMLURL: "https://github.com/contributor/example/pull/42",
+			HeadRef: "feature", HeadSHA: strings.Repeat("a", 40), BaseRef: "release", BaseSHA: baseSHA,
+			HeadRepository: normalizedRepository{ID: 2, Owner: "contributor", Name: "example"},
+		},
+	}
+	events := deliveryEvents(event)
+	if len(events) != 1 || events[0].Name != "pull_request_target" || events[0].SHA != baseSHA || events[0].ResolveRef != "" || events[0].Ref != "refs/heads/release" || events[0].HeadRef != "feature" || events[0].PullRequest != event.PullRequest {
+		t.Fatalf("delivery events = %#v", events)
+	}
+}
+
+func TestNormalizeRetainsForkPullRequestsForTrustedBaseWorkflows(t *testing.T) {
 	mergeable := true
-	for _, headRepositoryID := range []int64{0, 2} {
+	for _, tt := range []struct {
+		headRepositoryID int64
+		wantSupported    bool
+	}{
+		{headRepositoryID: 0},
+		{headRepositoryID: 2, wantSupported: true},
+	} {
 		event := &payload{Action: "synchronize"}
 		event.Repository.ID = 1
 		event.PullRequest.Number = 42
+		event.PullRequest.HTMLURL = "https://github.com/acme/example/pull/42"
 		event.PullRequest.State = "open"
 		event.PullRequest.Mergeable = &mergeable
 		event.PullRequest.MergeCommitSHA = strings.Repeat("a", 40)
 		event.PullRequest.Head.Ref = "feature"
-		event.PullRequest.Head.Repository.ID = headRepositoryID
+		event.PullRequest.Head.SHA = strings.Repeat("b", 40)
+		event.PullRequest.Head.Repository.ID = tt.headRepositoryID
+		event.PullRequest.Head.Repository.Owner.Login = "contributor"
+		event.PullRequest.Head.Repository.Name = "example"
 		event.PullRequest.Base.Ref = "main"
+		event.PullRequest.Base.SHA = strings.Repeat("9", 40)
 
-		_, supported, err := normalize("pull_request", event)
+		normalized, supported, err := normalize("pull_request", event)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if supported {
-			t.Fatalf("normalize() accepted pull request head repository %d", headRepositoryID)
+		if supported != tt.wantSupported || supported && !normalized.Fork {
+			t.Fatalf("normalized event = %#v, supported = %v", normalized, supported)
 		}
 	}
 }

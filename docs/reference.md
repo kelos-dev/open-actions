@@ -154,10 +154,10 @@ The resources expose these condition contracts:
 | `Runner` | `Busy` | `True` | `JobAssigned` |
 | `WorkflowRun` | `Planned` | `True` | `JobsPlanned` |
 | `WorkflowRun` | `Planned` | `Unknown` | `WaitingForConcurrency`, `WaitingForConcurrencyCancellation`, `ProjectUnavailable`, `CredentialsUnavailable`, `GitHubAuthenticationFailed`, `WorkflowFetchFailed`, `ChildCreationFailed`, `ConcurrencyCheckFailed` |
-| `WorkflowRun` | `Planned` | `False` | `ProjectUnavailable`, `WorkflowFetchFailed`, `WorkflowInvalid`, `ChildCreationFailed`, `ExecutionStateLost` |
+| `WorkflowRun` | `Planned` | `False` | `ProjectUnavailable`, `WorkflowFetchFailed`, `WorkflowInvalid`, `TriggerInvalid`, `ChildCreationFailed`, `ExecutionStateLost` |
 | `WorkflowRun` | `Succeeded` | `Unknown` | `JobsQueued`, `JobsRunning` |
 | `WorkflowRun` | `Succeeded` | `True` | `JobsSucceeded` |
-| `WorkflowRun` | `Succeeded` | `False` | `ProjectUnavailable`, `WorkflowFetchFailed`, `WorkflowInvalid`, `ChildCreationFailed`, `JobFailed`, `ExecutionStateLost` |
+| `WorkflowRun` | `Succeeded` | `False` | `ProjectUnavailable`, `WorkflowFetchFailed`, `WorkflowInvalid`, `TriggerInvalid`, `ChildCreationFailed`, `JobFailed`, `ExecutionStateLost` |
 | `WorkflowJob` | `Scheduled` | `True` | `RunnerAssigned` |
 | `WorkflowJob` | `Scheduled` | `False` | `ProjectRecreated` |
 | `WorkflowJob` | `Succeeded` | `Unknown` | `JobRunning` |
@@ -225,17 +225,17 @@ evaluation when the corresponding execution feature has not supplied it.
 
 | Phase | Allowed contexts and functions | Currently supplied |
 | --- | --- | --- |
-| Workflow concurrency | `github`, `inputs`, `vars` | `github` |
-| Job name and runner labels | `github`, `needs`, `strategy`, `matrix`, `vars`, `inputs` | `github` |
-| Job environment | `github`, `needs`, `strategy`, `matrix`, `vars`, `secrets`, `inputs` | `github` |
-| Workflow step name, run script, working directory, environment, and inputs | `github`, `needs`, `strategy`, `matrix`, `job`, `runner`, `env`, `vars`, `secrets`, `steps`, `inputs` | `github`, `runner`, `env` |
-| Workflow step condition | Step contexts except `secrets`, plus status functions | `github`, `runner`, `env`, and status functions |
+| Workflow concurrency | `github`, `inputs`, `vars` | `github`, `inputs` |
+| Job name and runner labels | `github`, `needs`, `strategy`, `matrix`, `vars`, `inputs` | `github`, `inputs` |
+| Job environment | `github`, `needs`, `strategy`, `matrix`, `vars`, `secrets`, `inputs` | `github`, `inputs` |
+| Workflow step name, run script, working directory, environment, and inputs | `github`, `needs`, `strategy`, `matrix`, `job`, `runner`, `env`, `vars`, `secrets`, `steps`, `inputs` | `github`, `runner`, `env`, `inputs` |
+| Workflow step condition | Step contexts except `secrets`, plus status functions | `github`, `runner`, `env`, `inputs`, and status functions |
 | Composite step fields and outputs | `github`, `runner`, `env`, `inputs`, `steps` | All listed contexts |
 | Composite step condition | Composite contexts and status functions | All listed contexts and functions |
 | Action input default | `github` | `github` |
 
-Dependency outputs, matrix expansion, workflow input loading, and repository
-secret and variable sources remain separate execution features. Values derived
+Dependency outputs, matrix expansion, and repository secret and variable
+sources remain separate execution features. Values derived
 from `github.token` or the `secrets` context are marked sensitive through
 interpolation and function calls, and evaluation diagnostics do not include
 resolved values. The runner maps interrupt and termination signals to cancelled
@@ -258,10 +258,105 @@ Pull request and merge group target branches are available as
 
 ### Trigger matching
 
-Push branch filters apply only to branch refs, not tags with the same short
-name. An omitted `pull_request.types` filter matches GitHub's default `opened`,
+Push branch filters apply only to branch refs, and push tag filters apply only
+to tag refs. Defining only one filter kind excludes the other ref kind. An
+omitted `pull_request.types` filter matches GitHub's default `opened`,
 `synchronize`, and `reopened` activities. Explicit empty `branches` and `types`
 lists are invalid. Configured concurrency requires a non-empty group.
+
+The supported trigger declarations are `push`, `pull_request`, `merge_group`,
+`workflow_run`, `workflow_dispatch`, `issues`, `pull_request_target`,
+`issue_comment`, `pull_request_review_comment`, `pull_request_review`,
+`schedule`, `release`, and `workflow_call`. Activity `types` are validated for
+each webhook-backed event. Webhook deliveries with unrecognized activity types
+are accepted without being queued. `pull_request_target` uses the pull request's
+trusted base-branch workflow and revision, including for fork pull requests;
+ordinary `pull_request` workflows continue to use the test merge revision. This
+differs from GitHub Actions, which loads native `pull_request_target` workflows
+from the repository's default branch. Review and review-comment events discover
+and execute workflows only from the trusted default branch, so a maintainer
+action cannot execute a fork-controlled workflow definition. Checks for review
+events are reported on the trusted default-branch revision,
+`pull_request_target` checks are reported on the trusted base-branch revision,
+and ordinary `pull_request` checks are reported on the pull request head
+revision.
+
+For `pull_request_target`, `spec.source.github.revision` always identifies the
+trusted base-branch workflow and execution commit, and `revision.ref` must equal
+`refs/heads/` followed by `event.pullRequest.baseRef`. The execution SHA is
+pinned to the base commit from the signed webhook instead of resolving the
+mutable branch during asynchronous delivery processing. Bounded untrusted
+metadata is recorded separately under `event.pullRequest`: the pull request
+number and body, HTML URL, head repository, head branch and SHA, and base branch.
+The normalized `github.event.pull_request` object exposes the same values and
+derives `merge_ref` from the pull request number. Open Actions does not
+automatically check out the head or merge ref, expand the runner token beyond
+repository-scoped Contents read, or grant approval-gated secrets based on this
+metadata.
+
+`workflow_run` accepts `workflows`, `types`, and `branches` filters and consumes
+GitHub App `workflow_run` webhooks. It does not synthesize a GitHub
+`workflow_run` delivery when an Open Actions run completes.
+
+Webhook-backed runs persist only the bounded event fields exposed by Open
+Actions. `github.event.workflow_run` contains `conclusion` and `head_sha`;
+`github.event.issue` contains `number` and `body`; `github.event.comment` and
+`github.event.review` contain `body`; and `github.event.release` contains
+`tag_name`, derived from the canonical revision tag ref. Draft release
+activities are ignored. Pull-request-backed events expose the pull request
+number, body, HTML URL, head repository, head branch and SHA, and base branch.
+These objects have the same shape in planning expressions and
+`GITHUB_EVENT_PATH`; the raw webhook payload is not persisted.
+
+Issue, comment, review, and pull request bodies contain at most 48,000
+characters. Pull request HTML URLs contain at most 2,048 characters.
+`workflow_run.conclusion` contains at most 64 lowercase letters or underscores,
+and `workflow_run.head_sha` is a 40-character lowercase hexadecimal SHA. Release
+tag names contain at most 1,014 characters so the `refs/tags/` revision ref
+remains within its 1,024-character limit.
+
+`workflow_dispatch` accepts up to 25 typed, bounded inputs. Initiate a manual
+run by creating a `WorkflowRun` through the Kubernetes API with the selected
+workflow path, pinned commit and branch or tag ref, and any supplied inputs.
+Use a deterministic `metadata.name` as the invocation's idempotency key; a
+retry of the same request must reuse that name. `deliveryID` is reserved for
+the `X-GitHub-Delivery` value on webhook-backed events. The controller verifies
+that the workflow declares `workflow_dispatch`, validates the supplied inputs,
+and applies defaults before planning jobs. See
+[`config/samples/actions_v1alpha1_workflowrun-dispatch.yaml`](../config/samples/actions_v1alpha1_workflowrun-dispatch.yaml).
+Supported input types are `string`, `boolean`, `number`, `choice`, and
+`environment`; `choice` inputs require options. `workflow_call` declarations
+accept `string`, `boolean`, and `number` inputs with required types and use the
+same direct `WorkflowRun` initiation and validation path. Optional
+`workflow_call` inputs without an explicit default resolve to `false`, `0`, or
+an empty string according to their type. Input names must be unique ignoring
+ASCII case, and input names and resolved values are limited to 65,535 characters
+in total. The `inputs.<name>` expression preserves declared boolean and number
+types, while `github.event.inputs.<name>` is always string-valued; number inputs
+use the canonical parsed number representation in both planning and runner
+expressions. Local job-level calls are described separately from trigger
+parsing.
+
+Schedules use five-field POSIX cron expressions in UTC with a minimum interval
+of five minutes. The controller enumerates repositories available to each
+configured GitHub App installation, reads workflows and the latest revision
+from each default branch, and creates one deterministic `WorkflowRun` for each
+matching workflow, cron expression, and minute. Reconciliation is idempotent,
+and transient repository failures are retried during the current minute, but
+missed minutes are not backfilled. Parsed schedules are cached while a
+repository's push metadata and resolved revision remain unchanged. Planning
+verifies that a scheduled `WorkflowRun` names a valid cron expression declared
+by the selected workflow.
+
+Scheduled WorkflowRuns retain an idempotency finalizer until their creation
+minute ends. A TTL of zero or a manual deletion may therefore leave the run
+terminating until that boundary, preventing the same scheduled invocation from
+being created twice during its due minute.
+
+Scheduled discovery supports at most 1,000 repositories per installation. An
+installation above that limit fails the schedule reconciliation before any
+repository is processed. A repository with more than 100 workflow files is
+skipped for scheduled discovery while other repositories continue.
 
 A repository without the configured workflow directory is accepted with zero
 runs. For a deleted branch or tag, trigger matching uses the deleted ref, while
@@ -275,6 +370,17 @@ Workflow definitions must satisfy these limits:
   matching workflows.
 - A workflow file may contain at most 1,000,000 bytes.
 - A workflow may contain at most 1,000 jobs.
+- A branch or tag filter may contain at most 256 patterns of at most 256
+  characters each.
+- A `workflow_run` trigger may contain at most 100 workflow names of at most
+  256 characters each.
+- A workflow trigger may define at most 25 inputs. Input names contain at most
+  100 characters, descriptions at most 1,024 characters, and choice inputs at
+  most 100 options. Each option, default, or supplied value contains at most
+  65,535 characters, and all input names and values together contain at most
+  65,535 characters.
+- A `schedule` trigger may contain at most 20 cron expressions, each at most
+  256 characters.
 - A job may contain at most 100 steps and 100,000 bytes of aggregate planned
   content.
 - A run script may contain at most 65,536 bytes.
@@ -301,12 +407,13 @@ Node, composite, and Bash steps can use Docker when assigned to a Runner with
 not add support for action metadata declaring `runs.using: docker`.
 
 `GITHUB_EVENT_PATH` contains a bounded normalized document with repository
-identity and the selected push, pull-request, or merge-group revision fields.
-Actions that require other fields from GitHub's raw webhook payload are not
-supported.
+identity, trigger action, event-specific metadata described above, manual or
+reusable inputs, the selected cron expression, and revision fields used by the
+supported event. Actions that require other fields from GitHub's raw webhook
+payload are not supported.
 
-The controller emits job-plan version 2, and the runner accepts versions 1 and
-2. When a release changes the job-plan version, update every Runner
+The controller emits job-plan version 3, and the runner accepts versions 1
+through 3. When a release changes the job-plan version, update every Runner
 `spec.execution.image` to an image that accepts both the installed and target
 controller versions before upgrading the controller.
 
@@ -326,11 +433,14 @@ are deleted. Open Actions does not archive logs.
 The webhook endpoint accepts only signed GitHub `POST` deliveries up to 10 MiB
 and requires exactly one configured project for the installation. Supported
 deliveries return HTTP 202 with `{"accepted":true,"queued":true}`. Unsupported
-event names, conflicted pull requests, and pull requests from fork repositories
-return HTTP 202 with `{"accepted":true,"queued":false}`. Open pull request
-workflows use GitHub's test merge revision for the webhook head. Deliveries wait
-up to two minutes for that revision; unavailable or superseded revisions
-produce a `Failed` delivery.
+event names return HTTP 202 with `{"accepted":true,"queued":false}`. Ordinary
+open pull request workflows use GitHub's test merge revision and are skipped
+for fork or conflicted pull requests. `pull_request_target` workflows remain
+eligible and load only from the pull request's base branch in the base
+repository. Deliveries wait up to two minutes for a test merge revision while
+eligible `pull_request_target` workflows are discovered independently.
+Unavailable or superseded test merge revisions produce a `Failed` delivery
+after that wait.
 
 Queued deliveries are processed asynchronously. Invalid or unsupported workflow
 definitions fail the whole delivery before any `WorkflowRun` resources are

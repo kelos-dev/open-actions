@@ -14,7 +14,7 @@ Kubernetes 1.29 or newer is required.
 
 The supported execution subset includes:
 
-- `push`, `pull_request`, and `merge_group` triggers with branch and action filters
+- webhook, manual, scheduled, chained, and reusable-workflow trigger declarations used by kelos
 - workflow concurrency groups and `cancel-in-progress`
 - runner-label scheduling for independent jobs using Kubernetes `Runner` and
   `WorkflowJob` resources
@@ -114,11 +114,15 @@ controller-owned child shape and is not applied independently. Expose the
 `open-actions-webhook.open-actions-system` Service through HTTPS and set that
 URL as the GitHub App's webhook URL. Expose
 `open-actions-console.open-actions-system` through HTTPS at its configured
-public URL. Subscribe the App to push, pull request, and merge group events.
+public URL. Subscribe the App to push, pull request, merge group, workflow run,
+issues, issue comment, pull request review comment, pull request review, and
+release events.
 Grant the App these repository permissions:
 
 - Contents: read, for workflow discovery and job execution
-- Pull requests: read, for `pull_request` webhooks
+- Actions: read, for `workflow_run` webhooks
+- Issues: read, for `issues` and `issue_comment` webhooks
+- Pull requests: read, for pull request and review webhooks
 - Merge queues: read, for `merge_group` webhooks
 - Checks: read and write, for WorkflowRun reporting
 

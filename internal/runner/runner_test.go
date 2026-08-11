@@ -285,8 +285,8 @@ func TestExecuteRejectsUnavailableExpressionContext(t *testing.T) {
 	}
 }
 
-func TestLoadPlanSupportsVersionsOneAndTwo(t *testing.T) {
-	for _, version := range []int{minimumPlanVersion, PlanVersion} {
+func TestLoadPlanSupportsKnownVersions(t *testing.T) {
+	for _, version := range []int{1, 2, PlanVersion} {
 		t.Run(fmt.Sprintf("version %d", version), func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "job.json")
 			data := fmt.Sprintf(`{"version":%d,"repository":{"id":1,"owner":"acme","name":"example","serverURL":"https://github.com","apiURL":"https://api.github.com","actionCloneBaseURL":"https://github.com"},"event":{"name":"push","deliveryID":"delivery"},"revision":{"sha":"abc","ref":"refs/heads/main","refName":"main"},"workflowName":"CI","jobID":"build","steps":[{"run":"true"}]}`, version)
@@ -301,6 +301,96 @@ func TestLoadPlanSupportsVersionsOneAndTwo(t *testing.T) {
 				t.Errorf("plan = %#v", plan)
 			}
 		})
+	}
+}
+
+func TestExpressionContextsPreserveTriggerInputTypes(t *testing.T) {
+	plan := testPlan()
+	plan.Inputs = map[string]any{"enabled": false, "retries": float64(2)}
+	plan.Event.Schedule = "0 6 * * *"
+	context := expressionContext(plan, nil, "", nil, runnerConditionAvailability, nil, "token")
+	enabled, err := evaluateCondition("${{ inputs.enabled }}", context, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if enabled {
+		t.Fatal("boolean false input evaluated as truthy")
+	}
+	retry, err := evaluateCondition("${{ inputs.retries > 1 }}", context, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !retry {
+		t.Fatal("numeric input did not retain number semantics")
+	}
+	event := githubExpressionEvent(plan)
+	if event["schedule"] != "0 6 * * *" || event["inputs"].(map[string]string)["enabled"] != "false" {
+		t.Fatalf("github.event = %#v", event)
+	}
+}
+
+func TestExpressionContextIncludesBoundedEventMetadata(t *testing.T) {
+	plan := testPlan()
+	plan.Event.Name = "pull_request_target"
+	plan.Event.PullRequest = &PullRequest{
+		Number: 42, Body: "Pull request body", HTMLURL: "https://github.com/contributor/example/pull/42",
+		HeadSHA:        strings.Repeat("a", 40),
+		HeadRepository: EventRepository{ID: 2, Owner: "contributor", Name: "example"},
+	}
+	plan.Event.WorkflowRun = &WorkflowRunEvent{Conclusion: "success", HeadSHA: strings.Repeat("b", 40)}
+	plan.Event.Issue = &IssueEvent{Number: 17, Body: "Issue body"}
+	plan.Event.Comment = &CommentEvent{Body: "Comment body"}
+	plan.Event.Review = &ReviewEvent{Body: "Review body"}
+	event := githubExpressionEvent(plan)
+	if event["pull_request"].(map[string]any)["html_url"] != plan.Event.PullRequest.HTMLURL ||
+		event["workflow_run"].(map[string]any)["head_sha"] != strings.Repeat("b", 40) ||
+		event["issue"].(map[string]any)["number"] != int64(17) ||
+		event["comment"].(map[string]any)["body"] != "Comment body" ||
+		event["review"].(map[string]any)["body"] != "Review body" {
+		t.Fatalf("github.event = %#v", event)
+	}
+	releasePlan := testPlan()
+	releasePlan.Event.Name = "release"
+	releasePlan.Revision.RefName = "v1.2.3"
+	if got := githubExpressionEvent(releasePlan)["release"].(map[string]any)["tag_name"]; got != "v1.2.3" {
+		t.Fatalf("release tag_name = %#v", got)
+	}
+}
+
+func TestLoadPlanValidatesDeliveryIdentityByEvent(t *testing.T) {
+	for _, tt := range []struct {
+		name  string
+		event string
+	}{
+		{name: "webhook delivery", event: `{"name":"push","deliveryID":"delivery"}`},
+		{name: "manual invocation", event: `{"name":"workflow_dispatch"}`},
+		{name: "schedule invocation", event: `{"name":"schedule"}`},
+		{name: "reusable invocation", event: `{"name":"workflow_call"}`},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "job.json")
+			data := fmt.Sprintf(`{"version":1,"repository":{"id":1,"owner":"acme","name":"example","serverURL":"https://github.com","apiURL":"https://api.github.com","actionCloneBaseURL":"https://github.com"},"event":%s,"revision":{"sha":"abc","ref":"refs/heads/main","refName":"main"},"workflowName":"CI","jobID":"build","steps":[{"run":"true"}]}`, tt.event)
+			if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := LoadPlan(path); err != nil {
+				t.Fatalf("LoadPlan() rejected valid event identity: %v", err)
+			}
+		})
+	}
+
+	for _, event := range []string{
+		`{"name":"push"}`,
+		`{"name":"schedule","deliveryID":"synthetic-delivery"}`,
+	} {
+		path := filepath.Join(t.TempDir(), "job.json")
+		data := fmt.Sprintf(`{"version":1,"repository":{"id":1,"owner":"acme","name":"example","serverURL":"https://github.com","apiURL":"https://api.github.com","actionCloneBaseURL":"https://github.com"},"event":%s,"revision":{"sha":"abc","ref":"refs/heads/main","refName":"main"},"workflowName":"CI","jobID":"build","steps":[{"run":"true"}]}`, event)
+		if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := LoadPlan(path); err == nil {
+			t.Fatalf("LoadPlan() accepted invalid event identity %s", event)
+		}
 	}
 }
 
@@ -362,13 +452,38 @@ func TestActionCloneTokenIsLimitedToWorkflowRepository(t *testing.T) {
 }
 
 func TestGitHubEventDocumentContainsNormalizedContext(t *testing.T) {
+	pullRequest := &PullRequest{
+		Number: 42, Body: "Pull request body", HTMLURL: "https://github.com/contributor/example/pull/42",
+		HeadRef: "feature", HeadSHA: strings.Repeat("b", 40), BaseRef: "main",
+		HeadRepository: EventRepository{ID: 2, Owner: "contributor", Name: "example"},
+	}
 	for _, event := range []Event{
 		{Name: "push", DeliveryID: "push-delivery"},
-		{Name: "pull_request", Action: "synchronize", DeliveryID: "pr-delivery"},
+		{Name: "pull_request", Action: "synchronize", DeliveryID: "pr-delivery", PullRequest: pullRequest},
+		{Name: "pull_request_target", Action: "synchronize", DeliveryID: "pr-target-delivery", PullRequest: pullRequest},
+		{Name: "pull_request_review", Action: "submitted", DeliveryID: "review-delivery", PullRequest: pullRequest, Review: &ReviewEvent{Body: "/kind api"}},
+		{Name: "pull_request_review_comment", Action: "created", DeliveryID: "review-comment-delivery", PullRequest: pullRequest, Comment: &CommentEvent{Body: "/priority important-soon"}},
 		{Name: "merge_group", Action: "checks_requested", DeliveryID: "merge-delivery"},
+		{Name: "workflow_run", Action: "completed", DeliveryID: "workflow-run-delivery", WorkflowRun: &WorkflowRunEvent{Conclusion: "success", HeadSHA: strings.Repeat("c", 40)}},
+		{Name: "issues", Action: "opened", DeliveryID: "issues-delivery", Issue: &IssueEvent{Number: 17, Body: "/kind bug"}},
+		{Name: "issue_comment", Action: "created", DeliveryID: "issue-comment-delivery", Issue: &IssueEvent{Number: 17, Body: "Issue body"}, Comment: &CommentEvent{Body: "/kind bug"}},
+		{Name: "release", Action: "published", DeliveryID: "release-delivery"},
+		{Name: "workflow_dispatch"},
+		{Name: "schedule", Schedule: "0 6 * * *"},
 	} {
 		plan := testPlan()
 		plan.Event = event
+		if event.Name == "release" {
+			plan.Revision.Ref = "refs/tags/v1.2.3"
+			plan.Revision.RefName = "v1.2.3"
+		}
+		if event.Name == "workflow_dispatch" {
+			plan.Inputs = map[string]any{"namespace": "default"}
+		}
+		if event.PullRequest != nil {
+			plan.Revision.HeadRef = "feature"
+			plan.Revision.BaseRef = "main"
+		}
 		data, err := githubEventDocument(plan)
 		if err != nil {
 			t.Fatal(err)
@@ -386,13 +501,56 @@ func TestGitHubEventDocumentContainsNormalizedContext(t *testing.T) {
 			if document["after"] != plan.Revision.SHA || document["ref"] != plan.Revision.Ref {
 				t.Fatalf("push document = %#v", document)
 			}
-		case "pull_request":
-			if document["pull_request"] == nil {
+		case "pull_request", "pull_request_target", "pull_request_review", "pull_request_review_comment":
+			pullRequestDocument, ok := document["pull_request"].(map[string]any)
+			if !ok || pullRequestDocument["number"] != float64(42) || pullRequestDocument["body"] != "Pull request body" || pullRequestDocument["html_url"] != "https://github.com/contributor/example/pull/42" || pullRequestDocument["merge_ref"] != "refs/pull/42/merge" {
 				t.Fatalf("pull request document = %#v", document)
+			}
+			head := pullRequestDocument["head"].(map[string]any)
+			repository := head["repo"].(map[string]any)
+			if head["sha"] != strings.Repeat("b", 40) || repository["full_name"] != "contributor/example" {
+				t.Fatalf("pull request head = %#v", head)
+			}
+			if event.Name == "pull_request_target" && pullRequestDocument["merge_commit_sha"] != nil {
+				t.Fatalf("trusted target document exposes execution SHA as merge SHA: %#v", pullRequestDocument)
+			}
+			if event.Name == "pull_request" && pullRequestDocument["merge_commit_sha"] != plan.Revision.SHA {
+				t.Fatalf("pull request merge_commit_sha = %#v, want %q", pullRequestDocument["merge_commit_sha"], plan.Revision.SHA)
+			}
+			if event.Name == "pull_request_review" && document["review"].(map[string]any)["body"] != "/kind api" {
+				t.Fatalf("review document = %#v", document)
+			}
+			if event.Name == "pull_request_review_comment" && document["comment"].(map[string]any)["body"] != "/priority important-soon" {
+				t.Fatalf("review comment document = %#v", document)
 			}
 		case "merge_group":
 			if document["merge_group"] == nil {
 				t.Fatalf("merge group document = %#v", document)
+			}
+		case "workflow_run":
+			workflowRun := document["workflow_run"].(map[string]any)
+			if workflowRun["conclusion"] != "success" || workflowRun["head_sha"] != strings.Repeat("c", 40) {
+				t.Fatalf("workflow run document = %#v", document)
+			}
+		case "issues":
+			if document["issue"].(map[string]any)["number"] != float64(17) {
+				t.Fatalf("issue document = %#v", document)
+			}
+		case "issue_comment":
+			if document["issue"].(map[string]any)["number"] != float64(17) || document["comment"].(map[string]any)["body"] != "/kind bug" {
+				t.Fatalf("issue comment document = %#v", document)
+			}
+		case "release":
+			if document["release"].(map[string]any)["tag_name"] != "v1.2.3" {
+				t.Fatalf("release document = %#v", document)
+			}
+		case "workflow_dispatch":
+			if document["inputs"].(map[string]any)["namespace"] != "default" {
+				t.Fatalf("workflow dispatch document = %#v", document)
+			}
+		case "schedule":
+			if document["schedule"] != "0 6 * * *" {
+				t.Fatalf("schedule document = %#v", document)
 			}
 		}
 	}
