@@ -93,6 +93,21 @@ func TestConsoleAuthenticatesWithStaticTokenAndStreamsLogs(t *testing.T) {
 	}
 }
 
+func TestConsoleKeepsTimestampedLogContentOnOneGridRow(t *testing.T) {
+	handler := newTestHandler(t, false)
+	request := httptest.NewRequest(http.MethodGet, "/runs/default/ci/jobs/build", nil)
+	request.Header.Set("Authorization", "Bearer "+testConsoleToken)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("log page status = %d, want %d", response.Code, http.StatusOK)
+	}
+	if !strings.Contains(response.Body.String(), ".show-time .log-line{grid-template-columns:auto auto auto minmax(0,1fr)}") {
+		t.Fatal("log page does not provide a fourth grid column for timestamps")
+	}
+}
+
 func TestConsoleMainPageListsWorkflowRunsNewestFirst(t *testing.T) {
 	handler := newTestHandler(t, false)
 
