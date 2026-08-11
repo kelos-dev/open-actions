@@ -31,31 +31,72 @@ import (
 var digestEncoding = base32.StdEncoding.WithPadding(base32.NoPadding)
 
 const (
-	deliveryLabel           = "actions.kelos.dev/webhook-delivery"
-	deliveryDataKey         = "delivery.json"
-	deliveryRevisionKey     = "resolvedRevision"
-	deliveryStateKey        = "state"
-	deliveryMessageKey      = "message"
-	deliveryRunCountKey     = "workflowRuns"
-	deliveryFinishedKey     = "finishedAt"
-	deliveryStateCompleted  = "Completed"
-	deliveryStateFailed     = "Failed"
-	maxDeliveryBytes        = 900_000
-	maxWorkflowFiles        = 100
-	maxWorkflowJobs         = 1000
-	mergeRefWaitTimeout     = 2 * time.Minute
-	resourceNameMaxLength   = 63
-	workflowRunDigestLength = 20
-	deliveryRetention       = 24 * time.Hour
+	deliveryLabel             = "actions.kelos.dev/webhook-delivery"
+	deliveryDataKey           = "delivery.json"
+	deliveryRevisionKey       = "resolvedRevision"
+	deliveryTargetRevisionKey = "resolvedTargetRevision"
+	deliveryTargetRunCountKey = "targetWorkflowRuns"
+	deliveryStateKey          = "state"
+	deliveryMessageKey        = "message"
+	deliveryRunCountKey       = "workflowRuns"
+	deliveryFinishedKey       = "finishedAt"
+	deliveryStateCompleted    = "Completed"
+	deliveryStateFailed       = "Failed"
+	maxDeliveryBytes          = 900_000
+	maxWorkflowFiles          = 100
+	maxWorkflowJobs           = 1000
+	mergeRefWaitTimeout       = 2 * time.Minute
+	resourceNameMaxLength     = 63
+	workflowRunDigestLength   = 20
+	deliveryRetention         = 24 * time.Hour
 )
 
 type queuedDelivery struct {
-	ProjectName string          `json:"projectName"`
-	ProjectUID  string          `json:"projectUID"`
-	Payload     payload         `json:"payload"`
-	Event       normalizedEvent `json:"event"`
-	ReplayID    string          `json:"replayID"`
-	DeliveryID  string          `json:"deliveryID"`
+	ProjectName string             `json:"projectName"`
+	ProjectUID  string             `json:"projectUID"`
+	Repository  deliveryRepository `json:"repository"`
+	Event       normalizedEvent    `json:"event"`
+	ReplayID    string             `json:"replayID"`
+	DeliveryID  string             `json:"deliveryID"`
+}
+
+type deliveryRepository struct {
+	ID    int64  `json:"id"`
+	Owner string `json:"owner"`
+	Name  string `json:"name"`
+}
+
+func (delivery *queuedDelivery) UnmarshalJSON(data []byte) error {
+	document := struct {
+		ProjectName string             `json:"projectName"`
+		ProjectUID  string             `json:"projectUID"`
+		Repository  deliveryRepository `json:"repository"`
+		Payload     *payload           `json:"payload"`
+		Event       normalizedEvent    `json:"event"`
+		ReplayID    string             `json:"replayID"`
+		DeliveryID  string             `json:"deliveryID"`
+	}{}
+	if err := json.Unmarshal(data, &document); err != nil {
+		return err
+	}
+	repositoryFromPayload := document.Repository.ID == 0 && document.Payload != nil
+	if repositoryFromPayload {
+		document.Repository = deliveryRepository{
+			ID: document.Payload.Repository.ID, Owner: document.Payload.Repository.Owner.Login,
+			Name: document.Payload.Repository.Name,
+		}
+	}
+	if document.Repository.ID < 1 || document.Repository.Owner == "" || document.Repository.Name == "" {
+		return errors.New("delivery repository is incomplete")
+	}
+	if repositoryFromPayload && document.Event.Name == "pull_request" && (document.Event.ResolveRef != "" || document.Event.SHA != "") {
+		document.Event.MergeRevision = true
+	}
+	*delivery = queuedDelivery{
+		ProjectName: document.ProjectName, ProjectUID: document.ProjectUID, Repository: document.Repository,
+		Event: document.Event, ReplayID: document.ReplayID, DeliveryID: document.DeliveryID,
+	}
+	return nil
 }
 
 type DeliveryReconciler struct {
@@ -67,14 +108,21 @@ type DeliveryReconciler struct {
 	Now                                func() time.Time
 }
 
+type workflowSelection struct {
+	Path  string
+	Event normalizedEvent
+}
+
 func (h *GitHubHandler) enqueueDelivery(ctx context.Context, project *actionsv1alpha1.Project, event *payload, normalized normalizedEvent, deliveryID string, signedBody []byte) error {
 	delivery := queuedDelivery{
 		ProjectName: project.Name,
 		ProjectUID:  string(project.UID),
-		Payload:     *event,
-		Event:       normalized,
-		ReplayID:    webhookReplayID(signedBody),
-		DeliveryID:  deliveryID,
+		Repository: deliveryRepository{
+			ID: event.Repository.ID, Owner: event.Repository.Owner.Login, Name: event.Repository.Name,
+		},
+		Event:      normalized,
+		ReplayID:   webhookReplayID(signedBody),
+		DeliveryID: deliveryID,
 	}
 	data, err := json.Marshal(delivery)
 	if err != nil {
@@ -188,6 +236,15 @@ func missingPullRequestMergeRef(err error) bool {
 	return errors.As(err, &apiError) && apiError.StatusCode == http.StatusNotFound
 }
 
+func unavailableDeliveryRevision(err error) bool {
+	apiError := &githubclient.APIError{}
+	if errors.As(err, &apiError) {
+		return apiError.StatusCode == http.StatusNotFound ||
+			apiError.StatusCode == http.StatusConflict && strings.EqualFold(strings.TrimSpace(apiError.Message), "Git Repository is empty.")
+	}
+	return strings.Contains(err.Error(), "GitHub returned no commits")
+}
+
 func mergeRefRetryInterval(age time.Duration) time.Duration {
 	switch {
 	case age >= 30*time.Second:
@@ -232,6 +289,18 @@ func (r *DeliveryReconciler) Reconcile(ctx context.Context, request ctrl.Request
 		}
 		delivery.Event.SHA = revision
 	}
+	targetRevision := object.Data[deliveryTargetRevisionKey]
+	if targetRevision != "" && !validGitSHA(targetRevision) {
+		return ctrl.Result{}, r.finish(ctx, object, deliveryStateFailed, 0, "delivery contains an invalid resolved target revision")
+	}
+	targetDiscoveryCompleted := false
+	if value, found := object.Data[deliveryTargetRunCountKey]; found {
+		count, err := strconv.Atoi(value)
+		if err != nil || count < 0 {
+			return ctrl.Result{}, r.finish(ctx, object, deliveryStateFailed, 0, "delivery contains an invalid target workflow run count")
+		}
+		targetDiscoveryCompleted = true
+	}
 	reader := r.APIReader
 	project := &actionsv1alpha1.Project{}
 	if err := reader.Get(ctx, client.ObjectKey{Namespace: object.Namespace, Name: delivery.ProjectName}, project); err != nil {
@@ -248,37 +317,159 @@ func (r *DeliveryReconciler) Reconcile(ctx context.Context, request ctrl.Request
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	installation, err := r.GitHub.Installation(ctx, githubConfig.AppID, githubConfig.InstallationID, privateKey, delivery.Payload.Repository.Name, githubclient.InstallationPermissions{ContentsRead: true})
+	installation, err := r.GitHub.Installation(ctx, githubConfig.AppID, githubConfig.InstallationID, privateKey, delivery.Repository.Name, githubclient.InstallationPermissions{ContentsRead: true})
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	if delivery.Event.ResolveRef != "" && delivery.Event.SHA == "" {
-		revision, ready, err := resolveDeliveryRevision(ctx, installation, delivery.Payload.Repository.Owner.Login, delivery.Payload.Repository.Name, delivery.Event)
+	events := deliveryEvents(delivery.Event)
+	for index := range events {
+		if events[index].Name == "pull_request_target" && targetRevision != "" {
+			events[index].SHA = targetRevision
+		}
+	}
+	selections := make([]workflowSelection, 0)
+	seenFiles := map[string]struct{}{}
+	workflowJobs := 0
+	pendingMergeRef := false
+	mergeRefFailure := ""
+	retryAfter := time.Duration(0)
+	targetDiscovered := false
+	targetSelections := 0
+	for _, candidate := range events {
+		if candidate.Name == "pull_request_target" && targetDiscoveryCompleted && pendingMergeRef {
+			continue
+		}
+		if candidate.ResolveRef != "" && candidate.SHA == "" {
+			revision, ready, err := resolveDeliveryRevision(ctx, installation, delivery.Repository.Owner, delivery.Repository.Name, candidate)
+			if err != nil {
+				if candidate.Name != "pull_request" && unavailableDeliveryRevision(err) {
+					message := fmt.Sprintf("GitHub event revision %q is unavailable: %v", candidate.ResolveRef, err)
+					return ctrl.Result{}, r.finish(ctx, object, deliveryStateFailed, 0, message)
+				}
+				return ctrl.Result{}, err
+			}
+			if !ready {
+				if candidate.Name != "pull_request" {
+					return ctrl.Result{}, fmt.Errorf("GitHub event revision %q is not ready", candidate.ResolveRef)
+				}
+				age := r.deliveryAge(object)
+				if age >= mergeRefWaitTimeout {
+					mergeRefFailure = fmt.Sprintf("GitHub pull request merge revision did not become ready for head %s within %s", candidate.HeadSHA, mergeRefWaitTimeout)
+				} else {
+					pendingMergeRef = true
+					retryAfter = mergeRefRetryInterval(age)
+				}
+				continue
+			}
+			candidate.SHA = revision
+			if err := r.persistResolvedRevision(ctx, object, candidate.Name, revision); err != nil {
+				return ctrl.Result{}, err
+			}
+		}
+		workflowFiles, err := workflowFilesAtRevision(ctx, installation, &delivery, project.Spec.WorkflowDirectory, candidate.SHA)
 		if err != nil {
 			return ctrl.Result{}, err
 		}
-		if !ready {
-			age := r.deliveryAge(object)
-			if age >= mergeRefWaitTimeout {
-				message := fmt.Sprintf("GitHub pull request merge revision did not become ready for head %s within %s", delivery.Event.HeadSHA, mergeRefWaitTimeout)
-				return ctrl.Result{}, r.finish(ctx, object, deliveryStateFailed, 0, message)
-			}
-			retryAfter := mergeRefRetryInterval(age)
-			r.Logger.Debug("waiting for GitHub pull request merge revision", "delivery_id", delivery.DeliveryID, "head_sha", delivery.Event.HeadSHA, "retry_after", retryAfter)
-			return ctrl.Result{RequeueAfter: retryAfter}, nil
+		workflowFileCount := recordWorkflowFiles(seenFiles, workflowFiles)
+		if err := validateDeliveryFanOut(workflowFileCount, workflowJobs); err != nil {
+			return ctrl.Result{}, r.finish(ctx, object, deliveryStateFailed, 0, err.Error())
 		}
-		delivery.Event.SHA = revision
-		if err := r.persistResolvedRevision(ctx, object, delivery.Event.SHA); err != nil {
+		for _, workflowPath := range workflowFiles {
+			data, err := installation.GetFile(ctx, delivery.Repository.Owner, delivery.Repository.Name, workflowPath, candidate.SHA)
+			if err != nil {
+				return ctrl.Result{}, err
+			}
+			definition, err := workflow.Parse(data)
+			if err != nil {
+				r.Logger.Warn("rejected invalid workflow", "path", workflowPath, "error", err)
+				return ctrl.Result{}, r.finish(ctx, object, deliveryStateFailed, 0, fmt.Sprintf("invalid workflow %q: %v", workflowPath, err))
+			}
+			_, matched, err := workflow.Match(definition.On, workflow.Event{
+				Name: candidate.Name, Action: candidate.Action, Ref: candidate.Ref,
+				RefName: githubclient.RefName(candidate.Ref), HeadRef: candidate.HeadRef,
+				BaseRef: candidate.BaseRef, WorkflowName: candidate.WorkflowName,
+			})
+			if err != nil {
+				return ctrl.Result{}, r.finish(ctx, object, deliveryStateFailed, 0, fmt.Sprintf("workflow %q does not accept the event: %v", workflowPath, err))
+			}
+			if matched {
+				workflowJobs += len(definition.Jobs)
+				if err := validateDeliveryFanOut(workflowFileCount, workflowJobs); err != nil {
+					return ctrl.Result{}, r.finish(ctx, object, deliveryStateFailed, 0, err.Error())
+				}
+				selections = append(selections, workflowSelection{Path: workflowPath, Event: candidate})
+				if candidate.Name == "pull_request_target" {
+					targetSelections++
+				}
+			}
+		}
+		if candidate.Name == "pull_request_target" {
+			targetDiscovered = true
+		}
+	}
+	for _, selection := range selections {
+		if err := r.createWorkflowRun(ctx, project, &delivery, selection); err != nil {
+			if terminalWorkflowRunCreationError(err) {
+				return ctrl.Result{}, r.finish(ctx, object, deliveryStateFailed, 0, err.Error())
+			}
 			return ctrl.Result{}, err
 		}
 	}
-	contents, err := installation.ListDirectory(ctx, delivery.Payload.Repository.Owner.Login, delivery.Payload.Repository.Name, project.Spec.WorkflowDirectory, delivery.Event.SHA)
-	if err != nil {
-		if missingWorkflowDirectory(err) {
-			contents = nil
-		} else {
+	if pendingMergeRef && targetDiscovered {
+		if err := r.persistTargetRunCount(ctx, object, targetSelections); err != nil {
 			return ctrl.Result{}, err
 		}
+	}
+	workflowRuns := len(selections)
+	if mergeRefFailure != "" {
+		return ctrl.Result{}, r.finish(ctx, object, deliveryStateFailed, workflowRuns, mergeRefFailure)
+	}
+	if pendingMergeRef {
+		r.Logger.Debug("waiting for GitHub pull request merge revision", "delivery_id", delivery.DeliveryID, "head_sha", delivery.Event.HeadSHA, "retry_after", retryAfter)
+		return ctrl.Result{RequeueAfter: retryAfter}, nil
+	}
+	r.Logger.Info("completed GitHub webhook discovery", "delivery_id", delivery.DeliveryID, "workflow_runs", workflowRuns)
+	return ctrl.Result{}, r.finish(ctx, object, deliveryStateCompleted, workflowRuns, "")
+}
+
+func recordWorkflowFiles(seen map[string]struct{}, paths []string) int {
+	for _, path := range paths {
+		seen[path] = struct{}{}
+	}
+	return len(seen)
+}
+
+func deliveryEvents(event normalizedEvent) []normalizedEvent {
+	if event.Name != "pull_request" {
+		return []normalizedEvent{event}
+	}
+	events := make([]normalizedEvent, 0, 2)
+	if !event.Fork && event.MergeRevision {
+		events = append(events, event)
+	}
+	if event.PullRequest == nil {
+		return events
+	}
+	target := event
+	target.Name = "pull_request_target"
+	target.SHA = event.PullRequest.BaseSHA
+	target.Ref = "refs/heads/" + event.PullRequest.BaseRef
+	target.ResolveRef = ""
+	if target.SHA == "" {
+		target.ResolveRef = event.PullRequest.BaseRef
+	}
+	target.HeadSHA = ""
+	events = append(events, target)
+	return events
+}
+
+func workflowFilesAtRevision(ctx context.Context, installation *githubclient.InstallationClient, delivery *queuedDelivery, directory, revision string) ([]string, error) {
+	contents, err := installation.ListDirectory(ctx, delivery.Repository.Owner, delivery.Repository.Name, directory, revision)
+	if err != nil {
+		if missingWorkflowDirectory(err) {
+			return nil, nil
+		}
+		return nil, err
 	}
 	workflowFiles := make([]string, 0, len(contents))
 	for _, content := range contents {
@@ -286,50 +477,19 @@ func (r *DeliveryReconciler) Reconcile(ctx context.Context, request ctrl.Request
 			workflowFiles = append(workflowFiles, content.Path)
 		}
 	}
-	if err := validateDeliveryFanOut(len(workflowFiles), 0); err != nil {
-		return ctrl.Result{}, r.finish(ctx, object, deliveryStateFailed, 0, err.Error())
-	}
-	workflowPaths := make([]string, 0, len(workflowFiles))
-	workflowJobs := 0
-	for _, workflowPath := range workflowFiles {
-		data, err := installation.GetFile(ctx, delivery.Payload.Repository.Owner.Login, delivery.Payload.Repository.Name, workflowPath, delivery.Event.SHA)
-		if err != nil {
-			return ctrl.Result{}, err
-		}
-		definition, err := workflow.Parse(data)
-		if err != nil {
-			r.Logger.Warn("rejected invalid workflow", "path", workflowPath, "error", err)
-			return ctrl.Result{}, r.finish(ctx, object, deliveryStateFailed, 0, fmt.Sprintf("invalid workflow %q: %v", workflowPath, err))
-		}
-		if workflow.Matches(definition.On, workflow.Event{
-			Name: delivery.Event.Name, Action: delivery.Event.Action, Ref: delivery.Event.Ref,
-			RefName: githubclient.RefName(delivery.Event.Ref), BaseRef: delivery.Event.BaseRef,
-		}) {
-			workflowJobs += len(definition.Jobs)
-			if err := validateDeliveryFanOut(len(workflowFiles), workflowJobs); err != nil {
-				return ctrl.Result{}, r.finish(ctx, object, deliveryStateFailed, 0, err.Error())
-			}
-			workflowPaths = append(workflowPaths, workflowPath)
-		}
-	}
-	for _, workflowPath := range workflowPaths {
-		if err := r.createWorkflowRun(ctx, project, &delivery, workflowPath); err != nil {
-			if terminalWorkflowRunCreationError(err) {
-				return ctrl.Result{}, r.finish(ctx, object, deliveryStateFailed, 0, err.Error())
-			}
-			return ctrl.Result{}, err
-		}
-	}
-	r.Logger.Info("completed GitHub webhook discovery", "delivery_id", delivery.DeliveryID, "workflow_runs", len(workflowPaths))
-	return ctrl.Result{}, r.finish(ctx, object, deliveryStateCompleted, len(workflowPaths), "")
+	return workflowFiles, nil
 }
 
 func terminalWorkflowRunCreationError(err error) bool {
 	return apierrors.IsConflict(err) || apierrors.IsInvalid(err)
 }
 
-func (r *DeliveryReconciler) createWorkflowRun(ctx context.Context, project *actionsv1alpha1.Project, delivery *queuedDelivery, workflowPath string) error {
-	name := workflowRunName(workflowPath, string(project.UID), delivery.ReplayID)
+func (r *DeliveryReconciler) createWorkflowRun(ctx context.Context, project *actionsv1alpha1.Project, delivery *queuedDelivery, selection workflowSelection) error {
+	replayID := delivery.ReplayID
+	if selection.Event.Name == "pull_request_target" {
+		replayID += ":pull_request_target"
+	}
+	name := workflowRunName(selection.Path, string(project.UID), replayID)
 	desired := &actionsv1alpha1.WorkflowRun{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: project.Namespace},
 		Spec: actionsv1alpha1.WorkflowRunSpec{
@@ -338,20 +498,16 @@ func (r *DeliveryReconciler) createWorkflowRun(ctx context.Context, project *act
 			Source: actionsv1alpha1.WorkflowRunSource{
 				Type: actionsv1alpha1.SourceTypeGitHub,
 				GitHub: &actionsv1alpha1.GitHubWorkflowRunSource{
-					Repository: actionsv1alpha1.GitHubRepository{ID: delivery.Payload.Repository.ID, Owner: delivery.Payload.Repository.Owner.Login, Name: delivery.Payload.Repository.Name},
-					Event: actionsv1alpha1.GitHubEvent{
-						Name:       actionsv1alpha1.GitHubEventName(delivery.Event.Name),
-						Action:     delivery.Event.Action,
-						DeliveryID: delivery.DeliveryID,
-					},
-					Revision: actionsv1alpha1.GitRevision{SHA: delivery.Event.SHA, HeadSHA: delivery.Event.HeadSHA, Ref: delivery.Event.Ref, HeadRef: delivery.Event.HeadRef, BaseRef: delivery.Event.BaseRef},
+					Repository: actionsv1alpha1.GitHubRepository{ID: delivery.Repository.ID, Owner: delivery.Repository.Owner, Name: delivery.Repository.Name},
+					Event:      workflowRunEvent(selection.Event, delivery.DeliveryID),
+					Revision:   workflowRunRevision(selection.Event),
 				},
 			},
-			WorkflowPath: workflowPath,
+			WorkflowPath: selection.Path,
 		},
 	}
 	alias := &actionsv1alpha1.WorkflowRun{}
-	aliasKey := client.ObjectKey{Namespace: desired.Namespace, Name: fullDigestWorkflowRunName(workflowPath, delivery.ReplayID)}
+	aliasKey := client.ObjectKey{Namespace: desired.Namespace, Name: fullDigestWorkflowRunName(selection.Path, replayID)}
 	if err := r.APIReader.Get(ctx, aliasKey, alias); err == nil {
 		return matchingWorkflowRun(alias, desired)
 	} else if !apierrors.IsNotFound(err) {
@@ -370,6 +526,55 @@ func (r *DeliveryReconciler) createWorkflowRun(ctx context.Context, project *act
 	return nil
 }
 
+func workflowRunEvent(event normalizedEvent, deliveryID string) actionsv1alpha1.GitHubEvent {
+	result := actionsv1alpha1.GitHubEvent{
+		Name: actionsv1alpha1.GitHubEventName(event.Name), Action: event.Action, DeliveryID: deliveryID,
+		PullRequest: workflowRunPullRequest(event.PullRequest),
+	}
+	if event.WorkflowRun != nil {
+		result.WorkflowRun = &actionsv1alpha1.GitHubWorkflowRunEvent{Conclusion: event.WorkflowRun.Conclusion, HeadSHA: event.WorkflowRun.HeadSHA}
+	}
+	if event.Issue != nil {
+		result.Issue = &actionsv1alpha1.GitHubIssueEvent{Number: event.Issue.Number, Body: event.Issue.Body}
+	}
+	if event.Comment != nil {
+		result.Comment = &actionsv1alpha1.GitHubCommentEvent{Body: event.Comment.Body}
+	}
+	if event.Review != nil {
+		result.Review = &actionsv1alpha1.GitHubReviewEvent{Body: event.Review.Body}
+	}
+	return result
+}
+
+func workflowRunPullRequest(pullRequest *normalizedPullRequest) *actionsv1alpha1.GitHubPullRequest {
+	if pullRequest == nil {
+		return nil
+	}
+	return &actionsv1alpha1.GitHubPullRequest{
+		Number: pullRequest.Number, Body: pullRequest.Body, HTMLURL: pullRequest.HTMLURL,
+		HeadRepository: actionsv1alpha1.GitHubRepository{
+			ID: pullRequest.HeadRepository.ID, Owner: pullRequest.HeadRepository.Owner, Name: pullRequest.HeadRepository.Name,
+		},
+		HeadRef: pullRequest.HeadRef,
+		HeadSHA: pullRequest.HeadSHA,
+		BaseRef: pullRequest.BaseRef,
+	}
+}
+
+func workflowRunRevision(event normalizedEvent) actionsv1alpha1.GitRevision {
+	revision := actionsv1alpha1.GitRevision{SHA: event.SHA, HeadSHA: event.HeadSHA, Ref: event.Ref}
+	if event.Name == "pull_request" {
+		revision.HeadRef = event.HeadRef
+		if event.PullRequest != nil {
+			revision.HeadSHA = event.PullRequest.HeadSHA
+		}
+	}
+	if event.Name == "pull_request" || event.Name == "merge_group" {
+		revision.BaseRef = event.BaseRef
+	}
+	return revision
+}
+
 func matchingWorkflowRun(existing, desired *actionsv1alpha1.WorkflowRun) error {
 	existingSpec := existing.Spec.DeepCopy()
 	desiredSpec := desired.Spec.DeepCopy()
@@ -378,6 +583,9 @@ func matchingWorkflowRun(existing, desired *actionsv1alpha1.WorkflowRun) error {
 	if existingGitHub, desiredGitHub := existingSpec.Source.GitHub, desiredSpec.Source.GitHub; existingGitHub != nil && desiredGitHub != nil && existingGitHub.Revision.HeadSHA == "" {
 		// Missing HeadSHA is compatible because the API defines SHA as its reporting fallback.
 		existingGitHub.Revision.HeadSHA = desiredGitHub.Revision.HeadSHA
+	}
+	if existingGitHub, desiredGitHub := existingSpec.Source.GitHub, desiredSpec.Source.GitHub; existingGitHub != nil && desiredGitHub != nil && existingGitHub.Event.Name == actionsv1alpha1.GitHubEventNamePullRequest && existingGitHub.Event.PullRequest == nil {
+		desiredGitHub.Event.PullRequest = nil
 	}
 	if apiequality.Semantic.DeepEqual(existingSpec, desiredSpec) {
 		return nil
@@ -410,12 +618,25 @@ func (r *DeliveryReconciler) finish(ctx context.Context, object *corev1.ConfigMa
 	return r.Patch(ctx, object, client.MergeFrom(before))
 }
 
-func (r *DeliveryReconciler) persistResolvedRevision(ctx context.Context, object *corev1.ConfigMap, revision string) error {
+func (r *DeliveryReconciler) persistResolvedRevision(ctx context.Context, object *corev1.ConfigMap, eventName, revision string) error {
 	before := object.DeepCopy()
 	if object.Data == nil {
 		object.Data = map[string]string{}
 	}
-	object.Data[deliveryRevisionKey] = revision
+	key := deliveryRevisionKey
+	if eventName == "pull_request_target" {
+		key = deliveryTargetRevisionKey
+	}
+	object.Data[key] = revision
+	return r.Patch(ctx, object, client.MergeFrom(before))
+}
+
+func (r *DeliveryReconciler) persistTargetRunCount(ctx context.Context, object *corev1.ConfigMap, count int) error {
+	before := object.DeepCopy()
+	if object.Data == nil {
+		object.Data = map[string]string{}
+	}
+	object.Data[deliveryTargetRunCountKey] = strconv.Itoa(count)
 	return r.Patch(ctx, object, client.MergeFrom(before))
 }
 

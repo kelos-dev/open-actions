@@ -2,13 +2,241 @@ package workflow
 
 import (
 	"fmt"
+	"maps"
 	"os"
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	workflowexpression "github.com/kelos-dev/open-actions/internal/expression"
 )
+
+const minimalJob = "jobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: make test\n"
+
+func TestParseRemainingKelosTriggers(t *testing.T) {
+	triggers := map[string]string{
+		"workflow run":                "workflow_run:\n    workflows: [Release]\n    types: [completed]\n    branches: [main]",
+		"workflow dispatch":           "workflow_dispatch:\n    inputs:\n      namespace:\n        description: Kubernetes namespace\n        required: false\n        default: ''",
+		"issues":                      "issues:\n    types: [opened, edited, labeled, unlabeled]",
+		"pull request target":         "pull_request_target:\n    types: [opened, synchronize, reopened]",
+		"issue comment":               "issue_comment:\n    types: [created]",
+		"pull request review comment": "pull_request_review_comment:\n    types: [created]",
+		"pull request review":         "pull_request_review:\n    types: [submitted]",
+		"schedule":                    "schedule:\n    - cron: '0 6 * * *'",
+		"release":                     "release:\n    types: [published]",
+		"workflow call":               "workflow_call:\n    inputs:\n      checkout-ref:\n        type: string\n        default: ''\n      persist-credentials:\n        type: boolean\n        default: true",
+	}
+	for name, trigger := range triggers {
+		t.Run(name, func(t *testing.T) {
+			if _, err := Parse([]byte("name: CI\non:\n  " + trigger + "\n" + minimalJob)); err != nil {
+				t.Fatalf("Parse() rejected trigger used by kelos: %v", err)
+			}
+		})
+	}
+}
+
+func TestMatchWorkflowRunFilters(t *testing.T) {
+	definition, err := Parse([]byte("name: Deploy\non:\n  workflow_run:\n    workflows: [Release]\n    types: [completed]\n    branches: [main]\n" + minimalJob))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !Matches(definition.On, Event{Name: "workflow_run", Action: "completed", WorkflowName: "Release", BaseRef: "main"}) {
+		t.Fatal("matching workflow_run event was rejected")
+	}
+	for _, event := range []Event{
+		{Name: "workflow_run", Action: "requested", WorkflowName: "Release", BaseRef: "main"},
+		{Name: "workflow_run", Action: "completed", WorkflowName: "CI", BaseRef: "main"},
+		{Name: "workflow_run", Action: "completed", WorkflowName: "Release", BaseRef: "feature"},
+	} {
+		if Matches(definition.On, event) {
+			t.Fatalf("workflow_run filters matched %#v", event)
+		}
+	}
+}
+
+func TestMatchPushBranchAndTagFilters(t *testing.T) {
+	definition, err := Parse([]byte("name: Release\non:\n  push:\n    branches: [main]\n    tags: ['v*']\n" + minimalJob))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, event := range []Event{
+		{Name: "push", Ref: "refs/heads/main", RefName: "main"},
+		{Name: "push", Ref: "refs/tags/v1.2.3", RefName: "v1.2.3"},
+	} {
+		if !Matches(definition.On, event) {
+			t.Fatalf("matching push was rejected: %#v", event)
+		}
+	}
+	for _, event := range []Event{
+		{Name: "push", Ref: "refs/heads/feature", RefName: "feature"},
+		{Name: "push", Ref: "refs/tags/canary", RefName: "canary"},
+	} {
+		if Matches(definition.On, event) {
+			t.Fatalf("non-matching push was accepted: %#v", event)
+		}
+	}
+
+	tagsOnly, err := Parse([]byte("name: Release\non:\n  push:\n    tags: ['v*']\n" + minimalJob))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if Matches(tagsOnly.On, Event{Name: "push", Ref: "refs/heads/main", RefName: "main"}) {
+		t.Fatal("tags-only push filter matched a branch")
+	}
+}
+
+func TestMatchWorkflowDispatchResolvesInputs(t *testing.T) {
+	definition, err := Parse([]byte("name: Manual\non:\n  workflow_dispatch:\n    inputs:\n      namespace:\n        required: true\n        type: string\n      dry-run:\n        type: boolean\n        default: false\n" + minimalJob))
+	if err != nil {
+		t.Fatal(err)
+	}
+	event, matched, err := Match(definition.On, Event{Name: "workflow_dispatch", Inputs: map[string]string{"namespace": "default"}})
+	if err != nil || !matched {
+		t.Fatalf("Match() = matched %v, error %v", matched, err)
+	}
+	if event.Inputs["namespace"] != "default" || event.Inputs["dry-run"] != "false" {
+		t.Fatalf("resolved inputs = %#v", event.Inputs)
+	}
+	if event.InputValues["namespace"] != "default" || event.InputValues["dry-run"] != false {
+		t.Fatalf("expression inputs = %#v", event.InputValues)
+	}
+	for _, inputs := range []map[string]string{
+		{},
+		{"namespace": "default", "unknown": "value"},
+		{"namespace": "default", "dry-run": "not-a-boolean"},
+		{"namespace": "default", "dry-run": "1"},
+		{"namespace": "default", "dry-run": "TRUE"},
+		{"namespace": strings.Repeat("界", maxInputValueLength+1)},
+	} {
+		if _, _, err := Match(definition.On, Event{Name: "workflow_dispatch", Inputs: inputs}); err == nil {
+			t.Fatalf("Match() accepted inputs %#v", inputs)
+		}
+	}
+}
+
+func TestMatchWorkflowCallResolvesImplicitDefaults(t *testing.T) {
+	definition, err := Parse([]byte("name: Reusable\non:\n  workflow_call:\n    inputs:\n      enabled:\n        type: boolean\n      retries:\n        type: number\n      label:\n        type: string\n" + minimalJob))
+	if err != nil {
+		t.Fatal(err)
+	}
+	event, matched, err := Match(definition.On, Event{Name: "workflow_call"})
+	if err != nil || !matched {
+		t.Fatalf("Match() = matched %v, error %v", matched, err)
+	}
+	want := map[string]string{"enabled": "false", "retries": "0", "label": ""}
+	if !maps.Equal(event.Inputs, want) {
+		t.Fatalf("resolved inputs = %#v, want %#v", event.Inputs, want)
+	}
+	if event.InputValues["enabled"] != false || event.InputValues["retries"] != float64(0) || event.InputValues["label"] != "" {
+		t.Fatalf("expression inputs = %#v", event.InputValues)
+	}
+}
+
+func TestParseRejectsCaseInsensitiveDuplicateInputNames(t *testing.T) {
+	for _, eventName := range []string{"workflow_dispatch", "workflow_call"} {
+		t.Run(eventName, func(t *testing.T) {
+			workflowText := fmt.Sprintf("name: Inputs\non:\n  %s:\n    inputs:\n      Target:\n        type: string\n      target:\n        type: string\n%s", eventName, minimalJob)
+			if _, err := Parse([]byte(workflowText)); err == nil {
+				t.Fatal("Parse() accepted input names that differ only by case")
+			}
+		})
+	}
+}
+
+func TestTypedInputLexicalForms(t *testing.T) {
+	definition, err := Parse([]byte("name: Reusable\non:\n  workflow_call:\n    inputs:\n      enabled:\n        type: boolean\n      amount:\n        type: number\n" + minimalJob))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, matched, err := Match(definition.On, Event{Name: "workflow_call", Inputs: map[string]string{"enabled": "true", "amount": "-1.5e+2"}}); err != nil || !matched {
+		t.Fatalf("Match() rejected canonical typed inputs: matched %v, error %v", matched, err)
+	}
+	for _, inputs := range []map[string]string{
+		{"enabled": "1"},
+		{"enabled": "t"},
+		{"enabled": "TRUE"},
+		{"amount": "NaN"},
+		{"amount": "Inf"},
+		{"amount": "+1"},
+		{"amount": ".5"},
+		{"amount": "01"},
+	} {
+		if _, _, err := Match(definition.On, Event{Name: "workflow_call", Inputs: inputs}); err == nil {
+			t.Fatalf("Match() accepted inputs %#v", inputs)
+		}
+	}
+}
+
+func TestInputPayloadBoundary(t *testing.T) {
+	workflowText := "name: Manual\non:\n  workflow_dispatch:\n    inputs:\n      a:\n        type: string\n" + minimalJob
+	definition, err := Parse([]byte(workflowText))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, matched, err := Match(definition.On, Event{Name: "workflow_dispatch", Inputs: map[string]string{"a": strings.Repeat("x", maxInputPayloadLength-1)}}); err != nil || !matched {
+		t.Fatalf("Match() rejected input payload at the maximum: matched %v, error %v", matched, err)
+	}
+	if _, _, err := Match(definition.On, Event{Name: "workflow_dispatch", Inputs: map[string]string{"a": strings.Repeat("x", maxInputPayloadLength)}}); err == nil {
+		t.Fatal("Match() accepted input payload above the maximum")
+	}
+
+	atLimit := fmt.Sprintf("name: Manual\non:\n  workflow_dispatch:\n    inputs:\n      a:\n        type: string\n        default: '%s'\n%s", strings.Repeat("x", maxInputPayloadLength-1), minimalJob)
+	if _, err := Parse([]byte(atLimit)); err != nil {
+		t.Fatalf("Parse() rejected default input payload at the maximum: %v", err)
+	}
+	aboveLimit := fmt.Sprintf("name: Manual\non:\n  workflow_dispatch:\n    inputs:\n      a:\n        type: string\n        default: '%s'\n%s", strings.Repeat("x", maxInputPayloadLength), minimalJob)
+	if _, err := Parse([]byte(aboveLimit)); err == nil {
+		t.Fatal("Parse() accepted default input payload above the maximum")
+	}
+}
+
+func TestParseAndMatchCron(t *testing.T) {
+	schedule, err := ParseCron("0 6 * * *")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ScheduleMatches(schedule, time.Date(2026, 8, 10, 6, 0, 30, 0, time.UTC)) {
+		t.Fatal("schedule did not match its minute")
+	}
+	if ScheduleMatches(schedule, time.Date(2026, 8, 10, 6, 1, 0, 0, time.UTC)) {
+		t.Fatal("schedule matched a different minute")
+	}
+	for _, expression := range []string{"", "* * * * *", "1,2 4 * * *", "@daily", "0 0 * *"} {
+		if _, err := ParseCron(expression); err == nil {
+			t.Fatalf("ParseCron() accepted %q", expression)
+		}
+	}
+	_, err = ParseCron(strings.Repeat("é", maxCronLength-8) + " 0 0 0 0")
+	if err == nil || strings.Contains(err.Error(), "1 to 256 characters") {
+		t.Fatalf("maximum-length cron error = %v", err)
+	}
+	_, err = ParseCron(strings.Repeat("é", maxCronLength-7) + " 0 0 0 0")
+	if err == nil || !strings.Contains(err.Error(), "1 to 256 characters") {
+		t.Fatalf("oversized cron error = %v", err)
+	}
+}
+
+func TestSupportsEventAction(t *testing.T) {
+	for _, tt := range []struct {
+		name      string
+		eventName string
+		action    string
+		want      bool
+	}{
+		{name: "push", eventName: "push", want: true},
+		{name: "issue opened", eventName: "issues", action: "opened", want: true},
+		{name: "unknown issue activity", eventName: "issues", action: "future_activity"},
+		{name: "push action", eventName: "push", action: "created"},
+		{name: "unknown event", eventName: "future_event"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := SupportsEventAction(tt.eventName, tt.action); got != tt.want {
+				t.Fatalf("SupportsEventAction(%q, %q) = %v, want %v", tt.eventName, tt.action, got, tt.want)
+			}
+		})
+	}
+}
 
 func TestParseCIWorkflow(t *testing.T) {
 	data, err := os.ReadFile("testdata/ci.yaml")
@@ -205,6 +433,76 @@ func TestEvaluateConcurrencyUsesRefNameFallback(t *testing.T) {
 	}
 	if group != "main" {
 		t.Errorf("group = %q, want main", group)
+	}
+}
+
+func TestEvaluateConcurrencyUsesInputs(t *testing.T) {
+	definition := &Definition{
+		Name:        "Deploy",
+		Concurrency: Concurrency{Group: "deploy-${{ inputs.environment }}-${{ github.event.inputs.environment }}"},
+	}
+	group, _, err := EvaluateConcurrency(definition, Event{Inputs: map[string]string{"environment": "staging"}, InputValues: map[string]any{"environment": "staging"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if group != "deploy-staging-staging" {
+		t.Errorf("group = %q, want deploy-staging-staging", group)
+	}
+}
+
+func TestEvaluateConcurrencyUsesPullRequestMetadata(t *testing.T) {
+	definition := &Definition{
+		Name:        "Fork E2E",
+		Concurrency: Concurrency{Group: "fork-e2e-${{ github.event.pull_request.number }}-${{ github.event.pull_request.head.repo.full_name }}-${{ github.event.pull_request.head.sha }}-${{ github.event.pull_request.merge_ref }}"},
+	}
+	event := Event{
+		Name: "pull_request_target", HeadRef: "feature", BaseRef: "main",
+		PullRequest: &PullRequest{
+			Number: 42, HeadRef: "feature", HeadSHA: strings.Repeat("a", 40), BaseRef: "main",
+			HeadRepository: Repository{ID: 2, Owner: "contributor", Name: "example"},
+		},
+	}
+	group, _, err := EvaluateConcurrency(definition, event)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "fork-e2e-42-contributor/example-" + strings.Repeat("a", 40) + "-refs/pull/42/merge"
+	if group != want {
+		t.Errorf("group = %q, want %q", group, want)
+	}
+}
+
+func TestEvaluateConcurrencyUsesPullRequestMergeRevision(t *testing.T) {
+	definition := &Definition{Name: "CI", Concurrency: Concurrency{Group: "pr-${{ github.event.pull_request.merge_commit_sha }}"}}
+	sha := strings.Repeat("a", 40)
+	group, _, err := EvaluateConcurrency(definition, Event{Name: "pull_request", SHA: sha, PullRequest: &PullRequest{Number: 42}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if group != "pr-"+sha {
+		t.Fatalf("group = %q, want %q", group, "pr-"+sha)
+	}
+}
+
+func TestEvaluateConcurrencyUsesBoundedEventMetadata(t *testing.T) {
+	definition := &Definition{
+		Name:        "Events",
+		Concurrency: Concurrency{Group: "${{ github.event.workflow_run.conclusion }}-${{ github.event.issue.number }}-${{ github.event.comment.body }}-${{ github.event.review.body }}-${{ github.event.release.tag_name }}"},
+	}
+	event := Event{
+		Name:        "release",
+		RefName:     "v1.2.3",
+		WorkflowRun: &WorkflowRunEvent{Conclusion: "success", HeadSHA: strings.Repeat("a", 40)},
+		Issue:       &IssueEvent{Number: 17, Body: "Issue body"},
+		Comment:     &CommentEvent{Body: "comment"},
+		Review:      &ReviewEvent{Body: "review"},
+	}
+	group, _, err := EvaluateConcurrency(definition, event)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if group != "success-17-comment-review-v1.2.3" {
+		t.Fatalf("group = %q", group)
 	}
 }
 

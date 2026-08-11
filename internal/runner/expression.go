@@ -10,9 +10,9 @@ import (
 )
 
 var (
-	runnerJobAvailability          = workflowexpression.NewAvailability("github")
-	runnerStepAvailability         = workflowexpression.NewAvailability("github", "runner", "env")
-	runnerConditionAvailability    = workflowexpression.NewAvailability("github", "runner", "env").WithStatusFunctions()
+	runnerJobAvailability          = workflowexpression.NewAvailability("github", "inputs")
+	runnerStepAvailability         = workflowexpression.NewAvailability("github", "runner", "env", "inputs")
+	runnerConditionAvailability    = workflowexpression.NewAvailability("github", "runner", "env", "inputs").WithStatusFunctions()
 	compositeAvailability          = workflowexpression.NewAvailability("github", "runner", "env", "inputs", "steps")
 	compositeConditionAvailability = workflowexpression.NewAvailability("github", "runner", "env", "inputs", "steps").WithStatusFunctions()
 )
@@ -89,6 +89,7 @@ func compositeExpressionContext(compositeContext *compositeContext, availability
 }
 
 func expressionContext(plan *Plan, environment []string, actionPath string, extra map[string]any, availability workflowexpression.Availability, status *workflowexpression.Status, token string) workflowexpression.Context {
+	pullRequestRefs := planPullRequestRefs(plan)
 	github := map[string]any{
 		"workflow":   plan.WorkflowName,
 		"event_name": plan.Event.Name,
@@ -97,8 +98,8 @@ func expressionContext(plan *Plan, environment []string, actionPath string, extr
 		"sha":        plan.Revision.SHA,
 		"ref":        plan.Revision.Ref,
 		"ref_name":   plan.Revision.RefName,
-		"head_ref":   plan.Revision.HeadRef,
-		"base_ref":   plan.Revision.BaseRef,
+		"head_ref":   pullRequestRefs.head,
+		"base_ref":   pullRequestRefs.base,
 		"workspace":  environmentValue(environment, "GITHUB_WORKSPACE"),
 		"server_url": strings.TrimSuffix(plan.Repository.ServerURL, "/"),
 		"api_url":    strings.TrimSuffix(plan.Repository.APIURL, "/"),
@@ -109,6 +110,7 @@ func expressionContext(plan *Plan, environment []string, actionPath string, extr
 	}
 	values := map[string]any{
 		"github": github,
+		"inputs": plan.Inputs,
 		"runner": map[string]any{
 			"os":         environmentValue(environment, "RUNNER_OS"),
 			"arch":       environmentValue(environment, "RUNNER_ARCH"),
@@ -125,20 +127,40 @@ func expressionContext(plan *Plan, environment []string, actionPath string, extr
 
 func githubExpressionEvent(plan *Plan) map[string]any {
 	result := map[string]any{"action": plan.Event.Action}
+	if len(plan.Inputs) > 0 {
+		result["inputs"] = eventInputValues(plan.Inputs)
+	}
+	if plan.Event.Schedule != "" {
+		result["schedule"] = plan.Event.Schedule
+	}
 	switch plan.Event.Name {
 	case "push":
 		result["after"] = plan.Revision.SHA
 		result["ref"] = plan.Revision.Ref
-	case "pull_request":
-		result["pull_request"] = map[string]any{
-			"merge_commit_sha": plan.Revision.SHA,
-			"head":             map[string]any{"ref": plan.Revision.HeadRef},
+	case "pull_request", "pull_request_target", "pull_request_review", "pull_request_review_comment":
+		if pullRequest := githubPullRequestEvent(plan); pullRequest != nil {
+			result["pull_request"] = pullRequest
 		}
 	case "merge_group":
 		result["merge_group"] = map[string]any{
 			"head_sha": plan.Revision.SHA,
 			"head_ref": plan.Revision.Ref,
 		}
+	}
+	if plan.Event.WorkflowRun != nil {
+		result["workflow_run"] = map[string]any{"conclusion": plan.Event.WorkflowRun.Conclusion, "head_sha": plan.Event.WorkflowRun.HeadSHA}
+	}
+	if plan.Event.Issue != nil {
+		result["issue"] = map[string]any{"number": plan.Event.Issue.Number, "body": plan.Event.Issue.Body}
+	}
+	if plan.Event.Comment != nil {
+		result["comment"] = map[string]any{"body": plan.Event.Comment.Body}
+	}
+	if plan.Event.Review != nil {
+		result["review"] = map[string]any{"body": plan.Event.Review.Body}
+	}
+	if plan.Event.Name == "release" {
+		result["release"] = map[string]any{"tag_name": plan.Revision.RefName}
 	}
 	return result
 }

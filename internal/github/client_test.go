@@ -114,6 +114,48 @@ func TestInstallationRequestsOnlySelectedPermissions(t *testing.T) {
 	}
 }
 
+func TestListRepositoriesStopsAtLimit(t *testing.T) {
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		requests++
+		page := request.URL.Query().Get("page")
+		pageSize := request.URL.Query().Get("per_page")
+		var repositories []Repository
+		switch page {
+		case "1":
+			if pageSize != "100" {
+				t.Errorf("first page size = %q", pageSize)
+			}
+			for index := range 100 {
+				repositories = append(repositories, Repository{ID: int64(index + 1)})
+			}
+		case "2":
+			if pageSize != "100" {
+				t.Errorf("second page size = %q", pageSize)
+			}
+			for index := range 100 {
+				repositories = append(repositories, Repository{ID: int64(index + 101)})
+			}
+		default:
+			t.Fatalf("unexpected repository page %q", page)
+		}
+		_ = json.NewEncoder(writer).Encode(map[string]any{"total_count": 10_000, "repositories": repositories})
+	}))
+	defer server.Close()
+	client, err := NewClient(server.URL, server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	installation := &InstallationClient{client: client, token: "token"}
+	repositories, err := installation.ListRepositories(context.Background(), 101)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(repositories) != 101 || repositories[100].ID != 101 || requests != 2 {
+		t.Fatalf("repositories = %#v, requests = %d", repositories, requests)
+	}
+}
+
 func TestCheckRunLifecycleAndRepositoryAccess(t *testing.T) {
 	revision := strings.Repeat("a", 40)
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {

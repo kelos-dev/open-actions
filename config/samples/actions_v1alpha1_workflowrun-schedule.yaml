@@ -1,0 +1,22 @@
+apiVersion: actions.kelos.dev/v1alpha1
+kind: WorkflowRun
+metadata:
+  name: example-scheduled-refresh
+  namespace: open-actions
+spec:
+  projectRef:
+    name: default
+  source:
+    type: GitHub
+    github:
+      repository:
+        id: 123456789
+        owner: example
+        name: project
+      event:
+        name: schedule
+        schedule: 0 6 * * *
+      revision:
+        sha: 0123456789abcdef0123456789abcdef01234567
+        ref: refs/heads/main
+  workflowPath: .open-actions/workflows/refresh.yaml

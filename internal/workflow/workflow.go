@@ -4,12 +4,16 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"math"
 	"regexp"
+	"strconv"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"github.com/kelos-dev/open-actions/internal/actionref"
 	"github.com/kelos-dev/open-actions/internal/expression"
+	"github.com/robfig/cron/v3"
 	"gopkg.in/yaml.v3"
 )
 
@@ -35,6 +39,16 @@ const (
 	maxBranchPatternLength    = 256
 	maxActivityTypes          = 64
 	maxActivityTypeLength     = 64
+	maxWorkflowFilters        = 100
+	maxWorkflowFilterLength   = 256
+	maxTriggerInputs          = 25
+	maxInputNameLength        = 100
+	maxInputDescriptionLength = 1024
+	maxInputOptions           = 100
+	maxInputValueLength       = 65_535
+	maxInputPayloadLength     = 65_535
+	maxSchedules              = 20
+	maxCronLength             = 256
 )
 
 type Definition struct {
@@ -55,10 +69,51 @@ type Trigger struct {
 }
 
 type EventFilter struct {
-	Branches    []string `yaml:"branches"`
-	Types       []string `yaml:"types"`
-	branchesSet bool
-	typesSet    bool
+	Branches     []string                 `yaml:"branches"`
+	Tags         []string                 `yaml:"tags"`
+	Types        []string                 `yaml:"types"`
+	Workflows    []string                 `yaml:"workflows"`
+	Inputs       map[string]WorkflowInput `yaml:"inputs"`
+	Schedules    []Schedule               `yaml:"-"`
+	branchesSet  bool
+	tagsSet      bool
+	typesSet     bool
+	workflowsSet bool
+	inputsSet    bool
+}
+
+type WorkflowInput struct {
+	Description string   `yaml:"description"`
+	Required    bool     `yaml:"required"`
+	Default     any      `yaml:"default"`
+	Type        string   `yaml:"type"`
+	Options     []string `yaml:"options"`
+	defaultSet  bool
+}
+
+type Schedule struct {
+	Cron string `yaml:"cron"`
+}
+
+func (schedule *Schedule) UnmarshalYAML(node *yaml.Node) error {
+	if node.Kind != yaml.MappingNode {
+		return fmt.Errorf("schedule must be a mapping")
+	}
+	if err := rejectDuplicateMappingKeys(node, "schedule"); err != nil {
+		return err
+	}
+	for index := 0; index < len(node.Content); index += 2 {
+		name := node.Content[index].Value
+		switch name {
+		case "cron":
+			if err := node.Content[index+1].Decode(&schedule.Cron); err != nil {
+				return err
+			}
+		default:
+			return fmt.Errorf("unsupported schedule field %q", name)
+		}
+	}
+	return nil
 }
 
 type Job struct {
@@ -85,12 +140,56 @@ type Step struct {
 }
 
 type Event struct {
-	Name    string
-	Action  string
-	Ref     string
-	RefName string
-	HeadRef string
-	BaseRef string
+	Name         string
+	Action       string
+	SHA          string
+	Ref          string
+	RefName      string
+	HeadRef      string
+	BaseRef      string
+	WorkflowName string
+	Inputs       map[string]string
+	InputValues  map[string]any
+	Schedule     string
+	PullRequest  *PullRequest
+	WorkflowRun  *WorkflowRunEvent
+	Issue        *IssueEvent
+	Comment      *CommentEvent
+	Review       *ReviewEvent
+}
+
+type PullRequest struct {
+	Number         int64
+	Body           string
+	HTMLURL        string
+	HeadRepository Repository
+	HeadRef        string
+	HeadSHA        string
+	BaseRef        string
+}
+
+type WorkflowRunEvent struct {
+	Conclusion string
+	HeadSHA    string
+}
+
+type IssueEvent struct {
+	Number int64
+	Body   string
+}
+
+type CommentEvent struct {
+	Body string
+}
+
+type ReviewEvent struct {
+	Body string
+}
+
+type Repository struct {
+	ID    int64
+	Owner string
+	Name  string
 }
 
 var (
@@ -398,13 +497,15 @@ func EvaluateConcurrency(definition *Definition, event Event) (string, bool, err
 	if err != nil {
 		return "", false, fmt.Errorf("parse concurrency group: %w", err)
 	}
+	eventValues := eventExpressionValue(event)
 	result, err := program.Evaluate(expression.Context{
-		Availability: expression.NewAvailability("github"),
+		Availability: expression.NewAvailability("github", "inputs"),
 		Values: map[string]any{
+			"inputs": event.InputValues,
 			"github": map[string]any{
 				"workflow":   definition.Name,
 				"event_name": event.Name,
-				"event":      map[string]any{"action": event.Action},
+				"event":      eventValues,
 				"ref":        event.Ref,
 				"ref_name":   event.RefName,
 				"head_ref":   event.HeadRef,
@@ -428,6 +529,63 @@ func EvaluateConcurrency(definition *Definition, event Event) (string, bool, err
 	return group, definition.Concurrency.CancelInProgress, nil
 }
 
+func eventExpressionValue(event Event) map[string]any {
+	eventValues := map[string]any{"action": event.Action}
+	if len(event.Inputs) > 0 {
+		eventValues["inputs"] = event.Inputs
+	}
+	if event.Schedule != "" {
+		eventValues["schedule"] = event.Schedule
+	}
+	if event.PullRequest != nil {
+		pullRequest := pullRequestExpressionValue(event.PullRequest)
+		if event.Name == "pull_request" {
+			pullRequest["merge_commit_sha"] = event.SHA
+		}
+		eventValues["pull_request"] = pullRequest
+	} else if event.Name == "pull_request" {
+		eventValues["pull_request"] = map[string]any{
+			"merge_commit_sha": event.SHA,
+			"head":             map[string]any{"ref": event.HeadRef},
+			"base":             map[string]any{"ref": event.BaseRef},
+		}
+	}
+	if event.WorkflowRun != nil {
+		eventValues["workflow_run"] = map[string]any{"conclusion": event.WorkflowRun.Conclusion, "head_sha": event.WorkflowRun.HeadSHA}
+	}
+	if event.Issue != nil {
+		eventValues["issue"] = map[string]any{"number": event.Issue.Number, "body": event.Issue.Body}
+	}
+	if event.Comment != nil {
+		eventValues["comment"] = map[string]any{"body": event.Comment.Body}
+	}
+	if event.Review != nil {
+		eventValues["review"] = map[string]any{"body": event.Review.Body}
+	}
+	if event.Name == "release" {
+		eventValues["release"] = map[string]any{"tag_name": event.RefName}
+	}
+	return eventValues
+}
+
+func pullRequestExpressionValue(pullRequest *PullRequest) map[string]any {
+	return map[string]any{
+		"number": pullRequest.Number, "body": pullRequest.Body, "html_url": pullRequest.HTMLURL,
+		"merge_ref": fmt.Sprintf("refs/pull/%d/merge", pullRequest.Number),
+		"head": map[string]any{
+			"ref": pullRequest.HeadRef,
+			"sha": pullRequest.HeadSHA,
+			"repo": map[string]any{
+				"id":        pullRequest.HeadRepository.ID,
+				"name":      pullRequest.HeadRepository.Name,
+				"full_name": pullRequest.HeadRepository.Owner + "/" + pullRequest.HeadRepository.Name,
+				"owner":     map[string]any{"login": pullRequest.HeadRepository.Owner},
+			},
+		},
+		"base": map[string]any{"ref": pullRequest.BaseRef},
+	}
+}
+
 var jobIDPattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_-]*$`)
 var runnerLabelPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
 
@@ -440,11 +598,43 @@ var supportedEventTypes = map[string][]string{
 		"ready_for_review", "review_requested", "review_request_removed",
 		"auto_merge_enabled", "auto_merge_disabled",
 	},
-	"merge_group": {"checks_requested"},
+	"merge_group":  {"checks_requested"},
+	"workflow_run": {"completed", "requested", "in_progress"},
+	"issues": {
+		"opened", "edited", "deleted", "transferred", "pinned", "unpinned",
+		"closed", "reopened", "assigned", "unassigned", "labeled", "unlabeled",
+		"locked", "unlocked", "milestoned", "demilestoned", "typed", "untyped",
+		"field_added", "field_removed",
+	},
+	"pull_request_target": {
+		"assigned", "unassigned", "labeled", "unlabeled", "opened", "edited",
+		"closed", "reopened", "synchronize", "converted_to_draft", "locked",
+		"unlocked", "enqueued", "dequeued", "milestoned", "demilestoned",
+		"ready_for_review", "review_requested", "review_request_removed",
+		"auto_merge_enabled", "auto_merge_disabled",
+	},
+	"issue_comment":               {"created", "edited", "deleted"},
+	"pull_request_review_comment": {"created", "edited", "deleted"},
+	"pull_request_review":         {"submitted", "edited", "dismissed"},
+	"release":                     {"published", "unpublished", "created", "edited", "deleted", "prereleased", "released"},
+	"workflow_dispatch":           nil,
+	"schedule":                    nil,
+	"workflow_call":               nil,
 }
 
 var defaultPullRequestTypes = []string{"opened", "synchronize", "reopened"}
 var defaultMergeGroupTypes = []string{"checks_requested"}
+
+func SupportsEventAction(eventName, action string) bool {
+	allowedTypes, supported := supportedEventTypes[eventName]
+	if !supported {
+		return false
+	}
+	if len(allowedTypes) == 0 {
+		return action == ""
+	}
+	return contains(allowedTypes, action)
+}
 
 func validateTrigger(trigger Trigger) error {
 	if len(trigger.Events) == 0 {
@@ -469,33 +659,197 @@ func validateTrigger(trigger Trigger) error {
 				return fmt.Errorf("trigger %q uses unsupported activity type %q", eventName, eventType)
 			}
 		}
-		if len(filter.Branches) > maxBranchPatterns {
-			return fmt.Errorf("trigger %q defines %d branch patterns; maximum is %d", eventName, len(filter.Branches), maxBranchPatterns)
+		if filter.typesSet && !eventSupportsTypes(eventName) {
+			return fmt.Errorf("trigger %q does not support activity types", eventName)
 		}
-		if filter.branchesSet && len(filter.Branches) == 0 {
-			return fmt.Errorf("trigger %q branch filters must not be empty", eventName)
+		if err := validateRefPatterns(eventName, "branch", filter.Branches, filter.branchesSet, eventSupportsBranches(eventName)); err != nil {
+			return err
 		}
-		hasPositivePattern := false
-		for _, pattern := range filter.Branches {
-			if utf8.RuneCountInString(pattern) > maxBranchPatternLength {
-				return fmt.Errorf("trigger %q branch pattern exceeds %d characters", eventName, maxBranchPatternLength)
-			}
-			if !strings.HasPrefix(pattern, "!") {
-				hasPositivePattern = true
-			}
-			candidate := strings.TrimPrefix(pattern, "!")
-			if candidate == "" {
-				return fmt.Errorf("trigger %q contains an empty branch pattern", eventName)
-			}
-			if _, err := compileGitHubPattern(candidate); err != nil {
-				return fmt.Errorf("trigger %q contains invalid branch pattern %q: %w", eventName, pattern, err)
+		if err := validateRefPatterns(eventName, "tag", filter.Tags, filter.tagsSet, eventName == "push"); err != nil {
+			return err
+		}
+		if len(filter.Workflows) > maxWorkflowFilters {
+			return fmt.Errorf("trigger %q defines %d workflow filters; maximum is %d", eventName, len(filter.Workflows), maxWorkflowFilters)
+		}
+		if filter.workflowsSet && eventName != "workflow_run" {
+			return fmt.Errorf("trigger %q does not support workflow filters", eventName)
+		}
+		if filter.workflowsSet && len(filter.Workflows) == 0 {
+			return fmt.Errorf("trigger %q workflow filters must not be empty", eventName)
+		}
+		for _, name := range filter.Workflows {
+			if name == "" || utf8.RuneCountInString(name) > maxWorkflowFilterLength {
+				return fmt.Errorf("trigger %q workflow filters must contain 1 to %d characters", eventName, maxWorkflowFilterLength)
 			}
 		}
-		if len(filter.Branches) > 0 && !hasPositivePattern {
-			return fmt.Errorf("trigger %q branch filters must include a positive pattern", eventName)
+		if filter.inputsSet && eventName != "workflow_dispatch" && eventName != "workflow_call" {
+			return fmt.Errorf("trigger %q does not support inputs", eventName)
+		}
+		if err := validateWorkflowInputs(eventName, filter.Inputs); err != nil {
+			return err
+		}
+		if eventName == "schedule" {
+			if len(filter.Schedules) == 0 {
+				return fmt.Errorf("trigger %q must define at least one cron schedule", eventName)
+			}
+			if len(filter.Schedules) > maxSchedules {
+				return fmt.Errorf("trigger %q defines %d schedules; maximum is %d", eventName, len(filter.Schedules), maxSchedules)
+			}
+			for _, schedule := range filter.Schedules {
+				if _, err := ParseCron(schedule.Cron); err != nil {
+					return fmt.Errorf("trigger %q has invalid cron schedule %q: %w", eventName, schedule.Cron, err)
+				}
+			}
+		} else if len(filter.Schedules) != 0 {
+			return fmt.Errorf("trigger %q does not support schedules", eventName)
 		}
 	}
 	return nil
+}
+
+func eventSupportsTypes(name string) bool {
+	return name != "push" && name != "workflow_dispatch" && name != "schedule" && name != "workflow_call"
+}
+
+func eventSupportsBranches(name string) bool {
+	return name == "push" || name == "pull_request" || name == "pull_request_target" || name == "merge_group" || name == "workflow_run"
+}
+
+func validateRefPatterns(eventName, kind string, patterns []string, configured, supported bool) error {
+	if len(patterns) > maxBranchPatterns {
+		return fmt.Errorf("trigger %q defines %d %s patterns; maximum is %d", eventName, len(patterns), kind, maxBranchPatterns)
+	}
+	if configured && len(patterns) == 0 {
+		return fmt.Errorf("trigger %q %s filters must not be empty", eventName, kind)
+	}
+	hasPositivePattern := false
+	for _, pattern := range patterns {
+		if utf8.RuneCountInString(pattern) > maxBranchPatternLength {
+			return fmt.Errorf("trigger %q %s pattern exceeds %d characters", eventName, kind, maxBranchPatternLength)
+		}
+		if !strings.HasPrefix(pattern, "!") {
+			hasPositivePattern = true
+		}
+		candidate := strings.TrimPrefix(pattern, "!")
+		if candidate == "" {
+			return fmt.Errorf("trigger %q contains an empty %s pattern", eventName, kind)
+		}
+		if _, err := compileGitHubPattern(candidate); err != nil {
+			return fmt.Errorf("trigger %q contains invalid %s pattern %q: %w", eventName, kind, pattern, err)
+		}
+	}
+	if len(patterns) > 0 && !hasPositivePattern {
+		return fmt.Errorf("trigger %q %s filters must include a positive pattern", eventName, kind)
+	}
+	if configured && !supported {
+		return fmt.Errorf("trigger %q does not support %s filters", eventName, kind)
+	}
+	return nil
+}
+
+var inputNamePattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_-]*$`)
+
+func validateWorkflowInputs(eventName string, inputs map[string]WorkflowInput) error {
+	if len(inputs) > maxTriggerInputs {
+		return fmt.Errorf("trigger %q defines %d inputs; maximum is %d", eventName, len(inputs), maxTriggerInputs)
+	}
+	defaults := make(map[string]string, len(inputs))
+	inputNames := make(map[string]struct{}, len(inputs))
+	for name, input := range inputs {
+		if utf8.RuneCountInString(name) > maxInputNameLength || !inputNamePattern.MatchString(name) {
+			return fmt.Errorf("trigger %q input %q must start with a letter or '_' and contain at most %d letters, digits, '-' or '_'", eventName, name, maxInputNameLength)
+		}
+		canonicalName := lowerASCII(name)
+		if _, found := inputNames[canonicalName]; found {
+			return fmt.Errorf("trigger %q input names must be unique ignoring case", eventName)
+		}
+		inputNames[canonicalName] = struct{}{}
+		if utf8.RuneCountInString(input.Description) > maxInputDescriptionLength {
+			return fmt.Errorf("trigger %q input %q description exceeds %d characters", eventName, name, maxInputDescriptionLength)
+		}
+		inputType := input.Type
+		if inputType == "" && eventName == "workflow_dispatch" {
+			inputType = "string"
+		}
+		if eventName == "workflow_call" && inputType == "" {
+			return fmt.Errorf("trigger %q input %q must define type", eventName, name)
+		}
+		allowed := inputType == "string" || inputType == "boolean" || inputType == "number"
+		if eventName == "workflow_dispatch" {
+			allowed = allowed || inputType == "choice" || inputType == "environment"
+		}
+		if !allowed {
+			return fmt.Errorf("trigger %q input %q uses unsupported type %q", eventName, name, input.Type)
+		}
+		if len(input.Options) > maxInputOptions {
+			return fmt.Errorf("trigger %q input %q defines %d options; maximum is %d", eventName, name, len(input.Options), maxInputOptions)
+		}
+		if inputType == "choice" && len(input.Options) == 0 {
+			return fmt.Errorf("trigger %q input %q choice options must not be empty", eventName, name)
+		}
+		if inputType != "choice" && len(input.Options) != 0 {
+			return fmt.Errorf("trigger %q input %q options require type choice", eventName, name)
+		}
+		for _, option := range input.Options {
+			if option == "" || utf8.RuneCountInString(option) > maxInputValueLength {
+				return fmt.Errorf("trigger %q input %q options must contain 1 to %d characters", eventName, name, maxInputValueLength)
+			}
+		}
+		if input.defaultSet {
+			value, ok := scalarString(input.Default)
+			if !ok || utf8.RuneCountInString(value) > maxInputValueLength || !validInputValue(inputType, value, input.Options) {
+				return fmt.Errorf("trigger %q input %q has an invalid default for type %s", eventName, name, inputType)
+			}
+			defaults[name] = value
+		}
+	}
+	return validateInputPayloadLength(fmt.Sprintf("trigger %q defaults", eventName), defaults)
+}
+
+var numberInputPattern = regexp.MustCompile(`^-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?$`)
+
+func validInputValue(inputType, value string, options []string) bool {
+	switch inputType {
+	case "boolean":
+		return value == "true" || value == "false"
+	case "number":
+		parsed, err := strconv.ParseFloat(value, 64)
+		return err == nil && !math.IsInf(parsed, 0) && !math.IsNaN(parsed) && numberInputPattern.MatchString(value)
+	case "choice":
+		return contains(options, value)
+	default:
+		return true
+	}
+}
+
+var cronParser = cron.NewParser(cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow)
+
+func ParseCron(expression string) (cron.Schedule, error) {
+	if expression == "" || utf8.RuneCountInString(expression) > maxCronLength {
+		return nil, fmt.Errorf("cron expression must contain 1 to %d characters", maxCronLength)
+	}
+	if len(strings.Fields(expression)) != 5 {
+		return nil, fmt.Errorf("cron expression must contain five fields")
+	}
+	parsed, err := cronParser.Parse(expression)
+	if err != nil {
+		return nil, err
+	}
+	cursor := time.Date(2000, time.January, 1, 0, 0, 0, 0, time.UTC)
+	for range 128 {
+		next := parsed.Next(cursor)
+		following := parsed.Next(next)
+		if following.Sub(next) < 5*time.Minute {
+			return nil, fmt.Errorf("cron schedule interval must be at least five minutes")
+		}
+		cursor = next
+	}
+	return parsed, nil
+}
+
+func ScheduleMatches(schedule cron.Schedule, instant time.Time) bool {
+	minute := instant.UTC().Truncate(time.Minute)
+	return schedule.Next(minute.Add(-time.Minute)).Equal(minute)
 }
 
 func lowerASCII(value string) string {
@@ -561,11 +915,28 @@ func (f *EventFilter) UnmarshalYAML(node *yaml.Node) error {
 			if err := value.Decode(&f.Branches); err != nil {
 				return err
 			}
+		case "tags":
+			f.tagsSet = true
+			if err := value.Decode(&f.Tags); err != nil {
+				return err
+			}
 		case "types":
 			f.typesSet = true
 			if err := value.Decode(&f.Types); err != nil {
 				return err
 			}
+		case "workflows":
+			f.workflowsSet = true
+			if err := value.Decode(&f.Workflows); err != nil {
+				return err
+			}
+		case "inputs":
+			f.inputsSet = true
+			inputs, err := decodeWorkflowInputs(value)
+			if err != nil {
+				return err
+			}
+			f.Inputs = inputs
 		default:
 			return fmt.Errorf("unsupported event filter %q", name)
 		}
@@ -573,29 +944,207 @@ func (f *EventFilter) UnmarshalYAML(node *yaml.Node) error {
 	return nil
 }
 
+func decodeWorkflowInputs(node *yaml.Node) (map[string]WorkflowInput, error) {
+	if node.Kind != yaml.MappingNode {
+		return nil, fmt.Errorf("workflow inputs must be a mapping")
+	}
+	if err := rejectDuplicateMappingKeys(node, "workflow inputs"); err != nil {
+		return nil, err
+	}
+	inputs := make(map[string]WorkflowInput, len(node.Content)/2)
+	for index := 0; index < len(node.Content); index += 2 {
+		name := node.Content[index].Value
+		input := WorkflowInput{}
+		if err := node.Content[index+1].Decode(&input); err != nil {
+			return nil, fmt.Errorf("decode workflow input %q: %w", name, err)
+		}
+		inputs[name] = input
+	}
+	return inputs, nil
+}
+
+func (input *WorkflowInput) UnmarshalYAML(node *yaml.Node) error {
+	if node.Kind != yaml.MappingNode {
+		return fmt.Errorf("workflow input must be a mapping")
+	}
+	if err := rejectDuplicateMappingKeys(node, "workflow input"); err != nil {
+		return err
+	}
+	for index := 0; index < len(node.Content); index += 2 {
+		name := node.Content[index].Value
+		value := node.Content[index+1]
+		switch name {
+		case "description":
+			if err := value.Decode(&input.Description); err != nil {
+				return err
+			}
+		case "required":
+			if err := value.Decode(&input.Required); err != nil {
+				return err
+			}
+		case "default":
+			input.defaultSet = true
+			if err := value.Decode(&input.Default); err != nil {
+				return err
+			}
+		case "type":
+			if err := value.Decode(&input.Type); err != nil {
+				return err
+			}
+		case "options":
+			if err := value.Decode(&input.Options); err != nil {
+				return err
+			}
+		default:
+			return fmt.Errorf("unsupported workflow input field %q", name)
+		}
+	}
+	return nil
+}
+
 func Matches(trigger Trigger, event Event) bool {
+	_, matched, err := Match(trigger, event)
+	return err == nil && matched
+}
+
+func Match(trigger Trigger, event Event) (Event, bool, error) {
 	filter, found := trigger.Events[event.Name]
 	if !found {
-		return false
+		return event, false, nil
 	}
 	types := filter.Types
-	if event.Name == "pull_request" && !filter.typesSet && len(types) == 0 {
+	if (event.Name == "pull_request" || event.Name == "pull_request_target") && !filter.typesSet && len(types) == 0 {
 		types = defaultPullRequestTypes
 	}
 	if event.Name == "merge_group" && !filter.typesSet && len(types) == 0 {
 		types = defaultMergeGroupTypes
 	}
 	if len(types) > 0 && !contains(types, event.Action) {
-		return false
+		return event, false, nil
 	}
-	if event.Name == "push" && len(filter.Branches) > 0 && !strings.HasPrefix(event.Ref, "refs/heads/") {
-		return false
+	if event.Name == "workflow_run" && len(filter.Workflows) > 0 && !contains(filter.Workflows, event.WorkflowName) {
+		return event, false, nil
+	}
+	if event.Name == "schedule" {
+		if _, err := ParseCron(event.Schedule); err != nil {
+			return event, false, fmt.Errorf("schedule event contains an invalid cron expression: %w", err)
+		}
+		for _, schedule := range filter.Schedules {
+			if schedule.Cron == event.Schedule {
+				return event, true, nil
+			}
+		}
+		return event, false, nil
+	}
+	if event.Name == "push" {
+		switch {
+		case strings.HasPrefix(event.Ref, "refs/heads/"):
+			if (filter.tagsSet && !filter.branchesSet) || (filter.branchesSet && !matchesBranch(filter.Branches, event.RefName)) {
+				return event, false, nil
+			}
+		case strings.HasPrefix(event.Ref, "refs/tags/"):
+			if (filter.branchesSet && !filter.tagsSet) || (filter.tagsSet && !matchesBranch(filter.Tags, event.RefName)) {
+				return event, false, nil
+			}
+		default:
+			return event, false, nil
+		}
 	}
 	branch := event.RefName
-	if event.Name == "pull_request" || event.Name == "merge_group" {
+	if event.Name == "pull_request" || event.Name == "pull_request_target" || event.Name == "merge_group" || event.Name == "workflow_run" {
 		branch = event.BaseRef
 	}
-	return len(filter.Branches) == 0 || matchesBranch(filter.Branches, branch)
+	if event.Name != "push" && len(filter.Branches) > 0 && !matchesBranch(filter.Branches, branch) {
+		return event, false, nil
+	}
+	if event.Name == "workflow_dispatch" || event.Name == "workflow_call" {
+		inputs, inputValues, err := resolveInputs(event.Name, filter.Inputs, event.Inputs)
+		if err != nil {
+			return event, false, err
+		}
+		event.Inputs = inputs
+		event.InputValues = inputValues
+	}
+	return event, true, nil
+}
+
+func resolveInputs(eventName string, definitions map[string]WorkflowInput, provided map[string]string) (map[string]string, map[string]any, error) {
+	if len(provided) > maxTriggerInputs {
+		return nil, nil, fmt.Errorf("%s event provides %d inputs; maximum is %d", eventName, len(provided), maxTriggerInputs)
+	}
+	for name := range provided {
+		if _, found := definitions[name]; !found {
+			return nil, nil, fmt.Errorf("%s event provides unknown input %q", eventName, name)
+		}
+	}
+	resolved := make(map[string]string, len(definitions))
+	inputValues := make(map[string]any, len(definitions))
+	for name, definition := range definitions {
+		inputType := definition.Type
+		if inputType == "" {
+			inputType = "string"
+		}
+		value, found := provided[name]
+		if !found && definition.defaultSet {
+			value, _ = scalarString(definition.Default)
+			found = true
+		}
+		if !found && definition.Required {
+			return nil, nil, fmt.Errorf("%s event is missing required input %q", eventName, name)
+		}
+		if !found && eventName == "workflow_call" {
+			value = implicitWorkflowCallInputDefault(inputType)
+			found = true
+		}
+		if !found {
+			continue
+		}
+		if utf8.RuneCountInString(value) > maxInputValueLength {
+			return nil, nil, fmt.Errorf("%s event input %q exceeds %d characters", eventName, name, maxInputValueLength)
+		}
+		if !validInputValue(inputType, value, definition.Options) {
+			return nil, nil, fmt.Errorf("%s event input %q is invalid for type %s", eventName, name, inputType)
+		}
+		resolved[name] = value
+		inputValues[name] = inputExpressionValue(inputType, value)
+	}
+	if err := validateInputPayloadLength(eventName+" event", resolved); err != nil {
+		return nil, nil, err
+	}
+	return resolved, inputValues, nil
+}
+
+func inputExpressionValue(inputType, value string) any {
+	switch inputType {
+	case "boolean":
+		return value == "true"
+	case "number":
+		parsed, _ := strconv.ParseFloat(value, 64)
+		return parsed
+	default:
+		return value
+	}
+}
+
+func implicitWorkflowCallInputDefault(inputType string) string {
+	if inputType == "boolean" {
+		return "false"
+	}
+	if inputType == "number" {
+		return "0"
+	}
+	return ""
+}
+
+func validateInputPayloadLength(field string, inputs map[string]string) error {
+	characters := 0
+	for name, value := range inputs {
+		characters += utf8.RuneCountInString(name) + utf8.RuneCountInString(value)
+	}
+	if characters > maxInputPayloadLength {
+		return fmt.Errorf("%s input names and values contain %d characters; maximum is %d", field, characters, maxInputPayloadLength)
+	}
+	return nil
 }
 
 func (t *Trigger) UnmarshalYAML(node *yaml.Node) error {
@@ -618,7 +1167,11 @@ func (t *Trigger) UnmarshalYAML(node *yaml.Node) error {
 			name := node.Content[i].Value
 			value := node.Content[i+1]
 			filter := EventFilter{}
-			if value.Kind != yaml.ScalarNode || value.Tag != "!!null" {
+			if name == "schedule" {
+				if err := value.Decode(&filter.Schedules); err != nil {
+					return fmt.Errorf("decode %s trigger: %w", name, err)
+				}
+			} else if value.Kind != yaml.ScalarNode || value.Tag != "!!null" {
 				if err := value.Decode(&filter); err != nil {
 					return fmt.Errorf("decode %s trigger: %w", name, err)
 				}

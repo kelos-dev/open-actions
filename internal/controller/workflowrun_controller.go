@@ -36,6 +36,7 @@ const (
 	workflowJobNameDigestLength      = 16
 	workflowRunCancellationFinalizer = "actions.kelos.dev/concurrency-cancellation"
 	workflowRunCheckFinalizer        = "actions.kelos.dev/github-check"
+	workflowRunScheduleFinalizer     = "actions.kelos.dev/schedule-idempotency"
 )
 
 var digestEncoding = base32.StdEncoding.WithPadding(base32.NoPadding)
@@ -157,11 +158,15 @@ func (r *WorkflowRunReconciler) reconcileWorkflowRun(ctx context.Context, run *a
 	if err != nil {
 		return r.planningFailed(ctx, run, "WorkflowInvalid", err, planningFailureTerminal)
 	}
-	concurrencyGroup, cancelInProgress, err := workflow.EvaluateConcurrency(definition, workflowEvent(githubSource))
+	planningRun, planningEvent, err := resolvePlanningEvent(run, definition)
+	if err != nil {
+		return r.planningFailed(ctx, run, "TriggerInvalid", err, planningFailureTerminal)
+	}
+	concurrencyGroup, cancelInProgress, err := workflow.EvaluateConcurrency(definition, planningEvent)
 	if err != nil {
 		return r.planningFailed(ctx, run, "WorkflowInvalid", err, planningFailureTerminal)
 	}
-	plannedJobs, err := r.planWorkflowJobs(run, definition)
+	plannedJobs, err := r.planWorkflowJobs(planningRun, definition, planningEvent.InputValues)
 	if err != nil {
 		return r.planningFailed(ctx, run, "WorkflowInvalid", err, planningFailureTerminal)
 	}
@@ -240,6 +245,28 @@ func (r *WorkflowRunReconciler) now() time.Time {
 		return r.Now()
 	}
 	return time.Now()
+}
+
+func resolvePlanningEvent(run *actionsv1alpha1.WorkflowRun, definition *workflow.Definition) (*actionsv1alpha1.WorkflowRun, workflow.Event, error) {
+	githubSource := run.Spec.Source.GitHub
+	event := workflowEvent(githubSource)
+	if githubSource.Event.Name != actionsv1alpha1.GitHubEventNameWorkflowDispatch && githubSource.Event.Name != actionsv1alpha1.GitHubEventNameWorkflowCall && githubSource.Event.Name != actionsv1alpha1.GitHubEventNameSchedule {
+		return run, event, nil
+	}
+	matchedEvent, matched, err := workflow.Match(definition.On, event)
+	if err != nil {
+		return nil, workflow.Event{}, err
+	}
+	if !matched {
+		return nil, workflow.Event{}, fmt.Errorf("workflow does not declare matching %s trigger", githubSource.Event.Name)
+	}
+	if githubSource.Event.Name == actionsv1alpha1.GitHubEventNameSchedule {
+		return run, matchedEvent, nil
+	}
+	planningRun := run.DeepCopy()
+	matchedEvent.Inputs = githubEventInputValues(matchedEvent.InputValues)
+	planningRun.Spec.Source.GitHub.Event.Inputs = matchedEvent.Inputs
+	return planningRun, matchedEvent, nil
 }
 
 type checkRunReport struct {
@@ -499,7 +526,7 @@ func (r *WorkflowRunReconciler) ensureWorkflowJobs(ctx context.Context, run *act
 	return nil
 }
 
-func (r *WorkflowRunReconciler) planWorkflowJobs(run *actionsv1alpha1.WorkflowRun, definition *workflow.Definition) ([]plannedWorkflowJob, error) {
+func (r *WorkflowRunReconciler) planWorkflowJobs(run *actionsv1alpha1.WorkflowRun, definition *workflow.Definition, inputValues map[string]any) ([]plannedWorkflowJob, error) {
 	jobIDs := make([]string, 0, len(definition.Jobs))
 	for id := range definition.Jobs {
 		jobIDs = append(jobIDs, id)
@@ -507,7 +534,7 @@ func (r *WorkflowRunReconciler) planWorkflowJobs(run *actionsv1alpha1.WorkflowRu
 	sort.Strings(jobIDs)
 	plannedJobs := make([]plannedWorkflowJob, 0, len(jobIDs))
 	for _, id := range jobIDs {
-		definitionJob, err := workflow.EvaluateJob(id, definition.Jobs[id], r.jobExpressionContext(run, definition.Name))
+		definitionJob, err := workflow.EvaluateJob(id, definition.Jobs[id], r.jobExpressionContext(run, definition.Name, inputValues))
 		if err != nil {
 			return nil, err
 		}
@@ -515,7 +542,7 @@ func (r *WorkflowRunReconciler) planWorkflowJobs(run *actionsv1alpha1.WorkflowRu
 		if displayName == "" {
 			displayName = id
 		}
-		plan, err := r.jobPlan(run, definition.Name, id, definitionJob)
+		plan, err := r.jobPlan(run, definition.Name, id, definitionJob, inputValues)
 		if err != nil {
 			return nil, err
 		}
@@ -532,35 +559,159 @@ func (r *WorkflowRunReconciler) planWorkflowJobs(run *actionsv1alpha1.WorkflowRu
 }
 
 func workflowEvent(source *actionsv1alpha1.GitHubWorkflowRunSource) workflow.Event {
+	headRef, baseRef := githubSourcePullRequestRefs(source)
 	return workflow.Event{
-		Name:    string(source.Event.Name),
-		Action:  source.Event.Action,
-		Ref:     source.Revision.Ref,
-		RefName: githubclient.RefName(source.Revision.Ref),
-		HeadRef: source.Revision.HeadRef,
-		BaseRef: source.Revision.BaseRef,
+		Name:        string(source.Event.Name),
+		Action:      source.Event.Action,
+		SHA:         source.Revision.SHA,
+		Ref:         source.Revision.Ref,
+		RefName:     githubclient.RefName(source.Revision.Ref),
+		HeadRef:     headRef,
+		BaseRef:     baseRef,
+		Inputs:      source.Event.Inputs,
+		Schedule:    source.Event.Schedule,
+		PullRequest: workflowPullRequest(source.Event.PullRequest),
+		WorkflowRun: workflowWorkflowRunEvent(source.Event.WorkflowRun),
+		Issue:       workflowIssueEvent(source.Event.Issue),
+		Comment:     workflowCommentEvent(source.Event.Comment),
+		Review:      workflowReviewEvent(source.Event.Review),
 	}
 }
 
-func (r *WorkflowRunReconciler) jobExpressionContext(run *actionsv1alpha1.WorkflowRun, workflowName string) workflowexpression.Context {
+func workflowPullRequest(pullRequest *actionsv1alpha1.GitHubPullRequest) *workflow.PullRequest {
+	if pullRequest == nil {
+		return nil
+	}
+	return &workflow.PullRequest{
+		Number: pullRequest.Number, Body: pullRequest.Body, HTMLURL: pullRequest.HTMLURL,
+		HeadRef: pullRequest.HeadRef, HeadSHA: pullRequest.HeadSHA, BaseRef: pullRequest.BaseRef,
+		HeadRepository: workflow.Repository{ID: pullRequest.HeadRepository.ID, Owner: pullRequest.HeadRepository.Owner, Name: pullRequest.HeadRepository.Name},
+	}
+}
+
+func workflowWorkflowRunEvent(event *actionsv1alpha1.GitHubWorkflowRunEvent) *workflow.WorkflowRunEvent {
+	if event == nil {
+		return nil
+	}
+	return &workflow.WorkflowRunEvent{Conclusion: event.Conclusion, HeadSHA: event.HeadSHA}
+}
+
+func workflowIssueEvent(event *actionsv1alpha1.GitHubIssueEvent) *workflow.IssueEvent {
+	if event == nil {
+		return nil
+	}
+	return &workflow.IssueEvent{Number: event.Number, Body: event.Body}
+}
+
+func workflowCommentEvent(event *actionsv1alpha1.GitHubCommentEvent) *workflow.CommentEvent {
+	if event == nil {
+		return nil
+	}
+	return &workflow.CommentEvent{Body: event.Body}
+}
+
+func workflowReviewEvent(event *actionsv1alpha1.GitHubReviewEvent) *workflow.ReviewEvent {
+	if event == nil {
+		return nil
+	}
+	return &workflow.ReviewEvent{Body: event.Body}
+}
+
+func githubSourcePullRequestRefs(source *actionsv1alpha1.GitHubWorkflowRunSource) (string, string) {
+	if source.Event.Name == actionsv1alpha1.GitHubEventNamePullRequestTarget && source.Event.PullRequest != nil {
+		return source.Event.PullRequest.HeadRef, source.Event.PullRequest.BaseRef
+	}
+	return source.Revision.HeadRef, source.Revision.BaseRef
+}
+
+func (r *WorkflowRunReconciler) jobExpressionContext(run *actionsv1alpha1.WorkflowRun, workflowName string, inputValues map[string]any) workflowexpression.Context {
 	githubSource := run.Spec.Source.GitHub
+	headRef, baseRef := githubSourcePullRequestRefs(githubSource)
+	eventValues := githubEventExpressionValue(githubSource, inputValues)
 	return workflowexpression.Context{
-		Availability: workflowexpression.NewAvailability("github"),
+		Availability: workflowexpression.NewAvailability("github", "inputs"),
 		Values: map[string]any{
+			"inputs": inputValues,
 			"github": map[string]any{
 				"workflow":   workflowName,
 				"event_name": string(githubSource.Event.Name),
-				"event":      map[string]any{"action": githubSource.Event.Action},
+				"event":      eventValues,
 				"repository": githubSource.Repository.Owner + "/" + githubSource.Repository.Name,
 				"sha":        githubSource.Revision.SHA,
 				"ref":        githubSource.Revision.Ref,
 				"ref_name":   githubclient.RefName(githubSource.Revision.Ref),
-				"head_ref":   githubSource.Revision.HeadRef,
-				"base_ref":   githubSource.Revision.BaseRef,
+				"head_ref":   headRef,
+				"base_ref":   baseRef,
 				"server_url": strings.TrimSuffix(r.GitHubServerURL, "/"),
 				"api_url":    strings.TrimSuffix(r.GitHubAPIBase, "/"),
 			},
 		},
+	}
+}
+
+func githubEventExpressionValue(source *actionsv1alpha1.GitHubWorkflowRunSource, inputValues map[string]any) map[string]any {
+	event := source.Event
+	eventValues := map[string]any{"action": event.Action}
+	if len(inputValues) > 0 {
+		eventValues["inputs"] = githubEventInputValues(inputValues)
+	}
+	if event.Schedule != "" {
+		eventValues["schedule"] = event.Schedule
+	}
+	if event.PullRequest != nil {
+		pullRequest := githubPullRequestExpressionValue(event.PullRequest)
+		if event.Name == actionsv1alpha1.GitHubEventNamePullRequest {
+			pullRequest["merge_commit_sha"] = source.Revision.SHA
+		}
+		eventValues["pull_request"] = pullRequest
+	} else if event.Name == actionsv1alpha1.GitHubEventNamePullRequest {
+		eventValues["pull_request"] = map[string]any{
+			"merge_commit_sha": source.Revision.SHA,
+			"head":             map[string]any{"ref": source.Revision.HeadRef},
+			"base":             map[string]any{"ref": source.Revision.BaseRef},
+		}
+	}
+	if event.WorkflowRun != nil {
+		eventValues["workflow_run"] = map[string]any{"conclusion": event.WorkflowRun.Conclusion, "head_sha": event.WorkflowRun.HeadSHA}
+	}
+	if event.Issue != nil {
+		eventValues["issue"] = map[string]any{"number": event.Issue.Number, "body": event.Issue.Body}
+	}
+	if event.Comment != nil {
+		eventValues["comment"] = map[string]any{"body": event.Comment.Body}
+	}
+	if event.Review != nil {
+		eventValues["review"] = map[string]any{"body": event.Review.Body}
+	}
+	if event.Name == actionsv1alpha1.GitHubEventNameRelease {
+		eventValues["release"] = map[string]any{"tag_name": githubclient.RefName(source.Revision.Ref)}
+	}
+	return eventValues
+}
+
+func githubEventInputValues(inputs map[string]any) map[string]string {
+	values := make(map[string]string, len(inputs))
+	for name, value := range inputs {
+		values[name] = fmt.Sprint(value)
+	}
+	return values
+}
+
+func githubPullRequestExpressionValue(pullRequest *actionsv1alpha1.GitHubPullRequest) map[string]any {
+	return map[string]any{
+		"number": pullRequest.Number, "body": pullRequest.Body, "html_url": pullRequest.HTMLURL,
+		"merge_ref": fmt.Sprintf("refs/pull/%d/merge", pullRequest.Number),
+		"head": map[string]any{
+			"ref": pullRequest.HeadRef,
+			"sha": pullRequest.HeadSHA,
+			"repo": map[string]any{
+				"id":        pullRequest.HeadRepository.ID,
+				"name":      pullRequest.HeadRepository.Name,
+				"full_name": pullRequest.HeadRepository.Owner + "/" + pullRequest.HeadRepository.Name,
+				"owner":     map[string]any{"login": pullRequest.HeadRepository.Owner},
+			},
+		},
+		"base": map[string]any{"ref": pullRequest.BaseRef},
 	}
 }
 
@@ -622,8 +773,9 @@ func (r *WorkflowRunReconciler) ensurePlanConfigMap(ctx context.Context, workflo
 	return nil
 }
 
-func (r *WorkflowRunReconciler) jobPlan(run *actionsv1alpha1.WorkflowRun, workflowName, id string, job workflow.Job) (*runner.Plan, error) {
+func (r *WorkflowRunReconciler) jobPlan(run *actionsv1alpha1.WorkflowRun, workflowName, id string, job workflow.Job, inputValues map[string]any) (*runner.Plan, error) {
 	githubSource := run.Spec.Source.GitHub
+	headRef, baseRef := githubSourcePullRequestRefs(githubSource)
 	jobEnv, err := stringMap(job.Env)
 	if err != nil {
 		return nil, fmt.Errorf("job %q env: %w", id, err)
@@ -650,6 +802,7 @@ func (r *WorkflowRunReconciler) jobPlan(run *actionsv1alpha1.WorkflowRun, workfl
 	}
 	return &runner.Plan{
 		Version: runner.PlanVersion,
+		Inputs:  inputValues,
 		Repository: runner.Repository{
 			ID:                 githubSource.Repository.ID,
 			Owner:              githubSource.Repository.Owner,
@@ -659,22 +812,67 @@ func (r *WorkflowRunReconciler) jobPlan(run *actionsv1alpha1.WorkflowRun, workfl
 			ActionCloneBaseURL: strings.TrimSuffix(r.ActionCloneBaseURL, "/"),
 		},
 		Event: runner.Event{
-			Name:       string(githubSource.Event.Name),
-			Action:     githubSource.Event.Action,
-			DeliveryID: githubSource.Event.DeliveryID,
+			Name:        string(githubSource.Event.Name),
+			Action:      githubSource.Event.Action,
+			DeliveryID:  githubSource.Event.DeliveryID,
+			Schedule:    githubSource.Event.Schedule,
+			PullRequest: runnerPullRequest(githubSource.Event.PullRequest),
+			WorkflowRun: runnerWorkflowRunEvent(githubSource.Event.WorkflowRun),
+			Issue:       runnerIssueEvent(githubSource.Event.Issue),
+			Comment:     runnerCommentEvent(githubSource.Event.Comment),
+			Review:      runnerReviewEvent(githubSource.Event.Review),
 		},
 		WorkflowName: workflowName,
 		Revision: runner.Revision{
 			SHA:     githubSource.Revision.SHA,
 			Ref:     githubSource.Revision.Ref,
 			RefName: githubclient.RefName(githubSource.Revision.Ref),
-			HeadRef: githubSource.Revision.HeadRef,
-			BaseRef: githubSource.Revision.BaseRef,
+			HeadRef: headRef,
+			BaseRef: baseRef,
 		},
 		JobID: id,
 		Env:   jobEnv,
 		Steps: steps,
 	}, nil
+}
+
+func runnerPullRequest(pullRequest *actionsv1alpha1.GitHubPullRequest) *runner.PullRequest {
+	if pullRequest == nil {
+		return nil
+	}
+	return &runner.PullRequest{
+		Number: pullRequest.Number, Body: pullRequest.Body, HTMLURL: pullRequest.HTMLURL,
+		HeadRef: pullRequest.HeadRef, HeadSHA: pullRequest.HeadSHA, BaseRef: pullRequest.BaseRef,
+		HeadRepository: runner.EventRepository{ID: pullRequest.HeadRepository.ID, Owner: pullRequest.HeadRepository.Owner, Name: pullRequest.HeadRepository.Name},
+	}
+}
+
+func runnerWorkflowRunEvent(event *actionsv1alpha1.GitHubWorkflowRunEvent) *runner.WorkflowRunEvent {
+	if event == nil {
+		return nil
+	}
+	return &runner.WorkflowRunEvent{Conclusion: event.Conclusion, HeadSHA: event.HeadSHA}
+}
+
+func runnerIssueEvent(event *actionsv1alpha1.GitHubIssueEvent) *runner.IssueEvent {
+	if event == nil {
+		return nil
+	}
+	return &runner.IssueEvent{Number: event.Number, Body: event.Body}
+}
+
+func runnerCommentEvent(event *actionsv1alpha1.GitHubCommentEvent) *runner.CommentEvent {
+	if event == nil {
+		return nil
+	}
+	return &runner.CommentEvent{Body: event.Body}
+}
+
+func runnerReviewEvent(event *actionsv1alpha1.GitHubReviewEvent) *runner.ReviewEvent {
+	if event == nil {
+		return nil
+	}
+	return &runner.ReviewEvent{Body: event.Body}
 }
 
 func (r *WorkflowRunReconciler) observeWorkflowJobs(ctx context.Context, run *actionsv1alpha1.WorkflowRun, workflowName, concurrencyGroup string, total int32) (ctrl.Result, error) {
@@ -922,7 +1120,8 @@ func (r *WorkflowRunReconciler) cancelWorkflowRun(ctx context.Context, run *acti
 func (r *WorkflowRunReconciler) finalizeCanceledWorkflowRun(ctx context.Context, run *actionsv1alpha1.WorkflowRun) (ctrl.Result, error) {
 	cancellationFinalizer := controllerutil.ContainsFinalizer(run, workflowRunCancellationFinalizer)
 	checkFinalizer := controllerutil.ContainsFinalizer(run, workflowRunCheckFinalizer)
-	if !cancellationFinalizer && !checkFinalizer {
+	scheduleFinalizer := controllerutil.ContainsFinalizer(run, workflowRunScheduleFinalizer)
+	if !cancellationFinalizer && !checkFinalizer && !scheduleFinalizer {
 		return ctrl.Result{}, nil
 	}
 	var reportError error
@@ -943,6 +1142,13 @@ func (r *WorkflowRunReconciler) finalizeCanceledWorkflowRun(ctx context.Context,
 	}
 	before := run.DeepCopy()
 	controllerutil.RemoveFinalizer(run, workflowRunCancellationFinalizer)
+	scheduleRemaining := time.Duration(0)
+	if scheduleFinalizer {
+		scheduleRemaining = r.scheduleFinalizerRemaining(run)
+		if scheduleRemaining <= 0 {
+			controllerutil.RemoveFinalizer(run, workflowRunScheduleFinalizer)
+		}
+	}
 	retryReport := false
 	if checkFinalizer {
 		switch {
@@ -955,7 +1161,7 @@ func (r *WorkflowRunReconciler) finalizeCanceledWorkflowRun(ctx context.Context,
 			retryReport = true
 		}
 	}
-	finalizersChanged := cancellationFinalizer || (checkFinalizer && !retryReport)
+	finalizersChanged := cancellationFinalizer || (scheduleFinalizer && scheduleRemaining <= 0) || (checkFinalizer && !retryReport)
 	if finalizersChanged {
 		if err := r.Patch(ctx, run, client.MergeFrom(before)); err != nil {
 			return ctrl.Result{}, err
@@ -964,7 +1170,18 @@ func (r *WorkflowRunReconciler) finalizeCanceledWorkflowRun(ctx context.Context,
 	if retryReport {
 		return ctrl.Result{}, reportError
 	}
+	if scheduleRemaining > 0 {
+		return ctrl.Result{RequeueAfter: scheduleRemaining}, nil
+	}
 	return ctrl.Result{}, nil
+}
+
+func (r *WorkflowRunReconciler) scheduleFinalizerRemaining(run *actionsv1alpha1.WorkflowRun) time.Duration {
+	if run.CreationTimestamp.IsZero() {
+		return 0
+	}
+	deadline := run.CreationTimestamp.UTC().Truncate(time.Minute).Add(time.Minute)
+	return deadline.Sub(r.now().UTC())
 }
 
 func (r *WorkflowRunReconciler) githubCheckReportPermanentlyUnavailable(ctx context.Context, run *actionsv1alpha1.WorkflowRun, reportError error) bool {

@@ -76,6 +76,68 @@ func TestWebhookReplayIDUsesSignedBody(t *testing.T) {
 	}
 }
 
+func TestEnqueueDeliveryStoresBoundedMetadataOnce(t *testing.T) {
+	scheme := deliveryTestScheme(t)
+	project := &actionsv1alpha1.Project{ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: "default", UID: "project-uid"}}
+	clusterClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(project).Build()
+	handler := &GitHubHandler{Client: clusterClient, APIReader: clusterClient}
+	body := strings.Repeat("😀", maxEventBodyLength)
+	event := &payload{}
+	event.Repository.ID = 1
+	event.Repository.Owner.Login = "acme"
+	event.Repository.Name = "example"
+	event.Repository.DefaultBranch = "main"
+	event.Issue.Number = 17
+	event.Issue.Body = body
+	event.Comment.Body = body
+	normalized := normalizedEvent{
+		Name: "issue_comment", Action: "created", Ref: "refs/heads/main", ResolveRef: "main",
+		Issue: &normalizedIssue{Number: 17, Body: body}, Comment: &normalizedComment{Body: body},
+	}
+	signedBody := []byte(`{"delivery":"bounded"}`)
+	if err := handler.enqueueDelivery(context.Background(), project, event, normalized, "delivery", signedBody); err != nil {
+		t.Fatal(err)
+	}
+	stored := &corev1.ConfigMap{}
+	key := client.ObjectKey{Namespace: project.Namespace, Name: webhookDeliveryName(signedBody)}
+	if err := clusterClient.Get(context.Background(), key, stored); err != nil {
+		t.Fatal(err)
+	}
+	data := stored.Data[deliveryDataKey]
+	if len(data) > maxDeliveryBytes {
+		t.Fatalf("delivery size = %d, maximum = %d", len(data), maxDeliveryBytes)
+	}
+	document := map[string]any{}
+	if err := json.Unmarshal([]byte(data), &document); err != nil {
+		t.Fatal(err)
+	}
+	if _, found := document["payload"]; found {
+		t.Fatal("queued delivery persisted the parsed webhook payload")
+	}
+	if document["repository"].(map[string]any)["name"] != "example" {
+		t.Fatalf("queued repository = %#v", document["repository"])
+	}
+}
+
+func TestQueuedDeliveryReadsRepositoryFromPayload(t *testing.T) {
+	data := []byte(`{"projectName":"default","projectUID":"project-uid","payload":{"repository":{"id":1,"owner":{"login":"acme"},"name":"example","default_branch":"main"}},"event":{"name":"push","sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","ref":"refs/heads/main"},"replayID":"replay","deliveryID":"delivery"}`)
+	delivery := queuedDelivery{}
+	if err := json.Unmarshal(data, &delivery); err != nil {
+		t.Fatal(err)
+	}
+	if delivery.Repository.ID != 1 || delivery.Repository.Owner != "acme" || delivery.Repository.Name != "example" {
+		t.Fatalf("delivery repository = %#v", delivery.Repository)
+	}
+	pullRequestData := []byte(`{"projectName":"default","projectUID":"project-uid","payload":{"repository":{"id":1,"owner":{"login":"acme"},"name":"example","default_branch":"main"}},"event":{"name":"pull_request","ref":"refs/pull/7/merge","resolveRef":"refs/pull/7/merge","headSHA":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},"replayID":"replay","deliveryID":"delivery"}`)
+	if err := json.Unmarshal(pullRequestData, &delivery); err != nil {
+		t.Fatal(err)
+	}
+	events := deliveryEvents(delivery.Event)
+	if !delivery.Event.MergeRevision || len(events) != 1 || events[0].Name != "pull_request" {
+		t.Fatalf("pull request delivery = %#v, events = %#v", delivery, events)
+	}
+}
+
 func TestCreateWorkflowRunIsIdempotent(t *testing.T) {
 	scheme := deliveryTestScheme(t)
 	project := &actionsv1alpha1.Project{ObjectMeta: metav1.ObjectMeta{Name: "project", Namespace: "default", UID: "project-uid"}}
@@ -84,12 +146,13 @@ func TestCreateWorkflowRunIsIdempotent(t *testing.T) {
 	event.Repository.Owner.Login = "acme"
 	event.Repository.Name = "example"
 	normalized := normalizedEvent{Name: "push", SHA: strings.Repeat("a", 40), Ref: "refs/heads/main"}
-	delivery := &queuedDelivery{Payload: *event, Event: normalized, ReplayID: "replay", DeliveryID: "delivery"}
+	delivery := &queuedDelivery{Repository: deliveryRepository{ID: 1, Owner: "acme", Name: "example"}, Event: normalized, ReplayID: "replay", DeliveryID: "delivery"}
 	ttl := int32(604800)
 
 	clusterClient := fake.NewClientBuilder().WithScheme(scheme).Build()
 	reconciler := &DeliveryReconciler{Client: clusterClient, APIReader: clusterClient, WorkflowRunTTLSecondsAfterFinished: &ttl}
-	if err := reconciler.createWorkflowRun(context.Background(), project, delivery, ".open-actions/workflows/ci.yaml"); err != nil {
+	selection := workflowSelection{Path: ".open-actions/workflows/ci.yaml", Event: delivery.Event}
+	if err := reconciler.createWorkflowRun(context.Background(), project, delivery, selection); err != nil {
 		t.Fatal(err)
 	}
 	run := &actionsv1alpha1.WorkflowRun{}
@@ -105,7 +168,7 @@ func TestCreateWorkflowRunIsIdempotent(t *testing.T) {
 	if err := clusterClient.Update(context.Background(), run); err != nil {
 		t.Fatal(err)
 	}
-	if err := reconciler.createWorkflowRun(context.Background(), project, delivery, ".open-actions/workflows/ci.yaml"); err != nil {
+	if err := reconciler.createWorkflowRun(context.Background(), project, delivery, selection); err != nil {
 		t.Fatalf("matching replay failed: %v", err)
 	}
 	if err := clusterClient.Get(context.Background(), runKey, run); err != nil {
@@ -129,7 +192,7 @@ func TestCreateWorkflowRunIsIdempotent(t *testing.T) {
 	}
 	conflictingDelivery := *delivery
 	conflictingDelivery.ReplayID = "conflict"
-	err := reconciler.createWorkflowRun(context.Background(), project, &conflictingDelivery, workflowPath)
+	err := reconciler.createWorkflowRun(context.Background(), project, &conflictingDelivery, workflowSelection{Path: workflowPath, Event: conflictingDelivery.Event})
 	if !apierrors.IsConflict(err) {
 		t.Fatalf("conflicting WorkflowRun error = %v, want conflict", err)
 	}
@@ -142,6 +205,13 @@ func TestMatchingWorkflowRunAcceptsMissingHeadSHA(t *testing.T) {
 			Source: actionsv1alpha1.WorkflowRunSource{
 				Type: actionsv1alpha1.SourceTypeGitHub,
 				GitHub: &actionsv1alpha1.GitHubWorkflowRunSource{
+					Event: actionsv1alpha1.GitHubEvent{
+						Name: actionsv1alpha1.GitHubEventNamePullRequest,
+						PullRequest: &actionsv1alpha1.GitHubPullRequest{
+							Number: 9, HeadRef: "feature", HeadSHA: strings.Repeat("b", 40), BaseRef: "main",
+							HeadRepository: actionsv1alpha1.GitHubRepository{ID: 1, Owner: "acme", Name: "example"},
+						},
+					},
 					Revision: actionsv1alpha1.GitRevision{SHA: strings.Repeat("a", 40), HeadSHA: strings.Repeat("b", 40)},
 				},
 			},
@@ -149,9 +219,10 @@ func TestMatchingWorkflowRunAcceptsMissingHeadSHA(t *testing.T) {
 	}
 	existing := desired.DeepCopy()
 	existing.Spec.Source.GitHub.Revision.HeadSHA = ""
+	existing.Spec.Source.GitHub.Event.PullRequest = nil
 
 	if err := matchingWorkflowRun(existing, desired); err != nil {
-		t.Fatalf("WorkflowRun using the SHA fallback did not match its delivery replay: %v", err)
+		t.Fatalf("compatible WorkflowRun source did not match its delivery replay: %v", err)
 	}
 
 	existing.Spec.Source.GitHub.Revision.HeadSHA = strings.Repeat("c", 40)
@@ -179,7 +250,7 @@ func TestCreateWorkflowRunReplayUsesLiveReader(t *testing.T) {
 	event.Repository.Name = "example"
 	normalized := normalizedEvent{Name: "push", SHA: strings.Repeat("a", 40), Ref: "refs/heads/main"}
 	workflowPath := ".open-actions/workflows/ci.yaml"
-	delivery := &queuedDelivery{Payload: *event, Event: normalized, ReplayID: "replay", DeliveryID: "delivery"}
+	delivery := &queuedDelivery{Repository: deliveryRepository{ID: 1, Owner: "acme", Name: "example"}, Event: normalized, ReplayID: "replay", DeliveryID: "delivery"}
 	existing := &actionsv1alpha1.WorkflowRun{
 		ObjectMeta: metav1.ObjectMeta{Name: fullDigestWorkflowRunName(workflowPath, delivery.ReplayID), Namespace: project.Namespace},
 		Spec: actionsv1alpha1.WorkflowRunSpec{
@@ -201,7 +272,7 @@ func TestCreateWorkflowRunReplayUsesLiveReader(t *testing.T) {
 		Client:    &workflowRunAlreadyExistsClient{Client: cachedClient},
 		APIReader: liveReader,
 	}
-	if err := reconciler.createWorkflowRun(context.Background(), project, delivery, workflowPath); err != nil {
+	if err := reconciler.createWorkflowRun(context.Background(), project, delivery, workflowSelection{Path: workflowPath, Event: delivery.Event}); err != nil {
 		t.Fatalf("matching replay failed against stale cache: %v", err)
 	}
 }
@@ -221,7 +292,9 @@ func TestDeliveryPinsCurrentPullRequestMergeRevision(t *testing.T) {
 		case "/app/installations/2/access_tokens":
 			fmt.Fprint(writer, `{"token":"installation-token"}`)
 		case "/repos/acme/example/commits":
-			resolveCalls++
+			if request.URL.Query().Get("sha") == "refs/pull/9/merge" {
+				resolveCalls++
+			}
 			fmt.Fprintf(writer, `[{"sha":%q,"parents":[{"sha":%q}]}]`, resolvedSHA, parentSHA)
 		case "/repos/acme/example/contents/.open-actions/workflows":
 			if failDiscovery {
@@ -289,6 +362,10 @@ func TestDeliveryPinsCurrentPullRequestMergeRevision(t *testing.T) {
 	if revision.SHA != mergeSHA || revision.HeadSHA != headSHA {
 		t.Fatalf("WorkflowRun revision = %#v, want execution SHA %q and head SHA %q", revision, mergeSHA, headSHA)
 	}
+	pullRequest := runs.Items[0].Spec.Source.GitHub.Event.PullRequest
+	if pullRequest == nil || pullRequest.Number != 9 || pullRequest.Body != "Pull request body" || pullRequest.HTMLURL != "https://github.com/acme/example/pull/9" || pullRequest.HeadRef != "feature" || pullRequest.HeadSHA != headSHA || pullRequest.BaseRef != "main" || pullRequest.HeadRepository.Owner != "acme" || pullRequest.HeadRepository.Name != "example" {
+		t.Fatalf("WorkflowRun pull request = %#v", pullRequest)
+	}
 	if got := runs.Items[0].Spec.Source.GitHub.Revision.BaseRef; got != "main" {
 		t.Fatalf("WorkflowRun base ref = %q, want main", got)
 	}
@@ -297,12 +374,30 @@ func TestDeliveryPinsCurrentPullRequestMergeRevision(t *testing.T) {
 func TestDeliveryTimesOutWhenPullRequestMergeRefIsUnavailable(t *testing.T) {
 	now := time.Date(2026, 8, 9, 23, 0, 0, 0, time.UTC)
 	headSHA := strings.Repeat("b", 40)
+	baseSHA := strings.Repeat("c", 40)
+	targetDirectoryCalls := 0
+	targetFileCalls := 0
+	workflowData := []byte("name: Trusted\non: pull_request_target\njobs:\n  check:\n    runs-on: ubuntu-latest\n    steps:\n      - run: make check\n")
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		switch request.URL.Path {
 		case "/app/installations/2/access_tokens":
 			fmt.Fprint(writer, `{"token":"installation-token"}`)
 		case "/repos/acme/example/commits":
 			http.NotFound(writer, request)
+		case "/repos/acme/example/contents/.open-actions/workflows":
+			if request.URL.Query().Get("ref") != baseSHA {
+				http.NotFound(writer, request)
+				return
+			}
+			targetDirectoryCalls++
+			fmt.Fprint(writer, `[{"name":"trusted.yaml","path":".open-actions/workflows/trusted.yaml","type":"file"}]`)
+		case "/repos/acme/example/contents/.open-actions/workflows/trusted.yaml":
+			if request.URL.Query().Get("ref") != baseSHA {
+				http.NotFound(writer, request)
+				return
+			}
+			targetFileCalls++
+			fmt.Fprintf(writer, `{"encoding":"base64","content":%q}`, base64.StdEncoding.EncodeToString(workflowData))
 		default:
 			http.NotFound(writer, request)
 		}
@@ -325,6 +420,25 @@ func TestDeliveryTimesOutWhenPullRequestMergeRefIsUnavailable(t *testing.T) {
 	if stored.Data[deliveryStateKey] != "" {
 		t.Fatalf("delivery state = %q, want pending", stored.Data[deliveryStateKey])
 	}
+	runs := &actionsv1alpha1.WorkflowRunList{}
+	if err := clusterClient.List(context.Background(), runs); err != nil {
+		t.Fatal(err)
+	}
+	if len(runs.Items) != 1 || runs.Items[0].Spec.Source.GitHub.Event.Name != actionsv1alpha1.GitHubEventNamePullRequestTarget || runs.Items[0].Spec.Source.GitHub.Revision.SHA != baseSHA {
+		t.Fatalf("trusted target runs = %#v", runs.Items)
+	}
+	targetSource := runs.Items[0].Spec.Source.GitHub
+	if targetSource.Revision.HeadSHA != "" || targetSource.Revision.HeadRef != "" || targetSource.Revision.BaseRef != "" || targetSource.Event.PullRequest == nil || targetSource.Event.PullRequest.HeadRef != "feature" || targetSource.Event.PullRequest.HeadSHA != headSHA || targetSource.Event.PullRequest.BaseRef != "main" {
+		t.Fatalf("trusted target source = %#v", targetSource)
+	}
+	reconciler.Now = func() time.Time { return now.Add(30 * time.Second) }
+	result, err = reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: deliveryKey})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.RequeueAfter != mergeRefRetryInterval(30*time.Second) {
+		t.Fatalf("intermediate requeue after = %v, want %v", result.RequeueAfter, mergeRefRetryInterval(30*time.Second))
+	}
 
 	reconciler.Now = func() time.Time { return now.Add(mergeRefWaitTimeout) }
 	result, err = reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: deliveryKey})
@@ -339,6 +453,139 @@ func TestDeliveryTimesOutWhenPullRequestMergeRefIsUnavailable(t *testing.T) {
 	}
 	if stored.Data[deliveryStateKey] != deliveryStateFailed || !strings.Contains(stored.Data[deliveryMessageKey], headSHA) {
 		t.Fatalf("terminal delivery data = %#v", stored.Data)
+	}
+	if stored.Data[deliveryRunCountKey] != "1" || stored.Data[deliveryTargetRunCountKey] != "1" {
+		t.Fatalf("delivery run accounting = %#v", stored.Data)
+	}
+	if targetDirectoryCalls != 2 || targetFileCalls != 2 {
+		t.Fatalf("target workflow discovery calls = directory %d, file %d; retry repeated discovery", targetDirectoryCalls, targetFileCalls)
+	}
+}
+
+func TestDeliveryFinishesWhenEventRevisionIsUnavailable(t *testing.T) {
+	now := time.Date(2026, 8, 10, 0, 0, 0, 0, time.UTC)
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/app/installations/2/access_tokens":
+			fmt.Fprint(writer, `{"token":"installation-token"}`)
+		case "/repos/acme/example/commits":
+			writer.WriteHeader(http.StatusConflict)
+			fmt.Fprint(writer, `{"message":"Git Repository is empty."}`)
+		default:
+			http.NotFound(writer, request)
+		}
+	}))
+	defer server.Close()
+	clusterClient, reconciler, handler, project := newPullRequestDeliveryTest(t, server, now)
+	event := &payload{}
+	event.Repository.ID = 1
+	event.Repository.Owner.Login = "acme"
+	event.Repository.Name = "example"
+	event.Repository.DefaultBranch = "main"
+	normalized := normalizedEvent{Name: "issues", Action: "opened", Ref: "refs/heads/main", ResolveRef: "main", Issue: &normalizedIssue{Number: 1}}
+	body := []byte(`{"delivery":"empty-repository"}`)
+	if err := handler.enqueueDelivery(context.Background(), project, event, normalized, "delivery", body); err != nil {
+		t.Fatal(err)
+	}
+	key := client.ObjectKey{Namespace: project.Namespace, Name: webhookDeliveryName(body)}
+	if _, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: key}); err != nil {
+		t.Fatal(err)
+	}
+	stored := &corev1.ConfigMap{}
+	if err := clusterClient.Get(context.Background(), key, stored); err != nil {
+		t.Fatal(err)
+	}
+	if stored.Data[deliveryStateKey] != deliveryStateFailed || stored.Data[deliveryFinishedKey] == "" || !strings.Contains(stored.Data[deliveryMessageKey], "unavailable") {
+		t.Fatalf("terminal delivery data = %#v", stored.Data)
+	}
+}
+
+func TestDeliveryDoesNotCountRunsBeforeTargetRevisionFailure(t *testing.T) {
+	now := time.Date(2026, 8, 10, 0, 0, 0, 0, time.UTC)
+	workflowData := []byte("name: CI\non: pull_request\njobs:\n  check:\n    runs-on: ubuntu-latest\n    steps:\n      - run: make check\n")
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/app/installations/2/access_tokens":
+			fmt.Fprint(writer, `{"token":"installation-token"}`)
+		case "/repos/acme/example/commits":
+			http.NotFound(writer, request)
+		case "/repos/acme/example/contents/.open-actions/workflows":
+			fmt.Fprint(writer, `[{"name":"ci.yaml","path":".open-actions/workflows/ci.yaml","type":"file"}]`)
+		case "/repos/acme/example/contents/.open-actions/workflows/ci.yaml":
+			fmt.Fprintf(writer, `{"encoding":"base64","content":%q}`, base64.StdEncoding.EncodeToString(workflowData))
+		default:
+			http.NotFound(writer, request)
+		}
+	}))
+	defer server.Close()
+	clusterClient, reconciler, handler, project := newPullRequestDeliveryTest(t, server, now)
+	event := &payload{}
+	event.Repository.ID = 1
+	event.Repository.Owner.Login = "acme"
+	event.Repository.Name = "example"
+	event.Repository.DefaultBranch = "main"
+	normalized := normalizedEvent{
+		Name: "pull_request", Action: "synchronize", SHA: strings.Repeat("a", 40), Ref: "refs/pull/9/merge", MergeRevision: true,
+		PullRequest: &normalizedPullRequest{
+			Number: 9, HeadRef: "feature", HeadSHA: strings.Repeat("b", 40), BaseRef: "main",
+			HeadRepository: normalizedRepository{ID: 1, Owner: "acme", Name: "example"},
+		},
+	}
+	body := []byte(`{"delivery":"missing-target"}`)
+	if err := handler.enqueueDelivery(context.Background(), project, event, normalized, "delivery", body); err != nil {
+		t.Fatal(err)
+	}
+	key := client.ObjectKey{Namespace: project.Namespace, Name: webhookDeliveryName(body)}
+	if _, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: key}); err != nil {
+		t.Fatal(err)
+	}
+	stored := &corev1.ConfigMap{}
+	if err := clusterClient.Get(context.Background(), key, stored); err != nil {
+		t.Fatal(err)
+	}
+	if stored.Data[deliveryStateKey] != deliveryStateFailed || stored.Data[deliveryRunCountKey] != "0" {
+		t.Fatalf("terminal delivery data = %#v", stored.Data)
+	}
+	runs := &actionsv1alpha1.WorkflowRunList{}
+	if err := clusterClient.List(context.Background(), runs); err != nil {
+		t.Fatal(err)
+	}
+	if len(runs.Items) != 0 {
+		t.Fatalf("WorkflowRuns = %#v, want none before terminal discovery", runs.Items)
+	}
+}
+
+func TestWorkflowRunRevisionOmitsFilterOnlyBaseRef(t *testing.T) {
+	revision := workflowRunRevision(normalizedEvent{
+		Name: "workflow_run", SHA: strings.Repeat("a", 40), Ref: "refs/heads/main", BaseRef: "release",
+	})
+	if revision.BaseRef != "" {
+		t.Fatalf("workflow_run revision baseRef = %q, want empty", revision.BaseRef)
+	}
+	revision = workflowRunRevision(normalizedEvent{
+		Name: "pull_request_target", SHA: strings.Repeat("b", 40), Ref: "refs/heads/main", HeadRef: "feature", BaseRef: "main",
+	})
+	if revision.HeadRef != "" || revision.BaseRef != "" {
+		t.Fatalf("pull_request_target revision = %#v", revision)
+	}
+}
+
+func TestWorkflowRunEventCopiesBoundedMetadata(t *testing.T) {
+	event := workflowRunEvent(normalizedEvent{
+		Name: "issue_comment", Action: "created",
+		PullRequest: &normalizedPullRequest{
+			Number: 42, Body: "Pull request body", HTMLURL: "https://github.com/acme/example/pull/42",
+			HeadRepository: normalizedRepository{ID: 2, Owner: "contributor", Name: "example"}, HeadRef: "feature", HeadSHA: strings.Repeat("a", 40), BaseRef: "main",
+		},
+		WorkflowRun: &normalizedWorkflowRun{Conclusion: "success", HeadSHA: strings.Repeat("b", 40)},
+		Issue:       &normalizedIssue{Number: 17, Body: "Issue body"},
+		Comment:     &normalizedComment{Body: "Comment body"},
+		Review:      &normalizedReview{Body: "Review body"},
+	}, "delivery")
+	if event.DeliveryID != "delivery" || event.PullRequest == nil || event.PullRequest.Body != "Pull request body" || event.PullRequest.HTMLURL != "https://github.com/acme/example/pull/42" ||
+		event.WorkflowRun == nil || event.WorkflowRun.Conclusion != "success" || event.Issue == nil || event.Issue.Number != 17 ||
+		event.Comment == nil || event.Comment.Body != "Comment body" || event.Review == nil || event.Review.Body != "Review body" {
+		t.Fatalf("WorkflowRun event = %#v", event)
 	}
 }
 
@@ -384,10 +631,16 @@ func enqueuePullRequestDelivery(t *testing.T, handler *GitHubHandler, clusterCli
 	event := &payload{}
 	event.Repository.ID = 1
 	event.Repository.Name = "example"
+	event.Repository.DefaultBranch = "main"
 	event.Repository.Owner.Login = "acme"
 	normalized := normalizedEvent{
 		Name: "pull_request", Action: "synchronize", Ref: "refs/pull/9/merge",
-		ResolveRef: "refs/pull/9/merge", HeadRef: "feature", BaseRef: "main", HeadSHA: headSHA,
+		ResolveRef: "refs/pull/9/merge", HeadRef: "feature", BaseRef: "main", HeadSHA: headSHA, MergeRevision: true,
+		PullRequest: &normalizedPullRequest{
+			Number: 9, Body: "Pull request body", HTMLURL: "https://github.com/acme/example/pull/9",
+			HeadRef: "feature", HeadSHA: headSHA, BaseRef: "main", BaseSHA: strings.Repeat("c", 40),
+			HeadRepository: normalizedRepository{ID: 1, Owner: "acme", Name: "example"},
+		},
 	}
 	if err := handler.enqueueDelivery(context.Background(), project, event, normalized, "delivery", body); err != nil {
 		t.Fatal(err)
@@ -485,6 +738,20 @@ func TestDeliveryFanOutLimits(t *testing.T) {
 				t.Fatalf("validateDeliveryFanOut() error = %v, wantError = %v", err, tt.wantError)
 			}
 		})
+	}
+}
+
+func TestWorkflowFileCountIsSharedAcrossRevisions(t *testing.T) {
+	paths := make([]string, 0, maxWorkflowFiles)
+	for index := range maxWorkflowFiles {
+		paths = append(paths, fmt.Sprintf(".open-actions/workflows/workflow-%03d.yaml", index))
+	}
+	seen := map[string]struct{}{}
+	if count := recordWorkflowFiles(seen, paths); count != maxWorkflowFiles {
+		t.Fatalf("first revision workflow files = %d, want %d", count, maxWorkflowFiles)
+	}
+	if count := recordWorkflowFiles(seen, paths); count != maxWorkflowFiles {
+		t.Fatalf("second revision workflow files = %d, want %d", count, maxWorkflowFiles)
 	}
 }
 

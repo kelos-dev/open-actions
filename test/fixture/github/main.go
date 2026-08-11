@@ -58,7 +58,7 @@ jobs:
 `
 
 const unsupportedTriggerWorkflowData = `name: Unsupported trigger
-on: schedule
+on: repository_dispatch
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -333,6 +333,13 @@ func main() {
 			return
 		}
 		writeJSON(writer, map[string]string{"token": "fixture-installation-token"})
+	})
+	mux.HandleFunc("/installation/repositories", func(writer http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodGet {
+			http.Error(writer, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		writeJSON(writer, map[string]any{"total_count": 0, "repositories": []any{}})
 	})
 	mux.HandleFunc("/repos/acme/example/contents/.open-actions/workflows", func(writer http.ResponseWriter, _ *http.Request) {
 		writeJSON(writer, []map[string]string{{"name": "ci.yaml", "path": workflowPath, "type": "file"}})

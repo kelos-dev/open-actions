@@ -84,12 +84,12 @@ spec:
                   revision.
                 properties:
                   github:
-                    description: GitHub records the GitHub delivery and repository
+                    description: GitHub records the GitHub trigger, repository, and
                       revision for this run.
                     properties:
                       event:
-                        description: Event identifies the GitHub delivery that requested
-                          this run.
+                        description: Event identifies the GitHub-compatible trigger
+                          that requested this run.
                         properties:
                           action:
                             description: Action is the payload action, when the event
@@ -98,28 +98,232 @@ spec:
                             minLength: 1
                             pattern: ^[a-z][a-z0-9_]*$
                             type: string
+                          comment:
+                            description: Comment records the comment body for issue
+                              and pull request comment events.
+                            properties:
+                              body:
+                                description: Body is the comment body observed in
+                                  the webhook payload.
+                                maxLength: 48000
+                                type: string
+                            required:
+                            - body
+                            type: object
                           deliveryID:
-                            description: DeliveryID is the value of the X-GitHub-Delivery
-                              header.
+                            description: |-
+                              DeliveryID is the value of the X-GitHub-Delivery header for webhook-backed
+                              runs. It must be omitted for manual, scheduled, and reusable-workflow runs.
                             maxLength: 128
                             minLength: 1
                             pattern: ^[A-Za-z0-9-]+$
                             type: string
+                          inputs:
+                            additionalProperties:
+                              type: string
+                            description: Inputs contains validated values supplied
+                              to a manual or reusable workflow.
+                            maxProperties: 25
+                            type: object
+                            x-kubernetes-validations:
+                            - message: input names must start with a letter or '_'
+                                and contain at most 100 letters, digits, '-' or '_'
+                              rule: self.all(key, key.matches('^[A-Za-z_][A-Za-z0-9_-]{0,99}$'))
+                            - message: input values must be no more than 65535 characters
+                              rule: self.all(key, size(self[key]) <= 65535)
+                            - message: input names and values must contain no more
+                                than 65535 characters in total
+                              rule: self.map(key, size(key) + size(self[key])).sum()
+                                <= 65535
+                          issue:
+                            description: Issue records bounded issue metadata for
+                              issues and issue_comment events.
+                            properties:
+                              body:
+                                description: Body is the issue or pull request body
+                                  observed in the webhook payload.
+                                maxLength: 48000
+                                type: string
+                              number:
+                                description: Number is the repository-scoped issue
+                                  or pull request number.
+                                format: int64
+                                maximum: 9007199254740991
+                                minimum: 1
+                                type: integer
+                            required:
+                            - body
+                            - number
+                            type: object
                           name:
-                            description: Name is the value of the X-GitHub-Event delivery
-                              header.
+                            description: Name identifies the GitHub-compatible event
+                              that initiated the run.
                             enum:
                             - push
                             - pull_request
                             - merge_group
+                            - workflow_run
+                            - workflow_dispatch
+                            - issues
+                            - pull_request_target
+                            - issue_comment
+                            - pull_request_review_comment
+                            - pull_request_review
+                            - schedule
+                            - release
+                            - workflow_call
                             type: string
+                          pullRequest:
+                            description: |-
+                              PullRequest records bounded pull request metadata separately from the
+                              trusted revision selected for workflow execution.
+                            properties:
+                              baseRef:
+                                description: BaseRef is the pull request target branch
+                                  name.
+                                maxLength: 255
+                                minLength: 1
+                                pattern: ^[^\x00-\x20\x7f~^:?*\[\\]+$
+                                type: string
+                                x-kubernetes-validations:
+                                - message: must be a well-formed GitHub branch name
+                                  rule: '!self.startsWith(''/'') && !self.startsWith(''.'')
+                                    && !self.startsWith(''refs/'') && !self.endsWith(''/'')
+                                    && !self.contains(''//'') && !self.contains(''..'')
+                                    && !self.contains(''/.'') && !self.endsWith(''.'')
+                                    && !self.contains(''.lock/'') && !self.endsWith(''.lock'')
+                                    && !self.contains(''@{'') && !self.matches(''^[0-9A-Fa-f]{40}$'')'
+                              body:
+                                description: Body is the pull request body observed
+                                  in the webhook payload.
+                                maxLength: 48000
+                                type: string
+                              headRef:
+                                description: HeadRef is the pull request source branch
+                                  name.
+                                maxLength: 255
+                                minLength: 1
+                                pattern: ^[^\x00-\x20\x7f~^:?*\[\\]+$
+                                type: string
+                                x-kubernetes-validations:
+                                - message: must be a well-formed GitHub branch name
+                                  rule: '!self.startsWith(''/'') && !self.startsWith(''.'')
+                                    && !self.startsWith(''refs/'') && !self.endsWith(''/'')
+                                    && !self.contains(''//'') && !self.contains(''..'')
+                                    && !self.contains(''/.'') && !self.endsWith(''.'')
+                                    && !self.contains(''.lock/'') && !self.endsWith(''.lock'')
+                                    && !self.contains(''@{'') && !self.matches(''^[0-9A-Fa-f]{40}$'')'
+                              headRepository:
+                                description: HeadRepository identifies the repository
+                                  containing the pull request head.
+                                properties:
+                                  id:
+                                    description: ID is GitHub's stable numeric repository
+                                      identifier.
+                                    format: int64
+                                    maximum: 9007199254740991
+                                    minimum: 1
+                                    type: integer
+                                  name:
+                                    description: Name is the repository name at the
+                                      time of the event.
+                                    maxLength: 100
+                                    minLength: 1
+                                    pattern: ^[A-Za-z0-9._-]+$
+                                    type: string
+                                  owner:
+                                    description: Owner is the repository owner's login
+                                      at the time of the event.
+                                    maxLength: 100
+                                    minLength: 1
+                                    pattern: ^[A-Za-z0-9][A-Za-z0-9_-]*$
+                                    type: string
+                                required:
+                                - id
+                                - name
+                                - owner
+                                type: object
+                                x-kubernetes-validations:
+                                - message: '`name` must be a GitHub repository name'
+                                  rule: self.name != '.' && self.name != '..'
+                              headSHA:
+                                description: HeadSHA is the pull request head commit
+                                  observed in the webhook payload.
+                                pattern: ^[0-9a-f]{40}$
+                                type: string
+                              htmlURL:
+                                description: HTMLURL is the browser URL for the pull
+                                  request.
+                                maxLength: 2048
+                                minLength: 1
+                                pattern: ^https?://[^[:space:]]+$
+                                type: string
+                              number:
+                                description: Number is the repository-scoped pull
+                                  request number.
+                                format: int64
+                                maximum: 9007199254740991
+                                minimum: 1
+                                type: integer
+                            required:
+                            - baseRef
+                            - body
+                            - headRef
+                            - headRepository
+                            - headSHA
+                            - htmlURL
+                            - number
+                            type: object
+                          review:
+                            description: Review records the review body for pull_request_review
+                              events.
+                            properties:
+                              body:
+                                description: Body is the review body observed in the
+                                  webhook payload.
+                                maxLength: 48000
+                                type: string
+                            required:
+                            - body
+                            type: object
+                          schedule:
+                            description: Schedule is the validated cron expression
+                              that initiated a scheduled run.
+                            maxLength: 256
+                            minLength: 1
+                            pattern: ^[^[:space:]]+([[:space:]]+[^[:space:]]+){4}$
+                            type: string
+                          workflowRun:
+                            description: |-
+                              WorkflowRun records bounded metadata about the GitHub Actions workflow run
+                              that initiated a workflow_run event.
+                            properties:
+                              conclusion:
+                                description: |-
+                                  Conclusion is the completed workflow run conclusion. It is absent while
+                                  the triggering run is requested or in progress.
+                                maxLength: 64
+                                minLength: 1
+                                pattern: ^[a-z][a-z_]*$
+                                type: string
+                              headSHA:
+                                description: HeadSHA is the triggering workflow run's
+                                  head commit.
+                                pattern: ^[0-9a-f]{40}$
+                                type: string
+                            required:
+                            - headSHA
+                            type: object
                         required:
-                        - deliveryID
                         - name
                         type: object
                         x-kubernetes-validations:
                         - message: push events must not specify action
                           rule: self.name != 'push' || !has(self.action)
+                        - message: workflow_dispatch, schedule, and workflow_call
+                            events must not specify action
+                          rule: '!(self.name in [''workflow_dispatch'', ''schedule'',
+                            ''workflow_call'']) || !has(self.action)'
                         - message: pull_request action must be a supported activity
                             type
                           rule: self.name != 'pull_request' || (has(self.action) &&
@@ -129,9 +333,84 @@ spec:
                             'dequeued', 'milestoned', 'demilestoned', 'ready_for_review',
                             'review_requested', 'review_request_removed', 'auto_merge_enabled',
                             'auto_merge_disabled'])
+                        - message: pull_request_target action must be a supported
+                            activity type
+                          rule: self.name != 'pull_request_target' || (has(self.action)
+                            && self.action in ['assigned', 'unassigned', 'labeled',
+                            'unlabeled', 'opened', 'edited', 'closed', 'reopened',
+                            'synchronize', 'converted_to_draft', 'locked', 'unlocked',
+                            'enqueued', 'dequeued', 'milestoned', 'demilestoned',
+                            'ready_for_review', 'review_requested', 'review_request_removed',
+                            'auto_merge_enabled', 'auto_merge_disabled'])
                         - message: merge_group action must be checks_requested
                           rule: self.name != 'merge_group' || (has(self.action) &&
                             self.action == 'checks_requested')
+                        - message: workflow_run action must be a supported activity
+                            type
+                          rule: self.name != 'workflow_run' || (has(self.action) &&
+                            self.action in ['completed', 'requested', 'in_progress'])
+                        - message: issues action must be a supported activity type
+                          rule: self.name != 'issues' || (has(self.action) && self.action
+                            in ['opened', 'edited', 'deleted', 'transferred', 'pinned',
+                            'unpinned', 'closed', 'reopened', 'assigned', 'unassigned',
+                            'labeled', 'unlabeled', 'locked', 'unlocked', 'milestoned',
+                            'demilestoned', 'typed', 'untyped', 'field_added', 'field_removed'])
+                        - message: issue_comment action must be a supported activity
+                            type
+                          rule: self.name != 'issue_comment' || (has(self.action)
+                            && self.action in ['created', 'edited', 'deleted'])
+                        - message: pull_request_review_comment action must be a supported
+                            activity type
+                          rule: self.name != 'pull_request_review_comment' || (has(self.action)
+                            && self.action in ['created', 'edited', 'deleted'])
+                        - message: pull_request_review action must be a supported
+                            activity type
+                          rule: self.name != 'pull_request_review' || (has(self.action)
+                            && self.action in ['submitted', 'edited', 'dismissed'])
+                        - message: release action must be a supported activity type
+                          rule: self.name != 'release' || (has(self.action) && self.action
+                            in ['published', 'unpublished', 'created', 'edited', 'deleted',
+                            'prereleased', 'released'])
+                        - message: pullRequest must be specified for pull_request_target
+                            and pull request review events
+                          rule: 'self.name in [''pull_request_target'', ''pull_request_review'',
+                            ''pull_request_review_comment''] ? has(self.pullRequest)
+                            : true'
+                        - message: pullRequest may be specified only for pull request
+                            events
+                          rule: '!has(self.pullRequest) || self.name in [''pull_request'',
+                            ''pull_request_target'', ''pull_request_review'', ''pull_request_review_comment'']'
+                        - message: workflowRun must be specified exactly for workflow_run
+                            events
+                          rule: 'self.name == ''workflow_run'' ? has(self.workflowRun)
+                            : !has(self.workflowRun)'
+                        - message: workflowRun.conclusion must be specified for completed
+                            workflow_run events
+                          rule: self.name != 'workflow_run' || (has(self.workflowRun)
+                            && (self.action != 'completed' || has(self.workflowRun.conclusion)))
+                        - message: issue must be specified exactly for issues and
+                            issue_comment events
+                          rule: 'self.name in [''issues'', ''issue_comment''] ? has(self.issue)
+                            : !has(self.issue)'
+                        - message: comment must be specified exactly for comment events
+                          rule: 'self.name in [''issue_comment'', ''pull_request_review_comment'']
+                            ? has(self.comment) : !has(self.comment)'
+                        - message: review must be specified exactly for pull_request_review
+                            events
+                          rule: 'self.name == ''pull_request_review'' ? has(self.review)
+                            : !has(self.review)'
+                        - message: inputs may be specified only for workflow_dispatch
+                            and workflow_call events
+                          rule: self.name in ['workflow_dispatch', 'workflow_call']
+                            || !has(self.inputs)
+                        - message: schedule must be specified exactly for schedule
+                            events
+                          rule: 'self.name == ''schedule'' ? has(self.schedule) :
+                            !has(self.schedule)'
+                        - message: deliveryID must be specified exactly for webhook-backed
+                            events
+                          rule: 'self.name in [''workflow_dispatch'', ''schedule'',
+                            ''workflow_call''] ? !has(self.deliveryID) : has(self.deliveryID)'
                       repository:
                         description: Repository identifies the GitHub repository at
                           the time of the event.
@@ -171,8 +450,8 @@ spec:
                         properties:
                           baseRef:
                             description: |-
-                              BaseRef is the target branch name for pull request and merge group events,
-                              when applicable.
+                              BaseRef is the target branch name for pull_request and merge_group execution
+                              revisions, when applicable.
                             maxLength: 255
                             minLength: 1
                             pattern: ^[^\x00-\x20\x7f~^:?*\[\\]+$
@@ -186,8 +465,9 @@ spec:
                                 && !self.contains(''.lock/'') && !self.endsWith(''.lock'')
                                 && !self.contains(''@{'') && !self.matches(''^[0-9A-Fa-f]{40}$'')'
                           headRef:
-                            description: HeadRef is the pull request source branch
-                              name, when applicable.
+                            description: |-
+                              HeadRef is the pull request source branch name, when applicable to the
+                              execution revision.
                             maxLength: 255
                             minLength: 1
                             pattern: ^[^\x00-\x20\x7f~^:?*\[\\]+$
@@ -260,6 +540,30 @@ spec:
                     - message: merge_group revision.ref must identify a merge queue
                         branch
                       rule: self.event.name != 'merge_group' || self.revision.ref.startsWith('refs/heads/gh-readonly-queue/')
+                    - message: pull_request_target revision.ref must identify event.pullRequest.baseRef
+                      rule: self.event.name != 'pull_request_target' || (has(self.event.pullRequest)
+                        && self.revision.ref == 'refs/heads/' + self.event.pullRequest.baseRef)
+                    - message: default-branch events must identify a branch ref
+                      rule: '!(self.event.name in [''workflow_run'', ''issues'', ''issue_comment'',
+                        ''pull_request_review'', ''pull_request_review_comment'',
+                        ''schedule'']) || self.revision.ref.startsWith(''refs/heads/'')'
+                    - message: workflow_dispatch and workflow_call revision.ref must
+                        identify a branch or tag
+                      rule: '!(self.event.name in [''workflow_dispatch'', ''workflow_call''])
+                        || self.revision.ref.startsWith(''refs/heads/'') || self.revision.ref.startsWith(''refs/tags/'')'
+                    - message: release revision.ref must identify a tag
+                      rule: self.event.name != 'release' || self.revision.ref.startsWith('refs/tags/')
+                    - message: pull request event metadata must match duplicated revision
+                        fields
+                      rule: self.event.name != 'pull_request' || !has(self.event.pullRequest)
+                        || (self.event.pullRequest.headRef == self.revision.headRef
+                        && self.event.pullRequest.baseRef == self.revision.baseRef
+                        && has(self.revision.headSHA) && self.event.pullRequest.headSHA
+                        == self.revision.headSHA)
+                    - message: pull request revision.ref must identify event.pullRequest.number
+                      rule: self.event.name != 'pull_request' || !has(self.event.pullRequest)
+                        || !self.revision.ref.startsWith('refs/pull/') || int(self.revision.ref.split('/')[2])
+                        == self.event.pullRequest.number
                   type:
                     description: Type selects the source data variant.
                     enum:

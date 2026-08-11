@@ -51,7 +51,7 @@ func TestJobPlanCoversSupportedSteps(t *testing.T) {
 		{Uses: "actions/setup-go@v5", With: map[string]any{"go-version-file": "go.mod"}},
 		{Name: "Build", Run: "make build"},
 	}}
-	plan, err := reconciler.jobPlan(run, "CI", "build", job)
+	plan, err := reconciler.jobPlan(run, "CI", "build", job, map[string]any{"enabled": false, "retries": float64(2)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -60,6 +60,9 @@ func TestJobPlanCoversSupportedSteps(t *testing.T) {
 	}
 	if plan.Version != runner.PlanVersion || plan.Repository.ID != 1 || plan.Event.DeliveryID != "delivery" || plan.Revision.BaseRef != "target" {
 		t.Errorf("plan identity = %#v", plan)
+	}
+	if plan.Inputs["enabled"] != false || plan.Inputs["retries"] != float64(2) {
+		t.Errorf("plan inputs = %#v", plan.Inputs)
 	}
 	if len(plan.Steps) != 3 {
 		t.Errorf("steps = %d", len(plan.Steps))
@@ -72,37 +75,229 @@ func TestPlanWorkflowJobsSetsDisplayNames(t *testing.T) {
 		Type: actionsv1alpha1.SourceTypeGitHub,
 		GitHub: &actionsv1alpha1.GitHubWorkflowRunSource{
 			Repository: actionsv1alpha1.GitHubRepository{ID: 1},
-			Event:      actionsv1alpha1.GitHubEvent{Name: "pull_request", Action: "synchronize", DeliveryID: "delivery"},
-			Revision:   actionsv1alpha1.GitRevision{SHA: strings.Repeat("a", 40), Ref: "refs/pull/1/merge", HeadRef: "feature", BaseRef: "main"},
+			Event: actionsv1alpha1.GitHubEvent{
+				Name: "pull_request", Action: "synchronize", DeliveryID: "delivery", Inputs: map[string]string{"environment": "staging"},
+				PullRequest: &actionsv1alpha1.GitHubPullRequest{
+					Number: 7, HeadRef: "feature", HeadSHA: strings.Repeat("b", 40), BaseRef: "main",
+					HeadRepository: actionsv1alpha1.GitHubRepository{ID: 2, Owner: "contributor", Name: "project"},
+				},
+			},
+			Revision: actionsv1alpha1.GitRevision{SHA: strings.Repeat("a", 40), Ref: "refs/pull/7/merge", HeadRef: "feature", BaseRef: "main"},
 		},
 	}}}
 	definition := &workflow.Definition{Name: "CI", Jobs: map[string]workflow.Job{
-		"build": {Name: "Build ${{ github.base_ref }}", RunsOn: workflow.StringList{"ubuntu-latest"}},
+		"build": {Name: "Build ${{ github.base_ref }} PR ${{ github.event.pull_request.number }} from ${{ github.event.pull_request.head.repo.full_name }} at ${{ github.event.pull_request.merge_commit_sha }} for ${{ inputs.environment }} (${{ github.event.inputs.environment }})", RunsOn: workflow.StringList{"ubuntu-latest"}},
 		"lint":  {RunsOn: workflow.StringList{"ubuntu-latest"}},
 	}}
 
-	planned, err := reconciler.planWorkflowJobs(run, definition)
+	planned, err := reconciler.planWorkflowJobs(run, definition, map[string]any{"environment": "staging"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(planned) != 2 {
 		t.Fatalf("planned jobs = %d, want 2", len(planned))
 	}
-	if planned[0].id != "build" || planned[0].displayName != "Build main" {
+	if planned[0].id != "build" || planned[0].displayName != "Build main PR 7 from contributor/project at "+strings.Repeat("a", 40)+" for staging (staging)" {
 		t.Errorf("build job = %#v", planned[0])
+	}
+	plan := &runner.Plan{}
+	if err := json.Unmarshal([]byte(planned[0].plan), plan); err != nil {
+		t.Fatal(err)
+	}
+	if plan.Event.PullRequest == nil || plan.Event.PullRequest.Number != 7 || plan.Event.PullRequest.HeadRepository.Owner != "contributor" || plan.Event.PullRequest.HeadSHA != strings.Repeat("b", 40) {
+		t.Fatalf("plan pull request = %#v", plan.Event.PullRequest)
 	}
 	if planned[1].id != "lint" || planned[1].displayName != "lint" {
 		t.Errorf("lint job = %#v", planned[1])
 	}
 }
 
+func TestJobExpressionsUseCanonicalEventInputs(t *testing.T) {
+	reconciler := &WorkflowRunReconciler{}
+	run := &actionsv1alpha1.WorkflowRun{Spec: actionsv1alpha1.WorkflowRunSpec{Source: actionsv1alpha1.WorkflowRunSource{
+		Type: actionsv1alpha1.SourceTypeGitHub,
+		GitHub: &actionsv1alpha1.GitHubWorkflowRunSource{
+			Repository: actionsv1alpha1.GitHubRepository{ID: 1, Owner: "acme", Name: "example"},
+			Event:      actionsv1alpha1.GitHubEvent{Name: "workflow_dispatch", Inputs: map[string]string{"retries": "1.10"}},
+			Revision:   actionsv1alpha1.GitRevision{SHA: strings.Repeat("a", 40), Ref: "refs/heads/main"},
+		},
+	}}}
+	definition := &workflow.Definition{Name: "Manual", Jobs: map[string]workflow.Job{
+		"check": {Name: "${{ inputs.retries }}-${{ github.event.inputs.retries }}", RunsOn: workflow.StringList{"ubuntu-latest"}},
+	}}
+	planned, err := reconciler.planWorkflowJobs(run, definition, map[string]any{"retries": float64(1.1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(planned) != 1 || planned[0].displayName != "1.1-1.1" {
+		t.Fatalf("planned jobs = %#v", planned)
+	}
+}
+
+func TestJobPlanFitsBoundedEncodedContexts(t *testing.T) {
+	reconciler := &WorkflowRunReconciler{}
+	job := workflow.Job{RunsOn: workflow.StringList{"ubuntu-latest"}, Steps: []workflow.Step{{Run: strings.Repeat("\\", workflow.MaxRunScriptBytes)}}}
+	t.Run("event bodies", func(t *testing.T) {
+		body := strings.Repeat("\x01", 48_000)
+		run := &actionsv1alpha1.WorkflowRun{Spec: actionsv1alpha1.WorkflowRunSpec{Source: actionsv1alpha1.WorkflowRunSource{
+			Type: actionsv1alpha1.SourceTypeGitHub,
+			GitHub: &actionsv1alpha1.GitHubWorkflowRunSource{
+				Repository: actionsv1alpha1.GitHubRepository{ID: 1, Owner: "acme", Name: "example"},
+				Event: actionsv1alpha1.GitHubEvent{
+					Name: "pull_request_review", Action: "submitted", DeliveryID: "delivery",
+					PullRequest: &actionsv1alpha1.GitHubPullRequest{
+						Number: 42, Body: body, HTMLURL: "https://github.com/acme/example/pull/42",
+						HeadRepository: actionsv1alpha1.GitHubRepository{ID: 2, Owner: "contributor", Name: "example"},
+						HeadRef:        "feature", HeadSHA: strings.Repeat("a", 40), BaseRef: "main",
+					},
+					Review: &actionsv1alpha1.GitHubReviewEvent{Body: body},
+				},
+				Revision: actionsv1alpha1.GitRevision{SHA: strings.Repeat("b", 40), Ref: "refs/heads/main"},
+			},
+		}}}
+		planned, err := reconciler.planWorkflowJobs(run, &workflow.Definition{Name: "Review", Jobs: map[string]workflow.Job{"check": job}}, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(planned) != 1 {
+			t.Fatalf("planned jobs = %d, want 1", len(planned))
+		}
+		if len(planned[0].plan) > maxJobPlanBytes {
+			t.Fatalf("job plan size = %d, maximum = %d", len(planned[0].plan), maxJobPlanBytes)
+		}
+	})
+	t.Run("escaped input", func(t *testing.T) {
+		value := strings.Repeat("\x01", 65_534)
+		run := &actionsv1alpha1.WorkflowRun{Spec: actionsv1alpha1.WorkflowRunSpec{Source: actionsv1alpha1.WorkflowRunSource{
+			Type: actionsv1alpha1.SourceTypeGitHub,
+			GitHub: &actionsv1alpha1.GitHubWorkflowRunSource{
+				Repository: actionsv1alpha1.GitHubRepository{ID: 1, Owner: "acme", Name: "example"},
+				Event:      actionsv1alpha1.GitHubEvent{Name: "workflow_dispatch", Inputs: map[string]string{"a": value}},
+				Revision:   actionsv1alpha1.GitRevision{SHA: strings.Repeat("b", 40), Ref: "refs/heads/main"},
+			},
+		}}}
+		planned, err := reconciler.planWorkflowJobs(run, &workflow.Definition{Name: "Manual", Jobs: map[string]workflow.Job{"check": job}}, map[string]any{"a": value})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(planned) != 1 {
+			t.Fatalf("planned jobs = %d, want 1", len(planned))
+		}
+		if len(planned[0].plan) > maxJobPlanBytes {
+			t.Fatalf("job plan size = %d, maximum = %d", len(planned[0].plan), maxJobPlanBytes)
+		}
+		document := map[string]any{}
+		if err := json.Unmarshal([]byte(planned[0].plan), &document); err != nil {
+			t.Fatal(err)
+		}
+		if _, found := document["event"].(map[string]any)["inputs"]; found {
+			t.Fatal("job plan serialized resolved inputs twice")
+		}
+	})
+}
+
+func TestJobExpressionsIncludeBoundedEventMetadata(t *testing.T) {
+	reconciler := &WorkflowRunReconciler{}
+	for _, tt := range []struct {
+		name       string
+		event      actionsv1alpha1.GitHubEvent
+		expression string
+		want       string
+	}{
+		{name: "workflow run", event: actionsv1alpha1.GitHubEvent{Name: "workflow_run", WorkflowRun: &actionsv1alpha1.GitHubWorkflowRunEvent{Conclusion: "success", HeadSHA: strings.Repeat("a", 40)}}, expression: "${{ github.event.workflow_run.conclusion }}-${{ github.event.workflow_run.head_sha }}", want: "success-" + strings.Repeat("a", 40)},
+		{name: "issue", event: actionsv1alpha1.GitHubEvent{Name: "issues", Issue: &actionsv1alpha1.GitHubIssueEvent{Number: 17, Body: "/kind bug"}}, expression: "${{ github.event.issue.number }}-${{ github.event.issue.body }}", want: "17-/kind bug"},
+		{name: "comment", event: actionsv1alpha1.GitHubEvent{Name: "issue_comment", Comment: &actionsv1alpha1.GitHubCommentEvent{Body: "/priority important-soon"}}, expression: "${{ github.event.comment.body }}", want: "/priority important-soon"},
+		{name: "review", event: actionsv1alpha1.GitHubEvent{Name: "pull_request_review", Review: &actionsv1alpha1.GitHubReviewEvent{Body: "/kind api"}}, expression: "${{ github.event.review.body }}", want: "/kind api"},
+		{name: "release", event: actionsv1alpha1.GitHubEvent{Name: "release"}, expression: "${{ github.event.release.tag_name }}", want: "v1.2.3"},
+		{name: "pull request", event: actionsv1alpha1.GitHubEvent{Name: "pull_request_target", PullRequest: &actionsv1alpha1.GitHubPullRequest{Number: 42, Body: "Pull request body", HTMLURL: "https://github.com/contributor/example/pull/42"}}, expression: "${{ github.event.pull_request.number }}-${{ github.event.pull_request.body }}-${{ github.event.pull_request.html_url }}", want: "42-Pull request body-https://github.com/contributor/example/pull/42"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			ref := "refs/heads/main"
+			if tt.event.Name == actionsv1alpha1.GitHubEventNameRelease {
+				ref = "refs/tags/v1.2.3"
+			}
+			run := &actionsv1alpha1.WorkflowRun{Spec: actionsv1alpha1.WorkflowRunSpec{Source: actionsv1alpha1.WorkflowRunSource{
+				Type: actionsv1alpha1.SourceTypeGitHub,
+				GitHub: &actionsv1alpha1.GitHubWorkflowRunSource{
+					Event: tt.event, Revision: actionsv1alpha1.GitRevision{SHA: strings.Repeat("b", 40), Ref: ref},
+				},
+			}}}
+			job, err := workflow.EvaluateJob("test", workflow.Job{Name: tt.expression, RunsOn: workflow.StringList{"ubuntu-latest"}}, reconciler.jobExpressionContext(run, "CI", nil))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if job.Name != tt.want {
+				t.Fatalf("evaluated job name = %q, want %q", job.Name, tt.want)
+			}
+		})
+	}
+}
+
 func TestWorkflowEventIncludesRevisionValues(t *testing.T) {
 	event := workflowEvent(&actionsv1alpha1.GitHubWorkflowRunSource{
-		Event:    actionsv1alpha1.GitHubEvent{Name: "push", Action: "created"},
-		Revision: actionsv1alpha1.GitRevision{Ref: "refs/heads/main", HeadRef: "feature", BaseRef: "target"},
+		Event: actionsv1alpha1.GitHubEvent{
+			Name: "pull_request_target", Action: "synchronize", Inputs: map[string]string{"environment": "staging"},
+			PullRequest: &actionsv1alpha1.GitHubPullRequest{
+				Number: 7, Body: "Pull request body", HTMLURL: "https://github.com/contributor/project/pull/7",
+				HeadRef: "feature", HeadSHA: strings.Repeat("a", 40), BaseRef: "target",
+				HeadRepository: actionsv1alpha1.GitHubRepository{ID: 2, Owner: "contributor", Name: "project"},
+			},
+		},
+		Revision: actionsv1alpha1.GitRevision{Ref: "refs/heads/main"},
 	})
-	if event.Name != "push" || event.Action != "created" || event.Ref != "refs/heads/main" || event.RefName != "main" || event.HeadRef != "feature" || event.BaseRef != "target" {
+	if event.Name != "pull_request_target" || event.Action != "synchronize" || event.Ref != "refs/heads/main" || event.RefName != "main" || event.HeadRef != "feature" || event.BaseRef != "target" || event.Inputs["environment"] != "staging" || event.PullRequest == nil || event.PullRequest.Number != 7 || event.PullRequest.Body != "Pull request body" || event.PullRequest.HTMLURL != "https://github.com/contributor/project/pull/7" || event.PullRequest.HeadRepository.Owner != "contributor" {
 		t.Fatalf("workflow event = %#v", event)
+	}
+}
+
+func TestResolvePlanningEventInputs(t *testing.T) {
+	definition, err := workflow.Parse([]byte("name: Manual\non:\n  workflow_dispatch:\n    inputs:\n      namespace:\n        required: true\n        type: string\n      dry-run:\n        type: boolean\n        default: false\n      retries:\n        type: number\njobs:\n  run:\n    runs-on: ubuntu-latest\n    steps:\n      - run: make deploy\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := &actionsv1alpha1.WorkflowRun{Spec: actionsv1alpha1.WorkflowRunSpec{Source: actionsv1alpha1.WorkflowRunSource{
+		Type: actionsv1alpha1.SourceTypeGitHub,
+		GitHub: &actionsv1alpha1.GitHubWorkflowRunSource{Event: actionsv1alpha1.GitHubEvent{
+			Name: actionsv1alpha1.GitHubEventNameWorkflowDispatch, Inputs: map[string]string{"namespace": "default", "retries": "1.10"},
+		}},
+	}}}
+	planningRun, event, err := resolvePlanningEvent(run, definition)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if planningRun.Spec.Source.GitHub.Event.Inputs["namespace"] != "default" || planningRun.Spec.Source.GitHub.Event.Inputs["dry-run"] != "false" || planningRun.Spec.Source.GitHub.Event.Inputs["retries"] != "1.1" {
+		t.Fatalf("resolved inputs = %#v", planningRun.Spec.Source.GitHub.Event.Inputs)
+	}
+	if _, found := run.Spec.Source.GitHub.Event.Inputs["dry-run"]; found {
+		t.Fatal("input defaults mutated the WorkflowRun spec")
+	}
+	if event.InputValues["namespace"] != "default" || event.InputValues["dry-run"] != false || event.InputValues["retries"] != float64(1.1) {
+		t.Fatalf("expression inputs = %#v", event.InputValues)
+	}
+
+	run.Spec.Source.GitHub.Event.Name = actionsv1alpha1.GitHubEventNameWorkflowCall
+	if _, _, err := resolvePlanningEvent(run, definition); err == nil {
+		t.Fatal("workflow_call matched a workflow_dispatch declaration")
+	}
+}
+
+func TestResolvePlanningEventValidatesSchedule(t *testing.T) {
+	definition, err := workflow.Parse([]byte("name: Scheduled\non:\n  schedule:\n    - cron: '0 6 * * *'\njobs:\n  run:\n    runs-on: ubuntu-latest\n    steps:\n      - run: make refresh\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := &actionsv1alpha1.WorkflowRun{Spec: actionsv1alpha1.WorkflowRunSpec{Source: actionsv1alpha1.WorkflowRunSource{
+		Type: actionsv1alpha1.SourceTypeGitHub,
+		GitHub: &actionsv1alpha1.GitHubWorkflowRunSource{Event: actionsv1alpha1.GitHubEvent{
+			Name: actionsv1alpha1.GitHubEventNameSchedule, Schedule: "0 6 * * *",
+		}},
+	}}}
+	if _, _, err := resolvePlanningEvent(run, definition); err != nil {
+		t.Fatalf("matching schedule was rejected: %v", err)
+	}
+	run.Spec.Source.GitHub.Event.Schedule = "x x x x x"
+	if _, _, err := resolvePlanningEvent(run, definition); err == nil {
+		t.Fatal("invalid schedule was accepted")
 	}
 }
 
@@ -531,6 +726,48 @@ func TestCanceledWorkflowRunWaitsForPodsBeforeFinalizing(t *testing.T) {
 		}
 	} else if controllerutil.ContainsFinalizer(stored, workflowRunCancellationFinalizer) || controllerutil.ContainsFinalizer(stored, workflowRunCheckFinalizer) {
 		t.Fatal("WorkflowRun finalizer remained after the Pod was deleted")
+	}
+}
+
+func TestScheduledWorkflowRunDeletionRetainsIdempotencyMarker(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := actionsv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	created := time.Date(2026, 8, 11, 6, 0, 10, 0, time.UTC)
+	deleted := metav1.NewTime(created.Add(10 * time.Second))
+	run := &actionsv1alpha1.WorkflowRun{ObjectMeta: metav1.ObjectMeta{
+		Name: "schedule-example", Namespace: "default", CreationTimestamp: metav1.NewTime(created),
+		DeletionTimestamp: &deleted, Finalizers: []string{workflowRunScheduleFinalizer},
+	}}
+	clusterClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(run).Build()
+	reconciler := &WorkflowRunReconciler{
+		Client: clusterClient, APIReader: clusterClient,
+		Now: func() time.Time { return time.Date(2026, 8, 11, 6, 0, 30, 0, time.UTC) },
+	}
+	result, err := reconciler.finalizeCanceledWorkflowRun(context.Background(), run)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.RequeueAfter != 30*time.Second {
+		t.Fatalf("requeue after = %v, want 30s", result.RequeueAfter)
+	}
+	stored := &actionsv1alpha1.WorkflowRun{}
+	if err := clusterClient.Get(context.Background(), client.ObjectKeyFromObject(run), stored); err != nil {
+		t.Fatal(err)
+	}
+	if !controllerutil.ContainsFinalizer(stored, workflowRunScheduleFinalizer) {
+		t.Fatal("schedule idempotency finalizer was removed during the due minute")
+	}
+	reconciler.Now = func() time.Time { return time.Date(2026, 8, 11, 6, 1, 0, 0, time.UTC) }
+	if _, err := reconciler.finalizeCanceledWorkflowRun(context.Background(), stored); err != nil {
+		t.Fatal(err)
+	}
+	stored = &actionsv1alpha1.WorkflowRun{}
+	if err := clusterClient.Get(context.Background(), client.ObjectKeyFromObject(run), stored); client.IgnoreNotFound(err) != nil {
+		t.Fatal(err)
+	} else if err == nil && controllerutil.ContainsFinalizer(stored, workflowRunScheduleFinalizer) {
+		t.Fatal("schedule idempotency finalizer remained after the due minute")
 	}
 }
 

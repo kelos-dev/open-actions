@@ -66,6 +66,8 @@ func normalizeWorkflowRunCELIntegers(object map[string]any) {
 
 func TestWorkflowRunAcceptsGitHubEventContracts(t *testing.T) {
 	crd, _ := loadCRD(t, "actions.kelos.dev_workflowruns.yaml")
+	validateSample(t, crd, "actions_v1alpha1_workflowrun-schedule.yaml")
+	validateSample(t, crd, "actions_v1alpha1_workflowrun-dispatch.yaml")
 	for _, tt := range []struct {
 		name   string
 		mutate func(map[string]any)
@@ -95,6 +97,94 @@ func TestWorkflowRunAcceptsGitHubEventContracts(t *testing.T) {
 				delete(revision, "headRef")
 			},
 		},
+		{
+			name: "workflow run",
+			mutate: func(github map[string]any) {
+				setBranchEvent(github, "workflow_run", "completed")
+				github["event"].(map[string]any)["workflowRun"] = map[string]any{"conclusion": "success", "headSHA": strings.Repeat("a", 40)}
+			},
+		},
+		{
+			name: "workflow dispatch with inputs",
+			mutate: func(github map[string]any) {
+				setBranchEvent(github, "workflow_dispatch", "")
+				github["event"].(map[string]any)["inputs"] = map[string]any{"namespace": "default"}
+			},
+		},
+		{
+			name: "issues",
+			mutate: func(github map[string]any) {
+				setBranchEvent(github, "issues", "opened")
+				github["event"].(map[string]any)["issue"] = map[string]any{"number": int64(42), "body": "/kind bug"}
+			},
+		},
+		{
+			name: "pull request target",
+			mutate: func(github map[string]any) {
+				event := github["event"].(map[string]any)
+				event["name"] = "pull_request_target"
+				event["pullRequest"] = pullRequestEventMetadata()
+				revision := github["revision"].(map[string]any)
+				revision["ref"] = "refs/heads/main"
+				delete(revision, "headSHA")
+				delete(revision, "headRef")
+				delete(revision, "baseRef")
+			},
+		},
+		{
+			name: "issue comment",
+			mutate: func(github map[string]any) {
+				setBranchEvent(github, "issue_comment", "created")
+				event := github["event"].(map[string]any)
+				event["issue"] = map[string]any{"number": int64(42), "body": "Issue body"}
+				event["comment"] = map[string]any{"body": "/kind bug"}
+			},
+		},
+		{
+			name: "pull request review comment",
+			mutate: func(github map[string]any) {
+				setBranchEvent(github, "pull_request_review_comment", "created")
+				event := github["event"].(map[string]any)
+				event["pullRequest"] = pullRequestEventMetadata()
+				event["comment"] = map[string]any{"body": "/priority important-soon"}
+			},
+		},
+		{
+			name: "pull request review",
+			mutate: func(github map[string]any) {
+				setBranchEvent(github, "pull_request_review", "submitted")
+				event := github["event"].(map[string]any)
+				event["pullRequest"] = pullRequestEventMetadata()
+				event["review"] = map[string]any{"body": "/kind api"}
+			},
+		},
+		{
+			name: "schedule",
+			mutate: func(github map[string]any) {
+				setBranchEvent(github, "schedule", "")
+				github["event"].(map[string]any)["schedule"] = "0 6 * * *"
+			},
+		},
+		{
+			name: "release",
+			mutate: func(github map[string]any) {
+				event := github["event"].(map[string]any)
+				event["name"] = "release"
+				event["action"] = "published"
+				revision := github["revision"].(map[string]any)
+				revision["ref"] = "refs/tags/v1.0.0"
+				delete(revision, "headSHA")
+				delete(revision, "headRef")
+				delete(revision, "baseRef")
+			},
+		},
+		{
+			name: "workflow call with inputs",
+			mutate: func(github map[string]any) {
+				setBranchEvent(github, "workflow_call", "")
+				github["event"].(map[string]any)["inputs"] = map[string]any{"enabled": "true"}
+			},
+		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			object := loadSample(t, "actions_v1alpha1_workflowrun.yaml")
@@ -104,6 +194,192 @@ func TestWorkflowRunAcceptsGitHubEventContracts(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestWorkflowRunValidatesPullRequestTargetMetadata(t *testing.T) {
+	crd, _ := loadCRD(t, "actions.kelos.dev_workflowruns.yaml")
+	object := loadSample(t, "actions_v1alpha1_workflowrun.yaml")
+	github := workflowRunGitHub(object)
+	event := github["event"].(map[string]any)
+	event["name"] = "pull_request_target"
+	revision := github["revision"].(map[string]any)
+	revision["ref"] = "refs/heads/main"
+	delete(revision, "headSHA")
+	delete(revision, "headRef")
+	delete(revision, "baseRef")
+	if errs := validateObject(t, crd, object, nil); len(errs) == 0 {
+		t.Fatal("pull_request_target without metadata passed validation")
+	}
+	event["pullRequest"] = map[string]any{
+		"number": int64(42), "body": "", "htmlURL": "github.com/contributor/example/pull/42",
+		"headSHA": strings.Repeat("b", 40), "headRef": "feature", "baseRef": "main",
+		"headRepository": map[string]any{"id": int64(2), "owner": "contributor", "name": "example"},
+	}
+	if errs := validateObject(t, crd, object, nil); len(errs) == 0 {
+		t.Fatal("pull_request_target with an invalid HTML URL passed validation")
+	}
+	event["pullRequest"] = pullRequestEventMetadata()
+	revision["ref"] = "refs/heads/release"
+	if errs := validateObject(t, crd, object, nil); len(errs) == 0 {
+		t.Fatal("pull_request_target with a revision outside its base branch passed validation")
+	}
+}
+
+func TestWorkflowRunRequiresGitHubEventMetadata(t *testing.T) {
+	crd, _ := loadCRD(t, "actions.kelos.dev_workflowruns.yaml")
+	for _, tt := range []struct {
+		name       string
+		eventName  string
+		action     string
+		missingKey string
+		metadata   map[string]any
+	}{
+		{name: "workflow run", eventName: "workflow_run", action: "completed", missingKey: "workflowRun", metadata: map[string]any{"workflowRun": map[string]any{"conclusion": "success", "headSHA": strings.Repeat("a", 40)}}},
+		{name: "issues", eventName: "issues", action: "opened", missingKey: "issue", metadata: map[string]any{"issue": map[string]any{"number": int64(42), "body": "Issue body"}}},
+		{name: "issue comment", eventName: "issue_comment", action: "created", missingKey: "comment", metadata: map[string]any{"issue": map[string]any{"number": int64(42), "body": "Issue body"}, "comment": map[string]any{"body": "Comment body"}}},
+		{name: "review comment", eventName: "pull_request_review_comment", action: "created", missingKey: "comment", metadata: map[string]any{"pullRequest": pullRequestEventMetadata(), "comment": map[string]any{"body": "Comment body"}}},
+		{name: "review", eventName: "pull_request_review", action: "submitted", missingKey: "review", metadata: map[string]any{"pullRequest": pullRequestEventMetadata(), "review": map[string]any{"body": "Review body"}}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			object := loadSample(t, "actions_v1alpha1_workflowrun.yaml")
+			github := workflowRunGitHub(object)
+			event := github["event"].(map[string]any)
+			setBranchEvent(github, tt.eventName, tt.action)
+			for key, value := range tt.metadata {
+				event[key] = value
+			}
+			if errs := validateObject(t, crd, object, nil); len(errs) > 0 {
+				t.Fatalf("valid event metadata was rejected: %v", errs.ToAggregate())
+			}
+			delete(event, tt.missingKey)
+			if errs := validateObject(t, crd, object, nil); len(errs) == 0 {
+				t.Fatalf("%s event without %s passed validation", tt.eventName, tt.missingKey)
+			}
+		})
+	}
+}
+
+func TestWorkflowRunRejectsMismatchedGitHubEventMetadata(t *testing.T) {
+	crd, _ := loadCRD(t, "actions.kelos.dev_workflowruns.yaml")
+	for _, tt := range []struct {
+		name   string
+		mutate func(map[string]any)
+	}{
+		{
+			name: "completed workflow run without conclusion",
+			mutate: func(github map[string]any) {
+				setBranchEvent(github, "workflow_run", "completed")
+				github["event"].(map[string]any)["workflowRun"] = map[string]any{"headSHA": strings.Repeat("a", 40)}
+			},
+		},
+		{
+			name: "review without pull request",
+			mutate: func(github map[string]any) {
+				setBranchEvent(github, "pull_request_review", "submitted")
+				github["event"].(map[string]any)["review"] = map[string]any{"body": "Review body"}
+			},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			object := loadSample(t, "actions_v1alpha1_workflowrun.yaml")
+			tt.mutate(workflowRunGitHub(object))
+			if errs := validateObject(t, crd, object, nil); len(errs) == 0 {
+				t.Fatal("invalid GitHub event metadata passed validation")
+			}
+		})
+	}
+}
+
+func TestWorkflowRunValidatesPullRequestMetadataConsistency(t *testing.T) {
+	crd, _ := loadCRD(t, "actions.kelos.dev_workflowruns.yaml")
+	for _, tt := range []struct {
+		name   string
+		mutate func(map[string]any)
+	}{
+		{name: "head ref", mutate: func(metadata map[string]any) { metadata["headRef"] = "other-branch" }},
+		{name: "base ref", mutate: func(metadata map[string]any) { metadata["baseRef"] = "other-branch" }},
+		{name: "head SHA", mutate: func(metadata map[string]any) { metadata["headSHA"] = strings.Repeat("a", 40) }},
+		{name: "number", mutate: func(metadata map[string]any) { metadata["number"] = int64(43) }},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			object := loadSample(t, "actions_v1alpha1_workflowrun.yaml")
+			event := workflowRunGitHub(object)["event"].(map[string]any)
+			metadata := pullRequestEventMetadata()
+			event["pullRequest"] = metadata
+			if errs := validateObject(t, crd, object, nil); len(errs) > 0 {
+				t.Fatalf("consistent pull request metadata was rejected: %v", errs.ToAggregate())
+			}
+			tt.mutate(metadata)
+			if errs := validateObject(t, crd, object, nil); len(errs) == 0 {
+				t.Fatal("inconsistent pull request metadata passed validation")
+			}
+		})
+	}
+	object := loadSample(t, "actions_v1alpha1_workflowrun.yaml")
+	github := workflowRunGitHub(object)
+	github["event"].(map[string]any)["pullRequest"] = pullRequestEventMetadata()
+	delete(github["revision"].(map[string]any), "headSHA")
+	if errs := validateObject(t, crd, object, nil); len(errs) == 0 {
+		t.Fatal("pull request metadata without revision.headSHA passed validation")
+	}
+}
+
+func TestWorkflowRunBoundsGitHubEventMetadata(t *testing.T) {
+	crd, _ := loadCRD(t, "actions.kelos.dev_workflowruns.yaml")
+	object := loadSample(t, "actions_v1alpha1_workflowrun.yaml")
+	github := workflowRunGitHub(object)
+	setBranchEvent(github, "issues", "opened")
+	issue := map[string]any{"number": int64(42), "body": strings.Repeat("x", 48_000)}
+	github["event"].(map[string]any)["issue"] = issue
+	if errs := validateObject(t, crd, object, nil); len(errs) > 0 {
+		t.Fatalf("maximum issue body was rejected: %v", errs.ToAggregate())
+	}
+	issue["body"] = strings.Repeat("x", 48_001)
+	if errs := validateObject(t, crd, object, nil); len(errs) == 0 {
+		t.Fatal("oversized issue body passed validation")
+	}
+}
+
+func pullRequestEventMetadata() map[string]any {
+	return map[string]any{
+		"number": int64(42), "body": "Pull request body", "htmlURL": "https://github.com/contributor/example/pull/42",
+		"headSHA": "fedcba9876543210fedcba9876543210fedcba98", "headRef": "feature-branch", "baseRef": "main",
+		"headRepository": map[string]any{"id": int64(2), "owner": "contributor", "name": "example"},
+	}
+}
+
+func TestWorkflowRunInputPayloadBoundary(t *testing.T) {
+	crd, _ := loadCRD(t, "actions.kelos.dev_workflowruns.yaml")
+	object := loadSample(t, "actions_v1alpha1_workflowrun-dispatch.yaml")
+	inputs := workflowRunGitHub(object)["event"].(map[string]any)["inputs"].(map[string]any)
+	inputs["a"] = strings.Repeat("x", 65_534)
+	delete(inputs, "environment")
+	if errs := validateObject(t, crd, object, nil); len(errs) > 0 {
+		t.Fatalf("input payload at the maximum was rejected: %v", errs.ToAggregate())
+	}
+
+	inputs["a"] = strings.Repeat("x", 65_535)
+	if errs := validateObject(t, crd, object, nil); len(errs) == 0 {
+		t.Fatal("input payload above the maximum passed validation")
+	}
+}
+
+func setBranchEvent(github map[string]any, name, action string) {
+	event := github["event"].(map[string]any)
+	event["name"] = name
+	if name == "workflow_dispatch" || name == "schedule" || name == "workflow_call" {
+		delete(event, "deliveryID")
+	}
+	if action == "" {
+		delete(event, "action")
+	} else {
+		event["action"] = action
+	}
+	revision := github["revision"].(map[string]any)
+	revision["ref"] = "refs/heads/main"
+	delete(revision, "headSHA")
+	delete(revision, "headRef")
+	delete(revision, "baseRef")
 }
 
 func TestWorkflowRunAcceptsAtBranchName(t *testing.T) {
@@ -614,7 +890,46 @@ func TestCRDRejectsInvalidCELValues(t *testing.T) {
 			name: "WorkflowRun unsupported event name",
 			crd:  "actions.kelos.dev_workflowruns.yaml", sample: "actions_v1alpha1_workflowrun.yaml",
 			mutate: func(object map[string]any) {
-				workflowRunGitHub(object)["event"].(map[string]any)["name"] = "schedule"
+				workflowRunGitHub(object)["event"].(map[string]any)["name"] = "deployment"
+			},
+		},
+		{
+			name: "WorkflowRun schedule without cron expression",
+			crd:  "actions.kelos.dev_workflowruns.yaml", sample: "actions_v1alpha1_workflowrun.yaml",
+			mutate: func(object map[string]any) {
+				setBranchEvent(workflowRunGitHub(object), "schedule", "")
+			},
+		},
+		{
+			name: "WorkflowRun schedule with malformed cron expression",
+			crd:  "actions.kelos.dev_workflowruns.yaml", sample: "actions_v1alpha1_workflowrun.yaml",
+			mutate: func(object map[string]any) {
+				github := workflowRunGitHub(object)
+				setBranchEvent(github, "schedule", "")
+				github["event"].(map[string]any)["schedule"] = "0 6 * *"
+			},
+		},
+		{
+			name: "WorkflowRun push with inputs",
+			crd:  "actions.kelos.dev_workflowruns.yaml", sample: "actions_v1alpha1_workflowrun.yaml",
+			mutate: func(object map[string]any) {
+				github := workflowRunGitHub(object)
+				setBranchEvent(github, "push", "")
+				github["event"].(map[string]any)["inputs"] = map[string]any{"value": "unexpected"}
+			},
+		},
+		{
+			name: "WorkflowRun webhook event without delivery ID",
+			crd:  "actions.kelos.dev_workflowruns.yaml", sample: "actions_v1alpha1_workflowrun.yaml",
+			mutate: func(object map[string]any) {
+				delete(workflowRunGitHub(object)["event"].(map[string]any), "deliveryID")
+			},
+		},
+		{
+			name: "WorkflowRun manual event with delivery ID",
+			crd:  "actions.kelos.dev_workflowruns.yaml", sample: "actions_v1alpha1_workflowrun-dispatch.yaml",
+			mutate: func(object map[string]any) {
+				workflowRunGitHub(object)["event"].(map[string]any)["deliveryID"] = "manual-delivery"
 			},
 		},
 		{

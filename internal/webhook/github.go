@@ -13,9 +13,11 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	actionsv1alpha1 "github.com/kelos-dev/open-actions/api/v1alpha1"
 	githubclient "github.com/kelos-dev/open-actions/internal/github"
+	"github.com/kelos-dev/open-actions/internal/workflow"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -23,8 +25,12 @@ import (
 )
 
 const (
-	maxPayloadBytes = 10 << 20
-	zeroGitSHA      = "0000000000000000000000000000000000000000"
+	maxPayloadBytes       = 10 << 20
+	maxEventBodyLength    = 48_000
+	maxEventURLLength     = 2_048
+	maxEventTagNameLength = 1_014
+	maxConclusionLength   = 64
+	zeroGitSHA            = "0000000000000000000000000000000000000000"
 )
 
 type GitHubHandler struct {
@@ -33,37 +39,40 @@ type GitHubHandler struct {
 	Logger    *slog.Logger
 }
 
+type payloadRepository struct {
+	ID            int64  `json:"id"`
+	Name          string `json:"name"`
+	DefaultBranch string `json:"default_branch"`
+	Owner         struct {
+		Login string `json:"login"`
+	} `json:"owner"`
+}
+
 type payload struct {
 	Action       string `json:"action"`
+	Ref          string `json:"ref"`
 	Installation struct {
 		ID int64 `json:"id"`
 	} `json:"installation"`
-	Repository struct {
-		ID            int64  `json:"id"`
-		Name          string `json:"name"`
-		DefaultBranch string `json:"default_branch"`
-		Owner         struct {
-			Login string `json:"login"`
-		} `json:"owner"`
-	} `json:"repository"`
-	After       string `json:"after"`
-	Deleted     bool   `json:"deleted"`
-	Ref         string `json:"ref"`
+	Repository  payloadRepository `json:"repository"`
+	After       string            `json:"after"`
+	Deleted     bool              `json:"deleted"`
 	PullRequest struct {
 		Number         int64  `json:"number"`
+		Body           string `json:"body"`
+		HTMLURL        string `json:"html_url"`
 		MergeCommitSHA string `json:"merge_commit_sha"`
 		State          string `json:"state"`
 		Merged         bool   `json:"merged"`
 		Mergeable      *bool  `json:"mergeable"`
 		Head           struct {
-			Ref        string `json:"ref"`
-			SHA        string `json:"sha"`
-			Repository struct {
-				ID int64 `json:"id"`
-			} `json:"repo"`
+			Ref        string            `json:"ref"`
+			SHA        string            `json:"sha"`
+			Repository payloadRepository `json:"repo"`
 		} `json:"head"`
 		Base struct {
 			Ref string `json:"ref"`
+			SHA string `json:"sha"`
 		} `json:"base"`
 	} `json:"pull_request"`
 	MergeGroup struct {
@@ -71,17 +80,80 @@ type payload struct {
 		HeadRef string `json:"head_ref"`
 		BaseRef string `json:"base_ref"`
 	} `json:"merge_group"`
+	WorkflowRun struct {
+		Name       string `json:"name"`
+		HeadBranch string `json:"head_branch"`
+		HeadSHA    string `json:"head_sha"`
+		Conclusion string `json:"conclusion"`
+	} `json:"workflow_run"`
+	Issue struct {
+		Number int64  `json:"number"`
+		Body   string `json:"body"`
+	} `json:"issue"`
+	Comment struct {
+		Body string `json:"body"`
+	} `json:"comment"`
+	Review struct {
+		Body string `json:"body"`
+	} `json:"review"`
+	Release struct {
+		TagName string `json:"tag_name"`
+		Draft   bool   `json:"draft"`
+	} `json:"release"`
+}
+
+type normalizedRepository struct {
+	ID    int64  `json:"id"`
+	Owner string `json:"owner"`
+	Name  string `json:"name"`
+}
+
+type normalizedPullRequest struct {
+	Number         int64                `json:"number"`
+	Body           string               `json:"body"`
+	HTMLURL        string               `json:"htmlURL"`
+	HeadRepository normalizedRepository `json:"headRepository"`
+	HeadRef        string               `json:"headRef"`
+	HeadSHA        string               `json:"headSHA"`
+	BaseRef        string               `json:"baseRef"`
+	BaseSHA        string               `json:"baseSHA,omitempty"`
+}
+
+type normalizedWorkflowRun struct {
+	Conclusion string `json:"conclusion,omitempty"`
+	HeadSHA    string `json:"headSHA"`
+}
+
+type normalizedIssue struct {
+	Number int64  `json:"number"`
+	Body   string `json:"body"`
+}
+
+type normalizedComment struct {
+	Body string `json:"body"`
+}
+
+type normalizedReview struct {
+	Body string `json:"body"`
 }
 
 type normalizedEvent struct {
-	Name       string `json:"name"`
-	Action     string `json:"action,omitempty"`
-	SHA        string `json:"sha,omitempty"`
-	Ref        string `json:"ref"`
-	HeadRef    string `json:"headRef,omitempty"`
-	BaseRef    string `json:"baseRef,omitempty"`
-	ResolveRef string `json:"resolveRef,omitempty"`
-	HeadSHA    string `json:"headSHA,omitempty"`
+	Name          string                 `json:"name"`
+	Action        string                 `json:"action,omitempty"`
+	SHA           string                 `json:"sha,omitempty"`
+	Ref           string                 `json:"ref"`
+	HeadRef       string                 `json:"headRef,omitempty"`
+	BaseRef       string                 `json:"baseRef,omitempty"`
+	ResolveRef    string                 `json:"resolveRef,omitempty"`
+	HeadSHA       string                 `json:"headSHA,omitempty"`
+	Fork          bool                   `json:"fork,omitempty"`
+	MergeRevision bool                   `json:"mergeRevision,omitempty"`
+	WorkflowName  string                 `json:"workflowName,omitempty"`
+	PullRequest   *normalizedPullRequest `json:"pullRequest,omitempty"`
+	WorkflowRun   *normalizedWorkflowRun `json:"workflowRun,omitempty"`
+	Issue         *normalizedIssue       `json:"issue,omitempty"`
+	Comment       *normalizedComment     `json:"comment,omitempty"`
+	Review        *normalizedReview      `json:"review,omitempty"`
 }
 
 func (h *GitHubHandler) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
@@ -170,6 +242,9 @@ func (h *GitHubHandler) projectForInstallation(ctx context.Context, installation
 
 func normalize(eventName string, event *payload) (normalizedEvent, bool, error) {
 	result := normalizedEvent{Name: eventName, Action: event.Action}
+	if !workflow.SupportsEventAction(eventName, event.Action) {
+		return result, false, nil
+	}
 	switch eventName {
 	case "push":
 		result.Ref = event.Ref
@@ -183,57 +258,157 @@ func normalize(eventName string, event *payload) (normalizedEvent, bool, error) 
 		if pullRequest.State != "open" && pullRequest.State != "closed" {
 			return normalizedEvent{}, false, errors.New("GitHub pull request event has an invalid state")
 		}
-		if pullRequest.Number < 1 || pullRequest.Head.Ref == "" || pullRequest.Base.Ref == "" {
-			return normalizedEvent{}, false, errors.New("GitHub pull request event is incomplete")
+		metadata, err := pullRequestMetadata(event)
+		if err != nil {
+			return normalizedEvent{}, false, err
 		}
-		if pullRequest.Head.Repository.ID == 0 || pullRequest.Head.Repository.ID != event.Repository.ID {
-			return normalizedEvent{}, false, nil
+		if metadata == nil {
+			return result, false, nil
 		}
 		if pullRequest.Merged && (pullRequest.State != "closed" || event.Action != "closed") {
 			return normalizedEvent{}, false, errors.New("GitHub pull request event has an invalid merged state")
 		}
-		if !pullRequest.Merged && pullRequest.Mergeable != nil && !*pullRequest.Mergeable {
-			return result, false, nil
-		}
+		mergeRef := "refs/pull/" + strconv.FormatInt(pullRequest.Number, 10) + "/merge"
+		result.PullRequest = metadata
+		result.Fork = pullRequest.Head.Repository.ID != event.Repository.ID
 		if pullRequest.Merged {
 			if pullRequest.MergeCommitSHA == "" {
 				return normalizedEvent{}, false, errors.New("GitHub merged pull request event does not identify a revision")
 			}
 			result.SHA = pullRequest.MergeCommitSHA
 			result.Ref = "refs/heads/" + pullRequest.Base.Ref
+			result.MergeRevision = true
 		} else {
-			result.Ref = "refs/pull/" + strconv.FormatInt(pullRequest.Number, 10) + "/merge"
-			if pullRequest.State == "open" {
-				if !validGitSHA(pullRequest.Head.SHA) {
-					return normalizedEvent{}, false, errors.New("GitHub pull request event contains an invalid head revision")
-				}
+			result.Ref = mergeRef
+			if pullRequest.State == "open" && !result.Fork && (pullRequest.Mergeable == nil || *pullRequest.Mergeable) {
 				result.ResolveRef = result.Ref
 				result.HeadSHA = pullRequest.Head.SHA
-			} else if pullRequest.MergeCommitSHA == "" {
-				return result, false, nil
-			} else {
+				result.MergeRevision = true
+			} else if pullRequest.State == "closed" && pullRequest.MergeCommitSHA != "" {
 				result.SHA = pullRequest.MergeCommitSHA
+				result.MergeRevision = true
 			}
 		}
 		result.HeadRef = pullRequest.Head.Ref
 		result.BaseRef = pullRequest.Base.Ref
-	case "merge_group":
-		if event.Action != "checks_requested" {
+	case "pull_request_review", "pull_request_review_comment":
+		pullRequest, err := pullRequestMetadata(event)
+		if err != nil {
+			return normalizedEvent{}, false, err
+		}
+		if pullRequest == nil {
 			return result, false, nil
 		}
+		result.PullRequest = pullRequest
+		if eventName == "pull_request_review" {
+			if !validEventBody(event.Review.Body) {
+				return normalizedEvent{}, false, errors.New("GitHub pull request review body is too large")
+			}
+			result.Review = &normalizedReview{Body: event.Review.Body}
+		} else {
+			if !validEventBody(event.Comment.Body) {
+				return normalizedEvent{}, false, errors.New("GitHub pull request review comment body is too large")
+			}
+			result.Comment = &normalizedComment{Body: event.Comment.Body}
+		}
+		setDefaultBranchRevision(&result, event)
+	case "merge_group":
 		result.SHA = event.MergeGroup.HeadSHA
 		result.Ref = event.MergeGroup.HeadRef
 		result.BaseRef = githubclient.RefName(event.MergeGroup.BaseRef)
+	case "workflow_run":
+		if event.WorkflowRun.Name == "" || !validGitSHA(event.WorkflowRun.HeadSHA) || !validConclusion(event.WorkflowRun.Conclusion, event.Action == "completed") {
+			return normalizedEvent{}, false, errors.New("GitHub workflow run event is incomplete")
+		}
+		result.WorkflowName = event.WorkflowRun.Name
+		result.BaseRef = event.WorkflowRun.HeadBranch
+		result.WorkflowRun = &normalizedWorkflowRun{Conclusion: event.WorkflowRun.Conclusion, HeadSHA: event.WorkflowRun.HeadSHA}
+		setDefaultBranchRevision(&result, event)
+	case "issues", "issue_comment":
+		if event.Issue.Number < 1 || !validEventBody(event.Issue.Body) {
+			return normalizedEvent{}, false, errors.New("GitHub issue event is incomplete")
+		}
+		result.Issue = &normalizedIssue{Number: event.Issue.Number, Body: event.Issue.Body}
+		if eventName == "issue_comment" {
+			if !validEventBody(event.Comment.Body) {
+				return normalizedEvent{}, false, errors.New("GitHub issue comment body is too large")
+			}
+			result.Comment = &normalizedComment{Body: event.Comment.Body}
+		}
+		setDefaultBranchRevision(&result, event)
+	case "release":
+		if event.Release.Draft {
+			return result, false, nil
+		}
+		if event.Release.TagName == "" || utf8.RuneCountInString(event.Release.TagName) > maxEventTagNameLength {
+			return normalizedEvent{}, false, errors.New("GitHub release event has no tag")
+		}
+		result.Ref = "refs/tags/" + event.Release.TagName
+		result.ResolveRef = result.Ref
 	default:
 		return result, false, nil
 	}
-	if (result.SHA == "" && result.ResolveRef == "") || result.Ref == "" || githubclient.RefName(result.Ref) == "" {
+	missingRevision := result.SHA == "" && result.ResolveRef == ""
+	targetOnlyPullRequest := eventName == "pull_request" && !result.MergeRevision
+	if (missingRevision && !targetOnlyPullRequest) || result.Ref == "" || githubclient.RefName(result.Ref) == "" {
 		return normalizedEvent{}, false, errors.New("GitHub event does not identify a revision")
 	}
 	if result.SHA != "" && !validGitSHA(result.SHA) {
 		return normalizedEvent{}, false, errors.New("GitHub event contains an invalid revision")
 	}
 	return result, true, nil
+}
+
+func pullRequestMetadata(event *payload) (*normalizedPullRequest, error) {
+	pullRequest := event.PullRequest
+	if pullRequest.Number < 1 || pullRequest.Head.Ref == "" || pullRequest.Base.Ref == "" || !validGitHubHTMLURL(pullRequest.HTMLURL) || !validEventBody(pullRequest.Body) {
+		return nil, errors.New("GitHub pull request event is incomplete")
+	}
+	if pullRequest.Head.Repository.ID == 0 || pullRequest.Head.Repository.Owner.Login == "" || pullRequest.Head.Repository.Name == "" {
+		return nil, nil
+	}
+	if !validGitSHA(pullRequest.Head.SHA) {
+		return nil, errors.New("GitHub pull request event contains an invalid head revision")
+	}
+	if !validGitSHA(pullRequest.Base.SHA) {
+		return nil, errors.New("GitHub pull request event contains an invalid base revision")
+	}
+	return &normalizedPullRequest{
+		Number: pullRequest.Number, Body: pullRequest.Body, HTMLURL: pullRequest.HTMLURL,
+		HeadRepository: normalizedRepository{
+			ID: pullRequest.Head.Repository.ID, Owner: pullRequest.Head.Repository.Owner.Login, Name: pullRequest.Head.Repository.Name,
+		},
+		HeadRef: pullRequest.Head.Ref, HeadSHA: pullRequest.Head.SHA,
+		BaseRef: pullRequest.Base.Ref, BaseSHA: pullRequest.Base.SHA,
+	}, nil
+}
+
+func validEventBody(body string) bool {
+	return utf8.RuneCountInString(body) <= maxEventBodyLength
+}
+
+func validGitHubHTMLURL(value string) bool {
+	return value != "" && utf8.RuneCountInString(value) <= maxEventURLLength && (strings.HasPrefix(value, "https://") || strings.HasPrefix(value, "http://")) && !strings.ContainsAny(value, " \t\r\n")
+}
+
+func validConclusion(value string, required bool) bool {
+	if value == "" {
+		return !required
+	}
+	if len(value) > maxConclusionLength || value[0] < 'a' || value[0] > 'z' {
+		return false
+	}
+	for _, character := range value[1:] {
+		if (character < 'a' || character > 'z') && character != '_' {
+			return false
+		}
+	}
+	return true
+}
+
+func setDefaultBranchRevision(result *normalizedEvent, event *payload) {
+	result.Ref = "refs/heads/" + event.Repository.DefaultBranch
+	result.ResolveRef = event.Repository.DefaultBranch
 }
 
 func validSignature(body, secret []byte, signature string) bool {
