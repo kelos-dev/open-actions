@@ -244,6 +244,41 @@ jobs:
           EOF
           done
 
+          kubectl apply -f - <<EOF
+          apiVersion: actions.kelos.dev/v1alpha1
+          kind: Runner
+          metadata:
+            name: docker-runner-1
+            namespace: default
+          spec:
+            projectRef:
+              name: default
+            execution:
+              image: ghcr.io/kelos-dev/open-actions-runner:${OPEN_ACTIONS_IMAGE_TAG}
+              resources:
+                requests:
+                  cpu: 100m
+                  memory: 256Mi
+                limits:
+                  cpu: "2"
+                  memory: 4Gi
+              docker:
+                image: docker:29.7.2-dind@sha256:12e683a161823b2a839aeea999b9d960e6e1f9a97b1679ad6b441982e2d9cf07
+                resources:
+                  requests:
+                    cpu: 500m
+                    memory: 1Gi
+                  limits:
+                    cpu: "4"
+                    memory: 8Gi
+                    ephemeral-storage: 20Gi
+            labels:
+              - self-hosted
+              - linux
+              - x64
+              - docker
+          EOF
+
       - name: Show Cloudflare Access logs
         if: failure()
         run: cat "${RUNNER_TEMP}/cloudflared-access.log" 2>/dev/null || true

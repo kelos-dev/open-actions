@@ -1,0 +1,32 @@
+apiVersion: actions.kelos.dev/v1alpha1
+kind: Runner
+metadata:
+  name: docker-runner-1
+  namespace: open-actions
+spec:
+  projectRef:
+    name: default
+  execution:
+    image: ghcr.io/kelos-dev/open-actions-runner:latest
+    resources:
+      requests:
+        cpu: "1"
+        memory: 1Gi
+      limits:
+        cpu: "2"
+        memory: 2Gi
+    docker:
+      image: docker:29.7.2-dind@sha256:12e683a161823b2a839aeea999b9d960e6e1f9a97b1679ad6b441982e2d9cf07
+      resources:
+        requests:
+          cpu: 500m
+          memory: 1Gi
+        limits:
+          cpu: "2"
+          memory: 4Gi
+          ephemeral-storage: 8Gi
+  labels:
+    - self-hosted
+    - linux
+    - x64
+    - docker

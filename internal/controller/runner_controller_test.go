@@ -111,6 +111,91 @@ func TestRunnerBuildsOwnedJob(t *testing.T) {
 	}
 }
 
+func TestRunnerBuildsDockerEnabledJob(t *testing.T) {
+	scheme := runnerTestScheme(t)
+	reconciler := &RunnerReconciler{Client: fake.NewClientBuilder().WithScheme(scheme).Build()}
+	runnerObject := &actionsv1alpha1.Runner{
+		ObjectMeta: metav1.ObjectMeta{Name: "runner-1", Namespace: "default", UID: types.UID("runner-uid")},
+		Spec: actionsv1alpha1.RunnerSpec{Execution: actionsv1alpha1.RunnerExecutionSpec{
+			Image: "runner:test",
+			Docker: &actionsv1alpha1.RunnerDockerSpec{
+				Image: "docker:dind",
+				Resources: &actionsv1alpha1.RunnerResources{
+					Requests: actionsv1alpha1.RunnerResourceList{corev1.ResourceCPU: resource.MustParse("500m")},
+					Limits:   actionsv1alpha1.RunnerResourceList{corev1.ResourceEphemeralStorage: resource.MustParse("6Gi")},
+				},
+			},
+		}},
+	}
+	workflowJob := &actionsv1alpha1.WorkflowJob{ObjectMeta: metav1.ObjectMeta{Name: "ci-kind", Namespace: "default", UID: types.UID("workflow-job-uid")}}
+	job, err := reconciler.buildJob(workflowJob, &actionsv1alpha1.WorkflowRun{}, &actionsv1alpha1.Project{}, runnerObject)
+	if err != nil {
+		t.Fatalf("build job: %v", err)
+	}
+
+	pod := job.Spec.Template.Spec
+	if len(pod.InitContainers) != 1 {
+		t.Fatalf("init containers = %#v", pod.InitContainers)
+	}
+	docker := pod.InitContainers[0]
+	if docker.Name != "docker" || docker.Image != "docker:dind" {
+		t.Errorf("Docker sidecar = %q %q", docker.Name, docker.Image)
+	}
+	if docker.RestartPolicy == nil || *docker.RestartPolicy != corev1.ContainerRestartPolicyAlways {
+		t.Errorf("Docker restart policy = %v", docker.RestartPolicy)
+	}
+	if !slices.Equal(docker.Args, []string{"dockerd", "--host=" + dockerHost, "--group=65532"}) {
+		t.Errorf("Docker args = %v", docker.Args)
+	}
+	if docker.SecurityContext == nil || docker.SecurityContext.Privileged == nil || !*docker.SecurityContext.Privileged ||
+		docker.SecurityContext.RunAsNonRoot == nil || *docker.SecurityContext.RunAsNonRoot ||
+		docker.SecurityContext.RunAsUser == nil || *docker.SecurityContext.RunAsUser != 0 {
+		t.Errorf("Docker security context = %#v", docker.SecurityContext)
+	}
+	if docker.StartupProbe == nil || docker.StartupProbe.Exec == nil || !slices.Equal(docker.StartupProbe.Exec.Command, []string{"docker", "info"}) {
+		t.Errorf("Docker startup probe = %#v", docker.StartupProbe)
+	}
+	if docker.Resources.Requests.Cpu().String() != "500m" {
+		t.Errorf("Docker CPU request = %s", docker.Resources.Requests.Cpu().String())
+	}
+
+	runnerContainer := pod.Containers[0]
+	environment := map[string]string{}
+	for _, variable := range runnerContainer.Env {
+		environment[variable.Name] = variable.Value
+	}
+	if environment["DOCKER_HOST"] != dockerHost {
+		t.Errorf("runner DOCKER_HOST = %q", environment["DOCKER_HOST"])
+	}
+	expectedRunnerMounts := []corev1.VolumeMount{
+		{Name: jobPlanVolume, MountPath: jobPlanMountPath, ReadOnly: true},
+		{Name: workspaceVolume, MountPath: workspaceVolumeMountPath},
+		{Name: dockerSocketVolume, MountPath: dockerSocketDirectory},
+	}
+	if !slices.Equal(runnerContainer.VolumeMounts, expectedRunnerMounts) {
+		t.Errorf("runner mounts = %#v", runnerContainer.VolumeMounts)
+	}
+	expectedDockerMounts := []corev1.VolumeMount{
+		{Name: dockerSocketVolume, MountPath: dockerSocketDirectory},
+		{Name: dockerStorageVolume, MountPath: dockerStoragePath},
+		{Name: workspaceVolume, MountPath: workspaceVolumeMountPath},
+	}
+	if !slices.Equal(docker.VolumeMounts, expectedDockerMounts) {
+		t.Errorf("Docker mounts = %#v", docker.VolumeMounts)
+	}
+	volumes := map[string]corev1.Volume{}
+	for _, volume := range pod.Volumes {
+		volumes[volume.Name] = volume
+	}
+	storage := volumes[dockerStorageVolume].EmptyDir
+	if storage == nil || storage.SizeLimit == nil || storage.SizeLimit.String() != "6Gi" {
+		t.Errorf("Docker storage volume = %#v", storage)
+	}
+	if socket := volumes[dockerSocketVolume].EmptyDir; socket == nil {
+		t.Errorf("Docker socket volume = %#v", volumes[dockerSocketVolume])
+	}
+}
+
 func TestRunnerClaimsOldestMatchingWorkflowJobInProject(t *testing.T) {
 	scheme := runnerTestScheme(t)
 	created := metav1.NewTime(time.Unix(100, 0))

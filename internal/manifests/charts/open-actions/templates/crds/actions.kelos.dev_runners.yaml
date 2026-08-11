@@ -63,6 +63,97 @@ spec:
                   to execute assigned WorkflowJobs. The controller owns the underlying Pod
                   and Job configuration. Changes apply only to Jobs created afterward.
                 properties:
+                  docker:
+                    description: |-
+                      Docker configures a job-scoped Docker daemon. The daemon runs in a
+                      privileged sidecar and is available to workflow steps through DOCKER_HOST.
+                    properties:
+                      image:
+                        description: |-
+                          Image is a Docker-in-Docker image whose entrypoint accepts dockerd as its
+                          first argument and provides the docker CLI for readiness checks.
+                        maxLength: 2048
+                        minLength: 1
+                        pattern: ^[^[:space:]]+$
+                        type: string
+                      resources:
+                        description: |-
+                          Resources describes the compute resources available to the Docker daemon
+                          and the containers it starts. An ephemeral-storage limit also sets the
+                          size limit of the Docker data volume.
+                        properties:
+                          limits:
+                            additionalProperties:
+                              anyOf:
+                              - type: integer
+                              - type: string
+                              pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                              x-kubernetes-int-or-string: true
+                            description: Limits describes the maximum compute resources
+                              available to the container.
+                            maxProperties: 7
+                            type: object
+                            x-kubernetes-validations:
+                            - message: resource names must be qualified names
+                              rule: self.all(k, size(k.split('/')) <= 2 && size(k.split('/')[size(k.split('/'))
+                                - 1]) <= 63 && k.split('/')[size(k.split('/')) - 1].matches('^[A-Za-z0-9]([-A-Za-z0-9_.]*[A-Za-z0-9])?$')
+                                && (size(k.split('/')) == 1 || (size(k.split('/')[0])
+                                <= 253 && k.split('/')[0].split('.').all(p, size(p)
+                                <= 63 && p.matches('^[a-z0-9]([-a-z0-9]*[a-z0-9])?$')))))
+                            - message: unprefixed resource names must be standard
+                                container resources
+                              rule: self.all(k, k == 'cpu' || k == 'memory' || k ==
+                                'ephemeral-storage' || k.startsWith('hugepages-')
+                                || k.contains('/'))
+                            - message: resource quantities must not be negative
+                              rule: self.all(k, sign(quantity(string(self[k]))) >=
+                                0)
+                            - message: extended resource quantities must be whole
+                                numbers
+                              rule: self.all(k, !k.contains('/') || quantity(string(self[k])).isInteger())
+                          requests:
+                            additionalProperties:
+                              anyOf:
+                              - type: integer
+                              - type: string
+                              pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                              x-kubernetes-int-or-string: true
+                            description: Requests describes the minimum compute resources
+                              reserved for the container.
+                            maxProperties: 7
+                            type: object
+                            x-kubernetes-validations:
+                            - message: resource names must be qualified names
+                              rule: self.all(k, size(k.split('/')) <= 2 && size(k.split('/')[size(k.split('/'))
+                                - 1]) <= 63 && k.split('/')[size(k.split('/')) - 1].matches('^[A-Za-z0-9]([-A-Za-z0-9_.]*[A-Za-z0-9])?$')
+                                && (size(k.split('/')) == 1 || (size(k.split('/')[0])
+                                <= 253 && k.split('/')[0].split('.').all(p, size(p)
+                                <= 63 && p.matches('^[a-z0-9]([-a-z0-9]*[a-z0-9])?$')))))
+                            - message: unprefixed resource names must be standard
+                                container resources
+                              rule: self.all(k, k == 'cpu' || k == 'memory' || k ==
+                                'ephemeral-storage' || k.startsWith('hugepages-')
+                                || k.contains('/'))
+                            - message: resource quantities must not be negative
+                              rule: self.all(k, sign(quantity(string(self[k]))) >=
+                                0)
+                            - message: extended resource quantities must be whole
+                                numbers
+                              rule: self.all(k, !k.contains('/') || quantity(string(self[k])).isInteger())
+                        type: object
+                        x-kubernetes-validations:
+                        - message: resource requests must not exceed limits
+                          rule: '!has(self.requests) || !has(self.limits) || self.requests.all(k,
+                            !(k in self.limits) || !quantity(string(self.requests[k])).isGreaterThan(quantity(string(self.limits[k]))))'
+                        - message: extended and huge-page resource requests require
+                            an equal limit
+                          rule: '!has(self.requests) || self.requests.all(k, k ==
+                            ''cpu'' || k == ''memory'' || k == ''ephemeral-storage''
+                            || (has(self.limits) && k in self.limits && quantity(string(self.requests[k])).compareTo(quantity(string(self.limits[k])))
+                            == 0))'
+                    required:
+                    - image
+                    type: object
                   image:
                     description: |-
                       Image is a container image whose entrypoint launches the Open Actions
@@ -83,7 +174,7 @@ spec:
                           pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
                           x-kubernetes-int-or-string: true
                         description: Limits describes the maximum compute resources
-                          available to the runner.
+                          available to the container.
                         maxProperties: 7
                         type: object
                         x-kubernetes-validations:
@@ -109,7 +200,7 @@ spec:
                           pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
                           x-kubernetes-int-or-string: true
                         description: Requests describes the minimum compute resources
-                          reserved for the runner.
+                          reserved for the container.
                         maxProperties: 7
                         type: object
                         x-kubernetes-validations:

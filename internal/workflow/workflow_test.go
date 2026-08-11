@@ -43,6 +43,33 @@ func TestParseDogfoodCIWorkflow(t *testing.T) {
 	}
 }
 
+func TestParseDogfoodE2EWorkflow(t *testing.T) {
+	data, err := os.ReadFile("../../.open-actions/workflows/e2e.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	definition, err := Parse(data)
+	if err != nil {
+		t.Fatalf("parse dogfood e2e workflow: %v", err)
+	}
+	if !Matches(definition.On, Event{Name: "push", Ref: "refs/heads/main", RefName: "main"}) {
+		t.Error("dogfood e2e workflow does not match a main push")
+	}
+	if Matches(definition.On, Event{Name: "pull_request", Action: "synchronize", BaseRef: "main"}) {
+		t.Error("dogfood e2e workflow matches a pull request")
+	}
+	job, found := definition.Jobs["test-e2e"]
+	if !found {
+		t.Fatal("dogfood e2e workflow does not define test-e2e")
+	}
+	if got, want := []string(job.RunsOn), []string{"self-hosted", "linux", "x64", "docker"}; !slices.Equal(got, want) {
+		t.Errorf("runs-on = %v, want %v", got, want)
+	}
+	if len(job.Steps) < 3 || job.Steps[2].Uses != "helm/kind-action@v1" {
+		t.Errorf("kind action step = %#v", job.Steps)
+	}
+}
+
 func TestParseRejectsTrailingYAMLDocument(t *testing.T) {
 	data := []byte("name: CI\non: push\njobs:\n  build:\n    runs-on: linux\n    steps:\n      - run: true\n---\nname: ignored\n")
 	if _, err := Parse(data); err == nil {

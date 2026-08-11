@@ -56,18 +56,40 @@ type RunnerExecutionSpec struct {
 	// Resources describes the compute resources available to the runner.
 	// +optional
 	Resources *RunnerResources `json:"resources,omitempty"`
+
+	// Docker configures a job-scoped Docker daemon. The daemon runs in a
+	// privileged sidecar and is available to workflow steps through DOCKER_HOST.
+	// +optional
+	Docker *RunnerDockerSpec `json:"docker,omitempty"`
 }
 
-// RunnerResources describes compute resource requests and limits for runner
-// execution.
+// RunnerDockerSpec describes the Docker daemon available to runner execution.
+type RunnerDockerSpec struct {
+	// Image is a Docker-in-Docker image whose entrypoint accepts dockerd as its
+	// first argument and provides the docker CLI for readiness checks.
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=2048
+	// +kubebuilder:validation:Pattern=`^[^[:space:]]+$`
+	// +required
+	Image string `json:"image"`
+
+	// Resources describes the compute resources available to the Docker daemon
+	// and the containers it starts. An ephemeral-storage limit also sets the
+	// size limit of the Docker data volume.
+	// +optional
+	Resources *RunnerResources `json:"resources,omitempty"`
+}
+
+// RunnerResources describes compute resource requests and limits for an
+// execution container.
 // +kubebuilder:validation:XValidation:rule="!has(self.requests) || !has(self.limits) || self.requests.all(k, !(k in self.limits) || !quantity(string(self.requests[k])).isGreaterThan(quantity(string(self.limits[k]))))",message="resource requests must not exceed limits"
 // +kubebuilder:validation:XValidation:rule="!has(self.requests) || self.requests.all(k, k == 'cpu' || k == 'memory' || k == 'ephemeral-storage' || (has(self.limits) && k in self.limits && quantity(string(self.requests[k])).compareTo(quantity(string(self.limits[k]))) == 0))",message="extended and huge-page resource requests require an equal limit"
 type RunnerResources struct {
-	// Limits describes the maximum compute resources available to the runner.
+	// Limits describes the maximum compute resources available to the container.
 	// +optional
 	Limits RunnerResourceList `json:"limits,omitempty"`
 
-	// Requests describes the minimum compute resources reserved for the runner.
+	// Requests describes the minimum compute resources reserved for the container.
 	// +optional
 	Requests RunnerResourceList `json:"requests,omitempty"`
 }

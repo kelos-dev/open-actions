@@ -30,8 +30,14 @@ var errRunnerAlreadyAssigned = errors.New("runner is already assigned a Workflow
 const (
 	jobPlanVolume            = "open-actions-job"
 	workspaceVolume          = "open-actions-workspace"
+	dockerSocketVolume       = "open-actions-docker-socket"
+	dockerStorageVolume      = "open-actions-docker-storage"
 	jobPlanMountPath         = "/var/run/open-actions"
 	workspaceVolumeMountPath = "/workspace"
+	dockerSocketDirectory    = "/var/run/open-actions-docker"
+	dockerSocketPath         = dockerSocketDirectory + "/docker.sock"
+	dockerHost               = "unix://" + dockerSocketPath
+	dockerStoragePath        = "/var/lib/docker"
 	// The repository lives below the volume root so the runner owns its Git worktree.
 	workspacePath               = workspaceVolumeMountPath + "/repository"
 	jobTTLSeconds               = int32(3600)
@@ -618,6 +624,9 @@ func (r *RunnerReconciler) buildJob(workflowJob *actionsv1alpha1.WorkflowJob, ru
 			},
 		},
 	}
+	if runnerObject.Spec.Execution.Docker != nil {
+		configureDockerExecution(&podTemplate.Spec, &podTemplate.Spec.Containers[0], runnerObject.Spec.Execution.Docker)
+	}
 	backoffLimit := int32(0)
 	job := &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
@@ -636,6 +645,43 @@ func (r *RunnerReconciler) buildJob(workflowJob *actionsv1alpha1.WorkflowJob, ru
 		return nil, err
 	}
 	return job, nil
+}
+
+func configureDockerExecution(pod *corev1.PodSpec, runnerContainer *corev1.Container, dockerSpec *actionsv1alpha1.RunnerDockerSpec) {
+	runnerContainer.Env = append(runnerContainer.Env, corev1.EnvVar{Name: "DOCKER_HOST", Value: dockerHost})
+	runnerContainer.VolumeMounts = append(runnerContainer.VolumeMounts, corev1.VolumeMount{Name: dockerSocketVolume, MountPath: dockerSocketDirectory})
+
+	dockerStorage := &corev1.EmptyDirVolumeSource{}
+	if dockerSpec.Resources != nil {
+		if limit, found := dockerSpec.Resources.Limits[corev1.ResourceEphemeralStorage]; found {
+			sizeLimit := limit.DeepCopy()
+			dockerStorage.SizeLimit = &sizeLimit
+		}
+	}
+	pod.Volumes = append(pod.Volumes,
+		corev1.Volume{Name: dockerSocketVolume, VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
+		corev1.Volume{Name: dockerStorageVolume, VolumeSource: corev1.VolumeSource{EmptyDir: dockerStorage}},
+	)
+	pod.InitContainers = append(pod.InitContainers, corev1.Container{
+		Name:            "docker",
+		Image:           dockerSpec.Image,
+		RestartPolicy:   pointerTo(corev1.ContainerRestartPolicyAlways),
+		Args:            []string{"dockerd", "--host=" + dockerHost, "--group=65532"},
+		Env:             []corev1.EnvVar{{Name: "DOCKER_HOST", Value: dockerHost}, {Name: "DOCKER_TLS_CERTDIR", Value: ""}},
+		Resources:       runnerResources(dockerSpec.Resources),
+		SecurityContext: &corev1.SecurityContext{Privileged: pointerTo(true), RunAsNonRoot: pointerTo(false), RunAsUser: pointerTo(int64(0))},
+		StartupProbe: &corev1.Probe{
+			ProbeHandler:     corev1.ProbeHandler{Exec: &corev1.ExecAction{Command: []string{"docker", "info"}}},
+			FailureThreshold: 60,
+			PeriodSeconds:    1,
+			TimeoutSeconds:   5,
+		},
+		VolumeMounts: []corev1.VolumeMount{
+			{Name: dockerSocketVolume, MountPath: dockerSocketDirectory},
+			{Name: dockerStorageVolume, MountPath: dockerStoragePath},
+			{Name: workspaceVolume, MountPath: workspaceVolumeMountPath},
+		},
+	})
 }
 
 func runnerResources(resources *actionsv1alpha1.RunnerResources) corev1.ResourceRequirements {

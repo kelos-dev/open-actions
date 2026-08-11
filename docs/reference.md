@@ -108,6 +108,38 @@ Runner labels are canonical lowercase ASCII in Kubernetes resources. Workflow
 execution slot and accepts one queued `WorkflowJob` from its `spec.projectRef`
 whose `runs-on` labels are all present in `spec.labels`.
 
+### Docker execution
+
+`spec.execution.docker` enables a job-scoped Docker daemon. Its required
+`image` field identifies a Docker-in-Docker image whose entrypoint accepts
+`dockerd` as its first argument and that provides the `docker` CLI used by the
+startup probe. `resources` uses the same requests and limits schema as the
+runner container. When an `ephemeral-storage` limit is present, the controller
+also applies it as the Docker data volume's size limit.
+
+The controller runs the daemon as a privileged Kubernetes native sidecar and
+connects the runner through a private Unix socket exposed as `DOCKER_HOST`.
+The daemon, socket, and image data exist only for one WorkflowJob. The runner
+and daemon share the workspace and Pod network, allowing kind's Docker node
+containers and loopback API-server endpoint to work from workflow steps. The
+sidecar does not receive the job plan or authentication Secret volume, and the
+Pod does not mount the node's Docker socket or a Kubernetes service-account
+token.
+
+The standard runner image includes the Docker CLI, Bash, curl, and the other
+tools needed by the default `helm/kind-action` workflow. A custom runner image
+used with `spec.execution.docker` must provide a compatible `docker` executable
+on `PATH`. The runner remains non-root; action options that invoke `sudo`, such
+as `helm/kind-action`'s local-registry and cloud-provider setup, are not
+supported by the standard image.
+
+Docker execution is disabled when `spec.execution.docker` is omitted. Enabling
+it changes the WorkflowJob Pod's security posture because the daemon sidecar is
+privileged. Use dedicated or sandboxed nodes when workflows are not fully
+trusted. See
+[`config/samples/actions_v1alpha1_docker_runner.yaml`](../config/samples/actions_v1alpha1_docker_runner.yaml)
+for a Docker-enabled Runner.
+
 ### Conditions
 
 The resources expose these condition contracts:
@@ -263,6 +295,10 @@ as `node24` on `PATH`; execution fails before the first lifecycle hook when the
 declared runtime is unavailable. Composite actions support Bash run steps and
 external action references. Composite expressions cover inputs, step outputs,
 selected GitHub and runner values, and environment variables.
+
+Node, composite, and Bash steps can use Docker when assigned to a Runner with
+`spec.execution.docker`. This capability supports tools such as kind but does
+not add support for action metadata declaring `runs.using: docker`.
 
 `GITHUB_EVENT_PATH` contains a bounded normalized document with repository
 identity and the selected push, pull-request, or merge-group revision fields.

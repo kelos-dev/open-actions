@@ -24,6 +24,8 @@ The supported execution subset includes:
 - composite run and uses steps, step outputs, and composite outputs
 - `::command::` and `##[command]` workflow commands, including problem matcher annotations
 - Bash `run` steps
+- optional job-scoped Docker daemons for Docker-dependent steps and Node actions,
+  including the default `helm/kind-action` cluster workflow
 - job and step environment variables and working directories
 - typed expressions and string interpolation in concurrency, job planning,
   workflow steps, and composite actions
@@ -124,6 +126,12 @@ Runner job tokens remain restricted to the selected repository with Contents
 read access. The Console runs with a separate ServiceAccount limited to reading
 workflow runs, workflow jobs, Pods, and Pod logs. Its administrator token is
 mounted directly into the Console pod from the configured Secret.
+
+The Docker Runner sample enables a privileged, job-scoped Docker-in-Docker
+sidecar for actions such as `helm/kind-action`. Docker execution is disabled
+when `spec.execution.docker` is omitted. Run Docker-enabled Runners only on
+nodes whose isolation policy is appropriate for privileged workflow code, and
+never replace the sidecar with a mount of the node's Docker socket.
 
 Move repository workflows from `.github/workflows` to
 `.open-actions/workflows`. A webhook delivery then follows the path shown in

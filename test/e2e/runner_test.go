@@ -58,7 +58,7 @@ var _ = Describe("Runner", func() {
 			}
 			workflowJob := jobs.Items[0]
 			workflowJobName = workflowJob.Name
-			g.Expect(workflowJob.Spec.RunsOn).To(ConsistOf("ubuntu-latest"))
+			g.Expect(workflowJob.Spec.RunsOn).To(ConsistOf("ubuntu-latest", "docker"))
 			g.Expect(workflowJob.Status.RunnerRef).NotTo(BeNil())
 			if workflowJob.Status.RunnerRef != nil {
 				g.Expect(workflowJob.Status.RunnerRef.Name).To(Equal("runner-1"))
@@ -155,7 +155,9 @@ var _ = Describe("Runner", func() {
 		Expect(output).To(ContainSubstring("external checkout main ran"))
 		Expect(output).To(ContainSubstring("external setup-go main ran"))
 		Expect(output).To(ContainSubstring("external kind-action main ran"))
+		Expect(output).To(ContainSubstring("external kind-action Docker ready"))
 		Expect(output).To(ContainSubstring("external composite run"))
+		Expect(output).To(ContainSubstring("Docker execution works"))
 		Expect(output).To(ContainSubstring("runner workspace git works"))
 		Expect(output).To(ContainSubstring("open actions e2e works"))
 		Expect(output).To(ContainSubstring("external marker post ran"))
