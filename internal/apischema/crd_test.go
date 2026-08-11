@@ -165,6 +165,11 @@ func TestRunnerAcceptsQualifiedResourceNames(t *testing.T) {
 	}
 }
 
+func TestRunnerAcceptsDockerExecution(t *testing.T) {
+	crd, _ := loadCRD(t, "actions.kelos.dev_runners.yaml")
+	validateSample(t, crd, "actions_v1alpha1_docker_runner.yaml")
+}
+
 func TestCRDConventions(t *testing.T) {
 	tests := []struct {
 		file                    string
@@ -250,12 +255,19 @@ func TestCRDConventions(t *testing.T) {
 				if !slices.Contains(execution.Required, "image") {
 					t.Error("spec.execution.image is not required")
 				}
+				if slices.Contains(execution.Required, "docker") {
+					t.Error("spec.execution.docker is required")
+				}
 				resources := execution.Properties["resources"]
 				for _, fieldName := range []string{"limits", "requests"} {
 					resourceList := resources.Properties[fieldName]
 					if resourceList.MaxProperties == nil || *resourceList.MaxProperties != 7 {
 						t.Errorf("spec.execution.resources.%s is not bounded to 7 entries", fieldName)
 					}
+				}
+				docker := execution.Properties["docker"]
+				if !slices.Contains(docker.Required, "image") {
+					t.Error("spec.execution.docker.image is not required")
 				}
 			}
 			if tt.kind == "WorkflowRun" {
@@ -333,6 +345,13 @@ func TestCRDRejectsInvalidCELValues(t *testing.T) {
 			crd:  "actions.kelos.dev_runners.yaml", sample: "actions_v1alpha1_runner.yaml",
 			mutate: func(object map[string]any) {
 				object["spec"].(map[string]any)["execution"].(map[string]any)["image"] = "runner image"
+			},
+		},
+		{
+			name: "Runner Docker execution with empty image",
+			crd:  "actions.kelos.dev_runners.yaml", sample: "actions_v1alpha1_runner.yaml",
+			mutate: func(object map[string]any) {
+				object["spec"].(map[string]any)["execution"].(map[string]any)["docker"] = map[string]any{"image": ""}
 			},
 		},
 		{

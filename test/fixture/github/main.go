@@ -25,7 +25,7 @@ on:
     branches: [main]
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: [ubuntu-latest, docker]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -43,11 +43,18 @@ jobs:
           test "$GITHUB_REF_NAME" = "main"
           test "$EXTERNAL_SETUP_GO" = "ready"
           test "$KIND_ACTION_RUNTIME" = "24"
+          test "$KIND_ACTION_DOCKER" = "ready"
           test "$COMPOSITE_VALUE" = "from composite"
           git status --short
           printf 'runner workspace git works\n'
           go test ./...
           printf 'open actions e2e works\n'
+      - name: Verify Docker execution
+        run: |
+          CGO_ENABLED=0 go build -o docker-e2e ./cmd/docker-e2e
+          docker build --tag open-actions-e2e --file Dockerfile.docker-e2e .
+          test "$(docker run --rm open-actions-e2e)" = "open actions docker e2e works"
+          printf 'Docker execution works\n'
 `
 
 const unsupportedTriggerWorkflowData = `name: Unsupported trigger
@@ -220,7 +227,8 @@ runs:
   post: "cleanup.js"
 `
 
-const kindActionScript = `const fs = require('fs');
+const kindActionScript = `const childProcess = require('child_process');
+const fs = require('fs');
 
 if (process.versions.node.split('.')[0] !== '24') {
   throw new Error('kind-action fixture did not run with Node 24');
@@ -228,8 +236,14 @@ if (process.versions.node.split('.')[0] !== '24') {
 if (process.env['INPUT_CLUSTER_NAME'] !== 'kind') {
   throw new Error('kind-action fixture did not receive its input');
 }
+const dockerVersion = childProcess.execFileSync('docker', ['version', '--format', '{{.Server.Version}}'], {encoding: 'utf8'}).trim();
+if (!dockerVersion) {
+  throw new Error('kind-action fixture could not reach Docker');
+}
 fs.appendFileSync(process.env.GITHUB_ENV, 'KIND_ACTION_RUNTIME=24\n');
+fs.appendFileSync(process.env.GITHUB_ENV, 'KIND_ACTION_DOCKER=ready\n');
 fs.appendFileSync(process.env.GITHUB_STATE, 'kind_cluster=created\n');
+console.log('external kind-action Docker ready');
 console.log('external kind-action main ran');
 `
 
@@ -415,9 +429,11 @@ func createRepositories(dataDirectory string) (string, error) {
 		return "", err
 	}
 	repositorySHA, err := createRepository(dataDirectory, "acme", "example", "", map[string]string{
-		"go.mod":          fmt.Sprintf("module example.com/fixture\n\ngo %s\n", strings.TrimPrefix(runtime.Version(), "go")),
-		"fixture.go":      "package fixture\n\nfunc Message() string { return \"open actions e2e works\" }\n",
-		"fixture_test.go": "package fixture\n\nimport \"testing\"\n\nfunc TestMessage(t *testing.T) {\n\tif Message() != \"open actions e2e works\" { t.Fatal(\"unexpected message\") }\n}\n",
+		"Dockerfile.docker-e2e":  "FROM scratch\nCOPY docker-e2e /docker-e2e\nENTRYPOINT [\"/docker-e2e\"]\n",
+		"cmd/docker-e2e/main.go": "package main\n\nimport \"fmt\"\n\nfunc main() { fmt.Println(\"open actions docker e2e works\") }\n",
+		"go.mod":                 fmt.Sprintf("module example.com/fixture\n\ngo %s\n", strings.TrimPrefix(runtime.Version(), "go")),
+		"fixture.go":             "package fixture\n\nfunc Message() string { return \"open actions e2e works\" }\n",
+		"fixture_test.go":        "package fixture\n\nimport \"testing\"\n\nfunc TestMessage(t *testing.T) {\n\tif Message() != \"open actions e2e works\" { t.Fatal(\"unexpected message\") }\n}\n",
 	})
 	if err != nil {
 		return "", err
