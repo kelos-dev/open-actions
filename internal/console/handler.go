@@ -1,6 +1,7 @@
 package console
 
 import (
+	"bufio"
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
@@ -30,6 +31,7 @@ const (
 	sessionCookieName = "open_actions_console_session"
 	sessionLifetime   = 7 * 24 * time.Hour
 	streamHeartbeat   = 15 * time.Second
+	maxLogLineBytes   = 256 << 10
 )
 
 var errLogsUnavailable = errors.New("logs are no longer available")
@@ -61,33 +63,48 @@ type loginRequest struct {
 }
 
 type runPageData struct {
-	Repository   string
-	WorkflowName string
-	WorkflowPath string
-	Revision     string
-	Status       string
-	Jobs         []jobPageData
+	RunURL        string
+	Repository    string
+	WorkflowName  string
+	WorkflowPath  string
+	Revision      string
+	ShortRevision string
+	RefName       string
+	Status        string
+	StatusClass   string
+	Started       string
+	Duration      string
+	Jobs          []jobPageData
 }
 
 type jobPageData struct {
-	ID        string
-	Runner    string
-	Status    string
-	URL       string
-	Started   string
-	Completed string
+	ID          string
+	DisplayName string
+	Runner      string
+	Status      string
+	StatusClass string
+	URL         string
+	Started     string
+	Duration    string
+	Selected    bool
 }
 
 type logPageData struct {
-	JobID     string
-	Status    string
-	RunURL    string
-	StreamURL string
+	Repository    string
+	WorkflowName  string
+	ShortRevision string
+	Status        string
+	JobName       string
+	Runner        string
+	Duration      string
+	RunURL        string
+	StreamURL     string
+	Jobs          []jobPageData
 }
 
 type logRead struct {
-	data string
-	err  error
+	entry *logEntry
+	err   error
 }
 
 // New creates a Console handler.
@@ -226,37 +243,55 @@ func (h *Handler) validToken(token string) bool {
 }
 
 func (h *Handler) runDetails(writer http.ResponseWriter, request *http.Request, run *actionsv1alpha1.WorkflowRun) {
-	jobs := &actionsv1alpha1.WorkflowJobList{}
-	if err := h.client.List(request.Context(), jobs, client.InNamespace(run.Namespace), client.MatchingLabels{actionsv1alpha1.LabelWorkflowRunUID: string(run.UID)}); err != nil {
-		http.Error(writer, "load workflow jobs", http.StatusInternalServerError)
+	data, err := h.loadRunPageData(request.Context(), run)
+	if err != nil {
+		h.writeResolutionError(writer, request, err)
 		return
+	}
+	h.writeHTML(writer, h.runPage, data)
+}
+
+func (h *Handler) loadRunPageData(ctx context.Context, run *actionsv1alpha1.WorkflowRun) (runPageData, error) {
+	jobs := &actionsv1alpha1.WorkflowJobList{}
+	if err := h.client.List(ctx, jobs, client.InNamespace(run.Namespace), client.MatchingLabels{actionsv1alpha1.LabelWorkflowRunUID: string(run.UID)}); err != nil {
+		return runPageData{}, fmt.Errorf("load workflow jobs: %w", err)
 	}
 	sort.Slice(jobs.Items, func(left, right int) bool { return jobs.Items[left].Spec.JobID < jobs.Items[right].Spec.JobID })
 	data := runPageData{
-		Repository:   run.Spec.Source.GitHub.Repository.Owner + "/" + run.Spec.Source.GitHub.Repository.Name,
-		WorkflowName: run.Status.WorkflowName,
-		WorkflowPath: run.Spec.WorkflowPath,
-		Revision:     run.Spec.Source.GitHub.Revision.SHA,
-		Status:       workflowstatus.Run(run),
+		RunURL:        runPath(run),
+		Repository:    run.Spec.Source.GitHub.Repository.Owner + "/" + run.Spec.Source.GitHub.Repository.Name,
+		WorkflowName:  run.Status.WorkflowName,
+		WorkflowPath:  run.Spec.WorkflowPath,
+		Revision:      run.Spec.Source.GitHub.Revision.SHA,
+		ShortRevision: shortRevision(run.Spec.Source.GitHub.Revision.SHA),
+		RefName:       shortRef(run.Spec.Source.GitHub.Revision.Ref),
+		Status:        workflowstatus.Run(run),
 	}
+	data.StatusClass = statusClass(data.Status)
 	if data.WorkflowName == "" {
 		data.WorkflowName = data.WorkflowPath
 	}
+	if run.Status.StartTime != nil {
+		data.Started = run.Status.StartTime.UTC().Format(time.RFC3339)
+	}
+	data.Duration = elapsedTime(run.Status.StartTime, run.Status.CompletionTime)
 	for index := range jobs.Items {
 		job := &jobs.Items[index]
-		item := jobPageData{ID: job.Spec.JobID, Status: workflowstatus.Job(job), URL: runPath(run) + "/jobs/" + url.PathEscape(job.Name)}
+		item := jobPageData{ID: job.Spec.JobID, DisplayName: job.Spec.DisplayName, Status: workflowstatus.Job(job), URL: runPath(run) + "/jobs/" + url.PathEscape(job.Name)}
+		if item.DisplayName == "" {
+			item.DisplayName = item.ID
+		}
+		item.StatusClass = statusClass(item.Status)
 		if job.Status.RunnerRef != nil {
 			item.Runner = job.Status.RunnerRef.Name
 		}
 		if job.Status.StartTime != nil {
 			item.Started = job.Status.StartTime.UTC().Format(time.RFC3339)
 		}
-		if job.Status.CompletionTime != nil {
-			item.Completed = job.Status.CompletionTime.UTC().Format(time.RFC3339)
-		}
+		item.Duration = elapsedTime(job.Status.StartTime, job.Status.CompletionTime)
 		data.Jobs = append(data.Jobs, item)
 	}
-	h.writeHTML(writer, h.runPage, data)
+	return data, nil
 }
 
 func (h *Handler) jobLogs(writer http.ResponseWriter, request *http.Request, run *actionsv1alpha1.WorkflowRun, jobName string) {
@@ -265,10 +300,29 @@ func (h *Handler) jobLogs(writer http.ResponseWriter, request *http.Request, run
 		h.writeResolutionError(writer, request, err)
 		return
 	}
+	runData, err := h.loadRunPageData(request.Context(), run)
+	if err != nil {
+		h.writeResolutionError(writer, request, err)
+		return
+	}
 	path := runPath(run)
+	jobStatus := workflowstatus.Job(job)
+	displayName := job.Spec.DisplayName
+	if displayName == "" {
+		displayName = job.Spec.JobID
+	}
+	for index := range runData.Jobs {
+		runData.Jobs[index].Selected = runData.Jobs[index].ID == job.Spec.JobID
+	}
+	runnerName := "Waiting for a runner"
+	if job.Status.RunnerRef != nil {
+		runnerName = job.Status.RunnerRef.Name
+	}
 	h.writeHTML(writer, h.logPage, logPageData{
-		JobID: job.Spec.JobID, Status: workflowstatus.Job(job), RunURL: path,
-		StreamURL: path + "/jobs/" + url.PathEscape(job.Name) + "/stream",
+		Repository: runData.Repository, WorkflowName: runData.WorkflowName,
+		ShortRevision: runData.ShortRevision, Status: jobStatus,
+		JobName: displayName, Runner: runnerName, Duration: elapsedTime(job.Status.StartTime, job.Status.CompletionTime),
+		RunURL: path, StreamURL: path + "/jobs/" + url.PathEscape(job.Name) + "/stream", Jobs: runData.Jobs,
 	})
 }
 
@@ -307,8 +361,8 @@ func (h *Handler) streamJobLogs(writer http.ResponseWriter, request *http.Reques
 			if !ok {
 				return
 			}
-			if result.data != "" {
-				writeEvent(writer, flusher, "log", result.data)
+			if result.entry != nil {
+				writeEvent(writer, flusher, "log", result.entry)
 			}
 			if result.err == nil {
 				continue
@@ -331,13 +385,41 @@ func readLogStream(ctx context.Context, stream io.Reader) <-chan logRead {
 	results := make(chan logRead)
 	go func() {
 		defer close(results)
-		buffer := make([]byte, 32*1024)
-		for {
-			count, err := stream.Read(buffer)
-			result := logRead{data: string(buffer[:count]), err: err}
+		reader := bufio.NewReaderSize(stream, maxLogLineBytes+1)
+		parser := &actionLogParser{}
+		send := func(result logRead) bool {
 			select {
 			case results <- result:
+				return true
 			case <-ctx.Done():
+				return false
+			}
+		}
+		for {
+			line, err := reader.ReadSlice('\n')
+			if errors.Is(err, bufio.ErrBufferFull) {
+				line = line[:maxLogLineBytes]
+				text := strings.ToValidUTF8(string(line), "�")
+				timestamp, content := splitLogTimestamp(strings.TrimSuffix(text, "\r"))
+				entry := logEntry{Kind: "output", Text: content + " … [log line truncated]", Time: timestamp}
+				if !send(logRead{entry: &entry}) {
+					return
+				}
+				err = discardLogLine(reader)
+				if err != nil {
+					send(logRead{err: err})
+					return
+				}
+				continue
+			}
+			text := strings.TrimSuffix(string(line), "\n")
+			result := logRead{err: err}
+			if text != "" || err == nil {
+				if entry, visible := parser.parse(text); visible {
+					result.entry = &entry
+				}
+			}
+			if !send(result) {
 				return
 			}
 			if err != nil {
@@ -346,6 +428,16 @@ func readLogStream(ctx context.Context, stream io.Reader) <-chan logRead {
 		}
 	}()
 	return results
+}
+
+func discardLogLine(reader *bufio.Reader) error {
+	for {
+		_, err := reader.ReadSlice('\n')
+		if errors.Is(err, bufio.ErrBufferFull) {
+			continue
+		}
+		return err
+	}
 }
 
 func (h *Handler) workflowJob(ctx context.Context, run *actionsv1alpha1.WorkflowRun, name string) (*actionsv1alpha1.WorkflowJob, error) {
@@ -393,6 +485,37 @@ func (h *Handler) waitForPod(ctx context.Context, job *actionsv1alpha1.WorkflowJ
 	}
 }
 
+func statusClass(status string) string {
+	return strings.ToLower(status)
+}
+
+func shortRevision(revision string) string {
+	if len(revision) <= 7 {
+		return revision
+	}
+	return revision[:7]
+}
+
+func shortRef(ref string) string {
+	for _, prefix := range []string{"refs/heads/", "refs/tags/"} {
+		if value, found := strings.CutPrefix(ref, prefix); found {
+			return value
+		}
+	}
+	return ref
+}
+
+func elapsedTime(start, completion *metav1.Time) string {
+	if start == nil || completion == nil || completion.Time.Before(start.Time) {
+		return ""
+	}
+	duration := completion.Time.Sub(start.Time).Round(time.Second)
+	if duration < time.Second {
+		return "<1s"
+	}
+	return duration.String()
+}
+
 func (h *Handler) writeHTML(writer http.ResponseWriter, page *template.Template, data any) {
 	writer.Header().Set("Content-Type", "text/html; charset=utf-8")
 	writer.Header().Set("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'; form-action 'self'")
@@ -436,7 +559,7 @@ func sessionValue(token string) string {
 	return base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
 }
 
-func writeEvent(writer io.Writer, flusher http.Flusher, event, value string) {
+func writeEvent(writer io.Writer, flusher http.Flusher, event string, value any) {
 	encoded, _ := json.Marshal(value)
 	_, _ = fmt.Fprintf(writer, "event: %s\ndata: %s\n\n", event, encoded)
 	flusher.Flush()

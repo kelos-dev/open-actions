@@ -14,20 +14,16 @@ const (
 	maxOutputBufferBytes = 64 << 10
 )
 
-var addMaskPrefix = []byte("::add-mask::")
-
 type outputMasker struct {
 	mutex sync.RWMutex
 	masks [][]byte
 }
 
 type maskingWriter struct {
-	masker             *outputMasker
-	target             io.Writer
-	mutex              sync.Mutex
-	buffer             []byte
-	lineStart          bool
-	discardMaskCommand bool
+	masker *outputMasker
+	target io.Writer
+	mutex  sync.Mutex
+	buffer []byte
 }
 
 func newOutputMasker(values ...string) *outputMasker {
@@ -39,7 +35,7 @@ func newOutputMasker(values ...string) *outputMasker {
 }
 
 func (m *outputMasker) writer(target io.Writer) *maskingWriter {
-	return &maskingWriter{masker: m, target: target, lineStart: true}
+	return &maskingWriter{masker: m, target: target}
 }
 
 func (m *outputMasker) add(value string) {
@@ -133,100 +129,15 @@ func (w *maskingWriter) flush() error {
 }
 
 func (w *maskingWriter) process(final bool) error {
-	for len(w.buffer) > 0 {
-		if w.discardMaskCommand {
-			newline := bytes.IndexByte(w.buffer, '\n')
-			if newline < 0 {
-				w.buffer = w.buffer[:0]
-				return nil
-			}
-			w.buffer = w.buffer[newline+1:]
-			w.discardMaskCommand = false
-			w.lineStart = true
-			continue
-		}
-		if w.lineStart && possibleAddMaskCommand(w.buffer) {
-			completeCommand := bytes.HasPrefix(w.buffer, addMaskPrefix)
-			newline := bytes.IndexByte(w.buffer, '\n')
-			if newline >= 0 {
-				if completeCommand {
-					w.addMaskCommand(w.buffer[:newline])
-				} else if err := w.writeMasked(w.buffer[:newline+1], true); err != nil {
-					return err
-				}
-				w.buffer = w.buffer[newline+1:]
-				w.lineStart = true
-				continue
-			}
-			if final {
-				if completeCommand {
-					w.addMaskCommand(w.buffer)
-				} else if err := w.writeMasked(w.buffer, true); err != nil {
-					return err
-				}
-				w.buffer = nil
-				return nil
-			}
-			if len(w.buffer) > len(addMaskPrefix)+maxMaskValueBytes {
-				w.buffer = w.buffer[:0]
-				w.discardMaskCommand = true
-			}
-			return nil
-		}
-		newline := bytes.IndexByte(w.buffer, '\n')
-		if newline >= 0 {
-			if err := w.writeMasked(w.buffer[:newline+1], true); err != nil {
-				return err
-			}
-			w.buffer = w.buffer[newline+1:]
-			w.lineStart = true
-			continue
-		}
-		if final {
-			if err := w.writeMasked(w.buffer, true); err != nil {
-				return err
-			}
-			w.buffer = nil
-			return nil
-		}
-		masked, consumed := w.masker.maskPrefix(w.buffer, false)
-		if consumed == 0 {
-			return nil
-		}
-		if err := writeAll(w.target, masked); err != nil {
-			return err
-		}
-		w.buffer = w.buffer[consumed:]
-		w.lineStart = false
+	masked, consumed := w.masker.maskPrefix(w.buffer, final)
+	if consumed == 0 {
+		return nil
 	}
+	if err := writeAll(w.target, masked); err != nil {
+		return err
+	}
+	w.buffer = w.buffer[consumed:]
 	return nil
-}
-
-func (w *maskingWriter) writeMasked(data []byte, final bool) error {
-	masked, consumed := w.masker.maskPrefix(data, final)
-	if consumed != len(data) {
-		return errors.New("output masker retained a completed line")
-	}
-	return writeAll(w.target, masked)
-}
-
-func (w *maskingWriter) addMaskCommand(command []byte) {
-	value := bytes.TrimSuffix(command, []byte{'\r'})
-	value = bytes.TrimPrefix(value, addMaskPrefix)
-	unescaped := unescapeCommandValue(string(value))
-	w.masker.add(unescaped)
-	for _, line := range strings.FieldsFunc(unescaped, func(character rune) bool {
-		return character == '\r' || character == '\n'
-	}) {
-		w.masker.add(line)
-	}
-}
-
-func possibleAddMaskCommand(data []byte) bool {
-	if len(data) <= len(addMaskPrefix) {
-		return bytes.HasPrefix(addMaskPrefix, data)
-	}
-	return bytes.HasPrefix(data, addMaskPrefix)
 }
 
 func writeAll(target io.Writer, data []byte) error {
@@ -241,10 +152,4 @@ func writeAll(target io.Writer, data []byte) error {
 		data = data[written:]
 	}
 	return nil
-}
-
-func unescapeCommandValue(value string) string {
-	value = strings.ReplaceAll(value, "%0D", "\r")
-	value = strings.ReplaceAll(value, "%0A", "\n")
-	return strings.ReplaceAll(value, "%25", "%")
 }

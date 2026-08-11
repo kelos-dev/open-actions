@@ -68,8 +68,16 @@ func TestConsoleAuthenticatesWithStaticTokenAndStreamsLogs(t *testing.T) {
 	runRequest.AddCookie(sessionCookie)
 	runResponse := httptest.NewRecorder()
 	handler.ServeHTTP(runResponse, runRequest)
-	if runResponse.Code != http.StatusOK || !strings.Contains(runResponse.Body.String(), "CI") || !strings.Contains(runResponse.Body.String(), "build") {
+	if runResponse.Code != http.StatusOK || !strings.Contains(runResponse.Body.String(), "CI") || !strings.Contains(runResponse.Body.String(), "build") || !strings.Contains(runResponse.Body.String(), "Workflow run Queued") {
 		t.Fatalf("run page = %d, %q", runResponse.Code, runResponse.Body.String())
+	}
+
+	logRequest := httptest.NewRequest(http.MethodGet, runURL+"/jobs/build", nil)
+	logRequest.AddCookie(sessionCookie)
+	logResponse := httptest.NewRecorder()
+	handler.ServeHTTP(logResponse, logRequest)
+	if logResponse.Code != http.StatusOK || !strings.Contains(logResponse.Body.String(), "Show debug") || !strings.Contains(logResponse.Body.String(), "Show timestamps") {
+		t.Fatalf("log page = %d, %q", logResponse.Code, logResponse.Body.String())
 	}
 
 	streamRequest := httptest.NewRequest(http.MethodGet, runURL+"/jobs/build/stream", nil)
@@ -78,6 +86,53 @@ func TestConsoleAuthenticatesWithStaticTokenAndStreamsLogs(t *testing.T) {
 	handler.ServeHTTP(streamResponse, streamRequest)
 	if streamResponse.Code != http.StatusOK || !strings.Contains(streamResponse.Body.String(), "event: log") || !strings.Contains(streamResponse.Body.String(), "build output") {
 		t.Fatalf("log stream = %d, %q", streamResponse.Code, streamResponse.Body.String())
+	}
+}
+
+func TestConsoleStructuresGitHubActionsLogs(t *testing.T) {
+	handler := newTestHandler(t, false)
+	source := handler.logs.(*testLogSource)
+	source.logs = strings.Join([]string{
+		`{"time":"2026-08-10T12:34:56Z","level":"INFO","msg":"starting workflow step","open_actions_runner":true,"job":"build","step":1,"name":"Build"}`,
+		`{"time":"2026-08-10T12:34:56Z","level":"INFO","msg":"workflow step input","open_actions_runner":true,"name":"target","value":"sensitive-input-value"}`,
+		"::debug::resolved%20input",
+		"::warning file=main.go,line=7,title=Compiler::check failed",
+		"[command]/usr/bin/go test ./...",
+		"##[add-matcher]/tmp/matcher.json",
+		"::set-output name=artifact::private-value",
+		"ordinary output",
+		`{"time":"2026-08-10T12:34:57Z","level":"INFO","msg":"workflow step output","open_actions_runner":true,"name":"artifact","value":"sensitive-output-value"}`,
+		`{"time":"2026-08-10T12:34:57Z","level":"INFO","msg":"completed workflow step","open_actions_runner":true,"job":"build","step":1,"name":"Build"}`,
+		`{"time":"2026-08-10T12:34:58Z","level":"INFO","msg":"starting post action","open_actions_runner":true,"action":"actions/example@v1"}`,
+		`{"time":"2026-08-10T12:34:59Z","level":"INFO","msg":"completed post action","open_actions_runner":true,"action":"actions/example@v1"}`,
+	}, "\n") + "\n"
+
+	request := httptest.NewRequest(http.MethodGet, "/runs/default/ci/jobs/build/stream", nil)
+	request.Header.Set("Authorization", "Bearer "+testConsoleToken)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	body := response.Body.String()
+	for _, expected := range []string{
+		`"kind":"group","text":"1. Build"`,
+		`"kind":"input","text":"target"`,
+		`"kind":"debug","text":"resolved%20input"`,
+		`"kind":"warning","text":"check failed"`,
+		`"kind":"command","text":"/usr/bin/go test ./..."`,
+		`"kind":"command","text":"Set output artifact"`,
+		`"kind":"output","text":"ordinary output"`,
+		`"kind":"step-output","text":"artifact"`,
+		`"kind":"endgroup"`,
+		`"kind":"group","text":"Post actions/example@v1"`,
+	} {
+		if !strings.Contains(body, expected) {
+			t.Fatalf("stream does not contain %q: %s", expected, body)
+		}
+	}
+	if strings.Contains(body, "private-value") || strings.Contains(body, "sensitive-input-value") || strings.Contains(body, "sensitive-output-value") {
+		t.Fatalf("stream exposed workflow command value: %s", body)
+	}
+	if strings.Contains(body, "add-matcher") {
+		t.Fatalf("stream exposed matcher command: %s", body)
 	}
 }
 

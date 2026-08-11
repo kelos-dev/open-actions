@@ -41,6 +41,25 @@ GitHub Check Runs. The Console serves HTTP on `--bind-address` (default
 through HTTPS. The Helm chart configures both authentication flags from its
 configured Secret and `console.publicURL`.
 
+The Console presents runner output as line-oriented GitHub Actions logs. It
+supports `group` and `endgroup`, debug and annotation commands, command lines,
+escaped command data and properties, and `stop-commands` markers. It also shows
+action input and output names without persisting their values and groups post
+actions separately. Log lines larger than 256 KiB are truncated so a workflow
+cannot retain unbounded Console memory.
+
+The runner accepts `::command::` and bracket-form `##[command]` syntax, with
+the property delimiters and escape rules defined for each form. It consumes
+mask, output, state, and problem matcher commands instead of exposing their raw
+protocol lines. Stdout `set-env` and `add-path` commands are ignored because
+step output is not a trusted environment update channel; actions must write to
+`GITHUB_ENV` and `GITHUB_PATH` instead. Problem matcher files may contain
+single-line or ordered multiline regular-expression patterns; matching output
+is emitted as a Console annotation. Matchers remain active until another
+matcher with the same owner replaces them or `remove-matcher` removes them. A
+matcher that encounters a regular-expression runtime error is disabled with a
+warning and does not fail the workflow step.
+
 Each URL requires an absolute `http` or `https` URL with a host and an optional
 clean path prefix. User information, queries, fragments, escaped paths, and `.`
 or `..` path segments are rejected. The API URL is normalized with a trailing

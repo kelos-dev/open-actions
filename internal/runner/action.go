@@ -261,7 +261,7 @@ func (e *Executor) runJavaScriptHook(ctx context.Context, invocation *actionInvo
 			actionEnvironment = setEnvironment(actionEnvironment, "STATE_"+name, value)
 		}
 	}
-	executionError := e.executeCommand(ctx, invocation.executable, []string{entrypointPath}, workspace, actionEnvironment)
+	executionError := e.executeCommandWithFiles(ctx, invocation.executable, []string{entrypointPath}, workspace, actionEnvironment, &files, workspace)
 	updates, commandError := files.read()
 	if commandError != nil {
 		return errors.Join(executionError, commandError)
@@ -284,6 +284,8 @@ func (e *Executor) executeAction(ctx context.Context, state *executionState, ste
 		return nil, err
 	}
 	e.logger.Info("prepared external action", "action", step.Uses, "runtime", invocation.definition.Runs.Using)
+	e.logCommandNames("workflow step input", invocation.inputs)
+	var outputs map[string]string
 	switch invocation.definition.Runs.Using {
 	case "node20", "node24":
 		executable, err := actionRuntimeExecutable(invocation.definition.Runs.Using, e.environment)
@@ -300,12 +302,17 @@ func (e *Executor) executeAction(ctx context.Context, state *executionState, ste
 		if err := e.runJavaScriptHook(ctx, invocation, "main", invocation.definition.Runs.Main, state.temporaryDirectory, state.workspace, &state.environment); err != nil {
 			return nil, err
 		}
-		return invocation.outputs, nil
+		outputs = invocation.outputs
 	case "composite":
-		return e.runComposite(ctx, state, invocation, depth+1, cancelled)
+		outputs, err = e.runComposite(ctx, state, invocation, depth+1, cancelled)
 	default:
 		return nil, fmt.Errorf("action %s uses unsupported runtime %q", step.Uses, invocation.definition.Runs.Using)
 	}
+	if err != nil {
+		return nil, err
+	}
+	e.logCommandNames("workflow step output", outputs)
+	return outputs, nil
 }
 
 func actionRuntimeExecutable(runtime string, environment []string) (string, error) {
