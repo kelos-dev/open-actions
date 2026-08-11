@@ -12,30 +12,12 @@ Actions and run on self-hosted infrastructure.
 
 Kubernetes 1.29 or newer is required.
 
-The supported execution subset includes:
-
-- webhook, manual, scheduled, chained, and reusable-workflow trigger declarations used by kelos
-- workflow concurrency groups and `cancel-in-progress`
-- runner-label scheduling for independent jobs using Kubernetes `Runner` and
-  `WorkflowJob` resources
-- external `owner/repository[/path]@ref` Node 20, Node 24, and composite
-  actions, including nested external actions
-- action inputs, pre/main/post hooks, and environment, PATH, and state file commands
-- composite run and uses steps, step outputs, and composite outputs
-- `::command::` and `##[command]` workflow commands, including problem matcher annotations
-- Bash `run` steps
-- optional job-scoped Docker daemons for Docker-dependent steps and Node actions,
-  including the default `helm/kind-action` cluster workflow
-- job and step environment variables and working directories
-- typed expressions and string interpolation in concurrency, job planning,
-  workflow steps, and composite actions
-- GitHub Check Runs linked to authenticated Console run and job pages
-- GitHub-style live runner logs with collapsible groups, annotations, debug
-  filtering, and timestamps while the native Kubernetes Job is retained
-
-Unsupported workflow fields and action reference forms are rejected during
-planning. Unsupported action runtimes fail explicitly in the runner so a
-workflow is never silently executed with different semantics.
+Open Actions supports event, manual, and scheduled triggers; independent jobs
+selected by runner labels; Bash steps; Node 20, Node 24, and composite actions;
+expressions and concurrency; optional job-scoped Docker; GitHub Check Runs; and
+live logs. See the [Workflow API](docs/reference.md#workflow-api) for the exact
+supported syntax and execution constraints. Unsupported workflows fail
+explicitly rather than run with different semantics.
 
 ## Architecture
 
@@ -52,94 +34,82 @@ commands, annotations, masked action inputs and outputs, debug messages, and
 post actions. A `Project` defines the execution domain and its GitHub App
 integration.
 
-## Installation
+## Migrate from GitHub Actions
 
-Install the CLI:
+### 1. Deploy Open Actions
+
+Kubernetes 1.29 or newer, Helm, and a public HTTPS endpoint for GitHub webhooks
+are required.
 
 ```console
 go install github.com/kelos-dev/open-actions/cmd/open-actions@latest
-```
-
-Then install the CRDs, RBAC, controller, Console, and Services in the
-cluster selected by the current Kubernetes context:
-
-```console
 open-actions install
 ```
 
-The command installs or upgrades the embedded Helm chart as the `open-actions`
-release in the `open-actions-system` namespace. It requires Helm on `PATH` and
-uses Helm's current Kubernetes context. Pass custom chart configuration with
-`open-actions install --values values.yaml`. The chart and its values are
-documented in
-[`internal/manifests/charts/open-actions`](internal/manifests/charts/open-actions).
-
-The Console is installed by default for access through a local port-forward:
+Expose `open-actions-webhook.open-actions-system:80` through HTTPS. The Console
+is available locally with:
 
 ```console
-kubectl port-forward --namespace open-actions-system service/open-actions-console 8080:80
+kubectl port-forward --namespace open-actions-system \
+  service/open-actions-console 8080:80
 ```
 
-When exposing the Console, set its public HTTPS URL and route that origin to
-its Service:
+See the [chart values](internal/manifests/charts/open-actions) to expose the
+Console or customize the installation.
 
-```yaml
-console:
-  publicURL: https://actions.example
-```
+### 2. Install the GitHub App
 
-The chart creates a random administrator token for the Console and preserves it
-across upgrades. Retrieve it after installation, then enter it on the Console
-login page:
+[Create a GitHub App](https://docs.github.com/en/apps/creating-github-apps/registering-a-github-app/registering-a-github-app)
+with the public webhook URL and a webhook secret. Configure it with:
+
+- repository permissions: Contents read, Actions read, Issues read, Pull
+  requests read, Merge queues read, and Checks read and write
+- events: Push, Pull request, Merge group, Workflow run, Issues, Issue comment,
+  Pull request review comment, Pull request review, and Release
+
+Generate a private key, [install the App](https://docs.github.com/en/apps/using-github-apps/installing-your-own-github-app)
+on the repositories to run, and record the App ID and installation ID. Then
+create the Kubernetes Secret, replacing `WEBHOOK_SECRET` with the secret from
+GitHub:
 
 ```console
-kubectl get secret open-actions-console-auth \
-  --namespace open-actions-system \
-  --output jsonpath='{.data.token}' | base64 --decode; echo
+kubectl create namespace open-actions
+kubectl create secret generic open-actions-github-app \
+  --namespace open-actions \
+  --from-file=private-key.pem=/path/to/private-key.pem \
+  --from-literal=webhook-secret='<WEBHOOK_SECRET>'
 ```
 
-To manage the token outside Helm, create a Secret in the release namespace and
-set `console.secretName` to its name. `console.tokenKey` selects the key, which
-defaults to `token`.
+Put the App and installation IDs in the [Project
+sample](config/samples/actions_v1alpha1_project.yaml), then create the Project
+and a Runner:
 
-The token grants read access to every run, job, and runner Pod log visible to
-the Console. Keep it secret, and use HTTPS whenever the Console is exposed
-outside a trusted local connection.
+```console
+kubectl apply -f config/samples/actions_v1alpha1_project.yaml
+kubectl apply -f config/samples/actions_v1alpha1_runner.yaml
+```
 
-Create a Secret containing a GitHub App RSA private key and webhook secret, a
-`Project`, and one or more `Runner` resources. Each `Runner` is one reusable
-execution slot; create more Runners to increase concurrency. Examples are under
-[`config/samples`](config/samples). The `WorkflowJob` manifest illustrates the
-controller-owned child shape and is not applied independently. Expose the
-`open-actions-webhook.open-actions-system` Service through HTTPS and set that
-URL as the GitHub App's webhook URL. Expose
-`open-actions-console.open-actions-system` through HTTPS at its configured
-public URL. Subscribe the App to push, pull request, merge group, workflow run,
-issues, issue comment, pull request review comment, pull request review, and
-release events.
-Grant the App these repository permissions:
+Each Runner executes one job at a time. Its labels must include every label in
+the job's `runs-on` value. Use the [Docker Runner
+sample](config/samples/actions_v1alpha1_docker_runner.yaml) for jobs that need
+Docker.
 
-- Contents: read, for workflow discovery and job execution
-- Actions: read, for `workflow_run` webhooks
-- Issues: read, for `issues` and `issue_comment` webhooks
-- Pull requests: read, for pull request and review webhooks
-- Merge queues: read, for `merge_group` webhooks
-- Checks: read and write, for WorkflowRun reporting
+### 3. Migrate a workflow
 
-Runner job tokens remain restricted to the selected repository with Contents
-read access. The Console runs with a separate ServiceAccount limited to reading
-workflow runs, workflow jobs, Pods, and Pod logs. Its administrator token is
-mounted directly into the Console pod from the configured Secret.
+Open Actions supports a [subset of the GitHub Actions workflow
+API](docs/reference.md#workflow-api). Check compatibility first, then copy one
+workflow without deleting the original:
 
-The Docker Runner sample enables a privileged, job-scoped Docker-in-Docker
-sidecar for actions such as `helm/kind-action`. Docker execution is disabled
-when `spec.execution.docker` is omitted. Run Docker-enabled Runners only on
-nodes whose isolation policy is appropriate for privileged workflow code, and
-never replace the sidecar with a mount of the node's Docker socket.
+```console
+mkdir -p .open-actions/workflows
+cp .github/workflows/ci.yaml .open-actions/workflows/ci.yaml
+```
 
-Move repository workflows from `.github/workflows` to
-`.open-actions/workflows`. A webhook delivery then follows the path shown in
-[Architecture](#architecture).
+Push the copy from a branch in the installed repository and confirm its
+`Open Actions / .open-actions/workflows/ci.yaml` check passes. GitHub Actions
+and Open Actions will run in parallel while both files exist. Then update any
+required checks and delete `.github/workflows/ci.yaml`. Restore that file to
+roll back.
 
 ## Inspecting workflow runs
 
