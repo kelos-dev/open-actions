@@ -546,6 +546,46 @@ func TestParseAcceptsRunsOnLabels(t *testing.T) {
 	}
 }
 
+func TestParseAndExpandMatrixStrategy(t *testing.T) {
+	definition, err := Parse([]byte("name: Release\non: push\njobs:\n  build:\n    strategy:\n      max-parallel: 1\n      matrix:\n        arch: [amd64, arm64]\n        variant: [default, race]\n    runs-on: '${{ matrix.arch }}'\n    steps:\n      - run: 'make image ARCH=${{ matrix.arch }}'\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	strategy := definition.Jobs["build"].Strategy
+	if strategy.MaxParallel != 1 {
+		t.Fatalf("max-parallel = %d, want 1", strategy.MaxParallel)
+	}
+	combinations := MatrixCombinations(strategy)
+	if len(combinations) != 4 {
+		t.Fatalf("matrix combinations = %d, want 4", len(combinations))
+	}
+	want := []string{"amd64/default", "amd64/race", "arm64/default", "arm64/race"}
+	for index, combination := range combinations {
+		got := fmt.Sprintf("%v/%v", combination["arch"], combination["variant"])
+		if got != want[index] {
+			t.Errorf("combination %d = %q, want %q", index, got, want[index])
+		}
+	}
+}
+
+func TestParseRejectsInvalidMatrixStrategy(t *testing.T) {
+	strategies := []string{
+		"strategy: {}",
+		"strategy: {matrix: {}}",
+		"strategy: {matrix: {arch: []}}",
+		"strategy: {matrix: {arch: [{name: arm64}]}}",
+		"strategy: {matrix: {arch: [" + strings.Repeat("a", maxMatrixValueLength+1) + "]}}",
+		"strategy: {max-parallel: 0, matrix: {arch: [amd64]}}",
+		"strategy: {fail-fast: false, matrix: {arch: [amd64]}}",
+	}
+	for _, strategy := range strategies {
+		data := fmt.Sprintf("name: Release\non: push\njobs:\n  build:\n    %s\n    runs-on: ubuntu-latest\n    steps:\n      - run: make image\n", strategy)
+		if _, err := Parse([]byte(data)); err == nil {
+			t.Errorf("Parse() accepted %s", strategy)
+		}
+	}
+}
+
 func TestEvaluateJobResolvesPlanningExpressions(t *testing.T) {
 	job := Job{
 		Name:   "Build ${{ github.ref_name }}",
@@ -578,6 +618,20 @@ func TestEvaluateJobRejectsUnavailablePlanningContext(t *testing.T) {
 	_, err := EvaluateJob("build", job, workflowexpression.Context{Availability: workflowexpression.NewAvailability("github")})
 	if err == nil || !strings.Contains(err.Error(), `context "matrix" is unavailable`) {
 		t.Fatalf("error = %v, want unavailable matrix context", err)
+	}
+}
+
+func TestEvaluateJobResolvesMatrixRunnerLabel(t *testing.T) {
+	job := Job{Name: "Build ${{ matrix.arch }}", RunsOn: StringList{"${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}"}}
+	resolved, err := EvaluateJob("build", job, workflowexpression.Context{
+		Availability: workflowexpression.NewAvailability("github", "matrix"),
+		Values:       map[string]any{"matrix": map[string]any{"arch": "arm64"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolved.Name != "Build arm64" || !slices.Equal([]string(resolved.RunsOn), []string{"ubuntu-24.04-arm"}) {
+		t.Fatalf("resolved job = %#v", resolved)
 	}
 }
 

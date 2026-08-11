@@ -10,9 +10,9 @@ import (
 )
 
 var (
-	runnerJobAvailability          = workflowexpression.NewAvailability("github", "inputs")
-	runnerStepAvailability         = workflowexpression.NewAvailability("github", "runner", "env", "inputs")
-	runnerConditionAvailability    = workflowexpression.NewAvailability("github", "runner", "env", "inputs").WithStatusFunctions()
+	runnerJobAvailability          = workflowexpression.NewAvailability("github", "matrix", "inputs")
+	runnerStepAvailability         = workflowexpression.NewAvailability("github", "matrix", "runner", "env", "inputs")
+	runnerConditionAvailability    = workflowexpression.NewAvailability("github", "matrix", "runner", "env", "inputs").WithStatusFunctions()
 	compositeAvailability          = workflowexpression.NewAvailability("github", "runner", "env", "inputs", "steps")
 	compositeConditionAvailability = workflowexpression.NewAvailability("github", "runner", "env", "inputs", "steps").WithStatusFunctions()
 )
@@ -111,6 +111,7 @@ func expressionContext(plan *Plan, environment []string, actionPath string, extr
 	values := map[string]any{
 		"github": github,
 		"inputs": plan.Inputs,
+		"matrix": plan.Matrix,
 		"runner": map[string]any{
 			"os":         environmentValue(environment, "RUNNER_OS"),
 			"arch":       environmentValue(environment, "RUNNER_ARCH"),

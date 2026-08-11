@@ -251,6 +251,18 @@ func (r *RunnerReconciler) claimWorkflowJob(ctx context.Context, runnerObject *a
 	); err != nil {
 		return nil, err
 	}
+	matrixActivity := map[string]int32{}
+	for index := range jobs.Items {
+		matrix := jobs.Items[index].Spec.Matrix
+		if matrix != nil && matrix.MaxParallel > 0 {
+			var err error
+			matrixActivity, err = r.activeMatrixJobs(ctx, runnerObject.Namespace, project)
+			if err != nil {
+				return nil, err
+			}
+			break
+		}
+	}
 	candidates := make([]*actionsv1alpha1.WorkflowJob, 0)
 	plannedRuns := map[string]bool{}
 	loadedRuns := map[string]bool{}
@@ -266,6 +278,9 @@ func (r *RunnerReconciler) claimWorkflowJob(ctx context.Context, runnerObject *a
 			continue
 		}
 		if !runnerLabelsMatch(runnerObject.Spec.Labels, workflowJob.Spec.RunsOn) {
+			continue
+		}
+		if matrix := workflowJob.Spec.Matrix; matrix != nil && matrix.MaxParallel > 0 && matrixActivity[matrixJobGroup(workflowJob)] >= matrix.MaxParallel {
 			continue
 		}
 		runName := workflowJob.Spec.WorkflowRunRef.Name
@@ -313,6 +328,29 @@ func (r *RunnerReconciler) claimWorkflowJob(ctx context.Context, runnerObject *a
 		return nil, errors.Join(err, r.releaseRunnerClaim(ctx, currentRunner, workflowJob.Name))
 	}
 	return workflowJob, nil
+}
+
+func (r *RunnerReconciler) activeMatrixJobs(ctx context.Context, namespace string, project *actionsv1alpha1.Project) (map[string]int32, error) {
+	jobs := &actionsv1alpha1.WorkflowJobList{}
+	if err := r.APIReader.List(ctx, jobs, client.InNamespace(namespace), client.MatchingLabels{actionsv1alpha1.LabelProjectUID: string(project.UID)}); err != nil {
+		return nil, err
+	}
+	active := make(map[string]int32)
+	for index := range jobs.Items {
+		job := &jobs.Items[index]
+		if job.Spec.Matrix != nil && job.Status.RunnerRef != nil && !terminalWorkflowJob(job) {
+			active[matrixJobGroup(job)]++
+		}
+	}
+	return active, nil
+}
+
+func matrixJobGroup(job *actionsv1alpha1.WorkflowJob) string {
+	runID := job.Labels[actionsv1alpha1.LabelWorkflowRunUID]
+	if runID == "" {
+		runID = job.Spec.WorkflowRunRef.Name
+	}
+	return runID + "\x00" + job.Spec.Matrix.LogicalJobID
 }
 
 func (r *RunnerReconciler) releaseRunnerClaim(ctx context.Context, runnerObject *actionsv1alpha1.Runner, workflowJobName string) error {

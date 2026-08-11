@@ -72,11 +72,50 @@ spec:
                 minLength: 1
                 type: string
               jobID:
-                description: JobID is the workflow-local identifier of this job.
+                description: |-
+                  JobID is the stable workflow-local identifier of this expanded job. For a
+                  matrix job, each combination has a distinct JobID and Matrix.LogicalJobID
+                  identifies the source workflow job.
                 maxLength: 256
                 minLength: 1
                 pattern: ^[A-Za-z_][A-Za-z0-9_-]*$
                 type: string
+              matrix:
+                description: Matrix describes the matrix combination represented by
+                  this job.
+                properties:
+                  logicalJobID:
+                    description: LogicalJobID is the workflow-local identifier before
+                      matrix expansion.
+                    maxLength: 256
+                    minLength: 1
+                    pattern: ^[A-Za-z_][A-Za-z0-9_-]*$
+                    type: string
+                  maxParallel:
+                    description: |-
+                      MaxParallel limits concurrently scheduled combinations in this logical
+                      job. Omit MaxParallel to apply no matrix-specific limit.
+                    format: int32
+                    minimum: 1
+                    type: integer
+                  values:
+                    additionalProperties:
+                      type: string
+                    description: |-
+                      Values contains the scalar matrix axis values for this combination.
+                      Values are represented using their workflow string form.
+                    maxProperties: 100
+                    minProperties: 1
+                    type: object
+                    x-kubernetes-validations:
+                    - message: matrix keys must contain 1 to 256 characters and values
+                        must contain at most 1024 characters
+                      rule: self.all(k, size(k) > 0 && size(k) <= 256 && size(self[k])
+                        <= 1024)
+                required:
+                - logicalJobID
+                - values
+                type: object
               runsOn:
                 description: |-
                   RunsOn contains the canonical lowercase labels requested by the workflow

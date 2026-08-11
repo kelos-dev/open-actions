@@ -51,7 +51,7 @@ func TestJobPlanCoversSupportedSteps(t *testing.T) {
 		{Uses: "actions/setup-go@v5", With: map[string]any{"go-version-file": "go.mod"}},
 		{Name: "Build", Run: "make build"},
 	}}
-	plan, err := reconciler.jobPlan(run, "CI", "build", job, map[string]any{"enabled": false, "retries": float64(2)})
+	plan, err := reconciler.jobPlan(run, "CI", "build", job, nil, map[string]any{"enabled": false, "retries": float64(2)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -230,6 +230,50 @@ func TestJobExpressionsIncludeBoundedEventMetadata(t *testing.T) {
 				t.Fatalf("evaluated job name = %q, want %q", job.Name, tt.want)
 			}
 		})
+	}
+}
+
+func TestPlanWorkflowJobsExpandsArchitectureMatrix(t *testing.T) {
+	reconciler := &WorkflowRunReconciler{}
+	run := &actionsv1alpha1.WorkflowRun{Spec: actionsv1alpha1.WorkflowRunSpec{Source: actionsv1alpha1.WorkflowRunSource{
+		Type: actionsv1alpha1.SourceTypeGitHub,
+		GitHub: &actionsv1alpha1.GitHubWorkflowRunSource{
+			Repository: actionsv1alpha1.GitHubRepository{ID: 1, Owner: "kelos-dev", Name: "kelos"},
+			Event:      actionsv1alpha1.GitHubEvent{Name: "push", DeliveryID: "delivery"},
+			Revision:   actionsv1alpha1.GitRevision{SHA: strings.Repeat("a", 40), Ref: "refs/heads/main"},
+		},
+	}}}
+	definition, err := workflow.Parse([]byte("name: Release\non: push\njobs:\n  build-images:\n    strategy:\n      max-parallel: 1\n      matrix:\n        arch: [amd64, arm64]\n    runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}\n    steps:\n      - run: make image IMAGE_PLATFORMS=linux/${{ matrix.arch }}\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	planned, err := reconciler.planWorkflowJobs(run, definition, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(planned) != 2 {
+		t.Fatalf("planned jobs = %d, want 2", len(planned))
+	}
+	for index, arch := range []string{"amd64", "arm64"} {
+		job := planned[index]
+		if job.id != fmt.Sprintf("build-images-matrix-%d", index+1) || job.matrix == nil || job.matrix.LogicalJobID != "build-images" || job.matrix.Values["arch"] != arch || job.matrix.MaxParallel != 1 {
+			t.Errorf("planned job %d = %#v", index, job)
+		}
+		wantRunner := "ubuntu-latest"
+		if arch == "arm64" {
+			wantRunner = "ubuntu-24.04-arm"
+		}
+		if len(job.runsOn) != 1 || job.runsOn[0] != wantRunner {
+			t.Errorf("runs-on for %s = %v, want %q", arch, job.runsOn, wantRunner)
+		}
+		plan := &runner.Plan{}
+		if err := json.Unmarshal([]byte(job.plan), plan); err != nil {
+			t.Fatal(err)
+		}
+		if plan.JobID != "build-images" || plan.Matrix["arch"] != arch {
+			t.Errorf("plan for %s = %#v", arch, plan)
+		}
 	}
 }
 
@@ -923,6 +967,23 @@ func TestWorkflowJobNameSeparatesCollidingJobIDs(t *testing.T) {
 	}
 }
 
+func TestMatrixWorkflowJobIDsAreStableUniqueAndBounded(t *testing.T) {
+	logicalID := strings.Repeat("a", workflowJobIDMaxLength)
+	first := matrixWorkflowJobID(logicalID, 0)
+	second := matrixWorkflowJobID(logicalID, 1)
+	if first == second || len(first) > workflowJobIDMaxLength || len(second) > workflowJobIDMaxLength {
+		t.Fatalf("matrix IDs = %q, %q", first, second)
+	}
+	if first != matrixWorkflowJobID(logicalID, 0) {
+		t.Fatal("matrix job ID is not stable")
+	}
+	sourceIDs := map[string]struct{}{"build-matrix-1": {}}
+	collisionFree := uniqueMatrixWorkflowJobID("build", 0, sourceIDs, nil)
+	if collisionFree == "build-matrix-1" || len(collisionFree) > workflowJobIDMaxLength {
+		t.Fatalf("collision-free matrix ID = %q", collisionFree)
+	}
+}
+
 func TestEnsureWorkflowJobsCreatesReadableNames(t *testing.T) {
 	scheme := runtime.NewScheme()
 	if err := actionsv1alpha1.AddToScheme(scheme); err != nil {
@@ -951,6 +1012,38 @@ func TestEnsureWorkflowJobsCreatesReadableNames(t *testing.T) {
 	job := &jobs.Items[0]
 	if job.Name != workflowJobName(run.Name, "build") || job.Spec.DisplayName != "Build and test" {
 		t.Errorf("WorkflowJob = %#v", job)
+	}
+}
+
+func TestEnsureWorkflowJobsPreservesMatrixIdentity(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := actionsv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	run := &actionsv1alpha1.WorkflowRun{ObjectMeta: metav1.ObjectMeta{Name: "release", Namespace: "default", UID: "run-uid"}}
+	project := &actionsv1alpha1.Project{ObjectMeta: metav1.ObjectMeta{Name: "project", Namespace: "default", UID: "project-uid"}}
+	clusterClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(run, project).Build()
+	reconciler := &WorkflowRunReconciler{Client: clusterClient, APIReader: clusterClient}
+	planned := []plannedWorkflowJob{{
+		id: "build-matrix-1", displayName: "build (arch=amd64)", runsOn: []string{"ubuntu-latest"}, plan: "{}",
+		matrix: &actionsv1alpha1.WorkflowJobMatrix{LogicalJobID: "build", Values: map[string]string{"arch": "amd64"}, MaxParallel: 1},
+	}}
+
+	if err := reconciler.ensureWorkflowJobs(context.Background(), run, project, planned); err != nil {
+		t.Fatal(err)
+	}
+	if err := reconciler.ensureWorkflowJobs(context.Background(), run, project, planned); err != nil {
+		t.Fatalf("reconcile persisted matrix job: %v", err)
+	}
+	jobs := &actionsv1alpha1.WorkflowJobList{}
+	if err := clusterClient.List(context.Background(), jobs); err != nil {
+		t.Fatal(err)
+	}
+	if len(jobs.Items) != 1 || jobs.Items[0].Spec.Matrix == nil || jobs.Items[0].Spec.Matrix.Values["arch"] != "amd64" || jobs.Items[0].Spec.Matrix.MaxParallel != 1 {
+		t.Fatalf("WorkflowJobs = %#v", jobs.Items)
 	}
 }
 
@@ -1382,6 +1475,43 @@ func TestWorkflowRunCountsAssignedJobAsActiveBeforeExecution(t *testing.T) {
 	}
 	condition := meta.FindStatusCondition(stored.Status.Conditions, actionsv1alpha1.WorkflowRunConditionSucceeded)
 	if condition == nil || condition.Status != metav1.ConditionUnknown || condition.Reason != "JobsRunning" {
+		t.Fatalf("succeeded condition = %#v", condition)
+	}
+}
+
+func TestWorkflowRunAggregatesMatrixFailure(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := actionsv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	run := &actionsv1alpha1.WorkflowRun{ObjectMeta: metav1.ObjectMeta{Name: "release", Namespace: "default", UID: "run-uid"}}
+	jobs := []client.Object{run}
+	for index, status := range []metav1.ConditionStatus{metav1.ConditionTrue, metav1.ConditionFalse} {
+		arch := []string{"amd64", "arm64"}[index]
+		jobs = append(jobs, &actionsv1alpha1.WorkflowJob{
+			ObjectMeta: metav1.ObjectMeta{Name: "build-" + arch, Namespace: run.Namespace, Labels: map[string]string{actionsv1alpha1.LabelWorkflowRunUID: string(run.UID)}},
+			Spec: actionsv1alpha1.WorkflowJobSpec{
+				WorkflowRunRef: corev1.LocalObjectReference{Name: run.Name}, JobID: fmt.Sprintf("build-matrix-%d", index+1),
+				Matrix: &actionsv1alpha1.WorkflowJobMatrix{LogicalJobID: "build", Values: map[string]string{"arch": arch}, MaxParallel: 1},
+			},
+			Status: actionsv1alpha1.WorkflowJobStatus{Conditions: []metav1.Condition{{Type: actionsv1alpha1.WorkflowJobConditionSucceeded, Status: status, Reason: "Completed", Message: "Completed"}}},
+		})
+	}
+	clusterClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&actionsv1alpha1.WorkflowRun{}).WithObjects(jobs...).Build()
+	reconciler := &WorkflowRunReconciler{Client: clusterClient, APIReader: clusterClient}
+
+	if _, err := reconciler.observeWorkflowJobs(context.Background(), run, "Release", "", 2); err != nil {
+		t.Fatal(err)
+	}
+	stored := &actionsv1alpha1.WorkflowRun{}
+	if err := clusterClient.Get(context.Background(), client.ObjectKeyFromObject(run), stored); err != nil {
+		t.Fatal(err)
+	}
+	if stored.Status.Jobs == nil || stored.Status.Jobs.Succeeded != 1 || stored.Status.Jobs.Failed != 1 {
+		t.Fatalf("job summary = %#v", stored.Status.Jobs)
+	}
+	condition := meta.FindStatusCondition(stored.Status.Conditions, actionsv1alpha1.WorkflowRunConditionSucceeded)
+	if condition == nil || condition.Status != metav1.ConditionFalse || condition.Reason != "JobFailed" {
 		t.Fatalf("succeeded condition = %#v", condition)
 	}
 }
