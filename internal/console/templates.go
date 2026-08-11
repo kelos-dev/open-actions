@@ -146,9 +146,9 @@ const logPageTemplate = `<!doctype html>
         const details=document.createElement('details');details.className='log-group';details.open=true;
         const summary=document.createElement('summary');const label=document.createElement('span');label.textContent=entry.text||'Log group';summary.append(label);
         if(entry.time){const time=document.createElement('span');time.className='group-time';time.textContent=timestamp(entry.time);summary.append(time)}
-        const body=document.createElement('div');details.append(summary,body);current().append(details);containers.push({body,scope:entry.scope||'command'});return;
+        const body=document.createElement('div');details.append(summary,body);current().append(details);containers.push({body,details,scope:entry.scope||'command'});return;
       }
-      if(entry.kind==='endgroup'){for(let index=containers.length-1;index>0;index--){if(containers[index].scope===entry.scope){containers.length=index;break}}return}
+      if(entry.kind==='endgroup'){for(let index=containers.length-1;index>0;index--){if(containers[index].scope===entry.scope){const container=containers[index];containers.length=index;if(entry.scope==='workflow')container.details.open=false;break}}return}
       const line=document.createElement('div');line.className='log-line '+entry.kind;
       const time=document.createElement('span');time.className='line-time';time.textContent=timestamp(entry.time);
       const icon=document.createElement('span');icon.className='line-icon';icon.textContent=iconFor(entry.kind);
