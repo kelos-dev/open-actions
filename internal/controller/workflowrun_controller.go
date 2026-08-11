@@ -262,6 +262,10 @@ func (r *WorkflowRunReconciler) reconcileGitHubCheck(ctx context.Context, run *a
 		return fmt.Errorf("get Project %q for GitHub check: %w", projectKey.Name, err)
 	}
 	githubConfig := project.Spec.Source.GitHub
+	checkHeadSHA := githubSource.Revision.SHA
+	if githubSource.Event.Name == actionsv1alpha1.GitHubEventNamePullRequest && githubSource.Revision.HeadSHA != "" {
+		checkHeadSHA = githubSource.Revision.HeadSHA
+	}
 	detailsURL := ""
 	if r.ConsoleURL != "" {
 		detailsURL = workflowRunConsoleURL(r.ConsoleURL, run)
@@ -270,7 +274,7 @@ func (r *WorkflowRunReconciler) reconcileGitHubCheck(ctx context.Context, run *a
 	externalID := string(run.UID)
 	createRequest := githubclient.CreateCheckRunRequest{
 		Name:        name,
-		HeadSHA:     githubSource.Revision.SHA,
+		HeadSHA:     checkHeadSHA,
 		DetailsURL:  detailsURL,
 		ExternalID:  externalID,
 		Status:      report.Status,
@@ -296,7 +300,7 @@ func (r *WorkflowRunReconciler) reconcileGitHubCheck(ctx context.Context, run *a
 
 	var checkRun *githubclient.CheckRun
 	if current == nil {
-		checkRun, err = installation.FindCheckRun(ctx, githubSource.Repository.Owner, githubSource.Repository.Name, githubSource.Revision.SHA, githubConfig.AppID, externalID)
+		checkRun, err = installation.FindCheckRun(ctx, githubSource.Repository.Owner, githubSource.Repository.Name, checkHeadSHA, githubConfig.AppID, externalID)
 		if err != nil {
 			return err
 		}

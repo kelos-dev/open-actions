@@ -73,6 +73,7 @@ type WorkflowRunSource struct {
 // requested a WorkflowRun.
 // +kubebuilder:validation:XValidation:rule="self.event.name == 'pull_request' ? has(self.revision.headRef) : !has(self.revision.headRef)",message="revision.headRef must be specified exactly for pull_request events"
 // +kubebuilder:validation:XValidation:rule="!has(self.revision.baseRef) || self.event.name in ['pull_request', 'merge_group']",message="revision.baseRef may be specified only for pull_request and merge_group events"
+// +kubebuilder:validation:XValidation:rule="!has(self.revision.headSHA) || self.event.name == 'pull_request'",message="revision.headSHA may be specified only for pull_request events"
 // +kubebuilder:validation:XValidation:rule="self.event.name != 'push' || self.revision.ref.startsWith('refs/heads/') || self.revision.ref.startsWith('refs/tags/')",message="push revision.ref must identify a branch or tag"
 // +kubebuilder:validation:XValidation:rule="self.event.name != 'pull_request' || self.revision.ref.matches('^refs/pull/[1-9][0-9]*/merge$') || (self.event.action == 'closed' && self.revision.ref.startsWith('refs/heads/'))",message="pull_request revision.ref must identify its merge ref, or its base branch when merged and closed"
 // +kubebuilder:validation:XValidation:rule="self.event.name != 'merge_group' || self.revision.ref.startsWith('refs/heads/gh-readonly-queue/')",message="merge_group revision.ref must identify a merge queue branch"
@@ -150,6 +151,13 @@ type GitRevision struct {
 	// +kubebuilder:validation:Pattern=`^[0-9a-f]{40}$`
 	// +required
 	SHA string `json:"sha"`
+
+	// HeadSHA is the pull request head commit used for GitHub check reporting.
+	// It may differ from SHA when the workflow executes a test merge commit.
+	// When absent, GitHub checks are reported on SHA.
+	// +kubebuilder:validation:Pattern=`^[0-9a-f]{40}$`
+	// +optional
+	HeadSHA string `json:"headSHA,omitempty"`
 
 	// Ref is the fully qualified Git ref associated with the event. For a
 	// deleted push, it records the deleted ref rather than identifying SHA.

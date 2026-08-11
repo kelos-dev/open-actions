@@ -135,6 +135,31 @@ func TestCreateWorkflowRunIsIdempotent(t *testing.T) {
 	}
 }
 
+func TestMatchingWorkflowRunAcceptsMissingHeadSHA(t *testing.T) {
+	desired := &actionsv1alpha1.WorkflowRun{
+		ObjectMeta: metav1.ObjectMeta{Name: "ci", Namespace: "default"},
+		Spec: actionsv1alpha1.WorkflowRunSpec{
+			Source: actionsv1alpha1.WorkflowRunSource{
+				Type: actionsv1alpha1.SourceTypeGitHub,
+				GitHub: &actionsv1alpha1.GitHubWorkflowRunSource{
+					Revision: actionsv1alpha1.GitRevision{SHA: strings.Repeat("a", 40), HeadSHA: strings.Repeat("b", 40)},
+				},
+			},
+		},
+	}
+	existing := desired.DeepCopy()
+	existing.Spec.Source.GitHub.Revision.HeadSHA = ""
+
+	if err := matchingWorkflowRun(existing, desired); err != nil {
+		t.Fatalf("WorkflowRun using the SHA fallback did not match its delivery replay: %v", err)
+	}
+
+	existing.Spec.Source.GitHub.Revision.HeadSHA = strings.Repeat("c", 40)
+	if err := matchingWorkflowRun(existing, desired); !apierrors.IsConflict(err) {
+		t.Fatalf("WorkflowRun with a different head SHA error = %v, want conflict", err)
+	}
+}
+
 func TestInvalidWorkflowRunCreationIsTerminal(t *testing.T) {
 	err := apierrors.NewInvalid(actionsv1alpha1.GroupVersion.WithKind("WorkflowRun").GroupKind(), "ci", nil)
 	if !terminalWorkflowRunCreationError(err) {
@@ -260,8 +285,9 @@ func TestDeliveryPinsCurrentPullRequestMergeRevision(t *testing.T) {
 	if len(runs.Items) != 1 {
 		t.Fatalf("WorkflowRuns = %d, want 1", len(runs.Items))
 	}
-	if got := runs.Items[0].Spec.Source.GitHub.Revision.SHA; got != mergeSHA {
-		t.Fatalf("WorkflowRun revision = %q, want pinned revision %q", got, mergeSHA)
+	revision := runs.Items[0].Spec.Source.GitHub.Revision
+	if revision.SHA != mergeSHA || revision.HeadSHA != headSHA {
+		t.Fatalf("WorkflowRun revision = %#v, want execution SHA %q and head SHA %q", revision, mergeSHA, headSHA)
 	}
 	if got := runs.Items[0].Spec.Source.GitHub.Revision.BaseRef; got != "main" {
 		t.Fatalf("WorkflowRun base ref = %q, want main", got)

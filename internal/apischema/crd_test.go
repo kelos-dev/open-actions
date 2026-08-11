@@ -91,6 +91,7 @@ func TestWorkflowRunAcceptsGitHubEventContracts(t *testing.T) {
 				event["action"] = "checks_requested"
 				revision := github["revision"].(map[string]any)
 				revision["ref"] = "refs/heads/gh-readonly-queue/main/pr-42"
+				delete(revision, "headSHA")
 				delete(revision, "headRef")
 			},
 		},
@@ -111,6 +112,15 @@ func TestWorkflowRunAcceptsAtBranchName(t *testing.T) {
 	workflowRunGitHub(object)["revision"].(map[string]any)["headRef"] = "@"
 	if errs := validateObject(t, crd, object, nil); len(errs) > 0 {
 		t.Fatalf("valid @ branch name was rejected: %v", errs.ToAggregate())
+	}
+}
+
+func TestWorkflowRunAcceptsPullRequestWithoutHeadSHA(t *testing.T) {
+	crd, _ := loadCRD(t, "actions.kelos.dev_workflowruns.yaml")
+	object := loadSample(t, "actions_v1alpha1_workflowrun.yaml")
+	delete(workflowRunGitHub(object)["revision"].(map[string]any), "headSHA")
+	if errs := validateObject(t, crd, object, nil); len(errs) > 0 {
+		t.Fatalf("pull request without optional head SHA was rejected: %v", errs.ToAggregate())
 	}
 }
 
@@ -456,6 +466,26 @@ func TestCRDRejectsInvalidCELValues(t *testing.T) {
 			crd:  "actions.kelos.dev_workflowruns.yaml", sample: "actions_v1alpha1_workflowrun.yaml",
 			mutate: func(object map[string]any) {
 				workflowRunGitHub(object)["revision"].(map[string]any)["sha"] = strings.Repeat("a", 41)
+			},
+		},
+		{
+			name: "WorkflowRun invalid head SHA length",
+			crd:  "actions.kelos.dev_workflowruns.yaml", sample: "actions_v1alpha1_workflowrun.yaml",
+			mutate: func(object map[string]any) {
+				workflowRunGitHub(object)["revision"].(map[string]any)["headSHA"] = strings.Repeat("a", 41)
+			},
+		},
+		{
+			name: "WorkflowRun non-pull request with head SHA",
+			crd:  "actions.kelos.dev_workflowruns.yaml", sample: "actions_v1alpha1_workflowrun.yaml",
+			mutate: func(object map[string]any) {
+				github := workflowRunGitHub(object)
+				event := github["event"].(map[string]any)
+				event["name"] = "push"
+				delete(event, "action")
+				revision := github["revision"].(map[string]any)
+				revision["ref"] = "refs/heads/main"
+				delete(revision, "headRef")
 			},
 		},
 		{
