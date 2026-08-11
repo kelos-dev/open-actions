@@ -8,6 +8,8 @@ their jobs in the team's own Kubernetes cluster. GitHub webhooks are the first
 source integration. Workflow planning, scheduling, and execution belong to Open
 Actions and run on self-hosted infrastructure.
 
+![Open Actions Console showing live workflow runner logs](docs/open-actions-console.png)
+
 Kubernetes 1.29 or newer is required.
 
 The supported execution subset includes:
