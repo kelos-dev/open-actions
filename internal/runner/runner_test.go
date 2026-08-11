@@ -83,7 +83,8 @@ func TestExecuteResolvesProblemMatchersFromWorkspace(t *testing.T) {
 func TestExecuteEvaluatesWorkflowExpressions(t *testing.T) {
 	workspace := t.TempDir()
 	plan := testPlan()
-	plan.Env = map[string]string{"BRANCH": "${{ github.ref_name }}", "JOB_TOKEN": "${{ github.token }}"}
+	plan.Matrix = map[string]any{"arch": "arm64"}
+	plan.Env = map[string]string{"ARCH": "${{ matrix.arch }}", "BRANCH": "${{ github.ref_name }}", "JOB_TOKEN": "${{ github.token }}"}
 	plan.Steps = []Step{
 		{
 			Name: "skipped",
@@ -99,7 +100,7 @@ func TestExecuteEvaluatesWorkflowExpressions(t *testing.T) {
 				"STEP_TOKEN": "${{ github.token }}",
 				"TARGET":     "main",
 			},
-			Run: "test \"$JOB_TOKEN\" = installation-token && test \"$STEP_TOKEN\" = installation-token && printf '%s/%s/${{ github.sha }}/${{ env.TARGET }}' \"$BRANCH\" \"$REPOSITORY\" > result",
+			Run: "test \"$JOB_TOKEN\" = installation-token && test \"$STEP_TOKEN\" = installation-token && printf '%s/%s/${{ github.sha }}/${{ env.TARGET }}/${{ matrix.arch }}' \"$BRANCH\" \"$REPOSITORY\" > result",
 		},
 	}
 	executor := testExecutor(t, io.Discard, io.Discard)
@@ -113,7 +114,7 @@ func TestExecuteEvaluatesWorkflowExpressions(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(result) != "main/acme/example/"+strings.Repeat("a", 40)+"/main" {
+	if string(result) != "main/acme/example/"+strings.Repeat("a", 40)+"/main/arm64" {
 		t.Fatalf("result = %q", result)
 	}
 }
@@ -285,8 +286,8 @@ func TestExecuteRejectsUnavailableExpressionContext(t *testing.T) {
 	}
 }
 
-func TestLoadPlanSupportsKnownVersions(t *testing.T) {
-	for _, version := range []int{1, 2, PlanVersion} {
+func TestLoadPlanSupportsCompatibleVersions(t *testing.T) {
+	for version := minimumPlanVersion; version <= PlanVersion; version++ {
 		t.Run(fmt.Sprintf("version %d", version), func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "job.json")
 			data := fmt.Sprintf(`{"version":%d,"repository":{"id":1,"owner":"acme","name":"example","serverURL":"https://github.com","apiURL":"https://api.github.com","actionCloneBaseURL":"https://github.com"},"event":{"name":"push","deliveryID":"delivery"},"revision":{"sha":"abc","ref":"refs/heads/main","refName":"main"},"workflowName":"CI","jobID":"build","steps":[{"run":"true"}]}`, version)
@@ -397,8 +398,8 @@ func TestLoadPlanValidatesDeliveryIdentityByEvent(t *testing.T) {
 func TestLoadPlanRejectsIncompatibleSchemas(t *testing.T) {
 	for name, data := range map[string]string{
 		"unversioned":         `{"repository":{}}`,
-		"unsupported version": `{"version":3,"repository":{}}`,
-		"unknown field":       `{"version":2,"futureField":true}`,
+		"unsupported version": fmt.Sprintf(`{"version":%d,"repository":{}}`, PlanVersion+1),
+		"unknown field":       fmt.Sprintf(`{"version":%d,"futureField":true}`, PlanVersion),
 	} {
 		t.Run(name, func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "job.json")

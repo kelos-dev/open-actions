@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"errors"
+	"fmt"
 	"slices"
 	"strings"
 	"testing"
@@ -279,6 +280,76 @@ func TestRunnerClaimsOldestMatchingWorkflowJobInProject(t *testing.T) {
 	staleCondition := meta.FindStatusCondition(staleJob.Status.Conditions, actionsv1alpha1.WorkflowJobConditionSucceeded)
 	if staleCondition == nil || staleCondition.Status != metav1.ConditionFalse || staleCondition.Reason != "ProjectRecreated" {
 		t.Fatalf("recreated project condition = %#v", staleCondition)
+	}
+}
+
+func TestMatrixMaxParallelLimitsRunnerClaims(t *testing.T) {
+	scheme := runnerTestScheme(t)
+	project := &actionsv1alpha1.Project{ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: "default", UID: types.UID("project-uid")}}
+	run := &actionsv1alpha1.WorkflowRun{
+		ObjectMeta: metav1.ObjectMeta{Name: "release", Namespace: "default", UID: types.UID("run-uid")},
+		Status: actionsv1alpha1.WorkflowRunStatus{Conditions: []metav1.Condition{
+			plannedCondition(metav1.ConditionTrue, "JobsPlanned"),
+		}},
+	}
+	runner1 := &actionsv1alpha1.Runner{ObjectMeta: metav1.ObjectMeta{Name: "runner-1", Namespace: "default", UID: "runner-1"}, Spec: actionsv1alpha1.RunnerSpec{Labels: []string{"ubuntu-latest"}}}
+	runner2 := &actionsv1alpha1.Runner{ObjectMeta: metav1.ObjectMeta{Name: "runner-2", Namespace: "default", UID: "runner-2"}, Spec: actionsv1alpha1.RunnerSpec{Labels: []string{"ubuntu-24.04-arm"}}}
+	created := metav1.NewTime(time.Unix(100, 0))
+	jobs := []*actionsv1alpha1.WorkflowJob{}
+	for index, arch := range []string{"amd64", "arm64"} {
+		runsOn := "ubuntu-latest"
+		if arch == "arm64" {
+			runsOn = "ubuntu-24.04-arm"
+		}
+		jobs = append(jobs, &actionsv1alpha1.WorkflowJob{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: fmt.Sprintf("build-%s", arch), Namespace: "default", CreationTimestamp: metav1.NewTime(created.Add(time.Duration(index) * time.Second)),
+				Labels: map[string]string{actionsv1alpha1.LabelProjectUID: string(project.UID), actionsv1alpha1.LabelWorkflowRunUID: string(run.UID)}, Annotations: map[string]string{actionsv1alpha1.AnnotationProjectName: project.Name},
+			},
+			Spec: actionsv1alpha1.WorkflowJobSpec{
+				WorkflowRunRef: corev1.LocalObjectReference{Name: run.Name}, JobID: fmt.Sprintf("build-matrix-%d", index+1), RunsOn: []string{runsOn},
+				Matrix: &actionsv1alpha1.WorkflowJobMatrix{LogicalJobID: "build", Values: map[string]string{"arch": arch}, MaxParallel: 1},
+			},
+		})
+	}
+	clusterClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithIndex(&actionsv1alpha1.WorkflowJob{}, workflowJobQueuedIndex, indexQueuedWorkflowJob).
+		WithIndex(&actionsv1alpha1.WorkflowJob{}, workflowJobProjectNameIndex, indexWorkflowJobProjectName).
+		WithStatusSubresource(&actionsv1alpha1.Runner{}, &actionsv1alpha1.WorkflowJob{}).
+		WithObjects(project, run, runner1, runner2, jobs[0], jobs[1]).
+		Build()
+	reconciler := &RunnerReconciler{Client: clusterClient, APIReader: clusterClient}
+
+	first, err := reconciler.claimWorkflowJob(context.Background(), runner1, project)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first == nil || first.Name != jobs[0].Name {
+		t.Fatalf("first claim = %#v", first)
+	}
+	second, err := reconciler.claimWorkflowJob(context.Background(), runner2, project)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second != nil {
+		t.Fatalf("claimed second matrix job while first was active: %#v", second)
+	}
+
+	storedFirst := &actionsv1alpha1.WorkflowJob{}
+	if err := clusterClient.Get(context.Background(), client.ObjectKeyFromObject(jobs[0]), storedFirst); err != nil {
+		t.Fatal(err)
+	}
+	meta.SetStatusCondition(&storedFirst.Status.Conditions, metav1.Condition{Type: actionsv1alpha1.WorkflowJobConditionSucceeded, Status: metav1.ConditionTrue, Reason: "JobSucceeded", Message: "Job completed"})
+	if err := clusterClient.Status().Update(context.Background(), storedFirst); err != nil {
+		t.Fatal(err)
+	}
+	second, err = reconciler.claimWorkflowJob(context.Background(), runner2, project)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second == nil || second.Name != jobs[1].Name {
+		t.Fatalf("second claim after slot opened = %#v", second)
 	}
 }
 

@@ -20,7 +20,9 @@ type WorkflowJobSpec struct {
 	// +required
 	WorkflowRunRef corev1.LocalObjectReference `json:"workflowRunRef"`
 
-	// JobID is the workflow-local identifier of this job.
+	// JobID is the stable workflow-local identifier of this expanded job. For a
+	// matrix job, each combination has a distinct JobID and Matrix.LogicalJobID
+	// identifies the source workflow job.
 	// +kubebuilder:validation:MinLength=1
 	// +kubebuilder:validation:MaxLength=256
 	// +kubebuilder:validation:Pattern=`^[A-Za-z_][A-Za-z0-9_-]*$`
@@ -46,6 +48,36 @@ type WorkflowJobSpec struct {
 	// +kubebuilder:validation:items:Pattern=`^[a-z0-9][a-z0-9._-]*$`
 	// +required
 	RunsOn []string `json:"runsOn"`
+
+	// Matrix describes the matrix combination represented by this job.
+	// +optional
+	Matrix *WorkflowJobMatrix `json:"matrix,omitempty"`
+}
+
+// WorkflowJobMatrix identifies one expanded combination of a logical workflow
+// job. The controller writes the same MaxParallel value to every combination
+// of a logical job.
+type WorkflowJobMatrix struct {
+	// LogicalJobID is the workflow-local identifier before matrix expansion.
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=256
+	// +kubebuilder:validation:Pattern=`^[A-Za-z_][A-Za-z0-9_-]*$`
+	// +required
+	LogicalJobID string `json:"logicalJobID"`
+
+	// Values contains the scalar matrix axis values for this combination.
+	// Values are represented using their workflow string form.
+	// +kubebuilder:validation:MinProperties=1
+	// +kubebuilder:validation:MaxProperties=100
+	// +kubebuilder:validation:XValidation:rule="self.all(k, size(k) > 0 && size(k) <= 256 && size(self[k]) <= 1024)",message="matrix keys must contain 1 to 256 characters and values must contain at most 1024 characters"
+	// +required
+	Values map[string]string `json:"values"`
+
+	// MaxParallel limits concurrently scheduled combinations in this logical
+	// job. Omit MaxParallel to apply no matrix-specific limit.
+	// +kubebuilder:validation:Minimum=1
+	// +optional
+	MaxParallel int32 `json:"maxParallel,omitempty"`
 }
 
 // WorkflowJobStatus contains observations made while executing a workflow job.

@@ -37,6 +37,7 @@ type Plan struct {
 	Inputs       map[string]any    `json:"inputs,omitempty"`
 	WorkflowName string            `json:"workflowName"`
 	JobID        string            `json:"jobID"`
+	Matrix       map[string]any    `json:"matrix,omitempty"`
 	Env          map[string]string `json:"env,omitempty"`
 	Steps        []Step            `json:"steps"`
 }

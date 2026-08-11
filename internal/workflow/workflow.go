@@ -6,6 +6,7 @@ import (
 	"io"
 	"math"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -22,6 +23,8 @@ const (
 	maxWorkflowNameLength     = 256
 	maxConcurrencyGroupLength = 256
 	maxJobs                   = 1000
+	maxMatrixJobs             = 256
+	maxMatrixValueLength      = 1024
 	maxJobIDLength            = 256
 	maxJobNameLength          = 256
 	maxRunnerLabels           = 16
@@ -121,11 +124,18 @@ type Job struct {
 	RunsOn    StringList     `yaml:"runs-on"`
 	Needs     StringList     `yaml:"needs"`
 	Steps     []Step         `yaml:"steps"`
-	Strategy  yaml.Node      `yaml:"strategy"`
+	Strategy  Strategy       `yaml:"strategy"`
 	Container yaml.Node      `yaml:"container"`
 	Services  yaml.Node      `yaml:"services"`
 	If        string         `yaml:"if"`
 	Env       map[string]any `yaml:"env"`
+}
+
+type Strategy struct {
+	Matrix         map[string][]any
+	MaxParallel    int32
+	configured     bool
+	maxParallelSet bool
 }
 
 type Step struct {
@@ -242,9 +252,19 @@ func Parse(data []byte) (*Definition, error) {
 	if len(definition.Jobs) > maxJobs {
 		return nil, fmt.Errorf("workflow defines %d jobs; maximum is %d", len(definition.Jobs), maxJobs)
 	}
+	expandedJobs := 0
 	for id, job := range definition.Jobs {
 		if err := validateJob(id, &job); err != nil {
 			return nil, err
+		}
+		combinations := MatrixCombinations(job.Strategy)
+		if len(combinations) == 0 {
+			expandedJobs++
+		} else {
+			expandedJobs += len(combinations)
+		}
+		if expandedJobs > maxJobs {
+			return nil, fmt.Errorf("workflow expands to more than %d jobs", maxJobs)
 		}
 		definition.Jobs[id] = job
 	}
@@ -297,7 +317,10 @@ func validateJob(id string, job *Job) error {
 	if len(job.Needs) > 0 {
 		return fmt.Errorf("job %q uses unsupported needs", id)
 	}
-	if job.Strategy.Kind != 0 || job.Container.Kind != 0 || job.Services.Kind != 0 || job.If != "" {
+	if err := validateStrategy(id, job.Strategy); err != nil {
+		return err
+	}
+	if job.Container.Kind != 0 || job.Services.Kind != 0 || job.If != "" {
 		return fmt.Errorf("job %q uses an unsupported job feature", id)
 	}
 	if len(job.Steps) == 0 {
@@ -377,6 +400,73 @@ func validateJob(id string, job *Job) error {
 		return fmt.Errorf("job %q configuration exceeds %d bytes", id, MaxJobContentBytes)
 	}
 	return nil
+}
+
+func validateStrategy(id string, strategy Strategy) error {
+	if !strategy.configured {
+		return nil
+	}
+	if len(strategy.Matrix) == 0 {
+		return fmt.Errorf("job %q strategy must define a matrix", id)
+	}
+	if len(strategy.Matrix) > maxMapEntries {
+		return fmt.Errorf("job %q matrix defines %d axes; maximum is %d", id, len(strategy.Matrix), maxMapEntries)
+	}
+	combinations := 1
+	for name, values := range strategy.Matrix {
+		if name == "" || utf8.RuneCountInString(name) > maxMapKeyLength {
+			return fmt.Errorf("job %q matrix axis %q must contain 1 to %d characters", id, name, maxMapKeyLength)
+		}
+		if len(values) == 0 {
+			return fmt.Errorf("job %q matrix axis %q must define at least one value", id, name)
+		}
+		if len(values) > maxMatrixJobs || combinations > maxMatrixJobs/len(values) {
+			return fmt.Errorf("job %q matrix expands to more than %d jobs", id, maxMatrixJobs)
+		}
+		combinations *= len(values)
+		for _, value := range values {
+			scalar, ok := scalarString(value)
+			if !ok {
+				return fmt.Errorf("job %q matrix axis %q values must be scalars", id, name)
+			}
+			if utf8.RuneCountInString(scalar) > maxMatrixValueLength {
+				return fmt.Errorf("job %q matrix axis %q value exceeds %d characters", id, name, maxMatrixValueLength)
+			}
+		}
+	}
+	if strategy.maxParallelSet && strategy.MaxParallel < 1 {
+		return fmt.Errorf("job %q strategy max-parallel must be greater than zero", id)
+	}
+	return nil
+}
+
+// MatrixCombinations returns matrix values in stable axis and value order.
+func MatrixCombinations(strategy Strategy) []map[string]any {
+	if len(strategy.Matrix) == 0 {
+		return nil
+	}
+	axisNames := make([]string, 0, len(strategy.Matrix))
+	for name := range strategy.Matrix {
+		axisNames = append(axisNames, name)
+	}
+	sort.Strings(axisNames)
+	combinations := []map[string]any{{}}
+	for _, name := range axisNames {
+		values := strategy.Matrix[name]
+		next := make([]map[string]any, 0, len(combinations)*len(values))
+		for _, combination := range combinations {
+			for _, value := range values {
+				item := make(map[string]any, len(combination)+1)
+				for existingName, existingValue := range combination {
+					item[existingName] = existingValue
+				}
+				item[name] = value
+				next = append(next, item)
+			}
+		}
+		combinations = next
+	}
+	return combinations
 }
 
 func validateEnvironmentMap(field string, values map[string]any, availability expression.Availability) (int, error) {
@@ -860,6 +950,40 @@ func lowerASCII(value string) string {
 		}
 	}
 	return string(buffer)
+}
+
+func (s *Strategy) UnmarshalYAML(node *yaml.Node) error {
+	s.configured = true
+	if node.Kind != yaml.MappingNode {
+		return fmt.Errorf("job strategy must be a mapping")
+	}
+	if err := rejectDuplicateMappingKeys(node, "job strategy"); err != nil {
+		return err
+	}
+	for index := 0; index < len(node.Content); index += 2 {
+		name := node.Content[index].Value
+		value := node.Content[index+1]
+		switch name {
+		case "matrix":
+			if value.Kind != yaml.MappingNode {
+				return fmt.Errorf("job strategy matrix must be a mapping")
+			}
+			if err := rejectDuplicateMappingKeys(value, "job strategy matrix"); err != nil {
+				return err
+			}
+			if err := value.Decode(&s.Matrix); err != nil {
+				return err
+			}
+		case "max-parallel":
+			s.maxParallelSet = true
+			if err := value.Decode(&s.MaxParallel); err != nil {
+				return err
+			}
+		default:
+			return fmt.Errorf("unsupported job strategy field %q", name)
+		}
+	}
+	return nil
 }
 
 func (c *Concurrency) UnmarshalYAML(node *yaml.Node) error {

@@ -34,6 +34,8 @@ const (
 	maxJobPlanBytes                  = 900_000
 	resourceNameMaxLength            = 63
 	workflowJobNameDigestLength      = 16
+	workflowJobDisplayNameMaxLength  = 256
+	workflowJobIDMaxLength           = 256
 	workflowRunCancellationFinalizer = "actions.kelos.dev/concurrency-cancellation"
 	workflowRunCheckFinalizer        = "actions.kelos.dev/github-check"
 	workflowRunScheduleFinalizer     = "actions.kelos.dev/schedule-idempotency"
@@ -463,6 +465,7 @@ type plannedWorkflowJob struct {
 	id          string
 	displayName string
 	runsOn      []string
+	matrix      *actionsv1alpha1.WorkflowJobMatrix
 	plan        string
 }
 
@@ -495,6 +498,7 @@ func (r *WorkflowRunReconciler) ensureWorkflowJobs(ctx context.Context, run *act
 				JobID:          id,
 				DisplayName:    item.displayName,
 				RunsOn:         append([]string(nil), item.runsOn...),
+				Matrix:         item.matrix.DeepCopy(),
 			},
 		}
 		if err := controllerutil.SetControllerReference(run, workflowJob, r.Scheme()); err != nil {
@@ -533,29 +537,128 @@ func (r *WorkflowRunReconciler) planWorkflowJobs(run *actionsv1alpha1.WorkflowRu
 	}
 	sort.Strings(jobIDs)
 	plannedJobs := make([]plannedWorkflowJob, 0, len(jobIDs))
+	plannedIDs := make(map[string]struct{})
+	sourceIDs := make(map[string]struct{}, len(jobIDs))
 	for _, id := range jobIDs {
-		definitionJob, err := workflow.EvaluateJob(id, definition.Jobs[id], r.jobExpressionContext(run, definition.Name, inputValues))
-		if err != nil {
-			return nil, err
+		sourceIDs[id] = struct{}{}
+	}
+	for _, id := range jobIDs {
+		definitionJob := definition.Jobs[id]
+		combinations := workflow.MatrixCombinations(definitionJob.Strategy)
+		if len(combinations) == 0 {
+			combinations = []map[string]any{nil}
 		}
-		displayName := definitionJob.Name
-		if displayName == "" {
-			displayName = id
+		for index, matrix := range combinations {
+			expandedID := id
+			var matrixSpec *actionsv1alpha1.WorkflowJobMatrix
+			if matrix != nil {
+				expandedID = uniqueMatrixWorkflowJobID(id, index, sourceIDs, plannedIDs)
+				matrixSpec = &actionsv1alpha1.WorkflowJobMatrix{
+					LogicalJobID: id,
+					Values:       matrixStringValues(matrix),
+					MaxParallel:  definitionJob.Strategy.MaxParallel,
+				}
+			}
+			if _, found := plannedIDs[expandedID]; found {
+				return nil, fmt.Errorf("expanded job ID %q is not unique", expandedID)
+			}
+			plannedIDs[expandedID] = struct{}{}
+
+			expressionContext := r.jobExpressionContext(run, definition.Name, inputValues)
+			if matrix != nil {
+				expressionContext.Availability = workflowexpression.NewAvailability("github", "matrix", "inputs")
+				expressionContext.Values["matrix"] = matrix
+			}
+			resolvedJob, err := workflow.EvaluateJob(id, definitionJob, expressionContext)
+			if err != nil {
+				return nil, err
+			}
+			displayName := resolvedJob.Name
+			if displayName == "" {
+				displayName = id
+			}
+			if matrix != nil {
+				displayName = matrixDisplayName(displayName, matrix, index)
+			}
+			plan, err := r.jobPlan(run, definition.Name, id, resolvedJob, matrix, inputValues)
+			if err != nil {
+				return nil, err
+			}
+			data, err := json.Marshal(plan)
+			if err != nil {
+				return nil, fmt.Errorf("encode job plan: %w", err)
+			}
+			if len(data) > maxJobPlanBytes {
+				return nil, fmt.Errorf("job plan for %q exceeds %d bytes", expandedID, maxJobPlanBytes)
+			}
+			plannedJobs = append(plannedJobs, plannedWorkflowJob{
+				id: expandedID, displayName: displayName, runsOn: append([]string(nil), resolvedJob.RunsOn...), matrix: matrixSpec, plan: string(data),
+			})
 		}
-		plan, err := r.jobPlan(run, definition.Name, id, definitionJob, inputValues)
-		if err != nil {
-			return nil, err
-		}
-		data, err := json.Marshal(plan)
-		if err != nil {
-			return nil, fmt.Errorf("encode job plan: %w", err)
-		}
-		if len(data) > maxJobPlanBytes {
-			return nil, fmt.Errorf("job plan for %q exceeds %d bytes", id, maxJobPlanBytes)
-		}
-		plannedJobs = append(plannedJobs, plannedWorkflowJob{id: id, displayName: displayName, runsOn: append([]string(nil), definitionJob.RunsOn...), plan: string(data)})
 	}
 	return plannedJobs, nil
+}
+
+func matrixWorkflowJobID(logicalJobID string, index int) string {
+	suffix := fmt.Sprintf("-matrix-%d", index+1)
+	return boundedWorkflowJobID(logicalJobID, suffix)
+}
+
+func uniqueMatrixWorkflowJobID(logicalJobID string, index int, sourceIDs, plannedIDs map[string]struct{}) string {
+	candidate := matrixWorkflowJobID(logicalJobID, index)
+	for attempt := 0; ; attempt++ {
+		_, sourceCollision := sourceIDs[candidate]
+		_, plannedCollision := plannedIDs[candidate]
+		if !sourceCollision && !plannedCollision {
+			return candidate
+		}
+		digest := sha256.Sum256([]byte(fmt.Sprintf("%s\x00%d\x00%d", logicalJobID, index, attempt)))
+		suffix := fmt.Sprintf("-matrix-%d-%s", index+1, strings.ToLower(digestEncoding.EncodeToString(digest[:]))[:workflowJobNameDigestLength])
+		candidate = boundedWorkflowJobID(logicalJobID, suffix)
+	}
+}
+
+func boundedWorkflowJobID(logicalJobID, suffix string) string {
+	if len(logicalJobID)+len(suffix) <= workflowJobIDMaxLength {
+		return logicalJobID + suffix
+	}
+	digest := sha256.Sum256([]byte(logicalJobID))
+	digestSuffix := "-" + strings.ToLower(digestEncoding.EncodeToString(digest[:]))[:workflowJobNameDigestLength] + suffix
+	return logicalJobID[:workflowJobIDMaxLength-len(digestSuffix)] + digestSuffix
+}
+
+func matrixStringValues(matrix map[string]any) map[string]string {
+	values := make(map[string]string, len(matrix))
+	for name, value := range matrix {
+		values[name] = fmt.Sprint(value)
+	}
+	return values
+}
+
+func matrixDescription(matrix map[string]any) string {
+	names := make([]string, 0, len(matrix))
+	for name := range matrix {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	parts := make([]string, 0, len(names))
+	for _, name := range names {
+		parts = append(parts, name+"="+fmt.Sprint(matrix[name]))
+	}
+	return strings.Join(parts, ", ")
+}
+
+func matrixDisplayName(name string, matrix map[string]any, index int) string {
+	suffix := " (" + matrixDescription(matrix) + ")"
+	if len([]rune(suffix)) >= workflowJobDisplayNameMaxLength {
+		suffix = fmt.Sprintf(" (matrix %d)", index+1)
+	}
+	nameRunes := []rune(name)
+	maximumNameLength := workflowJobDisplayNameMaxLength - len([]rune(suffix))
+	if len(nameRunes) > maximumNameLength {
+		nameRunes = nameRunes[:maximumNameLength]
+	}
+	return string(nameRunes) + suffix
 }
 
 func workflowEvent(source *actionsv1alpha1.GitHubWorkflowRunSource) workflow.Event {
@@ -773,7 +876,7 @@ func (r *WorkflowRunReconciler) ensurePlanConfigMap(ctx context.Context, workflo
 	return nil
 }
 
-func (r *WorkflowRunReconciler) jobPlan(run *actionsv1alpha1.WorkflowRun, workflowName, id string, job workflow.Job, inputValues map[string]any) (*runner.Plan, error) {
+func (r *WorkflowRunReconciler) jobPlan(run *actionsv1alpha1.WorkflowRun, workflowName, id string, job workflow.Job, matrix, inputValues map[string]any) (*runner.Plan, error) {
 	githubSource := run.Spec.Source.GitHub
 	headRef, baseRef := githubSourcePullRequestRefs(githubSource)
 	jobEnv, err := stringMap(job.Env)
@@ -830,9 +933,10 @@ func (r *WorkflowRunReconciler) jobPlan(run *actionsv1alpha1.WorkflowRun, workfl
 			HeadRef: headRef,
 			BaseRef: baseRef,
 		},
-		JobID: id,
-		Env:   jobEnv,
-		Steps: steps,
+		JobID:  id,
+		Matrix: matrix,
+		Env:    jobEnv,
+		Steps:  steps,
 	}, nil
 }
 
