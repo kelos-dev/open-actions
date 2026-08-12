@@ -54,7 +54,7 @@ with the public webhook URL and a webhook secret. Configure it with:
 - repository permissions: Contents read, Actions read, Issues read, Pull
   requests read, Merge queues read, and Checks read and write
 - events: Push, Pull request, Merge group, Workflow run, Issues, Issue comment,
-  Pull request review comment, Pull request review, and Release
+  Pull request review comment, Pull request review, Release, and Check run
 
 Generate a private key, [install the App](https://docs.github.com/en/apps/using-github-apps/installing-your-own-github-app)
 on the repositories to run, and record the App ID and installation ID. Then

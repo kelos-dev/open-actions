@@ -75,6 +75,66 @@ func TestWorkflowRunCancellationRequestIsMonotonic(t *testing.T) {
 	}
 }
 
+func TestWorkflowRunRerunContract(t *testing.T) {
+	crd, _ := loadCRD(t, "actions.kelos.dev_workflowruns.yaml")
+	original := loadSample(t, "actions_v1alpha1_workflowrun.yaml")
+	normalizeWorkflowRunCELIntegers(original)
+	original["spec"].(map[string]any)["rerun"] = map[string]any{
+		"originalRunRef": map[string]any{"name": "ci-original", "uid": "original-uid"},
+		"previousRunRef": map[string]any{"name": "ci-original", "uid": "original-uid"},
+		"attempt":        int64(2),
+		"requestID":      "delivery-123",
+		"jobIDs":         []any{"unit-matrix-2", "integration"},
+	}
+	if errs := validateObject(t, crd, original, nil); len(errs) > 0 {
+		t.Fatalf("valid WorkflowRun rerun was rejected: %v", errs.ToAggregate())
+	}
+
+	updated := loadSample(t, "actions_v1alpha1_workflowrun.yaml")
+	normalizeWorkflowRunCELIntegers(updated)
+	updated["spec"].(map[string]any)["rerun"] = map[string]any{
+		"originalRunRef": map[string]any{"name": "ci-original", "uid": "original-uid"},
+		"previousRunRef": map[string]any{"name": "ci-original", "uid": "original-uid"},
+		"attempt":        int64(2),
+		"jobIDs":         []any{"integration"},
+	}
+	if errs := validateObject(t, crd, updated, original); len(errs) == 0 {
+		t.Fatal("WorkflowRun rerun update passed CEL validation")
+	}
+
+	invalidAttempt := loadSample(t, "actions_v1alpha1_workflowrun.yaml")
+	normalizeWorkflowRunCELIntegers(invalidAttempt)
+	invalidAttempt["spec"].(map[string]any)["rerun"] = map[string]any{
+		"originalRunRef": map[string]any{"name": "ci-original", "uid": "original-uid"},
+		"previousRunRef": map[string]any{"name": "ci-original", "uid": "original-uid"},
+		"attempt":        int64(1),
+	}
+	if errs := validateObject(t, crd, invalidAttempt, nil); len(errs) == 0 {
+		t.Fatal("WorkflowRun rerun attempt 1 passed schema validation")
+	}
+
+	for _, test := range []struct {
+		name string
+		ref  map[string]any
+	}{
+		{name: "oversized reference name", ref: map[string]any{"name": strings.Repeat("a", 254), "uid": "original-uid"}},
+		{name: "malformed reference UID", ref: map[string]any{"name": "ci-original", "uid": "invalid/uid"}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			invalidReference := loadSample(t, "actions_v1alpha1_workflowrun.yaml")
+			normalizeWorkflowRunCELIntegers(invalidReference)
+			invalidReference["spec"].(map[string]any)["rerun"] = map[string]any{
+				"originalRunRef": test.ref,
+				"previousRunRef": map[string]any{"name": "ci-original", "uid": "original-uid"},
+				"attempt":        int64(2),
+			}
+			if errs := validateObject(t, crd, invalidReference, nil); len(errs) == 0 {
+				t.Fatal("invalid WorkflowRun reference passed schema validation")
+			}
+		})
+	}
+}
+
 func normalizeWorkflowRunCELIntegers(object map[string]any) {
 	repository := workflowRunGitHub(object)["repository"].(map[string]any)
 	if id, ok := repository["id"].(float64); ok {

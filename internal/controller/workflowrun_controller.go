@@ -78,6 +78,20 @@ func (r *WorkflowRunReconciler) Reconcile(ctx context.Context, request ctrl.Requ
 	if err := r.Get(ctx, request.NamespacedName, run); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
+	if run.Spec.Rerun != nil && !terminalRun(run) {
+		if err := r.validateWorkflowRunRerun(ctx, run); err != nil {
+			terminal := &terminalPlanningError{}
+			if !errors.As(err, &terminal) {
+				return ctrl.Result{}, err
+			}
+			return r.planningFailed(ctx, run, "RerunInvalid", err, planningFailureTerminal)
+		}
+	}
+	if run.DeletionTimestamp.IsZero() {
+		if err := r.ensureWorkflowRunLineageLabel(ctx, run); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
 	if r.githubCheckEnabled(run) && run.DeletionTimestamp.IsZero() && !controllerutil.ContainsFinalizer(run, workflowRunCheckFinalizer) {
 		before := run.DeepCopy()
 		controllerutil.AddFinalizer(run, workflowRunCheckFinalizer)
@@ -103,8 +117,66 @@ func (r *WorkflowRunReconciler) Reconcile(ctx context.Context, request ctrl.Requ
 	return result, nil
 }
 
+func (r *WorkflowRunReconciler) ensureWorkflowRunLineageLabel(ctx context.Context, run *actionsv1alpha1.WorkflowRun) error {
+	rootUID := run.UID
+	if run.Spec.Rerun != nil {
+		rootUID = run.Spec.Rerun.OriginalRunRef.UID
+	}
+	if run.Labels[actionsv1alpha1.LabelWorkflowRunRootUID] == string(rootUID) {
+		return nil
+	}
+	before := run.DeepCopy()
+	if run.Labels == nil {
+		run.Labels = map[string]string{}
+	}
+	run.Labels[actionsv1alpha1.LabelWorkflowRunRootUID] = string(rootUID)
+	return r.Patch(ctx, run, client.MergeFrom(before))
+}
+
 func (r *WorkflowRunReconciler) githubCheckEnabled(run *actionsv1alpha1.WorkflowRun) bool {
+	planned := meta.FindStatusCondition(run.Status.Conditions, actionsv1alpha1.WorkflowRunConditionPlanned)
+	if run.Spec.Rerun != nil && planned != nil && planned.Status == metav1.ConditionFalse && planned.Reason == "RerunInvalid" {
+		return false
+	}
 	return r.GitHub != nil && run.Spec.Source.Type == actionsv1alpha1.SourceTypeGitHub && run.Spec.Source.GitHub != nil && run.UID != ""
+}
+
+func (r *WorkflowRunReconciler) validateWorkflowRunRerun(ctx context.Context, run *actionsv1alpha1.WorkflowRun) error {
+	rerun := run.Spec.Rerun
+	previous := &actionsv1alpha1.WorkflowRun{}
+	key := client.ObjectKey{Namespace: run.Namespace, Name: rerun.PreviousRunRef.Name}
+	if err := r.APIReader.Get(ctx, key, previous); err != nil {
+		if apierrors.IsNotFound(err) {
+			return &terminalPlanningError{cause: fmt.Errorf("previous WorkflowRun %q does not exist", key.Name)}
+		}
+		return err
+	}
+	if previous.UID != rerun.PreviousRunRef.UID {
+		return &terminalPlanningError{cause: fmt.Errorf("previous WorkflowRun %q has a different UID", previous.Name)}
+	}
+	if !terminalRun(previous) {
+		return &terminalPlanningError{cause: fmt.Errorf("previous WorkflowRun %q is not complete", previous.Name)}
+	}
+	if !apiEquality.Semantic.DeepEqual(run.Spec.ProjectRef, previous.Spec.ProjectRef) ||
+		!apiEquality.Semantic.DeepEqual(run.Spec.Source, previous.Spec.Source) || run.Spec.WorkflowPath != previous.Spec.WorkflowPath {
+		return &terminalPlanningError{cause: fmt.Errorf("WorkflowRun %q does not match previous WorkflowRun %q", run.Name, previous.Name)}
+	}
+
+	previousAttempt := int32(1)
+	if previous.Spec.Rerun == nil {
+		if rerun.OriginalRunRef.Name != previous.Name || rerun.OriginalRunRef.UID != previous.UID {
+			return &terminalPlanningError{cause: fmt.Errorf("original WorkflowRun reference does not identify previous WorkflowRun %q", previous.Name)}
+		}
+	} else {
+		previousAttempt = previous.Spec.Rerun.Attempt
+		if rerun.OriginalRunRef != previous.Spec.Rerun.OriginalRunRef {
+			return &terminalPlanningError{cause: fmt.Errorf("original WorkflowRun reference does not match previous WorkflowRun %q", previous.Name)}
+		}
+	}
+	if rerun.Attempt != previousAttempt+1 {
+		return &terminalPlanningError{cause: fmt.Errorf("rerun attempt %d must follow attempt %d", rerun.Attempt, previousAttempt)}
+	}
+	return nil
 }
 
 func (r *WorkflowRunReconciler) reconcileWorkflowRun(ctx context.Context, run *actionsv1alpha1.WorkflowRun) (ctrl.Result, error) {
@@ -171,6 +243,10 @@ func (r *WorkflowRunReconciler) reconcileWorkflowRun(ctx context.Context, run *a
 	plannedJobs, err := r.planWorkflowJobs(planningRun, definition, planningEvent.InputValues)
 	if err != nil {
 		return r.planningFailed(ctx, run, "WorkflowInvalid", err, planningFailureTerminal)
+	}
+	plannedJobs, err = selectRerunWorkflowJobs(run, plannedJobs)
+	if err != nil {
+		return r.planningFailed(ctx, run, "RerunInvalid", err, planningFailureTerminal)
 	}
 	jobCount := int32(len(plannedJobs))
 	run.Status.WorkflowName = definition.Name
@@ -300,7 +376,7 @@ func (r *WorkflowRunReconciler) reconcileGitHubCheck(ctx context.Context, run *a
 		detailsURL = workflowRunConsoleURL(r.ConsoleURL, run)
 	}
 	name := "Open Actions / " + run.Spec.WorkflowPath
-	externalID := string(run.UID)
+	externalID := workflowRunCheckExternalID(run)
 	createRequest := githubclient.CreateCheckRunRequest{
 		Name:        name,
 		HeadSHA:     checkHeadSHA,
@@ -315,6 +391,13 @@ func (r *WorkflowRunReconciler) reconcileGitHubCheck(ctx context.Context, run *a
 	reportDigest := checkRunReportDigest(createRequest)
 	current := workflowRunCheckRunStatus(run)
 	if current != nil && current.Status == report.Status && current.Conclusion == report.Conclusion && current.ReportDigest == reportDigest {
+		return nil
+	}
+	currentAttempt, err := r.githubCheckCurrentAttempt(ctx, run)
+	if err != nil {
+		return err
+	}
+	if !currentAttempt {
 		return nil
 	}
 
@@ -369,10 +452,46 @@ func (r *WorkflowRunReconciler) reconcileGitHubCheck(ctx context.Context, run *a
 	return r.recordGitHubCheckRun(ctx, run, checkRun.ID, report.Status, report.Conclusion, reportDigest)
 }
 
+func (r *WorkflowRunReconciler) githubCheckCurrentAttempt(ctx context.Context, run *actionsv1alpha1.WorkflowRun) (bool, error) {
+	rootUID := run.UID
+	rootName := run.Name
+	attempt := int32(1)
+	if run.Spec.Rerun != nil {
+		rootUID = run.Spec.Rerun.OriginalRunRef.UID
+		rootName = run.Spec.Rerun.OriginalRunRef.Name
+		attempt = run.Spec.Rerun.Attempt
+	}
+	runs := &actionsv1alpha1.WorkflowRunList{}
+	if err := r.APIReader.List(ctx, runs, client.InNamespace(run.Namespace), client.MatchingLabels{actionsv1alpha1.LabelWorkflowRunRootUID: string(rootUID)}); err != nil {
+		return false, err
+	}
+	for index := range runs.Items {
+		candidate := &runs.Items[index]
+		candidateAttempt := int32(1)
+		if candidate.UID != rootUID {
+			if candidate.Spec.Rerun == nil || candidate.Spec.Rerun.OriginalRunRef.Name != rootName || candidate.Spec.Rerun.OriginalRunRef.UID != rootUID {
+				continue
+			}
+			candidateAttempt = candidate.Spec.Rerun.Attempt
+		}
+		if candidateAttempt > attempt && candidate.Spec.ProjectRef == run.Spec.ProjectRef && candidate.Spec.WorkflowPath == run.Spec.WorkflowPath && apiEquality.Semantic.DeepEqual(candidate.Spec.Source, run.Spec.Source) {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
 func checkRunReportDigest(request githubclient.CreateCheckRunRequest) string {
 	data, _ := json.Marshal(request)
 	digest := sha256.Sum256(data)
 	return fmt.Sprintf("%x", digest)
+}
+
+func workflowRunCheckExternalID(run *actionsv1alpha1.WorkflowRun) string {
+	if run.Spec.Rerun != nil {
+		return string(run.Spec.Rerun.OriginalRunRef.UID)
+	}
+	return string(run.UID)
 }
 
 func workflowRunCheckReport(run *actionsv1alpha1.WorkflowRun) checkRunReport {
@@ -428,6 +547,19 @@ func workflowRunCheckReport(run *actionsv1alpha1.WorkflowRun) checkRunReport {
 		jobs := run.Status.Jobs
 		report.Output.Text = fmt.Sprintf("Jobs: %d total, %d waiting, %d queued, %d active, %d succeeded, %d failed, %d skipped, %d cancelled.", jobs.Total, jobs.Waiting, jobs.Queued, jobs.Active, jobs.Succeeded, jobs.Failed, jobs.Skipped, jobs.Cancelled)
 	}
+	if run.Spec.Rerun != nil {
+		report.Output.Title = fmt.Sprintf("%s (attempt %d)", title, run.Spec.Rerun.Attempt)
+		selection := "all jobs"
+		if count := len(run.Spec.Rerun.JobIDs); count > 0 {
+			selection = fmt.Sprintf("%d requested jobs plus required dependencies", count)
+		}
+		attempt := fmt.Sprintf("Attempt %d reruns %s.", run.Spec.Rerun.Attempt, selection)
+		if report.Output.Text == "" {
+			report.Output.Text = attempt
+		} else {
+			report.Output.Text = attempt + "\n\n" + report.Output.Text
+		}
+	}
 	return report
 }
 
@@ -474,6 +606,64 @@ type plannedWorkflowJob struct {
 	matrix        *actionsv1alpha1.WorkflowJobMatrix
 	plan          string
 	resultVersion string
+}
+
+func selectRerunWorkflowJobs(run *actionsv1alpha1.WorkflowRun, plannedJobs []plannedWorkflowJob) ([]plannedWorkflowJob, error) {
+	if run.Spec.Rerun == nil || len(run.Spec.Rerun.JobIDs) == 0 {
+		return plannedJobs, nil
+	}
+	selectedIDs := make(map[string]struct{}, len(run.Spec.Rerun.JobIDs))
+	for _, id := range run.Spec.Rerun.JobIDs {
+		selectedIDs[id] = struct{}{}
+	}
+	plannedByID := make(map[string]*plannedWorkflowJob, len(plannedJobs))
+	plannedByLogicalID := make(map[string][]*plannedWorkflowJob)
+	for index := range plannedJobs {
+		job := &plannedJobs[index]
+		plannedByID[job.id] = job
+		logicalID := job.id
+		if job.matrix != nil {
+			logicalID = job.matrix.LogicalJobID
+		}
+		plannedByLogicalID[logicalID] = append(plannedByLogicalID[logicalID], job)
+	}
+	missing := make([]string, 0)
+	for id := range selectedIDs {
+		if plannedByID[id] == nil {
+			missing = append(missing, id)
+		}
+	}
+	if len(missing) > 0 {
+		sort.Strings(missing)
+		return nil, fmt.Errorf("selected jobs are not present in the workflow: %s", strings.Join(missing, ", "))
+	}
+
+	for changed := true; changed; {
+		changed = false
+		for id := range selectedIDs {
+			for _, dependency := range plannedByID[id].needs {
+				needed := plannedByLogicalID[dependency]
+				if len(needed) == 0 {
+					return nil, fmt.Errorf("selected job %q needs missing job %q", id, dependency)
+				}
+				for _, job := range needed {
+					if _, found := selectedIDs[job.id]; found {
+						continue
+					}
+					selectedIDs[job.id] = struct{}{}
+					changed = true
+				}
+			}
+		}
+	}
+
+	selected := make([]plannedWorkflowJob, 0, len(selectedIDs))
+	for _, job := range plannedJobs {
+		if _, found := selectedIDs[job.id]; found {
+			selected = append(selected, job)
+		}
+	}
+	return selected, nil
 }
 
 func (r *WorkflowRunReconciler) ensureWorkflowJobs(ctx context.Context, run *actionsv1alpha1.WorkflowRun, project *actionsv1alpha1.Project, plannedJobs []plannedWorkflowJob) error {
