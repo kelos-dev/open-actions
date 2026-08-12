@@ -30,6 +30,7 @@ spec:
           imagePullPolicy: {{ .Values.console.image.pullPolicy }}
           args:
             - "--token-file=/var/run/secrets/open-actions-console/token"
+            - "--secret-management-namespace={{ .Release.Namespace }}"
             {{- if hasPrefix "https://" .Values.console.publicURL }}
             - "--secure-cookie=true"
             {{- end }}

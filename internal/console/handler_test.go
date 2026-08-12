@@ -7,11 +7,13 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
 
 	actionsv1alpha1 "github.com/kelos-dev/open-actions/api/v1alpha1"
+	"github.com/kelos-dev/open-actions/internal/projectvalue"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -185,6 +187,157 @@ func TestConsoleMainPageLimitsWorkflowRuns(t *testing.T) {
 	}
 }
 
+func TestConsoleManagesReferencedProjectSecretWithoutDisplayingValues(t *testing.T) {
+	handler := newTestHandler(t, false)
+
+	projectsRequest := httptest.NewRequest(http.MethodGet, "/projects", nil)
+	projectsRequest.Header.Set("Authorization", "Bearer "+testConsoleToken)
+	projectsResponse := httptest.NewRecorder()
+	handler.ServeHTTP(projectsResponse, projectsRequest)
+	if projectsResponse.Code != http.StatusOK || !strings.Contains(projectsResponse.Body.String(), `href="/projects/default/project"`) {
+		t.Fatalf("projects page = %d, %q", projectsResponse.Code, projectsResponse.Body.String())
+	}
+
+	detailsRequest := httptest.NewRequest(http.MethodGet, "/projects/default/project", nil)
+	detailsRequest.Header.Set("Authorization", "Bearer "+testConsoleToken)
+	detailsResponse := httptest.NewRecorder()
+	handler.ServeHTTP(detailsResponse, detailsRequest)
+	detailsBody := detailsResponse.Body.String()
+	if detailsResponse.Code != http.StatusOK || !strings.Contains(detailsBody, "DEPLOY_TOKEN") || !strings.Contains(detailsBody, "Add or replace") {
+		t.Fatalf("Project page = %d, %q", detailsResponse.Code, detailsBody)
+	}
+	if strings.Contains(detailsBody, "existing-secret-value") {
+		t.Fatalf("Project page exposed a secret value: %s", detailsBody)
+	}
+
+	invalid := url.Values{"csrf": {"invalid"}, "action": {"set"}, "name": {"release_token"}, "value": {"replacement-value"}}
+	invalidRequest := httptest.NewRequest(http.MethodPost, "/projects/default/project/secrets", strings.NewReader(invalid.Encode()))
+	invalidRequest.Header.Set("Authorization", "Bearer "+testConsoleToken)
+	invalidRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	invalidResponse := httptest.NewRecorder()
+	handler.ServeHTTP(invalidResponse, invalidRequest)
+	if invalidResponse.Code != http.StatusForbidden {
+		t.Fatalf("invalid CSRF response = %d, %q", invalidResponse.Code, invalidResponse.Body.String())
+	}
+
+	set := url.Values{"csrf": {handler.csrfToken}, "action": {"set"}, "name": {"release_token"}, "value": {"replacement-value"}}
+	setRequest := httptest.NewRequest(http.MethodPost, "/projects/default/project/secrets", strings.NewReader(set.Encode()))
+	setRequest.Header.Set("Authorization", "Bearer "+testConsoleToken)
+	setRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	setResponse := httptest.NewRecorder()
+	handler.ServeHTTP(setResponse, setRequest)
+	if setResponse.Code != http.StatusSeeOther || setResponse.Header().Get("Location") != "/projects/default/project" {
+		t.Fatalf("set response = %d, %q", setResponse.Code, setResponse.Header().Get("Location"))
+	}
+	secret := &corev1.Secret{}
+	if err := handler.client.Get(context.Background(), client.ObjectKey{Namespace: "default", Name: "project-secrets"}, secret); err != nil {
+		t.Fatal(err)
+	}
+	if string(secret.Data["RELEASE_TOKEN"]) != "replacement-value" {
+		t.Fatalf("updated Secret data = %#v", secret.Data)
+	}
+
+	deleteForm := url.Values{"csrf": {handler.csrfToken}, "action": {"delete"}, "name": {"DEPLOY_TOKEN"}}
+	deleteRequest := httptest.NewRequest(http.MethodPost, "/projects/default/project/secrets", strings.NewReader(deleteForm.Encode()))
+	deleteRequest.Header.Set("Authorization", "Bearer "+testConsoleToken)
+	deleteRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	deleteResponse := httptest.NewRecorder()
+	handler.ServeHTTP(deleteResponse, deleteRequest)
+	if deleteResponse.Code != http.StatusSeeOther {
+		t.Fatalf("delete response = %d, %q", deleteResponse.Code, deleteResponse.Body.String())
+	}
+	if err := handler.client.Get(context.Background(), client.ObjectKey{Namespace: "default", Name: "project-secrets"}, secret); err != nil {
+		t.Fatal(err)
+	}
+	if _, found := secret.Data["DEPLOY_TOKEN"]; found {
+		t.Fatalf("deleted secret remains: %#v", secret.Data)
+	}
+
+	if err := handler.client.Delete(context.Background(), secret); err != nil {
+		t.Fatal(err)
+	}
+	create := url.Values{"csrf": {handler.csrfToken}, "action": {"set"}, "name": {"FIRST_TOKEN"}, "value": {"created-value"}}
+	createRequest := httptest.NewRequest(http.MethodPost, "/projects/default/project/secrets", strings.NewReader(create.Encode()))
+	createRequest.Header.Set("Authorization", "Bearer "+testConsoleToken)
+	createRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	createResponse := httptest.NewRecorder()
+	handler.ServeHTTP(createResponse, createRequest)
+	if createResponse.Code != http.StatusSeeOther {
+		t.Fatalf("create response = %d, %q", createResponse.Code, createResponse.Body.String())
+	}
+	if err := handler.client.Get(context.Background(), client.ObjectKey{Namespace: "default", Name: "project-secrets"}, secret); err != nil {
+		t.Fatal(err)
+	}
+	if string(secret.Data["FIRST_TOKEN"]) != "created-value" {
+		t.Fatalf("created Secret data = %#v", secret.Data)
+	}
+
+	otherNamespaceRequest := httptest.NewRequest(http.MethodPost, "/projects/other/project/secrets", strings.NewReader(set.Encode()))
+	otherNamespaceRequest.Header.Set("Authorization", "Bearer "+testConsoleToken)
+	otherNamespaceRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	otherNamespaceResponse := httptest.NewRecorder()
+	handler.ServeHTTP(otherNamespaceResponse, otherNamespaceRequest)
+	if otherNamespaceResponse.Code != http.StatusForbidden {
+		t.Fatalf("other namespace response = %d, %q", otherNamespaceResponse.Code, otherNamespaceResponse.Body.String())
+	}
+}
+
+func TestConsoleAcceptsEncodingHeavySecretAtValueLimit(t *testing.T) {
+	handler := newTestHandler(t, false)
+	value := strings.Repeat("%", projectvalue.MaxValueBytes)
+	form := url.Values{"csrf": {handler.csrfToken}, "action": {"set"}, "name": {"ENCODED_TOKEN"}, "value": {value}}
+	encoded := form.Encode()
+	if len(encoded) <= projectvalue.MaxValueBytes+(8<<10) {
+		t.Fatalf("encoded request does not exercise form expansion: %d bytes", len(encoded))
+	}
+	request := httptest.NewRequest(http.MethodPost, "/projects/default/project/secrets", strings.NewReader(encoded))
+	request.Header.Set("Authorization", "Bearer "+testConsoleToken)
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusSeeOther {
+		t.Fatalf("set response = %d, %q", response.Code, response.Body.String())
+	}
+	secret := &corev1.Secret{}
+	if err := handler.client.Get(context.Background(), client.ObjectKey{Namespace: "default", Name: "project-secrets"}, secret); err != nil {
+		t.Fatal(err)
+	}
+	if string(secret.Data["ENCODED_TOKEN"]) != value {
+		t.Fatalf("stored value length = %d, want %d", len(secret.Data["ENCODED_TOKEN"]), len(value))
+	}
+}
+
+func TestConsoleReportsProjectSecretCountLimit(t *testing.T) {
+	handler := newTestHandler(t, false)
+	secret := &corev1.Secret{}
+	key := client.ObjectKey{Namespace: "default", Name: "project-secrets"}
+	if err := handler.client.Get(context.Background(), key, secret); err != nil {
+		t.Fatal(err)
+	}
+	for index := len(secret.Data); index < projectvalue.MaxSecretCount; index++ {
+		secret.Data[fmt.Sprintf("TOKEN_%03d", index)] = []byte("value")
+	}
+	if err := handler.client.Update(context.Background(), secret); err != nil {
+		t.Fatal(err)
+	}
+
+	form := url.Values{"csrf": {handler.csrfToken}, "action": {"set"}, "name": {"NEW_TOKEN"}, "value": {"value"}}
+	request := httptest.NewRequest(http.MethodPost, "/projects/default/project/secrets", strings.NewReader(form.Encode()))
+	request.Header.Set("Authorization", "Bearer "+testConsoleToken)
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusConflict || !strings.Contains(response.Body.String(), "already contains 100 values") {
+		t.Fatalf("limit response = %d, %q", response.Code, response.Body.String())
+	}
+	if err := handler.client.Get(context.Background(), key, secret); err != nil {
+		t.Fatal(err)
+	}
+	if _, found := secret.Data["NEW_TOKEN"]; found {
+		t.Fatalf("Secret contains rejected value: %#v", secret.Data)
+	}
+}
+
 func TestConsoleRedirectsAuthenticatedLoginToMainPage(t *testing.T) {
 	handler := newTestHandler(t, false)
 	request := httptest.NewRequest(http.MethodGet, "/login", nil)
@@ -328,11 +481,22 @@ func newTestHandler(t *testing.T, secureCookie bool) *Handler {
 	newerRun.UID = "lint-run-uid"
 	newerRun.CreationTimestamp = metav1.NewTime(time.Date(2026, 8, 10, 13, 0, 0, 0, time.UTC))
 	newerRun.Status.WorkflowName = "Lint"
+	project := &actionsv1alpha1.Project{
+		ObjectMeta: metav1.ObjectMeta{Name: "project", Namespace: "default", Generation: 1},
+		Spec: actionsv1alpha1.ProjectSpec{
+			Source:  actionsv1alpha1.ProjectSource{Type: actionsv1alpha1.SourceTypeGitHub, GitHub: &actionsv1alpha1.GitHubAppConfiguration{AppID: 1, InstallationID: 2}},
+			Secrets: &actionsv1alpha1.ProjectSecretSource{SecretRef: corev1.LocalObjectReference{Name: "project-secrets"}},
+		},
+		Status: actionsv1alpha1.ProjectStatus{ObservedGeneration: 1, Conditions: []metav1.Condition{{
+			Type: actionsv1alpha1.ProjectConditionConfigured, Status: metav1.ConditionTrue, ObservedGeneration: 1, Reason: "ConfigurationValid", Message: "Configuration is valid",
+		}}},
+	}
+	secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "project-secrets", Namespace: "default"}, Data: map[string][]byte{"DEPLOY_TOKEN": []byte("existing-secret-value")}}
 	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "build", Namespace: "default", Labels: map[string]string{actionsv1alpha1.LabelWorkflowJobUID: string(job.UID)}}}
-	clusterClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(run, newerRun, job).Build()
+	clusterClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(run, newerRun, job, project, secret).Build()
 	handler, err := New(Config{
 		Client: clusterClient, Logs: &testLogSource{pod: pod, logs: "build output\n"}, Token: testConsoleToken,
-		SecureCookie: secureCookie, Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		SecretManagementNamespace: "default", SecureCookie: secureCookie, Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
 	})
 	if err != nil {
 		t.Fatal(err)

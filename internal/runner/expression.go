@@ -10,19 +10,20 @@ import (
 )
 
 var (
-	runnerJobAvailability          = workflowexpression.NewAvailability("github", "matrix", "inputs")
-	runnerStepAvailability         = workflowexpression.NewAvailability("github", "matrix", "runner", "env", "inputs", "steps")
-	runnerConditionAvailability    = workflowexpression.NewAvailability("github", "matrix", "runner", "env", "inputs", "steps").WithStatusFunctions()
+	runnerJobAvailability          = workflowexpression.NewAvailability("github", "matrix", "vars", "secrets", "inputs")
+	actionDefaultAvailability      = workflowexpression.NewAvailability("github")
+	runnerStepAvailability         = workflowexpression.NewAvailability("github", "matrix", "runner", "env", "vars", "secrets", "inputs", "steps")
+	runnerConditionAvailability    = workflowexpression.NewAvailability("github", "matrix", "runner", "env", "vars", "inputs", "steps").WithStatusFunctions()
 	compositeAvailability          = workflowexpression.NewAvailability("github", "runner", "env", "inputs", "steps")
 	compositeConditionAvailability = workflowexpression.NewAvailability("github", "runner", "env", "inputs", "steps").WithStatusFunctions()
 )
 
-func resolveJobEnvironment(values map[string]string, plan *Plan, environment []string, token string) (map[string]string, error) {
-	return resolveExpressionMap(values, expressionContext(plan, environment, "", nil, runnerJobAvailability, nil, token))
+func resolveJobEnvironment(values map[string]string, plan *Plan, environment []string, token string, secrets, variables map[string]string) (map[string]string, error) {
+	return resolveExpressionMap(values, expressionContext(plan, environment, "", nil, runnerJobAvailability, nil, token, secrets, variables))
 }
 
 func resolveActionDefaultExpression(input string, plan *Plan, environment []string, token string) (string, error) {
-	context := expressionContext(plan, environment, "", nil, runnerJobAvailability, nil, token)
+	context := expressionContext(plan, environment, "", nil, actionDefaultAvailability, nil, token, nil, nil)
 	return resolveExpressionString(input, context)
 }
 
@@ -77,7 +78,7 @@ func workflowStepCondition(input string, environment map[string]string, status w
 
 func workflowExpressionContext(state *executionState, environment []string, availability workflowexpression.Availability, status *workflowexpression.Status) workflowexpression.Context {
 	values := map[string]any{"steps": state.stepOutputs}
-	return expressionContext(state.plan, environment, "", values, availability, status, state.githubToken)
+	return expressionContext(state.plan, environment, "", values, availability, status, state.githubToken, state.secrets, state.variables)
 }
 
 func compositeExpressionContext(compositeContext *compositeContext, availability workflowexpression.Availability, status *workflowexpression.Status) workflowexpression.Context {
@@ -90,10 +91,10 @@ func compositeExpressionContext(compositeContext *compositeContext, availability
 		"inputs": compositeContext.inputs,
 		"steps":  steps,
 	}
-	return expressionContext(compositeContext.state.plan, environment, compositeContext.actionPath, values, availability, status, compositeContext.state.githubToken)
+	return expressionContext(compositeContext.state.plan, environment, compositeContext.actionPath, values, availability, status, compositeContext.state.githubToken, nil, nil)
 }
 
-func expressionContext(plan *Plan, environment []string, actionPath string, extra map[string]any, availability workflowexpression.Availability, status *workflowexpression.Status, token string) workflowexpression.Context {
+func expressionContext(plan *Plan, environment []string, actionPath string, extra map[string]any, availability workflowexpression.Availability, status *workflowexpression.Status, token string, secrets, variables map[string]string) workflowexpression.Context {
 	pullRequestRefs := planPullRequestRefs(plan)
 	github := map[string]any{
 		"workflow":   plan.WorkflowName,
@@ -114,9 +115,11 @@ func expressionContext(plan *Plan, environment []string, actionPath string, extr
 		github["action_path"] = actionPath
 	}
 	values := map[string]any{
-		"github": github,
-		"inputs": plan.Inputs,
-		"matrix": plan.Matrix,
+		"github":  github,
+		"inputs":  plan.Inputs,
+		"matrix":  plan.Matrix,
+		"secrets": secretContext(token, secrets),
+		"vars":    variables,
 		"runner": map[string]any{
 			"os":         environmentValue(environment, "RUNNER_OS"),
 			"arch":       environmentValue(environment, "RUNNER_ARCH"),
@@ -129,6 +132,15 @@ func expressionContext(plan *Plan, environment []string, actionPath string, extr
 		values[name] = value
 	}
 	return workflowexpression.Context{Availability: availability, Values: values, Status: status}
+}
+
+func secretContext(token string, secrets map[string]string) map[string]any {
+	values := make(map[string]any, len(secrets)+1)
+	for name, value := range secrets {
+		values[name] = workflowexpression.Secret(value)
+	}
+	values["GITHUB_TOKEN"] = workflowexpression.Secret(token)
+	return values
 }
 
 func githubExpressionEvent(plan *Plan) map[string]any {

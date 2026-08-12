@@ -67,3 +67,27 @@ func TestWithoutEnvironmentVariable(t *testing.T) {
 		t.Fatalf("filtered environment = %#v", environment)
 	}
 }
+
+func TestLoadValuesReadsProjectedFiles(t *testing.T) {
+	directory := t.TempDir()
+	dataDirectory := filepath.Join(directory, "..2026_08_12_14_00_00.000000000")
+	if err := os.Mkdir(dataDirectory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dataDirectory, "TOKEN"), []byte("secret-value"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Base(dataDirectory), filepath.Join(directory, "..data")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join("..data", "TOKEN"), filepath.Join(directory, "TOKEN")); err != nil {
+		t.Fatal(err)
+	}
+	values, err := loadValues(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if values["TOKEN"] != "secret-value" || len(values) != 1 {
+		t.Fatalf("values = %#v", values)
+	}
+}

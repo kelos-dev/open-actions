@@ -3,12 +3,14 @@ package runner
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"maps"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -231,6 +233,109 @@ func TestExecuteEvaluatesWorkflowExpressions(t *testing.T) {
 	}
 }
 
+func TestExecuteResolvesAndMasksRepositoryValues(t *testing.T) {
+	secret := "repository-secret-value"
+	encodedSecret := base64.StdEncoding.EncodeToString([]byte(secret))
+	plan := testPlan()
+	plan.Env = map[string]string{
+		"BUILTIN_TOKEN":    "${{ secrets.GITHUB_TOKEN }}",
+		"NAMESPACE":        "${{ vars.deployment_namespace }}",
+		"REPOSITORY_TOKEN": "${{ secrets.repository_token }}",
+	}
+	plan.Outputs = map[string]string{"secret": "${{ steps.value.outputs.secret }}"}
+	plan.Steps = []Step{{
+		ID: "value",
+		Run: fmt.Sprintf(
+			`test "$BUILTIN_TOKEN" = installation-token && test "$REPOSITORY_TOKEN" = %q && test "$NAMESPACE" = production && printf 'secret=%%s\n' "$REPOSITORY_TOKEN" >> "$GITHUB_OUTPUT" && printf '%%s\n%%s\n%%s\n' "$REPOSITORY_TOKEN" %q "$NAMESPACE"`,
+			secret,
+			encodedSecret,
+		),
+	}}
+	var output bytes.Buffer
+	executor, err := NewExecutor(ExecutorConfig{
+		Logger:      slog.New(slog.NewTextHandler(&output, nil)),
+		GitHubToken: "installation-token",
+		Secrets:     map[string]string{"REPOSITORY_TOKEN": secret},
+		Variables:   map[string]string{"DEPLOYMENT_NAMESPACE": "production"},
+		Environment: os.Environ(),
+		Stdout:      &output,
+		Stderr:      &output,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := executor.ExecuteResult(context.Background(), plan, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, found := result.Outputs["secret"]; found {
+		t.Fatalf("secret-derived output was persisted: %#v", result.Outputs)
+	}
+	if strings.Contains(output.String(), secret) || strings.Contains(output.String(), encodedSecret) {
+		t.Fatalf("runner output exposed a Project secret: %s", output.String())
+	}
+	if !strings.Contains(output.String(), "production") || !strings.Contains(output.String(), "***") {
+		t.Fatalf("runner output = %q", output.String())
+	}
+}
+
+func TestOutputMaskerMasksSecretEncodingsAndLines(t *testing.T) {
+	secret := `"alpha' beta&gamma<delta>"`
+	masker := newOutputMasker()
+	masker.addSecret(secret)
+	jsonValue, err := json.Marshal(secret)
+	if err != nil {
+		t.Fatal(err)
+	}
+	forms := []string{
+		secret,
+		base64.StdEncoding.EncodeToString([]byte(secret)),
+		base64.RawStdEncoding.EncodeToString([]byte(secret[1:])),
+		string(jsonValue[1 : len(jsonValue)-1]),
+		strings.ReplaceAll(url.QueryEscape(secret), "+", "%20"),
+		strings.ReplaceAll(secret, `"`, `\"`),
+		strings.ReplaceAll(secret, `'`, `''`),
+		"&quot;alpha&apos; beta&amp;gamma&lt;delta&gt;&quot;",
+		secret[1 : len(secret)-1],
+	}
+	for _, form := range forms {
+		if masked := masker.mask(form); masked != "***" {
+			t.Errorf("masked form = %q, want redacted", masked)
+		}
+	}
+
+	masker = newOutputMasker()
+	masker.addSecret("first secret line\n  second secret line  ")
+	for _, line := range []string{"first secret line", "second secret line"} {
+		if masked := masker.mask(line); masked != "***" {
+			t.Errorf("masked line = %q, want redacted", masked)
+		}
+	}
+
+	masker = newOutputMasker()
+	masker.addSecret("{\n  \"private_key\": \"long-secret-value\"\n}")
+	if masked := masker.mask("New version {\"result\":\"ready\"}"); masked != "New version {\"result\":\"ready\"}" {
+		t.Errorf("short multiline fragments corrupted output: %q", masked)
+	}
+	if masker.contains(`{"result":"ready"}`) {
+		t.Fatal("short multiline fragments marked a non-secret output as sensitive")
+	}
+	if masked := masker.mask("encoded fragments ew fQ"); masked != "encoded fragments ew fQ" {
+		t.Errorf("encoded short multiline fragments corrupted output: %q", masked)
+	}
+	if masked := masker.mask(`"private_key": "long-secret-value"`); masked != "***" {
+		t.Errorf("long multiline fragment was not masked: %q", masked)
+	}
+
+	masker = newOutputMasker()
+	masker.addSecret("secretpart1&+secretpart2&secretpart3")
+	for _, section := range []string{"secretpart1&+", "ecretpart2&secretpart3"} {
+		if masked := masker.mask(section); masked != "***" {
+			t.Errorf("masked PowerShell section = %q, want redacted", masked)
+		}
+	}
+}
+
 func TestExecuteRunsFailureAndAlwaysSteps(t *testing.T) {
 	workspace := t.TempDir()
 	plan := testPlan()
@@ -389,12 +494,13 @@ func TestResolvedStepBytesEnforcesFieldLimits(t *testing.T) {
 	}
 }
 
-func TestExecuteRejectsUnavailableExpressionContext(t *testing.T) {
+func TestExecuteUsesEmptyStringForMissingRepositorySecret(t *testing.T) {
 	plan := testPlan()
 	plan.Env = map[string]string{"TOKEN": "${{ secrets.TOKEN }}"}
+	plan.Steps = []Step{{Run: `test -z "$TOKEN"`}}
 	err := testExecutor(t, io.Discard, io.Discard).Execute(context.Background(), plan, t.TempDir())
-	if err == nil || !strings.Contains(err.Error(), `context "secrets" is unavailable`) {
-		t.Fatalf("error = %v, want unavailable secrets context", err)
+	if err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -421,7 +527,7 @@ func TestExpressionContextsPreserveTriggerInputTypes(t *testing.T) {
 	plan := testPlan()
 	plan.Inputs = map[string]any{"enabled": false, "retries": float64(2)}
 	plan.Event.Schedule = "0 6 * * *"
-	context := expressionContext(plan, nil, "", nil, runnerConditionAvailability, nil, "token")
+	context := expressionContext(plan, nil, "", nil, runnerConditionAvailability, nil, "token", nil, nil)
 	enabled, err := evaluateCondition("${{ inputs.enabled }}", context, true)
 	if err != nil {
 		t.Fatal(err)

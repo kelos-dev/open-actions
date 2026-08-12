@@ -2,16 +2,21 @@ package runner
 
 import (
 	"bytes"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"io"
+	"net/url"
 	"sort"
 	"strings"
 	"sync"
+	"unicode/utf8"
 )
 
 const (
-	maxMaskValueBytes    = 8 << 10
-	maxOutputBufferBytes = 64 << 10
+	maxMaskValueBytes    = 384 << 10
+	maxOutputBufferBytes = 512 << 10
+	minDerivedMaskBytes  = 6
 )
 
 type outputMasker struct {
@@ -52,6 +57,63 @@ func (m *outputMasker) add(value string) {
 	}
 	m.masks = append(m.masks, valueBytes)
 	sort.Slice(m.masks, func(left, right int) bool { return len(m.masks[left]) > len(m.masks[right]) })
+}
+
+func (m *outputMasker) addSecret(value string) {
+	if value == "" {
+		return
+	}
+	m.addSecretValue(value)
+	for _, line := range strings.FieldsFunc(value, func(character rune) bool { return character == '\r' || character == '\n' }) {
+		line = strings.TrimSpace(line)
+		if len(line) >= minDerivedMaskBytes && line != value {
+			m.addSecretValue(line)
+		}
+	}
+}
+
+func (m *outputMasker) addSecretValue(value string) {
+	m.add(value)
+	valueBytes := []byte(value)
+	for shift := 0; shift < 3 && shift < len(valueBytes); shift++ {
+		m.add(base64.StdEncoding.EncodeToString(valueBytes[shift:]))
+		m.add(base64.RawStdEncoding.EncodeToString(valueBytes[shift:]))
+	}
+	encodedJSON, err := json.Marshal(value)
+	if err == nil && len(encodedJSON) >= 2 {
+		m.add(string(encodedJSON[1 : len(encodedJSON)-1]))
+	}
+	m.add(strings.ReplaceAll(url.QueryEscape(value), "+", "%20"))
+	m.add(strings.ReplaceAll(value, `"`, `\"`))
+	m.add(strings.ReplaceAll(value, `'`, `''`))
+	m.add(strings.NewReplacer(
+		"&", "&amp;",
+		"<", "&lt;",
+		">", "&gt;",
+		`"`, "&quot;",
+		"'", "&apos;",
+	).Replace(value))
+	if len(value) > 8 && strings.HasPrefix(value, `"`) && strings.HasSuffix(value, `"`) {
+		m.add(value[1 : len(value)-1])
+	}
+	if separator := strings.LastIndex(value, "&"); separator >= 0 {
+		m.addSecretSection(value[:separator+1])
+		m.addSecretSection(value[separator+1:])
+	}
+	if separator := strings.Index(value, "&+"); separator >= 0 {
+		m.addSecretSection(value[:separator+2])
+		remainder := value[separator+2:]
+		_, size := utf8.DecodeRuneInString(remainder)
+		if size < len(remainder) {
+			m.addSecretSection(remainder[size:])
+		}
+	}
+}
+
+func (m *outputMasker) addSecretSection(value string) {
+	if len(value) >= minDerivedMaskBytes {
+		m.add(value)
+	}
 }
 
 func (m *outputMasker) maskPrefix(data []byte, final bool) ([]byte, int) {

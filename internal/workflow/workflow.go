@@ -717,7 +717,7 @@ func EvaluateJobCondition(id, input string, context expression.Context) (bool, e
 	return result.Bool(), nil
 }
 
-func EvaluateConcurrency(definition *Definition, event Event) (string, bool, error) {
+func EvaluateConcurrency(definition *Definition, event Event, variables any) (string, bool, error) {
 	if definition.Concurrency.Group == "" {
 		return "", false, nil
 	}
@@ -727,9 +727,10 @@ func EvaluateConcurrency(definition *Definition, event Event) (string, bool, err
 	}
 	eventValues := eventExpressionValue(event)
 	result, err := program.Evaluate(expression.Context{
-		Availability: expression.NewAvailability("github", "inputs"),
+		Availability: expression.NewAvailability("github", "inputs", "vars"),
 		Values: map[string]any{
 			"inputs": event.InputValues,
+			"vars":   variables,
 			"github": map[string]any{
 				"workflow":   definition.Name,
 				"event_name": event.Name,

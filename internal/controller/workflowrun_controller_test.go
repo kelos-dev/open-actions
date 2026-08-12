@@ -12,11 +12,13 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 
 	actionsv1alpha1 "github.com/kelos-dev/open-actions/api/v1alpha1"
+	workflowexpression "github.com/kelos-dev/open-actions/internal/expression"
 	githubclient "github.com/kelos-dev/open-actions/internal/github"
 	"github.com/kelos-dev/open-actions/internal/runner"
 	"github.com/kelos-dev/open-actions/internal/workflow"
@@ -33,6 +35,16 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 )
+
+type countingReader struct {
+	client.Reader
+	getCount int
+}
+
+func (r *countingReader) Get(ctx context.Context, key client.ObjectKey, object client.Object, options ...client.GetOption) error {
+	r.getCount++
+	return r.Reader.Get(ctx, key, object, options...)
+}
 
 func TestJobPlanCoversSupportedSteps(t *testing.T) {
 	reconciler := &WorkflowRunReconciler{GitHubServerURL: "https://github.com", GitHubAPIBase: "https://api.github.com", ActionCloneBaseURL: "https://github.com/git"}
@@ -93,7 +105,7 @@ func TestPlanWorkflowJobsSetsDisplayNames(t *testing.T) {
 		"lint":  {RunsOn: workflow.StringList{"ubuntu-latest"}, Needs: workflow.StringList{"build"}, If: "always()"},
 	}}
 
-	planned, err := reconciler.planWorkflowJobs(run, definition, map[string]any{"environment": "staging"})
+	planned, err := reconciler.planWorkflowJobs(run, definition, map[string]any{"environment": "staging"}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -157,6 +169,7 @@ func TestWorkflowJobGraphSchedulesAndPropagatesResults(t *testing.T) {
 		running,
 		job("diamond-report", []string{"left", "right"}, "needs.left.result == 'success' && needs.right.result == 'success'", ""),
 		job("input-condition", []string{"build"}, "inputs.deploy && needs.build.outputs.artifact == 'ready'", ""),
+		job("variable-condition", []string{"build"}, "vars.DEPLOY == 'true'", ""),
 		job("condition-false", []string{"build"}, "false", ""),
 		job("default-after-failure", []string{"failing"}, "", ""),
 		job("always-report", []string{"failing"}, "always()", ""),
@@ -170,7 +183,7 @@ func TestWorkflowJobGraphSchedulesAndPropagatesResults(t *testing.T) {
 		t.Fatal(err)
 	}
 	reconciler := &WorkflowRunReconciler{Client: clusterClient, APIReader: clusterClient}
-	if err := reconciler.reconcileWorkflowJobGraph(context.Background(), run, "CI", map[string]any{"deploy": true}, jobs.Items); err != nil {
+	if err := reconciler.reconcileWorkflowJobGraph(context.Background(), run, "CI", map[string]any{"deploy": true}, map[string]string{"DEPLOY": "true"}, jobs.Items); err != nil {
 		t.Fatal(err)
 	}
 
@@ -181,6 +194,7 @@ func TestWorkflowJobGraphSchedulesAndPropagatesResults(t *testing.T) {
 	}{
 		{name: "diamond-report", ready: metav1.ConditionTrue},
 		{name: "input-condition", ready: metav1.ConditionTrue},
+		{name: "variable-condition", ready: metav1.ConditionTrue},
 		{name: "condition-false", result: actionsv1alpha1.WorkflowJobResultSkipped, ready: metav1.ConditionFalse},
 		{name: "default-after-failure", result: actionsv1alpha1.WorkflowJobResultSkipped, ready: metav1.ConditionFalse},
 		{name: "always-report", ready: metav1.ConditionTrue},
@@ -202,6 +216,54 @@ func TestWorkflowJobGraphSchedulesAndPropagatesResults(t *testing.T) {
 			}
 			if test.result == actionsv1alpha1.WorkflowJobResultSkipped && stored.Status.RunnerRef != nil {
 				t.Errorf("skipped job runnerRef = %#v", stored.Status.RunnerRef)
+			}
+		})
+	}
+}
+
+func TestWorkflowJobGraphRetriesUnavailableVariables(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := actionsv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	run := &actionsv1alpha1.WorkflowRun{
+		ObjectMeta: metav1.ObjectMeta{Name: "ci", Namespace: "default", UID: types.UID("run-uid")},
+		Spec: actionsv1alpha1.WorkflowRunSpec{
+			Source: actionsv1alpha1.WorkflowRunSource{Type: actionsv1alpha1.SourceTypeGitHub, GitHub: &actionsv1alpha1.GitHubWorkflowRunSource{
+				Repository: actionsv1alpha1.GitHubRepository{ID: 1, Owner: "example", Name: "project"},
+				Event:      actionsv1alpha1.GitHubEvent{Name: "push", DeliveryID: "delivery"},
+				Revision:   actionsv1alpha1.GitRevision{SHA: strings.Repeat("a", 40), Ref: "refs/heads/main"},
+			}},
+		},
+	}
+	readError := errors.New("API server unavailable")
+	variables := workflowexpression.DeferredObject(func(string) (any, bool, error) {
+		return nil, true, &projectValuesUnavailableError{cause: readError}
+	})
+
+	for _, assigned := range []bool{false, true} {
+		t.Run(fmt.Sprintf("assigned=%t", assigned), func(t *testing.T) {
+			testRun := run.DeepCopy()
+			testRun.Spec.CancelRequested = assigned
+			job := &actionsv1alpha1.WorkflowJob{
+				ObjectMeta: metav1.ObjectMeta{Name: "deploy", Namespace: run.Namespace},
+				Spec:       actionsv1alpha1.WorkflowJobSpec{JobID: "deploy", If: "always() && vars.DEPLOY == 'true'"},
+			}
+			if assigned {
+				job.Status.RunnerRef = &corev1.LocalObjectReference{Name: "runner"}
+			}
+			clusterClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&actionsv1alpha1.WorkflowJob{}).WithObjects(job).Build()
+			reconciler := &WorkflowRunReconciler{Client: clusterClient, APIReader: clusterClient}
+			err := reconciler.reconcileWorkflowJobGraph(context.Background(), testRun, "CI", nil, variables, []actionsv1alpha1.WorkflowJob{*job})
+			if !errors.Is(err, readError) {
+				t.Fatalf("reconcileWorkflowJobGraph() error = %v", err)
+			}
+			stored := &actionsv1alpha1.WorkflowJob{}
+			if err := clusterClient.Get(context.Background(), client.ObjectKeyFromObject(job), stored); err != nil {
+				t.Fatal(err)
+			}
+			if stored.Status.Result != "" || len(stored.Status.Conditions) != 0 {
+				t.Fatalf("WorkflowJob was completed after transient value failure: %#v", stored.Status)
 			}
 		})
 	}
@@ -257,7 +319,7 @@ func TestWorkflowJobGraphWaitsForMatrixDependencies(t *testing.T) {
 	if err := clusterClient.List(context.Background(), jobs); err != nil {
 		t.Fatal(err)
 	}
-	if err := reconciler.reconcileWorkflowJobGraph(context.Background(), run, "Release", nil, jobs.Items); err != nil {
+	if err := reconciler.reconcileWorkflowJobGraph(context.Background(), run, "Release", nil, nil, jobs.Items); err != nil {
 		t.Fatal(err)
 	}
 	storedReport := &actionsv1alpha1.WorkflowJob{}
@@ -280,7 +342,7 @@ func TestWorkflowJobGraphWaitsForMatrixDependencies(t *testing.T) {
 	if err := clusterClient.List(context.Background(), jobs); err != nil {
 		t.Fatal(err)
 	}
-	if err := reconciler.reconcileWorkflowJobGraph(context.Background(), run, "Release", nil, jobs.Items); err != nil {
+	if err := reconciler.reconcileWorkflowJobGraph(context.Background(), run, "Release", nil, nil, jobs.Items); err != nil {
 		t.Fatal(err)
 	}
 	if err := clusterClient.Get(context.Background(), client.ObjectKeyFromObject(report), storedReport); err != nil {
@@ -373,7 +435,7 @@ func TestWorkflowCancellationPreservesEligibleCleanupJobs(t *testing.T) {
 		t.Fatal(err)
 	}
 	reconciler := &WorkflowRunReconciler{Client: clusterClient, APIReader: clusterClient}
-	if err := reconciler.reconcileWorkflowJobGraph(context.Background(), run, "CI", nil, jobs.Items); err != nil {
+	if err := reconciler.reconcileWorkflowJobGraph(context.Background(), run, "CI", nil, nil, jobs.Items); err != nil {
 		t.Fatal(err)
 	}
 
@@ -405,6 +467,65 @@ func TestWorkflowCancellationPreservesEligibleCleanupJobs(t *testing.T) {
 	assertJob("queued-cleanup", "", "", metav1.ConditionTrue)
 }
 
+func TestPlanWorkflowJobsResolvesOnlyPlanningVariables(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	variables := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: "project-variables", Namespace: "default"}, Data: map[string]string{
+		"ENVIRONMENT": "production",
+		"RUNNER":      "ubuntu-latest",
+	}}
+	reader := &countingReader{Reader: fake.NewClientBuilder().WithScheme(scheme).WithObjects(variables).Build()}
+	reconciler := &WorkflowRunReconciler{APIReader: reader}
+	project := &actionsv1alpha1.Project{
+		ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: "default"},
+		Spec:       actionsv1alpha1.ProjectSpec{Variables: &actionsv1alpha1.ProjectVariableSource{ConfigMapRef: corev1.LocalObjectReference{Name: variables.Name}}},
+	}
+	run := &actionsv1alpha1.WorkflowRun{Spec: actionsv1alpha1.WorkflowRunSpec{Source: actionsv1alpha1.WorkflowRunSource{
+		Type: actionsv1alpha1.SourceTypeGitHub,
+		GitHub: &actionsv1alpha1.GitHubWorkflowRunSource{
+			Repository: actionsv1alpha1.GitHubRepository{ID: 1, Owner: "acme", Name: "example"},
+			Event:      actionsv1alpha1.GitHubEvent{Name: "push", DeliveryID: "delivery"},
+			Revision:   actionsv1alpha1.GitRevision{SHA: strings.Repeat("a", 40), Ref: "refs/heads/main"},
+		},
+	}}}
+	definition := &workflow.Definition{Name: "Deploy", Jobs: map[string]workflow.Job{
+		"deploy": {
+			Name:   "Deploy ${{ vars.ENVIRONMENT }}",
+			RunsOn: workflow.StringList{"${{ vars.RUNNER }}"},
+			Env:    map[string]any{"ENVIRONMENT": "${{ vars.ENVIRONMENT }}"},
+			Steps:  []workflow.Step{{Run: "deploy '${{ secrets.DEPLOY_TOKEN }}' to '$ENVIRONMENT'"}},
+		},
+	}}
+	variablesContext := reconciler.projectVariableContext(context.Background(), project)
+	planned, err := reconciler.planWorkflowJobs(run, definition, nil, variablesContext)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(planned) != 1 || planned[0].displayName != "Deploy production" || !slices.Equal(planned[0].runsOn, []string{"ubuntu-latest"}) {
+		t.Fatalf("planned jobs = %#v", planned)
+	}
+	plan := &runner.Plan{}
+	if err := json.Unmarshal([]byte(planned[0].plan), plan); err != nil {
+		t.Fatal(err)
+	}
+	if plan.Env["ENVIRONMENT"] != "${{ vars.ENVIRONMENT }}" || plan.Steps[0].Run != "deploy '${{ secrets.DEPLOY_TOKEN }}' to '$ENVIRONMENT'" {
+		t.Fatalf("runtime expressions were resolved in the plan: %#v", plan)
+	}
+	if strings.Contains(planned[0].plan, "production") {
+		t.Fatalf("runtime variable value was persisted in the plan: %s", planned[0].plan)
+	}
+	for range 2 {
+		if _, found, err := variablesContext("MISSING"); err != nil || found {
+			t.Fatalf("missing variable = found %t, error %v", found, err)
+		}
+	}
+	if reader.getCount != 1 {
+		t.Fatalf("ConfigMap reads = %d, want 1", reader.getCount)
+	}
+}
+
 func TestJobExpressionsUseCanonicalEventInputs(t *testing.T) {
 	reconciler := &WorkflowRunReconciler{}
 	run := &actionsv1alpha1.WorkflowRun{Spec: actionsv1alpha1.WorkflowRunSpec{Source: actionsv1alpha1.WorkflowRunSource{
@@ -418,7 +539,7 @@ func TestJobExpressionsUseCanonicalEventInputs(t *testing.T) {
 	definition := &workflow.Definition{Name: "Manual", Jobs: map[string]workflow.Job{
 		"check": {Name: "${{ inputs.retries }}-${{ github.event.inputs.retries }}", RunsOn: workflow.StringList{"ubuntu-latest"}},
 	}}
-	planned, err := reconciler.planWorkflowJobs(run, definition, map[string]any{"retries": float64(1.1)})
+	planned, err := reconciler.planWorkflowJobs(run, definition, map[string]any{"retries": float64(1.1)}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -448,7 +569,7 @@ func TestJobPlanFitsBoundedEncodedContexts(t *testing.T) {
 				Revision: actionsv1alpha1.GitRevision{SHA: strings.Repeat("b", 40), Ref: "refs/heads/main"},
 			},
 		}}}
-		planned, err := reconciler.planWorkflowJobs(run, &workflow.Definition{Name: "Review", Jobs: map[string]workflow.Job{"check": job}}, nil)
+		planned, err := reconciler.planWorkflowJobs(run, &workflow.Definition{Name: "Review", Jobs: map[string]workflow.Job{"check": job}}, nil, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -469,7 +590,7 @@ func TestJobPlanFitsBoundedEncodedContexts(t *testing.T) {
 				Revision:   actionsv1alpha1.GitRevision{SHA: strings.Repeat("b", 40), Ref: "refs/heads/main"},
 			},
 		}}}
-		planned, err := reconciler.planWorkflowJobs(run, &workflow.Definition{Name: "Manual", Jobs: map[string]workflow.Job{"check": job}}, map[string]any{"a": value})
+		planned, err := reconciler.planWorkflowJobs(run, &workflow.Definition{Name: "Manual", Jobs: map[string]workflow.Job{"check": job}}, map[string]any{"a": value}, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -515,7 +636,7 @@ func TestJobExpressionsIncludeBoundedEventMetadata(t *testing.T) {
 					Event: tt.event, Revision: actionsv1alpha1.GitRevision{SHA: strings.Repeat("b", 40), Ref: ref},
 				},
 			}}}
-			job, err := workflow.EvaluateJob("test", workflow.Job{Name: tt.expression, RunsOn: workflow.StringList{"ubuntu-latest"}}, reconciler.jobExpressionContext(run, "CI", nil))
+			job, err := workflow.EvaluateJob("test", workflow.Job{Name: tt.expression, RunsOn: workflow.StringList{"ubuntu-latest"}}, reconciler.jobExpressionContext(run, "CI", nil, nil))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -541,7 +662,7 @@ func TestPlanWorkflowJobsExpandsArchitectureMatrix(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	planned, err := reconciler.planWorkflowJobs(run, definition, nil)
+	planned, err := reconciler.planWorkflowJobs(run, definition, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -584,7 +705,7 @@ func TestPlanWorkflowJobsPreservesDisabledMatrixFailFast(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	planned, err := reconciler.planWorkflowJobs(run, definition, nil)
+	planned, err := reconciler.planWorkflowJobs(run, definition, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1875,6 +1996,40 @@ func TestInvalidWorkflowPlanningDoesNotRetry(t *testing.T) {
 	succeeded := meta.FindStatusCondition(stored.Status.Conditions, actionsv1alpha1.WorkflowRunConditionSucceeded)
 	if succeeded == nil || succeeded.Status != metav1.ConditionFalse || succeeded.Reason != "WorkflowInvalid" {
 		t.Fatalf("succeeded condition = %#v", succeeded)
+	}
+}
+
+func TestProjectValuePlanningFailureRemainsRetryable(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := actionsv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	run := &actionsv1alpha1.WorkflowRun{ObjectMeta: metav1.ObjectMeta{Name: "deploy", Namespace: "default"}}
+	clusterClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&actionsv1alpha1.WorkflowRun{}).WithObjects(run).Build()
+	reconciler := &WorkflowRunReconciler{Client: clusterClient, APIReader: clusterClient}
+	project := &actionsv1alpha1.Project{
+		ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: "default"},
+		Spec:       actionsv1alpha1.ProjectSpec{Variables: &actionsv1alpha1.ProjectVariableSource{ConfigMapRef: corev1.LocalObjectReference{Name: "missing"}}},
+	}
+	definition := &workflow.Definition{Name: "Deploy", Concurrency: workflow.Concurrency{Group: "deploy-${{ vars.ENVIRONMENT }}"}}
+	_, _, cause := workflow.EvaluateConcurrency(definition, workflow.Event{}, reconciler.projectVariableContext(context.Background(), project))
+	var unavailable *projectValuesUnavailableError
+	if !errors.As(cause, &unavailable) {
+		t.Fatalf("EvaluateConcurrency() error = %v", cause)
+	}
+	if _, err := reconciler.planningEvaluationFailed(context.Background(), run, cause); !errors.Is(err, cause) {
+		t.Fatalf("planningEvaluationFailed() error = %v", err)
+	}
+	stored := &actionsv1alpha1.WorkflowRun{}
+	if err := clusterClient.Get(context.Background(), client.ObjectKeyFromObject(run), stored); err != nil {
+		t.Fatal(err)
+	}
+	condition := meta.FindStatusCondition(stored.Status.Conditions, actionsv1alpha1.WorkflowRunConditionPlanned)
+	if condition == nil || condition.Status != metav1.ConditionUnknown || condition.Reason != "ProjectValuesUnavailable" {
+		t.Fatalf("planned condition = %#v", condition)
 	}
 }
 

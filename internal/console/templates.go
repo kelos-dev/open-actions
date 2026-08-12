@@ -28,7 +28,7 @@ const loginPageTemplate = `<!doctype html>
     form.addEventListener('submit',async event=>{event.preventDefault();error.textContent='';button.disabled=true;
       try{const response=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({token:form.token.value})});
         if(!response.ok){error.textContent='The token is invalid.';return}
-        const next=new URLSearchParams(location.search).get('next');location.assign(next&&next.startsWith('/runs/')?next:'/');
+        const next=new URLSearchParams(location.search).get('next');location.assign(next&&(next.startsWith('/runs/')||next==='/projects'||next.startsWith('/projects/'))?next:'/');
       }catch(_){error.textContent='The Console is unavailable.'}finally{button.disabled=false}
     });
   </script>
@@ -46,7 +46,7 @@ const mainPageTemplate = `<!doctype html>
   </style>
 </head>
 <body>
-  <nav class="topbar" aria-label="Global"><a class="brand" href="/"><span class="brand-mark" aria-hidden="true">OA</span><span>Open Actions</span></a></nav>
+  <nav class="topbar" aria-label="Global"><a class="brand" href="/"><span class="brand-mark" aria-hidden="true">OA</span><span>Open Actions</span></a><a href="/projects">Projects</a></nav>
   <main class="page">
     <header class="page-heading"><div><h1>Workflow runs</h1><p>Workflow activity across all namespaces{{if .Truncated}} · Showing {{.Limit}} most recent runs{{end}}</p></div><span class="count" aria-label="Workflow run count">{{len .Runs}}</span></header>
     <section class="runs" aria-label="Workflow runs">
@@ -62,6 +62,72 @@ const mainPageTemplate = `<!doctype html>
 </body>
 </html>`
 
+const projectsPageTemplate = `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Projects · Open Actions</title>
+  <style>
+    :root{color-scheme:dark;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#0d1117;color:#f0f6fc}*{box-sizing:border-box}body{margin:0;background:#0d1117;color:#f0f6fc;font-size:14px}a{color:#58a6ff;text-decoration:none}a:hover{text-decoration:underline}.topbar{height:64px;display:flex;align-items:center;gap:24px;padding:0 24px;border-bottom:1px solid #21262d;background:#010409}.brand{display:flex;align-items:center;gap:10px;color:#f0f6fc;font-weight:600}.brand:hover{text-decoration:none}.brand-mark{display:grid;place-items:center;width:30px;height:30px;border:1px solid #30363d;border-radius:7px;color:#58a6ff;font-size:12px;font-weight:800}.page{width:min(1000px,100%);margin:0 auto;padding:32px 32px 56px}.page-heading{display:flex;align-items:flex-end;justify-content:space-between;gap:24px;margin-bottom:20px}.page-heading h1{margin:0 0 6px;font-size:24px}.page-heading p{margin:0;color:#8b949e}.count{padding:2px 8px;border-radius:20px;background:#30363d;color:#c9d1d9;font-size:12px}.projects{overflow:hidden;border:1px solid #30363d;border-radius:6px}.project{display:grid;grid-template-columns:minmax(240px,1fr) 170px 160px;align-items:center;gap:20px;min-height:72px;padding:14px 16px;border-bottom:1px solid #21262d}.project:last-child{border-bottom:0}.project:hover{background:#161b2266}.project-name{color:#f0f6fc}.project-name strong,.project-name small{display:block}.project-name small,.detail{margin-top:4px;color:#8b949e}.status{display:flex;align-items:center;gap:8px}.status-mark{width:12px;height:12px;border:2px solid currentColor;border-radius:50%}.status-mark.succeeded{color:#3fb950}.status-mark.failed{color:#f85149}.status-mark.queued{color:#8b949e}.empty{padding:48px;text-align:center;color:#8b949e}@media(max-width:680px){.page{padding:24px 16px}.project{grid-template-columns:1fr auto}.project .secret{display:none}}
+  </style>
+</head>
+<body>
+  <nav class="topbar" aria-label="Global"><a class="brand" href="/"><span class="brand-mark" aria-hidden="true">OA</span><span>Open Actions</span></a><a href="/projects">Projects</a></nav>
+  <main class="page">
+    <header class="page-heading"><div><h1>Projects</h1><p>Workflow sources and Project-scoped configuration</p></div><span class="count">{{len .Projects}}</span></header>
+    <section class="projects" aria-label="Projects">
+      {{range .Projects}}<article class="project">
+        <a class="project-name" href="{{.URL}}"><strong>{{.Name}}</strong><small>{{.Namespace}}</small></a>
+        <div class="status"><span class="status-mark {{.StatusClass}}" aria-hidden="true"></span><span>{{.Status}}</span></div>
+        <div class="detail secret">{{if .SecretName}}{{.SecretName}}{{else}}No Secret{{end}}</div>
+      </article>{{else}}<div class="empty">No Projects are configured.</div>{{end}}
+    </section>
+  </main>
+</body>
+</html>`
+
+const projectPageTemplate = `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>{{.Name}} · Projects · Open Actions</title>
+  <style>
+    :root{color-scheme:dark;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#0d1117;color:#f0f6fc}*{box-sizing:border-box}body{margin:0;background:#0d1117;color:#f0f6fc;font-size:14px}a{color:#58a6ff;text-decoration:none}a:hover{text-decoration:underline}.topbar{height:64px;display:flex;align-items:center;gap:24px;padding:0 24px;border-bottom:1px solid #21262d;background:#010409}.brand{display:flex;align-items:center;gap:10px;color:#f0f6fc;font-weight:600}.brand:hover{text-decoration:none}.brand-mark{display:grid;place-items:center;width:30px;height:30px;border:1px solid #30363d;border-radius:7px;color:#58a6ff;font-size:12px;font-weight:800}.page{width:min(900px,100%);margin:0 auto;padding:28px 32px 56px}.breadcrumbs{display:flex;gap:8px;margin-bottom:22px;color:#8b949e}.heading{display:flex;align-items:flex-start;justify-content:space-between;gap:20px;margin-bottom:24px}.heading h1{margin:0 0 6px;font-size:24px}.muted{color:#8b949e}.pill{display:flex;align-items:center;gap:7px}.status-mark{width:12px;height:12px;border:2px solid currentColor;border-radius:50%}.status-mark.succeeded{color:#3fb950}.status-mark.failed{color:#f85149}.status-mark.queued{color:#8b949e}.summary,.panel{padding:20px;border:1px solid #30363d;border-radius:6px}.summary{display:grid;grid-template-columns:170px 1fr;gap:12px 20px;margin-bottom:28px}.summary dt{color:#8b949e}.summary dd{margin:0;overflow-wrap:anywhere}.panel h2{margin:0 0 6px;font-size:18px}.hint{margin:0 0 18px;color:#8b949e;line-height:1.5}.notice{padding:12px;border:1px solid #30363d;border-radius:6px;background:#161b22;color:#c9d1d9}.secret-list{margin:0 0 22px;padding:0;list-style:none;border:1px solid #30363d;border-radius:6px}.secret-row{display:flex;align-items:center;justify-content:space-between;gap:16px;min-height:48px;padding:8px 12px;border-bottom:1px solid #21262d}.secret-row:last-child{border-bottom:0}.secret-row code{font:13px ui-monospace,SFMono-Regular,Consolas,monospace}.secret-row form{margin:0}.form{display:grid;grid-template-columns:minmax(180px,.7fr) minmax(220px,1fr) auto;align-items:end;gap:12px}.field label{display:block;margin-bottom:7px;font-size:13px;font-weight:600}.field input{width:100%;height:34px;padding:5px 10px;border:1px solid #30363d;border-radius:6px;background:#0d1117;color:#f0f6fc;font:inherit}.field input:focus{border-color:#2f81f7;outline:none;box-shadow:0 0 0 3px #2f81f74d}button{height:34px;padding:0 14px;border:1px solid #2ea043;border-radius:6px;background:#238636;color:#fff;font-weight:600;cursor:pointer}.delete{border-color:#da3633;background:#b62324}.empty{padding:18px;color:#8b949e;text-align:center}@media(max-width:680px){.page{padding:22px 16px}.heading{display:block}.pill{margin-top:12px}.summary{grid-template-columns:1fr}.summary dd{margin-bottom:8px}.form{grid-template-columns:1fr}}
+  </style>
+</head>
+<body>
+  <nav class="topbar" aria-label="Global"><a class="brand" href="/"><span class="brand-mark" aria-hidden="true">OA</span><span>Open Actions</span></a><a href="/projects">Projects</a></nav>
+  <main class="page">
+    <div class="breadcrumbs"><a href="/projects">Projects</a><span>/</span><span>{{.Namespace}}</span><span>/</span><span>{{.Name}}</span></div>
+    <header class="heading"><div><h1>{{.Name}}</h1><span class="muted">{{.Namespace}}</span></div><div class="pill"><span class="status-mark {{.StatusClass}}" aria-hidden="true"></span><span>{{.Status}}</span></div></header>
+    <dl class="summary">
+      <dt>Installation</dt><dd>{{.Installation}}</dd>
+      <dt>Workflow directory</dt><dd><code>{{.WorkflowDirectory}}</code></dd>
+      <dt>Secret</dt><dd>{{if .SecretName}}<code>{{.SecretName}}</code>{{else}}Not configured{{end}}</dd>
+      <dt>Configuration</dt><dd>{{.StatusMessage}}</dd>
+    </dl>
+    <section class="panel" aria-label="Workflow secrets">
+      <h2>Workflow secrets</h2>
+      <p class="hint">Secret values are write-only. Existing values are never returned to the browser; submitting an existing name replaces its value.</p>
+      {{if .CanManageSecrets}}
+        {{if .SecretMissing}}<p class="notice">The referenced Secret does not exist. Adding the first value will create it.</p>{{end}}
+        <ul class="secret-list">
+          {{range .SecretNames}}<li class="secret-row"><code>{{.}}</code><form method="post" action="{{$.SecretsURL}}" onsubmit="return confirm('Delete this workflow secret?')"><input type="hidden" name="csrf" value="{{$.CSRFToken}}"><input type="hidden" name="action" value="delete"><input type="hidden" name="name" value="{{.}}"><button class="delete" type="submit">Delete</button></form></li>{{else}}<li class="empty">No workflow secrets are configured.</li>{{end}}
+        </ul>
+        <form class="form" method="post" action="{{.SecretsURL}}">
+          <input type="hidden" name="csrf" value="{{.CSRFToken}}"><input type="hidden" name="action" value="set">
+          <div class="field"><label for="secret-name">Name</label><input id="secret-name" name="name" pattern="[A-Za-z_][A-Za-z0-9_]*" maxlength="255" autocomplete="off" required></div>
+          <div class="field"><label for="secret-value">New value</label><input id="secret-value" name="value" type="password" autocomplete="new-password" required></div>
+          <button type="submit">Add or replace</button>
+        </form>
+      {{else}}<p class="notice">{{.ManagementNotice}}</p>{{end}}
+    </section>
+  </main>
+</body>
+</html>`
+
 const runPageTemplate = `<!doctype html>
 <html lang="en">
 <head>
@@ -73,7 +139,7 @@ const runPageTemplate = `<!doctype html>
   </style>
 </head>
 <body>
-  <nav class="topbar" aria-label="Global"><a class="brand" href="/"><span class="brand-mark" aria-hidden="true">OA</span><span>Open Actions</span></a></nav>
+  <nav class="topbar" aria-label="Global"><a class="brand" href="/"><span class="brand-mark" aria-hidden="true">OA</span><span>Open Actions</span></a><a href="/projects">Projects</a></nav>
   <main class="page">
     <div class="breadcrumbs"><strong>{{.Repository}}</strong><span>/</span><span>Actions</span><span>/</span><span>{{.WorkflowName}}</span></div>
     <div class="run-heading">
@@ -109,7 +175,7 @@ const logPageTemplate = `<!doctype html>
   </style>
 </head>
 <body data-stream-url="{{.StreamURL}}">
-  <nav class="topbar" aria-label="Global"><a class="brand" href="/"><span class="brand-mark" aria-hidden="true">OA</span><span>Open Actions</span></a></nav>
+  <nav class="topbar" aria-label="Global"><a class="brand" href="/"><span class="brand-mark" aria-hidden="true">OA</span><span>Open Actions</span></a><a href="/projects">Projects</a></nav>
   <main class="page">
     <div class="breadcrumbs"><strong>{{.Repository}}</strong><span>/</span><span>Actions</span><span>/</span><a href="{{.RunURL}}">{{.WorkflowName}}</a></div>
     <div class="layout">

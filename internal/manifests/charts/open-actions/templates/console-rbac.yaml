@@ -5,7 +5,7 @@ metadata:
   name: open-actions-console
 rules:
   - apiGroups: [actions.kelos.dev]
-    resources: [workflowjobs, workflowruns]
+    resources: [projects, workflowjobs, workflowruns]
     verbs: [get, list]
   - apiGroups: [""]
     resources: [pods]
@@ -22,6 +22,30 @@ roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
   name: open-actions-console
+subjects:
+  - kind: ServiceAccount
+    name: open-actions-console
+    namespace: {{ .Release.Namespace }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: open-actions-console-secrets
+  namespace: {{ .Release.Namespace }}
+rules:
+  - apiGroups: [""]
+    resources: [secrets]
+    verbs: [get, create, update]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: open-actions-console-secrets
+  namespace: {{ .Release.Namespace }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: open-actions-console-secrets
 subjects:
   - kind: ServiceAccount
     name: open-actions-console

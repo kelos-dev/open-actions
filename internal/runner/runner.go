@@ -120,6 +120,8 @@ type Step struct {
 type ExecutorConfig struct {
 	Logger      *slog.Logger
 	GitHubToken string
+	Secrets     map[string]string
+	Variables   map[string]string
 	Environment []string
 	Stdout      io.Writer
 	Stderr      io.Writer
@@ -128,6 +130,8 @@ type ExecutorConfig struct {
 type Executor struct {
 	logger      *slog.Logger
 	githubToken string
+	secrets     map[string]string
+	variables   map[string]string
 	environment []string
 	stdout      io.Writer
 	stderr      io.Writer
@@ -142,6 +146,8 @@ type executionState struct {
 	temporaryDirectory string
 	environment        []string
 	githubToken        string
+	secrets            map[string]string
+	variables          map[string]string
 	resolver           *actionResolver
 	posts              []*actionInvocation
 	compositeStack     map[string]bool
@@ -153,17 +159,34 @@ func NewExecutor(config ExecutorConfig) (*Executor, error) {
 	if config.Logger == nil || config.GitHubToken == "" || config.Environment == nil || config.Stdout == nil || config.Stderr == nil {
 		return nil, errors.New("runner executor configuration is incomplete")
 	}
-	masker := newOutputMasker(config.GitHubToken)
+	masker := newOutputMasker()
+	masker.addSecret(config.GitHubToken)
 	masker.add(base64.StdEncoding.EncodeToString([]byte("x-access-token:" + config.GitHubToken)))
+	for _, secret := range config.Secrets {
+		masker.addSecret(secret)
+	}
 	return &Executor{
 		logger:      config.Logger.With(runnerLogMarker, true),
 		githubToken: config.GitHubToken,
+		secrets:     cloneStringMap(config.Secrets),
+		variables:   cloneStringMap(config.Variables),
 		environment: append([]string(nil), config.Environment...),
 		stdout:      config.Stdout,
 		stderr:      config.Stderr,
 		masker:      masker,
 		commands:    newWorkflowCommandState(),
 	}, nil
+}
+
+func cloneStringMap(values map[string]string) map[string]string {
+	if len(values) == 0 {
+		return nil
+	}
+	result := make(map[string]string, len(values))
+	for name, value := range values {
+		result[name] = value
+	}
+	return result
 }
 
 func LoadPlan(path string) (*Plan, error) {
@@ -264,7 +287,7 @@ func (e *Executor) executePlan(ctx context.Context, plan *Plan, workspace string
 		"RUNNER_TEMP="+filepath.Join(temporaryDirectory, "temp"),
 		"RUNNER_TOOL_CACHE="+filepath.Join(temporaryDirectory, "tool-cache"),
 	)
-	jobEnvironment, err := resolveJobEnvironment(plan.Env, plan, environment, e.githubToken)
+	jobEnvironment, err := resolveJobEnvironment(plan.Env, plan, environment, e.githubToken, e.secrets, e.variables)
 	if err != nil {
 		return emptyResult, fmt.Errorf("resolve job environment: %w", err)
 	}
@@ -282,6 +305,8 @@ func (e *Executor) executePlan(ctx context.Context, plan *Plan, workspace string
 		temporaryDirectory: temporaryDirectory,
 		environment:        environment,
 		githubToken:        e.githubToken,
+		secrets:            e.secrets,
+		variables:          e.variables,
 		resolver:           newActionResolver(plan.Repository.ActionCloneBaseURL, filepath.Join(temporaryDirectory, "actions"), environment, e.executeCommand),
 		compositeStack:     map[string]bool{},
 		stepOutputs:        map[string]map[string]any{},

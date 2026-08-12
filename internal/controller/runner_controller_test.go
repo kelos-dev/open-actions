@@ -120,6 +120,48 @@ func TestRunnerBuildsOwnedJob(t *testing.T) {
 	}
 }
 
+func TestRunnerBuildsJobWithProjectValues(t *testing.T) {
+	scheme := runnerTestScheme(t)
+	reconciler := &RunnerReconciler{Client: fake.NewClientBuilder().WithScheme(scheme).Build()}
+	project := &actionsv1alpha1.Project{
+		Spec: actionsv1alpha1.ProjectSpec{
+			Secrets:   &actionsv1alpha1.ProjectSecretSource{SecretRef: corev1.LocalObjectReference{Name: "project-secrets"}},
+			Variables: &actionsv1alpha1.ProjectVariableSource{ConfigMapRef: corev1.LocalObjectReference{Name: "project-variables"}},
+		},
+	}
+	runnerObject := &actionsv1alpha1.Runner{Spec: actionsv1alpha1.RunnerSpec{Execution: actionsv1alpha1.RunnerExecutionSpec{Image: "runner:test"}}}
+	workflowJob := &actionsv1alpha1.WorkflowJob{ObjectMeta: metav1.ObjectMeta{Name: "ci-build", Namespace: "default", UID: types.UID("workflow-job-uid")}}
+	job, err := reconciler.buildJob(workflowJob, &actionsv1alpha1.WorkflowRun{}, project, runnerObject)
+	if err != nil {
+		t.Fatal(err)
+	}
+	container := job.Spec.Template.Spec.Containers[0]
+	if !slices.Contains(container.Args, "--secrets-directory="+jobContextMountPath+"/secrets") ||
+		!slices.Contains(container.Args, "--variables-directory="+jobContextMountPath+"/variables") {
+		t.Fatalf("runner args = %v", container.Args)
+	}
+	if !slices.Contains(container.VolumeMounts, corev1.VolumeMount{Name: jobSecretsVolume, MountPath: jobContextMountPath + "/secrets", ReadOnly: true}) ||
+		!slices.Contains(container.VolumeMounts, corev1.VolumeMount{Name: jobVariablesVolume, MountPath: jobContextMountPath + "/variables", ReadOnly: true}) {
+		t.Fatalf("runner volume mounts = %#v", container.VolumeMounts)
+	}
+	var secret *corev1.SecretVolumeSource
+	var variables *corev1.ConfigMapVolumeSource
+	for _, volume := range job.Spec.Template.Spec.Volumes {
+		switch volume.Name {
+		case jobSecretsVolume:
+			secret = volume.Secret
+		case jobVariablesVolume:
+			variables = volume.ConfigMap
+		}
+	}
+	if secret == nil || secret.SecretName != "project-secrets" {
+		t.Fatalf("secret volume = %#v", secret)
+	}
+	if variables == nil || variables.Name != "project-variables" {
+		t.Fatalf("variable volume = %#v", variables)
+	}
+}
+
 func TestRunnerBuildsDockerEnabledJob(t *testing.T) {
 	scheme := runnerTestScheme(t)
 	reconciler := &RunnerReconciler{Client: fake.NewClientBuilder().WithScheme(scheme).Build()}

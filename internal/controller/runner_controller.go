@@ -33,10 +33,13 @@ var (
 
 const (
 	jobPlanVolume            = "open-actions-job"
+	jobSecretsVolume         = "open-actions-secrets"
+	jobVariablesVolume       = "open-actions-variables"
 	workspaceVolume          = "open-actions-workspace"
 	dockerSocketVolume       = "open-actions-docker-socket"
 	dockerStorageVolume      = "open-actions-docker-storage"
 	jobPlanMountPath         = "/var/run/open-actions"
+	jobContextMountPath      = "/var/run/open-actions/context"
 	workspaceVolumeMountPath = "/workspace"
 	jobResultPath            = "/dev/termination-log"
 	dockerSocketDirectory    = "/var/run/open-actions-docker"
@@ -463,6 +466,12 @@ func (r *RunnerReconciler) executeWorkflowJob(ctx context.Context, runnerObject 
 	if !metav1.IsControlledBy(plan, workflowJob) {
 		return false, fmt.Errorf("job plan ConfigMap %q is not controlled by WorkflowJob %q", plan.Name, workflowJob.Name)
 	}
+	if err := validateProjectSecretValues(ctx, r.APIReader, project); err != nil {
+		return false, err
+	}
+	if err := validateProjectVariableValues(ctx, r.APIReader, project); err != nil {
+		return false, err
+	}
 	githubConfig := project.Spec.Source.GitHub
 	githubSource := run.Spec.Source.GitHub
 	privateKey, err := secretValue(ctx, r.APIReader, project.Namespace, githubConfig.PrivateKeySecretRef)
@@ -803,6 +812,7 @@ func (r *RunnerReconciler) buildJob(workflowJob *actionsv1alpha1.WorkflowJob, ru
 	if runnerObject.Spec.Execution.Docker != nil {
 		configureDockerExecution(&podTemplate.Spec, &podTemplate.Spec.Containers[0], runnerObject.Spec.Execution.Docker)
 	}
+	configureProjectValues(&podTemplate.Spec, &podTemplate.Spec.Containers[0], project)
 	backoffLimit := int32(0)
 	job := &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
@@ -821,6 +831,32 @@ func (r *RunnerReconciler) buildJob(workflowJob *actionsv1alpha1.WorkflowJob, ru
 		return nil, err
 	}
 	return job, nil
+}
+
+func configureProjectValues(pod *corev1.PodSpec, container *corev1.Container, project *actionsv1alpha1.Project) {
+	mode := int32(0o440)
+	if project.Spec.Secrets != nil {
+		pod.Volumes = append(pod.Volumes, corev1.Volume{
+			Name: jobSecretsVolume,
+			VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{
+				SecretName:  project.Spec.Secrets.SecretRef.Name,
+				DefaultMode: &mode,
+			}},
+		})
+		container.VolumeMounts = append(container.VolumeMounts, corev1.VolumeMount{Name: jobSecretsVolume, MountPath: jobContextMountPath + "/secrets", ReadOnly: true})
+		container.Args = append(container.Args, "--secrets-directory="+jobContextMountPath+"/secrets")
+	}
+	if project.Spec.Variables != nil {
+		pod.Volumes = append(pod.Volumes, corev1.Volume{
+			Name: jobVariablesVolume,
+			VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{
+				LocalObjectReference: project.Spec.Variables.ConfigMapRef,
+				DefaultMode:          &mode,
+			}},
+		})
+		container.VolumeMounts = append(container.VolumeMounts, corev1.VolumeMount{Name: jobVariablesVolume, MountPath: jobContextMountPath + "/variables", ReadOnly: true})
+		container.Args = append(container.Args, "--variables-directory="+jobContextMountPath+"/variables")
+	}
 }
 
 func configureDockerExecution(pod *corev1.PodSpec, runnerContainer *corev1.Container, dockerSpec *actionsv1alpha1.RunnerDockerSpec) {

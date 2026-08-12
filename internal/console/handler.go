@@ -18,13 +18,19 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	actionsv1alpha1 "github.com/kelos-dev/open-actions/api/v1alpha1"
+	"github.com/kelos-dev/open-actions/internal/projectvalue"
 	"github.com/kelos-dev/open-actions/internal/workflowstatus"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/validation"
+	"k8s.io/client-go/util/retry"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
@@ -35,31 +41,45 @@ const (
 	maxLogLineBytes    = 256 << 10
 	truncatedLogMarker = " … [log line truncated]"
 	mainPageRunLimit   = 100
+	secretRequestSize  = 3*projectvalue.MaxValueBytes + (8 << 10)
 )
 
 var errLogsUnavailable = errors.New("logs are no longer available")
 
+type secretCountLimitError struct {
+	name string
+}
+
+func (e *secretCountLimitError) Error() string {
+	return fmt.Sprintf("Secret %q already contains %d values", e.name, projectvalue.MaxSecretCount)
+}
+
 // Config contains required Console dependencies.
 type Config struct {
-	Client       client.Reader
-	Logs         LogSource
-	Token        string
-	SecureCookie bool
-	Logger       *slog.Logger
+	Client                    client.Client
+	Logs                      LogSource
+	Token                     string
+	SecretManagementNamespace string
+	SecureCookie              bool
+	Logger                    *slog.Logger
 }
 
 // Handler serves an authenticated workflow run overview, details, and logs.
 type Handler struct {
-	client       client.Reader
-	logs         LogSource
-	tokenDigest  [sha256.Size]byte
-	sessionValue string
-	secureCookie bool
-	logger       *slog.Logger
-	loginPage    *template.Template
-	mainPage     *template.Template
-	runPage      *template.Template
-	logPage      *template.Template
+	client                    client.Client
+	logs                      LogSource
+	tokenDigest               [sha256.Size]byte
+	sessionValue              string
+	csrfToken                 string
+	secretManagementNamespace string
+	secureCookie              bool
+	logger                    *slog.Logger
+	loginPage                 *template.Template
+	mainPage                  *template.Template
+	projectsPage              *template.Template
+	projectPage               *template.Template
+	runPage                   *template.Template
+	logPage                   *template.Template
 }
 
 type loginRequest struct {
@@ -86,6 +106,37 @@ type mainRunPageData struct {
 	StatusClass   string
 	Created       string
 	Duration      string
+}
+
+type projectsPageData struct {
+	Projects []projectListItem
+}
+
+type projectListItem struct {
+	URL          string
+	Name         string
+	Namespace    string
+	Installation int64
+	Status       string
+	StatusClass  string
+	SecretName   string
+}
+
+type projectPageData struct {
+	Name              string
+	Namespace         string
+	SecretsURL        string
+	Installation      int64
+	Status            string
+	StatusClass       string
+	StatusMessage     string
+	WorkflowDirectory string
+	SecretName        string
+	SecretNames       []string
+	SecretMissing     bool
+	CanManageSecrets  bool
+	ManagementNotice  string
+	CSRFToken         string
 }
 
 type runPageData struct {
@@ -152,6 +203,14 @@ func New(config Config) (*Handler, error) {
 	if err != nil {
 		return nil, err
 	}
+	projectsPage, err := template.New("projects").Parse(projectsPageTemplate)
+	if err != nil {
+		return nil, err
+	}
+	projectPage, err := template.New("project").Parse(projectPageTemplate)
+	if err != nil {
+		return nil, err
+	}
 	runPage, err := template.New("run").Parse(runPageTemplate)
 	if err != nil {
 		return nil, err
@@ -163,8 +222,9 @@ func New(config Config) (*Handler, error) {
 	tokenDigest := sha256.Sum256([]byte(config.Token))
 	return &Handler{
 		client: config.Client, logs: config.Logs, tokenDigest: tokenDigest,
-		sessionValue: sessionValue(config.Token), secureCookie: config.SecureCookie, logger: config.Logger,
-		loginPage: loginPage, mainPage: mainPage, runPage: runPage, logPage: logPage,
+		sessionValue: sessionValue(config.Token), csrfToken: csrfValue(config.Token), secretManagementNamespace: config.SecretManagementNamespace,
+		secureCookie: config.SecureCookie, logger: config.Logger,
+		loginPage: loginPage, mainPage: mainPage, projectsPage: projectsPage, projectPage: projectPage, runPage: runPage, logPage: logPage,
 	}, nil
 }
 
@@ -181,20 +241,32 @@ func (h *Handler) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 		h.login(writer, request)
 		return
 	}
+	if !h.authenticated(request) {
+		http.Redirect(writer, request, "/login?next="+url.QueryEscape(request.URL.RequestURI()), http.StatusFound)
+		return
+	}
+	parts := splitPath(request.URL.Path)
+	if request.Method == http.MethodPost && len(parts) == 4 && parts[0] == "projects" && parts[3] == "secrets" {
+		h.updateProjectSecret(writer, request, parts[1], parts[2])
+		return
+	}
 	if request.Method != http.MethodGet {
 		writer.Header().Set("Allow", http.MethodGet)
 		http.Error(writer, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	if !h.authenticated(request) {
-		http.Redirect(writer, request, "/login?next="+url.QueryEscape(request.URL.RequestURI()), http.StatusFound)
 		return
 	}
 	if request.URL.Path == "/" {
 		h.main(writer, request)
 		return
 	}
-	parts := splitPath(request.URL.Path)
+	if request.URL.Path == "/projects" {
+		h.projects(writer, request)
+		return
+	}
+	if len(parts) == 3 && parts[0] == "projects" {
+		h.projectDetails(writer, request, parts[1], parts[2])
+		return
+	}
 	if len(parts) < 3 || parts[0] != "runs" {
 		http.NotFound(writer, request)
 		return
@@ -278,6 +350,10 @@ func (h *Handler) validToken(token string) bool {
 	return hmac.Equal(digest[:], h.tokenDigest[:])
 }
 
+func (h *Handler) validCSRF(token string) bool {
+	return hmac.Equal([]byte(token), []byte(h.csrfToken))
+}
+
 func (h *Handler) main(writer http.ResponseWriter, request *http.Request) {
 	data, err := h.loadMainPageData(request.Context())
 	if err != nil {
@@ -335,6 +411,187 @@ func (h *Handler) loadMainPageData(ctx context.Context) (mainPageData, error) {
 		data.Runs = append(data.Runs, item)
 	}
 	return data, nil
+}
+
+func (h *Handler) projects(writer http.ResponseWriter, request *http.Request) {
+	projects := &actionsv1alpha1.ProjectList{}
+	if err := h.client.List(request.Context(), projects); err != nil {
+		h.writeResolutionError(writer, request, fmt.Errorf("load Projects: %w", err))
+		return
+	}
+	sort.Slice(projects.Items, func(left, right int) bool {
+		if projects.Items[left].Namespace == projects.Items[right].Namespace {
+			return projects.Items[left].Name < projects.Items[right].Name
+		}
+		return projects.Items[left].Namespace < projects.Items[right].Namespace
+	})
+	data := projectsPageData{Projects: make([]projectListItem, 0, len(projects.Items))}
+	for index := range projects.Items {
+		project := &projects.Items[index]
+		status, statusClass, _ := projectConfigurationStatus(project)
+		item := projectListItem{
+			URL:  "/projects/" + url.PathEscape(project.Namespace) + "/" + url.PathEscape(project.Name),
+			Name: project.Name, Namespace: project.Namespace, Status: status, StatusClass: statusClass,
+		}
+		if project.Spec.Source.GitHub != nil {
+			item.Installation = project.Spec.Source.GitHub.InstallationID
+		}
+		if project.Spec.Secrets != nil {
+			item.SecretName = project.Spec.Secrets.SecretRef.Name
+		}
+		data.Projects = append(data.Projects, item)
+	}
+	h.writeHTML(writer, h.projectsPage, data)
+}
+
+func (h *Handler) projectDetails(writer http.ResponseWriter, request *http.Request, namespace, name string) {
+	project := &actionsv1alpha1.Project{}
+	if err := h.client.Get(request.Context(), types.NamespacedName{Namespace: namespace, Name: name}, project); err != nil {
+		h.writeResolutionError(writer, request, err)
+		return
+	}
+	status, statusClass, statusMessage := projectConfigurationStatus(project)
+	data := projectPageData{
+		Name: project.Name, Namespace: project.Namespace, Status: status, StatusClass: statusClass, StatusMessage: statusMessage,
+		SecretsURL:        "/projects/" + url.PathEscape(project.Namespace) + "/" + url.PathEscape(project.Name) + "/secrets",
+		WorkflowDirectory: project.Spec.WorkflowDirectory, CSRFToken: h.csrfToken,
+	}
+	if project.Spec.Source.GitHub != nil {
+		data.Installation = project.Spec.Source.GitHub.InstallationID
+	}
+	if data.WorkflowDirectory == "" {
+		data.WorkflowDirectory = ".open-actions/workflows"
+	}
+	if project.Spec.Secrets == nil {
+		data.ManagementNotice = "Configure spec.secrets.secretRef before managing workflow secrets."
+		h.writeHTML(writer, h.projectPage, data)
+		return
+	}
+	data.SecretName = project.Spec.Secrets.SecretRef.Name
+	if project.Namespace != h.secretManagementNamespace {
+		data.ManagementNotice = "Secret management is not enabled for this Project namespace."
+		h.writeHTML(writer, h.projectPage, data)
+		return
+	}
+	data.CanManageSecrets = true
+	secret := &corev1.Secret{}
+	if err := h.client.Get(request.Context(), types.NamespacedName{Namespace: project.Namespace, Name: data.SecretName}, secret); err != nil {
+		if apierrors.IsNotFound(err) {
+			data.SecretMissing = true
+			h.writeHTML(writer, h.projectPage, data)
+			return
+		}
+		h.writeResolutionError(writer, request, fmt.Errorf("load Project %q Secret %q: %w", project.Name, data.SecretName, err))
+		return
+	}
+	data.SecretNames = sortedSecretDataNames(secret.Data)
+	h.writeHTML(writer, h.projectPage, data)
+}
+
+func (h *Handler) updateProjectSecret(writer http.ResponseWriter, request *http.Request, namespace, name string) {
+	request.Body = http.MaxBytesReader(writer, request.Body, secretRequestSize)
+	if err := request.ParseForm(); err != nil {
+		http.Error(writer, "invalid secret update", http.StatusBadRequest)
+		return
+	}
+	if !h.validCSRF(request.PostForm.Get("csrf")) {
+		http.Error(writer, "invalid CSRF token", http.StatusForbidden)
+		return
+	}
+	if namespace != h.secretManagementNamespace {
+		http.Error(writer, "secret management is not enabled for this namespace", http.StatusForbidden)
+		return
+	}
+	project := &actionsv1alpha1.Project{}
+	if err := h.client.Get(request.Context(), types.NamespacedName{Namespace: namespace, Name: name}, project); err != nil {
+		h.writeResolutionError(writer, request, err)
+		return
+	}
+	if project.Spec.Secrets == nil {
+		http.Error(writer, "Project does not reference a workflow Secret", http.StatusConflict)
+		return
+	}
+	action := request.PostForm.Get("action")
+	if action != "set" && action != "delete" {
+		http.Error(writer, "invalid secret action", http.StatusBadRequest)
+		return
+	}
+	secretName := strings.TrimSpace(request.PostForm.Get("name"))
+	if action == "set" {
+		secretName = strings.ToUpper(secretName)
+		if err := projectvalue.ValidateName(secretName); err != nil {
+			http.Error(writer, "invalid secret name: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+	} else if validationErrors := validation.IsConfigMapKey(secretName); len(validationErrors) > 0 {
+		http.Error(writer, "invalid Secret key", http.StatusBadRequest)
+		return
+	}
+	value := request.PostForm.Get("value")
+	if action == "set" && (len(value) > projectvalue.MaxValueBytes || !utf8.ValidString(value)) {
+		http.Error(writer, fmt.Sprintf("secret value must be valid UTF-8 and no more than %d bytes", projectvalue.MaxValueBytes), http.StatusBadRequest)
+		return
+	}
+	key := types.NamespacedName{Namespace: project.Namespace, Name: project.Spec.Secrets.SecretRef.Name}
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		secret := &corev1.Secret{}
+		err := h.client.Get(request.Context(), key, secret)
+		if apierrors.IsNotFound(err) {
+			if action == "delete" {
+				return nil
+			}
+			return h.client.Create(request.Context(), &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{Name: key.Name, Namespace: key.Namespace},
+				Type:       corev1.SecretTypeOpaque, Data: map[string][]byte{secretName: []byte(value)},
+			})
+		}
+		if err != nil {
+			return err
+		}
+		if secret.Data == nil {
+			secret.Data = map[string][]byte{}
+		}
+		if action == "delete" {
+			delete(secret.Data, secretName)
+		} else {
+			if _, found := secret.Data[secretName]; !found && len(secret.Data) >= projectvalue.MaxSecretCount {
+				return &secretCountLimitError{name: secret.Name}
+			}
+			secret.Data[secretName] = []byte(value)
+		}
+		return h.client.Update(request.Context(), secret)
+	})
+	if err != nil {
+		var limit *secretCountLimitError
+		if errors.As(err, &limit) {
+			http.Error(writer, limit.Error(), http.StatusConflict)
+			return
+		}
+		h.writeResolutionError(writer, request, fmt.Errorf("update Project %q Secret %q: %w", project.Name, key.Name, err))
+		return
+	}
+	h.logger.Info("Updated Project secret", "namespace", project.Namespace, "project", project.Name, "secret", key.Name, "key", secretName, "action", action)
+	http.Redirect(writer, request, "/projects/"+url.PathEscape(project.Namespace)+"/"+url.PathEscape(project.Name), http.StatusSeeOther)
+}
+
+func projectConfigurationStatus(project *actionsv1alpha1.Project) (string, string, string) {
+	configured := meta.FindStatusCondition(project.Status.Conditions, actionsv1alpha1.ProjectConditionConfigured)
+	if configured == nil || configured.ObservedGeneration != project.Generation {
+		return "Pending", "queued", "Configuration has not been observed."
+	}
+	if configured.Status == metav1.ConditionTrue {
+		return "Configured", "succeeded", configured.Message
+	}
+	return "Unconfigured", "failed", configured.Message
+}
+
+func sortedSecretDataNames(data map[string][]byte) []string {
+	names := make([]string, 0, len(data))
+	for name := range data {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
 }
 
 func (h *Handler) runDetails(writer http.ResponseWriter, request *http.Request, run *actionsv1alpha1.WorkflowRun) {
@@ -665,7 +922,7 @@ func splitPath(value string) []string {
 
 func safeNext(value string) string {
 	parsed, err := url.Parse(value)
-	if err != nil || parsed.IsAbs() || parsed.Host != "" || (parsed.Path != "/" && !strings.HasPrefix(parsed.Path, "/runs/")) {
+	if err != nil || parsed.IsAbs() || parsed.Host != "" || (parsed.Path != "/" && parsed.Path != "/projects" && !strings.HasPrefix(parsed.Path, "/projects/") && !strings.HasPrefix(parsed.Path, "/runs/")) {
 		return ""
 	}
 	return value
@@ -674,6 +931,12 @@ func safeNext(value string) string {
 func sessionValue(token string) string {
 	mac := hmac.New(sha256.New, []byte(token))
 	_, _ = mac.Write([]byte("open-actions/console/session"))
+	return base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+}
+
+func csrfValue(token string) string {
+	mac := hmac.New(sha256.New, []byte(token))
+	_, _ = mac.Write([]byte("open-actions/console/csrf"))
 	return base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
 }
 
