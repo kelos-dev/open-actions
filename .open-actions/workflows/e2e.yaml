@@ -16,6 +16,9 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
+      - uses: azure/setup-helm@v4
+        with:
+          version: 3.20.1
       - uses: helm/kind-action@v1
         with:
           cluster_name: kind
