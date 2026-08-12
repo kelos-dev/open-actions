@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 
@@ -27,6 +28,8 @@ func run(ctx context.Context, arguments []string) error {
 	flags := flag.NewFlagSet("open-actions-runner", flag.ContinueOnError)
 	jobFile := flags.String("job-file", "/var/run/open-actions/job.json", "Path to the workflow job plan")
 	resultFile := flags.String("result-file", "/dev/termination-log", "Path used to report the workflow job result")
+	secretsDirectory := flags.String("secrets-directory", "", "Directory containing Project secret values")
+	variablesDirectory := flags.String("variables-directory", "", "Directory containing Project variable values")
 	workspace := flags.String("workspace", "/workspace", "Path to the job workspace")
 	if err := flags.Parse(arguments); err != nil {
 		return err
@@ -35,10 +38,20 @@ func run(ctx context.Context, arguments []string) error {
 	if err != nil {
 		return err
 	}
+	secrets, err := loadValues(*secretsDirectory)
+	if err != nil {
+		return fmt.Errorf("load Project secrets: %w", err)
+	}
+	variables, err := loadValues(*variablesDirectory)
+	if err != nil {
+		return fmt.Errorf("load Project variables: %w", err)
+	}
 	githubToken := os.Getenv("OPEN_ACTIONS_GITHUB_TOKEN")
 	executor, err := runner.NewExecutor(runner.ExecutorConfig{
 		Logger:      slog.New(slog.NewJSONHandler(os.Stdout, nil)),
 		GitHubToken: githubToken,
+		Secrets:     secrets,
+		Variables:   variables,
 		Environment: withoutEnvironmentVariable(os.Environ(), "OPEN_ACTIONS_GITHUB_TOKEN"),
 		Stdout:      os.Stdout,
 		Stderr:      os.Stderr,
@@ -54,6 +67,31 @@ func run(ctx context.Context, arguments []string) error {
 		}
 	}
 	return errors.Join(executionError, resultError)
+}
+
+func loadValues(directory string) (map[string]string, error) {
+	if directory == "" {
+		return nil, nil
+	}
+	entries, err := os.ReadDir(directory)
+	if err != nil {
+		return nil, err
+	}
+	values := make(map[string]string, len(entries))
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), ".") {
+			continue
+		}
+		if entry.IsDir() {
+			return nil, fmt.Errorf("value path %q is a directory", entry.Name())
+		}
+		value, err := os.ReadFile(filepath.Join(directory, entry.Name()))
+		if err != nil {
+			return nil, fmt.Errorf("read value %q: %w", entry.Name(), err)
+		}
+		values[entry.Name()] = string(value)
+	}
+	return values, nil
 }
 
 func withoutEnvironmentVariable(environment []string, name string) []string {

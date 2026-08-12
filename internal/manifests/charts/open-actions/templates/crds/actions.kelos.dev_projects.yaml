@@ -53,6 +53,36 @@ spec:
             description: ProjectSpec describes the workflow source for an Open Actions
               Project.
             properties:
+              secrets:
+                description: |-
+                  Secrets selects the Secret whose data entries become available to
+                  workflows through the secrets context. The Secret must be in the Project
+                  namespace, and its keys use GitHub's canonical uppercase representation.
+                properties:
+                  secretRef:
+                    description: SecretRef identifies the Secret in the Project namespace.
+                    properties:
+                      name:
+                        default: ""
+                        description: |-
+                          Name of the referent.
+                          This field is effectively required, but due to backwards compatibility is
+                          allowed to be empty. Instances of this type with an empty value here are
+                          almost certainly wrong.
+                          More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                        type: string
+                    type: object
+                    x-kubernetes-map-type: atomic
+                required:
+                - secretRef
+                type: object
+                x-kubernetes-validations:
+                - message: '`secretRef.name` must be specified'
+                  rule: size(self.secretRef.name) > 0
+                - message: '`secretRef.name` must be no more than 253 characters'
+                  rule: size(self.secretRef.name) <= 253
+                - message: '`secretRef.name` must be a DNS subdomain'
+                  rule: self.secretRef.name.matches('^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?([.][a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?)*$')
               source:
                 description: Source selects and configures the external workflow source.
                 properties:
@@ -182,6 +212,37 @@ spec:
                   rule: 'self.type == ''GitHub'' ? has(self.github) : !has(self.github)'
                 - message: source type is immutable
                   rule: self.type == oldSelf.type
+              variables:
+                description: |-
+                  Variables selects the ConfigMap whose data entries become available to
+                  workflows through the vars context. The ConfigMap must be in the Project
+                  namespace, and its keys use GitHub's canonical uppercase representation.
+                properties:
+                  configMapRef:
+                    description: ConfigMapRef identifies the ConfigMap in the Project
+                      namespace.
+                    properties:
+                      name:
+                        default: ""
+                        description: |-
+                          Name of the referent.
+                          This field is effectively required, but due to backwards compatibility is
+                          allowed to be empty. Instances of this type with an empty value here are
+                          almost certainly wrong.
+                          More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                        type: string
+                    type: object
+                    x-kubernetes-map-type: atomic
+                required:
+                - configMapRef
+                type: object
+                x-kubernetes-validations:
+                - message: '`configMapRef.name` must be specified'
+                  rule: size(self.configMapRef.name) > 0
+                - message: '`configMapRef.name` must be no more than 253 characters'
+                  rule: size(self.configMapRef.name) <= 253
+                - message: '`configMapRef.name` must be a DNS subdomain'
+                  rule: self.configMapRef.name.matches('^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?([.][a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?)*$')
               workflowDirectory:
                 default: .open-actions/workflows
                 description: |-

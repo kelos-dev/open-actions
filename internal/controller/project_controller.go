@@ -7,6 +7,7 @@ import (
 
 	actionsv1alpha1 "github.com/kelos-dev/open-actions/api/v1alpha1"
 	githubclient "github.com/kelos-dev/open-actions/internal/github"
+	corev1 "k8s.io/api/core/v1"
 	apiEquality "k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -30,7 +31,7 @@ func (r *ProjectReconciler) Reconcile(ctx context.Context, request ctrl.Request)
 
 	status := metav1.ConditionTrue
 	reason := "ConfigurationValid"
-	message := "Referenced credentials are present and locally valid"
+	message := "Referenced credentials and workflow values are present and locally valid"
 	if owner, err := r.installationOwner(ctx, project); err != nil {
 		return ctrl.Result{}, err
 	} else if owner.UID != project.UID {
@@ -72,6 +73,12 @@ func (r *ProjectReconciler) validate(ctx context.Context, project *actionsv1alph
 	if _, err := secretValue(ctx, r.APIReader, project.Namespace, github.WebhookSecretRef); err != nil {
 		return "CredentialsUnavailable", err
 	}
+	if err := validateProjectSecretValues(ctx, r.APIReader, project); err != nil {
+		return "ProjectValuesUnavailable", err
+	}
+	if err := validateProjectVariableValues(ctx, r.APIReader, project); err != nil {
+		return "ProjectValuesUnavailable", err
+	}
 	return "", nil
 }
 
@@ -110,7 +117,33 @@ func (r *ProjectReconciler) SetupWithManager(manager ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(manager).
 		For(&actionsv1alpha1.Project{}).
 		Watches(&actionsv1alpha1.Project{}, handler.EnqueueRequestsFromMapFunc(r.projectsForInstallation)).
+		WatchesMetadata(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(r.projectsForValueSource)).
+		WatchesMetadata(&corev1.ConfigMap{}, handler.EnqueueRequestsFromMapFunc(r.projectsForValueSource)).
 		Complete(r)
+}
+
+func (r *ProjectReconciler) projectsForValueSource(ctx context.Context, object client.Object) []reconcile.Request {
+	projects := &actionsv1alpha1.ProjectList{}
+	if err := r.List(ctx, projects, client.InNamespace(object.GetNamespace())); err != nil {
+		return nil
+	}
+	requests := []reconcile.Request{}
+	for index := range projects.Items {
+		project := &projects.Items[index]
+		matched := false
+		switch object.GetObjectKind().GroupVersionKind() {
+		case corev1.SchemeGroupVersion.WithKind("Secret"):
+			github := project.Spec.Source.GitHub
+			matched = github != nil && (github.PrivateKeySecretRef.Name == object.GetName() || github.WebhookSecretRef.Name == object.GetName())
+			matched = matched || project.Spec.Secrets != nil && project.Spec.Secrets.SecretRef.Name == object.GetName()
+		case corev1.SchemeGroupVersion.WithKind("ConfigMap"):
+			matched = project.Spec.Variables != nil && project.Spec.Variables.ConfigMapRef.Name == object.GetName()
+		}
+		if matched {
+			requests = append(requests, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(project)})
+		}
+	}
+	return requests
 }
 
 func (r *ProjectReconciler) projectsForInstallation(ctx context.Context, object client.Object) []reconcile.Request {

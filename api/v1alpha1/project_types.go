@@ -18,6 +18,18 @@ type ProjectSpec struct {
 	// +required
 	Source ProjectSource `json:"source"`
 
+	// Secrets selects the Secret whose data entries become available to
+	// workflows through the secrets context. The Secret must be in the Project
+	// namespace, and its keys use GitHub's canonical uppercase representation.
+	// +optional
+	Secrets *ProjectSecretSource `json:"secrets,omitempty"`
+
+	// Variables selects the ConfigMap whose data entries become available to
+	// workflows through the vars context. The ConfigMap must be in the Project
+	// namespace, and its keys use GitHub's canonical uppercase representation.
+	// +optional
+	Variables *ProjectVariableSource `json:"variables,omitempty"`
+
 	// WorkflowDirectory is the repository-relative directory containing workflow
 	// files. The default keeps the files outside GitHub's native workflow path.
 	// +kubebuilder:default=".open-actions/workflows"
@@ -27,6 +39,26 @@ type ProjectSpec struct {
 	// +kubebuilder:validation:XValidation:rule="self != '..' && !self.startsWith('../') && !self.contains('/../') && !self.endsWith('/..')",message="must not contain '..' path segments"
 	// +optional
 	WorkflowDirectory string `json:"workflowDirectory,omitempty"`
+}
+
+// +kubebuilder:validation:XValidation:rule="size(self.secretRef.name) > 0",message="`secretRef.name` must be specified"
+// +kubebuilder:validation:XValidation:rule="size(self.secretRef.name) <= 253",message="`secretRef.name` must be no more than 253 characters"
+// +kubebuilder:validation:XValidation:rule="self.secretRef.name.matches('^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?([.][a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?)*$')",message="`secretRef.name` must be a DNS subdomain"
+// ProjectSecretSource selects one Kubernetes Secret.
+type ProjectSecretSource struct {
+	// SecretRef identifies the Secret in the Project namespace.
+	// +required
+	SecretRef corev1.LocalObjectReference `json:"secretRef"`
+}
+
+// +kubebuilder:validation:XValidation:rule="size(self.configMapRef.name) > 0",message="`configMapRef.name` must be specified"
+// +kubebuilder:validation:XValidation:rule="size(self.configMapRef.name) <= 253",message="`configMapRef.name` must be no more than 253 characters"
+// +kubebuilder:validation:XValidation:rule="self.configMapRef.name.matches('^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?([.][a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?)*$')",message="`configMapRef.name` must be a DNS subdomain"
+// ProjectVariableSource selects one Kubernetes ConfigMap.
+type ProjectVariableSource struct {
+	// ConfigMapRef identifies the ConfigMap in the Project namespace.
+	// +required
+	ConfigMapRef corev1.LocalObjectReference `json:"configMapRef"`
 }
 
 // ProjectSource is a discriminated union of supported workflow sources.

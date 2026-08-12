@@ -31,6 +31,11 @@ func TestWorkflowRunAcceptsGitPathCharacters(t *testing.T) {
 	}
 }
 
+func TestProjectAcceptsValueSources(t *testing.T) {
+	crd, _ := loadCRD(t, "actions.kelos.dev_projects.yaml")
+	validateSample(t, crd, "actions_v1alpha1_project-values.yaml")
+}
+
 func TestWorkflowRunTTLIsMutable(t *testing.T) {
 	crd, _ := loadCRD(t, "actions.kelos.dev_workflowruns.yaml")
 	original := loadSample(t, "actions_v1alpha1_workflowrun.yaml")
@@ -604,6 +609,16 @@ func TestCRDConventions(t *testing.T) {
 				t.Error("spec update contract has no CEL validation")
 			}
 
+			if tt.kind == "Project" {
+				secrets := spec.Properties["secrets"]
+				if !slices.Contains(secrets.Required, "secretRef") || len(secrets.XValidations) != 3 {
+					t.Errorf("spec.secrets schema = %#v", secrets)
+				}
+				variables := spec.Properties["variables"]
+				if !slices.Contains(variables.Required, "configMapRef") || len(variables.XValidations) != 3 {
+					t.Errorf("spec.variables schema = %#v", variables)
+				}
+			}
 			if tt.kind == "Runner" {
 				execution := spec.Properties["execution"]
 				if !slices.Contains(execution.Required, "image") {
@@ -673,6 +688,27 @@ func TestCRDRejectsInvalidCELValues(t *testing.T) {
 			crd:  "actions.kelos.dev_projects.yaml", sample: "actions_v1alpha1_project.yaml",
 			mutate: func(object map[string]any) {
 				object["spec"].(map[string]any)["workflowDirectory"] = ".open-actions/workflows/"
+			},
+		},
+		{
+			name: "Project secret reference without a name",
+			crd:  "actions.kelos.dev_projects.yaml", sample: "actions_v1alpha1_project-values.yaml",
+			mutate: func(object map[string]any) {
+				delete(object["spec"].(map[string]any)["secrets"].(map[string]any)["secretRef"].(map[string]any), "name")
+			},
+		},
+		{
+			name: "Project secret reference with invalid name",
+			crd:  "actions.kelos.dev_projects.yaml", sample: "actions_v1alpha1_project-values.yaml",
+			mutate: func(object map[string]any) {
+				object["spec"].(map[string]any)["secrets"].(map[string]any)["secretRef"].(map[string]any)["name"] = "invalid/name"
+			},
+		},
+		{
+			name: "Project variable reference with invalid name",
+			crd:  "actions.kelos.dev_projects.yaml", sample: "actions_v1alpha1_project-values.yaml",
+			mutate: func(object map[string]any) {
+				object["spec"].(map[string]any)["variables"].(map[string]any)["configMapRef"].(map[string]any)["name"] = "invalid/name"
 			},
 		},
 		{

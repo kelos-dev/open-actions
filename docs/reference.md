@@ -55,6 +55,15 @@ bold, dim, italic, underline, and strike-through text. Other CSI control
 sequences are discarded. Log lines larger than 256 KiB are truncated so a
 workflow cannot retain unbounded Console memory.
 
+The authenticated Projects page lists Project configuration across all
+namespaces. A Project detail page lists the names, but never the values, of keys
+in its referenced workflow Secret. The administrator token can add, replace,
+and delete those keys only when the Project is in the Console's
+`--secret-management-namespace`. The Helm chart sets that namespace to its
+release namespace and grants the Console `get`, `create`, and `update` access to
+Secrets only there. Direct Kubernetes clients and external secret controllers
+can manage the same Secret.
+
 The runner accepts `::command::` and bracket-form `##[command]` syntax, with
 the property delimiters and escape rules defined for each form. It consumes
 mask, output, state, and problem matcher commands instead of exposing their raw
@@ -116,6 +125,53 @@ execution, `status.outputs` contains the non-secret outputs declared by that
 workflow job. The controller copies these values from the completed runner Pod
 before allowing native Job cleanup, so they remain available after controller
 restarts and Pod deletion.
+
+### Project secrets and variables
+
+A Project selects one namespace-local Secret through
+`spec.secrets.secretRef` and one namespace-local ConfigMap through
+`spec.variables.configMapRef`. Each key becomes a name in the corresponding
+`secrets` or `vars` workflow context. Keys must use the canonical uppercase
+GitHub representation: letters, digits, and `_`, without a leading digit or
+the reserved `GITHUB_` prefix. A Project supports up to 100 secrets and 500
+variables. Individual values are limited to 48 KiB, Secret values must be valid
+UTF-8, and the variable ConfigMap must not contain `binaryData`.
+
+```yaml
+spec:
+  secrets:
+    secretRef:
+      name: project-secrets
+  variables:
+    configMapRef:
+      name: project-variables
+```
+
+The Project remains unconfigured while a referenced object is missing or its
+contents violate these constraints. Variables needed for workflow concurrency,
+job names, or runner labels are read during planning; job conditions read them
+when their dependencies settle. Job and step expressions remain unresolved in
+the immutable plan. Kubernetes mounts the Secret and ConfigMap into runner-only,
+read-only volumes when a job Pod starts, and the runner reads a consistent
+snapshot at startup. Rotations apply to new jobs. The Docker sidecar does not
+mount these volumes, and workflow commands do not receive the internal files as
+ambient environment variables.
+
+See the [Project value source sample](../config/samples/actions_v1alpha1_project-values.yaml)
+for a complete Project manifest.
+
+Secret values never enter job-plan ConfigMaps, custom-resource specs or status,
+controller logs, or Console records. The runner marks values derived from the
+`secrets` context as sensitive and masks configured secrets in raw, standard
+and unpadded Base64, JSON-string, percent-encoded, XML-escaped, and common
+shell-escaped forms. Project variables are non-sensitive and are not
+masked. Missing names in either context evaluate to an empty string.
+
+The job-scoped GitHub App installation token is available as both
+`github.token` and `secrets.GITHUB_TOKEN`. It is not added to the step
+environment unless the workflow assigns one of those expressions to an
+environment variable or action input. Token permission selection is described
+separately from Project value sources.
 
 `spec.rerun` identifies a repeated attempt. `originalRunRef` anchors the
 attempt lineage, `previousRunRef` names the immediately preceding completed
@@ -189,13 +245,13 @@ The resources expose these condition contracts:
 | Resource | Condition | Status | Reasons |
 | --- | --- | --- | --- |
 | `Project` | `Configured` | `True` | `ConfigurationValid` |
-| `Project` | `Configured` | `False` | `DuplicateInstallation`, `CredentialsUnavailable`, `InvalidCredentials` |
+| `Project` | `Configured` | `False` | `DuplicateInstallation`, `CredentialsUnavailable`, `InvalidCredentials`, `ProjectValuesUnavailable` |
 | `Runner` | `Ready` | `True` | `Ready` |
 | `Runner` | `Ready` | `False` | `ProjectUnavailable`, `ProjectNotConfigured` |
 | `Runner` | `Busy` | `False` | `Idle` |
 | `Runner` | `Busy` | `True` | `JobAssigned` |
 | `WorkflowRun` | `Planned` | `True` | `JobsPlanned` |
-| `WorkflowRun` | `Planned` | `Unknown` | `WaitingForConcurrency`, `WaitingForConcurrencyCancellation`, `ProjectUnavailable`, `CredentialsUnavailable`, `GitHubAuthenticationFailed`, `WorkflowFetchFailed`, `ChildCreationFailed`, `ConcurrencyCheckFailed` |
+| `WorkflowRun` | `Planned` | `Unknown` | `WaitingForConcurrency`, `WaitingForConcurrencyCancellation`, `ProjectUnavailable`, `CredentialsUnavailable`, `ProjectValuesUnavailable`, `GitHubAuthenticationFailed`, `WorkflowFetchFailed`, `ChildCreationFailed`, `ConcurrencyCheckFailed` |
 | `WorkflowRun` | `Planned` | `False` | `ProjectUnavailable`, `WorkflowFetchFailed`, `WorkflowInvalid`, `TriggerInvalid`, `RerunInvalid`, `ChildCreationFailed`, `ExecutionStateLost` |
 | `WorkflowRun` | `Succeeded` | `Unknown` | `JobsWaiting`, `JobsQueued`, `JobsRunning` |
 | `WorkflowRun` | `Succeeded` | `True` | `JobsSucceeded` |
@@ -211,11 +267,11 @@ The resources expose these condition contracts:
 | `WorkflowJob` | `CancellationRequested` | `True` | `CancellationRequested`, `ConditionEvaluationFailed`, `MatrixFailFast` |
 | `WorkflowJob` | `CancellationRequested` | `False` | `ConditionPassed` |
 
-`Project/Configured` covers local Secret availability, private-key parsing, and
-installation uniqueness. It does not assert remote GitHub App or installation
-availability. `Runner/Ready` reports operational health independently of
-capacity; clients use `Runner/Busy` to determine whether a Runner already has
-an assignment.
+`Project/Configured` covers local Secret and ConfigMap availability,
+private-key parsing, Project value constraints, and installation uniqueness. It
+does not assert remote GitHub App or installation availability. `Runner/Ready`
+reports operational health independently of capacity; clients use
+`Runner/Busy` to determine whether a Runner already has an assignment.
 
 ### Resource metadata
 
@@ -279,24 +335,22 @@ evaluation when the corresponding execution feature has not supplied it.
 
 | Phase | Allowed contexts and functions | Currently supplied |
 | --- | --- | --- |
-| Workflow concurrency | `github`, `inputs`, `vars` | `github`, `inputs` |
-| Workflow job condition | `github`, `needs`, `vars`, `inputs`, and status functions | `github`, direct dependency results and outputs, `inputs`, and status functions |
-| Job name and runner labels | `github`, `needs`, `strategy`, `matrix`, `vars`, `inputs` | `github`, `inputs`, and `matrix` for matrix jobs |
-| Job environment | `github`, `needs`, `strategy`, `matrix`, `vars`, `secrets`, `inputs` | `github`, `inputs`, and `matrix` for matrix jobs |
-| Workflow step name, run script, working directory, environment, and inputs | `github`, `needs`, `strategy`, `matrix`, `job`, `runner`, `env`, `vars`, `secrets`, `steps`, `inputs` | `github`, `matrix`, `runner`, `env`, `inputs`, `steps` |
-| Workflow step condition | Step contexts except `secrets`, plus status functions | `github`, `matrix`, `runner`, `env`, `inputs`, `steps`, and status functions |
-| Job outputs | Workflow step contexts | `github`, `matrix`, `runner`, `env`, `inputs`, `steps` |
+| Workflow concurrency | `github`, `inputs`, `vars` | All listed contexts |
+| Workflow job condition | `github`, `needs`, `vars`, `inputs`, and status functions | `github`, direct dependency results and outputs, `vars`, `inputs`, and status functions |
+| Job name and runner labels | `github`, `needs`, `strategy`, `matrix`, `vars`, `inputs` | `github`, `inputs`, `vars`, and `matrix` for matrix jobs |
+| Job environment | `github`, `needs`, `strategy`, `matrix`, `vars`, `secrets`, `inputs` | `github`, `inputs`, `vars`, `secrets`, and `matrix` for matrix jobs |
+| Workflow step name, run script, working directory, environment, and inputs | `github`, `needs`, `strategy`, `matrix`, `job`, `runner`, `env`, `vars`, `secrets`, `steps`, `inputs` | `github`, `matrix`, `runner`, `env`, `vars`, `secrets`, `inputs`, `steps` |
+| Workflow step condition | Step contexts except `secrets`, plus status functions | `github`, `matrix`, `runner`, `env`, `vars`, `inputs`, `steps`, and status functions |
+| Job outputs | Workflow step contexts | `github`, `matrix`, `runner`, `env`, `vars`, `secrets`, `inputs`, `steps` |
 | Composite step fields and outputs | `github`, `runner`, `env`, `inputs`, `steps` | All listed contexts |
 | Composite step condition | Composite contexts and status functions | All listed contexts and functions |
 | Action input default | `github` | `github` |
 
-Repository secret and variable sources remain separate execution features.
-Values derived
-from `github.token` or the `secrets` context are marked sensitive through
-interpolation and function calls, and evaluation diagnostics do not include
-resolved values. The runner maps interrupt and termination signals to cancelled
-status, separately from failure, so eligible workflow and composite cleanup
-steps can run during pod termination.
+Values derived from `github.token` or the `secrets` context are marked sensitive
+through interpolation and function calls, and evaluation diagnostics do not
+include resolved values. The runner maps interrupt and termination signals to
+cancelled status, separately from failure, so eligible workflow and composite
+cleanup steps can run during pod termination.
 
 ### Step and job outputs
 
@@ -530,10 +584,10 @@ than one plan version must emit the result version assigned to that plan, not
 always the latest result version supported by the runner binary.
 
 Docker and local actions, private cross-repository action authentication,
-matrix `include` and `exclude`, service containers, repository
-secret and variable sources, caches, and artifacts are not supported.
-Expressions outside the documented fields and runtime contexts are rejected
-during planning or execution and are never interpreted as literal values.
+matrix `include` and `exclude`, service containers, caches, and artifacts are
+not supported. Expressions outside the documented fields and runtime contexts
+are rejected during planning or execution and are never interpreted as literal
+values.
 `WorkflowJob` resources are not retried or reassigned when a Runner is removed.
 Native Jobs and their Pod logs are deleted one hour after completion. Completed
 WorkflowRuns are retained indefinitely unless `spec.ttlSecondsAfterFinished` is

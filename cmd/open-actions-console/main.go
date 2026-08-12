@@ -31,6 +31,7 @@ func runConsole(ctx context.Context, arguments []string) error {
 	flags := flag.NewFlagSet("open-actions-console", flag.ContinueOnError)
 	bindAddress := flags.String("bind-address", ":8080", "Address used by the Console HTTP server")
 	tokenFile := flags.String("token-file", "", "File containing the Console administrator token")
+	secretManagementNamespace := flags.String("secret-management-namespace", "", "Namespace in which Console administrators may manage Project Secrets")
 	secureCookie := flags.Bool("secure-cookie", false, "Restrict the Console session cookie to HTTPS")
 	if err := flags.Parse(arguments); err != nil {
 		return err
@@ -62,7 +63,7 @@ func runConsole(ctx context.Context, arguments []string) error {
 	}
 	handler, err := console.New(console.Config{
 		Client: kubernetesClient, Logs: console.NewKubernetesLogSource(clientset),
-		Token: token, SecureCookie: *secureCookie, Logger: logger,
+		Token: token, SecretManagementNamespace: *secretManagementNamespace, SecureCookie: *secureCookie, Logger: logger,
 	})
 	if err != nil {
 		return fmt.Errorf("configure Console: %w", err)

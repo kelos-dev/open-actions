@@ -480,7 +480,7 @@ func TestEvaluateConcurrency(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	group, cancel, err := EvaluateConcurrency(definition, Event{RefName: "42/merge", HeadRef: "feature"})
+	group, cancel, err := EvaluateConcurrency(definition, Event{RefName: "42/merge", HeadRef: "feature"}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -494,7 +494,7 @@ func TestEvaluateConcurrencyUsesRefNameFallback(t *testing.T) {
 		Name:        "CI",
 		Concurrency: Concurrency{Group: "${{ github.head_ref || github.ref_name }}"},
 	}
-	group, _, err := EvaluateConcurrency(definition, Event{Name: "push", RefName: "main"})
+	group, _, err := EvaluateConcurrency(definition, Event{Name: "push", RefName: "main"}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -508,12 +508,26 @@ func TestEvaluateConcurrencyUsesInputs(t *testing.T) {
 		Name:        "Deploy",
 		Concurrency: Concurrency{Group: "deploy-${{ inputs.environment }}-${{ github.event.inputs.environment }}"},
 	}
-	group, _, err := EvaluateConcurrency(definition, Event{Inputs: map[string]string{"environment": "staging"}, InputValues: map[string]any{"environment": "staging"}})
+	group, _, err := EvaluateConcurrency(definition, Event{Inputs: map[string]string{"environment": "staging"}, InputValues: map[string]any{"environment": "staging"}}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if group != "deploy-staging-staging" {
 		t.Errorf("group = %q, want deploy-staging-staging", group)
+	}
+}
+
+func TestEvaluateConcurrencyUsesRepositoryVariables(t *testing.T) {
+	definition := &Definition{
+		Name:        "Deploy",
+		Concurrency: Concurrency{Group: "deploy-${{ vars.ENVIRONMENT }}"},
+	}
+	group, _, err := EvaluateConcurrency(definition, Event{}, map[string]string{"ENVIRONMENT": "production"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if group != "deploy-production" {
+		t.Errorf("group = %q, want deploy-production", group)
 	}
 }
 
@@ -529,7 +543,7 @@ func TestEvaluateConcurrencyUsesPullRequestMetadata(t *testing.T) {
 			HeadRepository: Repository{ID: 2, Owner: "contributor", Name: "example"},
 		},
 	}
-	group, _, err := EvaluateConcurrency(definition, event)
+	group, _, err := EvaluateConcurrency(definition, event, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -542,7 +556,7 @@ func TestEvaluateConcurrencyUsesPullRequestMetadata(t *testing.T) {
 func TestEvaluateConcurrencyUsesPullRequestMergeRevision(t *testing.T) {
 	definition := &Definition{Name: "CI", Concurrency: Concurrency{Group: "pr-${{ github.event.pull_request.merge_commit_sha }}"}}
 	sha := strings.Repeat("a", 40)
-	group, _, err := EvaluateConcurrency(definition, Event{Name: "pull_request", SHA: sha, PullRequest: &PullRequest{Number: 42}})
+	group, _, err := EvaluateConcurrency(definition, Event{Name: "pull_request", SHA: sha, PullRequest: &PullRequest{Number: 42}}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -564,7 +578,7 @@ func TestEvaluateConcurrencyUsesBoundedEventMetadata(t *testing.T) {
 		Comment:     &CommentEvent{Body: "comment"},
 		Review:      &ReviewEvent{Body: "review"},
 	}
-	group, _, err := EvaluateConcurrency(definition, event)
+	group, _, err := EvaluateConcurrency(definition, event, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -575,7 +589,7 @@ func TestEvaluateConcurrencyUsesBoundedEventMetadata(t *testing.T) {
 
 func TestEvaluateConcurrencyUsesEmptyStringForMissingProperty(t *testing.T) {
 	definition := &Definition{Name: "CI", Concurrency: Concurrency{Group: "deploy-${{ github.head_ref }}"}}
-	group, _, err := EvaluateConcurrency(definition, Event{Name: "push", RefName: "main"})
+	group, _, err := EvaluateConcurrency(definition, Event{Name: "push", RefName: "main"}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -586,7 +600,7 @@ func TestEvaluateConcurrencyUsesEmptyStringForMissingProperty(t *testing.T) {
 
 func TestEvaluateConcurrencyRejectsEmptyEvaluatedGroup(t *testing.T) {
 	definition := &Definition{Name: "CI", Concurrency: Concurrency{Group: "${{ github.head_ref }}"}}
-	if _, _, err := EvaluateConcurrency(definition, Event{Name: "push", RefName: "main"}); err == nil {
+	if _, _, err := EvaluateConcurrency(definition, Event{Name: "push", RefName: "main"}, nil); err == nil {
 		t.Fatal("EvaluateConcurrency() accepted an empty evaluated group")
 	}
 }
