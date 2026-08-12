@@ -71,6 +71,13 @@ spec:
                 maxLength: 256
                 minLength: 1
                 type: string
+              if:
+                description: |-
+                  If is the GitHub Actions condition that gates Runner assignment after all
+                  jobs in Needs have reached terminal results. An omitted condition uses the
+                  default success gate.
+                maxLength: 65536
+                type: string
               jobID:
                 description: |-
                   JobID is the stable workflow-local identifier of this expanded job. For a
@@ -116,6 +123,18 @@ spec:
                 - logicalJobID
                 - values
                 type: object
+              needs:
+                description: |-
+                  Needs contains the workflow-local IDs of jobs that must reach a terminal
+                  result before this job's condition can be evaluated.
+                items:
+                  maxLength: 256
+                  minLength: 1
+                  pattern: ^[A-Za-z_][A-Za-z0-9_-]*$
+                  type: string
+                maxItems: 1000
+                type: array
+                x-kubernetes-list-type: set
               runsOn:
                 description: |-
                   RunsOn contains the canonical lowercase labels requested by the workflow
@@ -170,9 +189,11 @@ spec:
                 type: string
               conditions:
                 description: |-
-                  Conditions describe Runner assignment and the terminal result. Scheduled
-                  is true after the scheduler assigns status.runnerRef. Known condition types
-                  are Scheduled and Succeeded.
+                  Conditions describe dependency readiness, Runner assignment, cancellation,
+                  and the terminal result. When present, Ready is true when a Runner may claim
+                  the job. Dependency-free unconditional jobs are also claimable when Ready is
+                  absent. Scheduled is true after the scheduler assigns status.runnerRef. Known
+                  condition types are Ready, Scheduled, Succeeded, and CancellationRequested.
                 items:
                   description: Condition contains details for one aspect of the current
                     state of this API Resource.
@@ -252,6 +273,15 @@ spec:
                   rule: self.all(k, size(k) <= 256 && k.matches('^[A-Za-z_][A-Za-z0-9_-]*$'))
                 - message: output values must be no more than 4096 characters
                   rule: self.all(k, size(self[k]) <= 4096)
+              result:
+                description: Result is the immutable terminal result exposed through
+                  the needs context.
+                enum:
+                - success
+                - failure
+                - skipped
+                - cancelled
+                type: string
               runnerRef:
                 description: |-
                   RunnerRef identifies the Runner assigned by the scheduler in the same
@@ -276,6 +306,8 @@ spec:
             x-kubernetes-validations:
             - message: runnerRef is immutable after assignment
               rule: '!has(oldSelf.runnerRef) || self.runnerRef == oldSelf.runnerRef'
+            - message: result is immutable after completion
+              rule: '!has(oldSelf.result) || self.result == oldSelf.result'
             - message: '`runnerRef.name` must be a DNS subdomain'
               rule: '!has(self.runnerRef) || (size(self.runnerRef.name) > 0 && size(self.runnerRef.name)
                 <= 253 && self.runnerRef.name.matches(''^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?([.][a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?)*$''))'

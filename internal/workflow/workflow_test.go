@@ -257,6 +257,73 @@ func TestParseCIWorkflow(t *testing.T) {
 	}
 }
 
+func TestParseAcceptsJobDependencyGraph(t *testing.T) {
+	definition, err := Parse([]byte("name: CI\non: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: make build\n  test:\n    needs: build\n    runs-on: ubuntu-latest\n    steps:\n      - run: make test\n  report:\n    needs: [build, test]\n    if: always() && needs.test.result == 'success'\n    runs-on: ubuntu-latest\n    steps:\n      - run: report\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(definition.Jobs["test"].Needs, StringList{"build"}) {
+		t.Fatalf("test needs = %v", definition.Jobs["test"].Needs)
+	}
+	if !slices.Equal(definition.Jobs["report"].Needs, StringList{"build", "test"}) {
+		t.Fatalf("report needs = %v", definition.Jobs["report"].Needs)
+	}
+	if definition.Jobs["report"].If == "" {
+		t.Fatal("report condition was not retained")
+	}
+}
+
+func TestParseRejectsInvalidJobDependencyGraph(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		data string
+		want string
+	}{
+		{name: "missing", data: "  build:\n    needs: absent\n    runs-on: ubuntu-latest\n    steps:\n      - run: true\n", want: `needs missing job "absent"`},
+		{name: "self", data: "  build:\n    needs: build\n    runs-on: ubuntu-latest\n    steps:\n      - run: true\n", want: "cannot need itself"},
+		{name: "duplicate", data: "  build:\n    needs: [test, test]\n    runs-on: ubuntu-latest\n    steps:\n      - run: true\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - run: true\n", want: `repeats needed job "test"`},
+		{name: "cycle", data: "  build:\n    needs: test\n    runs-on: ubuntu-latest\n    steps:\n      - run: true\n  test:\n    needs: report\n    runs-on: ubuntu-latest\n    steps:\n      - run: true\n  report:\n    needs: build\n    runs-on: ubuntu-latest\n    steps:\n      - run: true\n", want: "dependency cycle"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			data := "name: CI\non: push\njobs:\n" + test.data
+			_, err := Parse([]byte(data))
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("error = %v, want %q", err, test.want)
+			}
+		})
+	}
+}
+
+func TestEvaluateJobConditionAppliesDefaultSuccessGate(t *testing.T) {
+	tests := []struct {
+		name      string
+		condition string
+		status    workflowexpression.Status
+		want      bool
+	}{
+		{name: "default success", status: workflowexpression.Status{Success: true}, want: true},
+		{name: "default failure", status: workflowexpression.Status{Failure: true}},
+		{name: "plain condition after failure", condition: "github.ref_name == 'main'", status: workflowexpression.Status{Failure: true}},
+		{name: "always after failure", condition: "always()", status: workflowexpression.Status{Failure: true}, want: true},
+		{name: "failure function", condition: "failure()", status: workflowexpression.Status{Failure: true}, want: true},
+		{name: "cancelled function", condition: "cancelled()", status: workflowexpression.Status{Cancelled: true}, want: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := EvaluateJobCondition("report", test.condition, workflowexpression.Context{
+				Values: map[string]any{"github": map[string]any{"ref_name": "main"}, "needs": map[string]any{}},
+				Status: &test.status,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != test.want {
+				t.Fatalf("EvaluateJobCondition() = %t, want %t", got, test.want)
+			}
+		})
+	}
+}
+
 func TestParseDogfoodCIWorkflow(t *testing.T) {
 	data, err := os.ReadFile("../../.open-actions/workflows/ci.yaml")
 	if err != nil {

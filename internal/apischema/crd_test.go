@@ -57,6 +57,24 @@ func TestWorkflowRunTTLIsMutable(t *testing.T) {
 	}
 }
 
+func TestWorkflowRunCancellationRequestIsMonotonic(t *testing.T) {
+	crd, _ := loadCRD(t, "actions.kelos.dev_workflowruns.yaml")
+	original := loadSample(t, "actions_v1alpha1_workflowrun.yaml")
+	requested := loadSample(t, "actions_v1alpha1_workflowrun.yaml")
+	normalizeWorkflowRunCELIntegers(original)
+	normalizeWorkflowRunCELIntegers(requested)
+	requested["spec"].(map[string]any)["cancelRequested"] = true
+	if errs := validateObject(t, crd, requested, original); len(errs) > 0 {
+		t.Fatalf("WorkflowRun cancellation request was rejected: %v", errs.ToAggregate())
+	}
+
+	cleared := loadSample(t, "actions_v1alpha1_workflowrun.yaml")
+	normalizeWorkflowRunCELIntegers(cleared)
+	if errs := validateObject(t, crd, cleared, requested); len(errs) == 0 {
+		t.Fatal("WorkflowRun cancellation request was cleared")
+	}
+}
+
 func normalizeWorkflowRunCELIntegers(object map[string]any) {
 	repository := workflowRunGitHub(object)["repository"].(map[string]any)
 	if id, ok := repository["id"].(float64); ok {
@@ -752,6 +770,20 @@ func TestCRDRejectsInvalidCELValues(t *testing.T) {
 			},
 		},
 		{
+			name: "WorkflowJob dependency with invalid syntax",
+			crd:  "actions.kelos.dev_workflowjobs.yaml", sample: "actions_v1alpha1_workflowjob.yaml",
+			mutate: func(object map[string]any) {
+				object["spec"].(map[string]any)["needs"] = []any{"build.test"}
+			},
+		},
+		{
+			name: "WorkflowJob invalid result",
+			crd:  "actions.kelos.dev_workflowjobs.yaml", sample: "actions_v1alpha1_workflowjob.yaml",
+			mutate: func(object map[string]any) {
+				object["status"] = map[string]any{"result": "neutral"}
+			},
+		},
+		{
 			name: "WorkflowRun reference with empty DNS label",
 			crd:  "actions.kelos.dev_workflowruns.yaml", sample: "actions_v1alpha1_workflowrun.yaml",
 			mutate: func(object map[string]any) {
@@ -1039,6 +1071,22 @@ func TestWorkflowJobRunnerAssignmentIsSetOnce(t *testing.T) {
 	reassigned["status"] = map[string]any{"runnerRef": map[string]any{"name": "runner-2"}}
 	if errs := validateObject(t, crd, reassigned, assigned); len(errs) == 0 {
 		t.Fatal("runner reassignment passed CEL validation")
+	}
+}
+
+func TestWorkflowJobResultIsSetOnce(t *testing.T) {
+	crd, _ := loadCRD(t, "actions.kelos.dev_workflowjobs.yaml")
+	queued := loadSample(t, "actions_v1alpha1_workflowjob.yaml")
+	completed := loadSample(t, "actions_v1alpha1_workflowjob.yaml")
+	completed["status"] = map[string]any{"result": "success"}
+	if errs := validateObject(t, crd, completed, queued); len(errs) > 0 {
+		t.Fatalf("initial result was rejected: %v", errs.ToAggregate())
+	}
+
+	changed := loadSample(t, "actions_v1alpha1_workflowjob.yaml")
+	changed["status"] = map[string]any{"result": "failure"}
+	if errs := validateObject(t, crd, changed, completed); len(errs) == 0 {
+		t.Fatal("result update passed CEL validation")
 	}
 }
 

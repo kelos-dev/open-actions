@@ -6,9 +6,19 @@ import (
 )
 
 const (
-	WorkflowJobConditionScheduled = "Scheduled"
-	WorkflowJobConditionSucceeded = "Succeeded"
+	WorkflowJobConditionReady                 = "Ready"
+	WorkflowJobConditionScheduled             = "Scheduled"
+	WorkflowJobConditionSucceeded             = "Succeeded"
+	WorkflowJobConditionCancellationRequested = "CancellationRequested"
+
+	WorkflowJobResultSuccess   WorkflowJobResult = "success"
+	WorkflowJobResultFailure   WorkflowJobResult = "failure"
+	WorkflowJobResultSkipped   WorkflowJobResult = "skipped"
+	WorkflowJobResultCancelled WorkflowJobResult = "cancelled"
 )
+
+// WorkflowJobResult is the terminal result exposed to dependent workflow jobs.
+type WorkflowJobResult string
 
 // WorkflowJobSpec describes one immutable job expanded from a WorkflowRun.
 // +kubebuilder:validation:XValidation:rule="self == oldSelf",message="spec is immutable"
@@ -49,6 +59,23 @@ type WorkflowJobSpec struct {
 	// +required
 	RunsOn []string `json:"runsOn"`
 
+	// Needs contains the workflow-local IDs of jobs that must reach a terminal
+	// result before this job's condition can be evaluated.
+	// +listType=set
+	// +kubebuilder:validation:MaxItems=1000
+	// +kubebuilder:validation:items:MinLength=1
+	// +kubebuilder:validation:items:MaxLength=256
+	// +kubebuilder:validation:items:Pattern=`^[A-Za-z_][A-Za-z0-9_-]*$`
+	// +optional
+	Needs []string `json:"needs,omitempty"`
+
+	// If is the GitHub Actions condition that gates Runner assignment after all
+	// jobs in Needs have reached terminal results. An omitted condition uses the
+	// default success gate.
+	// +kubebuilder:validation:MaxLength=65536
+	// +optional
+	If string `json:"if,omitempty"`
+
 	// Matrix describes the matrix combination represented by this job.
 	// +optional
 	Matrix *WorkflowJobMatrix `json:"matrix,omitempty"`
@@ -82,12 +109,18 @@ type WorkflowJobMatrix struct {
 
 // WorkflowJobStatus contains observations made while executing a workflow job.
 // +kubebuilder:validation:XValidation:rule="!has(oldSelf.runnerRef) || self.runnerRef == oldSelf.runnerRef",message="runnerRef is immutable after assignment"
+// +kubebuilder:validation:XValidation:rule="!has(oldSelf.result) || self.result == oldSelf.result",message="result is immutable after completion"
 // +kubebuilder:validation:XValidation:rule="!has(self.runnerRef) || (size(self.runnerRef.name) > 0 && size(self.runnerRef.name) <= 253 && self.runnerRef.name.matches('^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?([.][a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?)*$'))",message="`runnerRef.name` must be a DNS subdomain"
 type WorkflowJobStatus struct {
 	// ObservedGeneration is the most recent generation observed by the
 	// controller.
 	// +optional
 	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
+
+	// Result is the immutable terminal result exposed through the needs context.
+	// +kubebuilder:validation:Enum=success;failure;skipped;cancelled
+	// +optional
+	Result WorkflowJobResult `json:"result,omitempty"`
 
 	// RunnerRef identifies the Runner assigned by the scheduler in the same
 	// namespace. It is set once when the job is scheduled.
@@ -110,9 +143,11 @@ type WorkflowJobStatus struct {
 	// +optional
 	Outputs map[string]string `json:"outputs,omitempty"`
 
-	// Conditions describe Runner assignment and the terminal result. Scheduled
-	// is true after the scheduler assigns status.runnerRef. Known condition types
-	// are Scheduled and Succeeded.
+	// Conditions describe dependency readiness, Runner assignment, cancellation,
+	// and the terminal result. When present, Ready is true when a Runner may claim
+	// the job. Dependency-free unconditional jobs are also claimable when Ready is
+	// absent. Scheduled is true after the scheduler assigns status.runnerRef. Known
+	// condition types are Ready, Scheduled, Succeeded, and CancellationRequested.
 	// +listType=map
 	// +listMapKey=type
 	// +kubebuilder:validation:MaxItems=16

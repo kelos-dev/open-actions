@@ -29,8 +29,10 @@ type GitHubEventName string
 
 // WorkflowRunSpec describes one workflow execution. ProjectRef, Source, and
 // WorkflowPath are immutable.
-// Deleting a WorkflowRun requests cancellation of its child resources.
+// Set CancelRequested to request graceful cancellation. Deleting a WorkflowRun
+// force-cancels and removes its child resources.
 // +kubebuilder:validation:XValidation:rule="self.projectRef == oldSelf.projectRef && self.source == oldSelf.source && self.workflowPath == oldSelf.workflowPath",message="projectRef, source, and workflowPath are immutable"
+// +kubebuilder:validation:XValidation:rule="!has(oldSelf.cancelRequested) || !oldSelf.cancelRequested || (has(self.cancelRequested) && self.cancelRequested)",message="cancelRequested cannot be cleared"
 // +kubebuilder:validation:XValidation:rule="size(self.projectRef.name) > 0",message="`projectRef.name` must be specified"
 // +kubebuilder:validation:XValidation:rule="size(self.projectRef.name) <= 253",message="`projectRef.name` must be no more than 253 characters"
 // +kubebuilder:validation:XValidation:rule="self.projectRef.name.matches('^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?([.][a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?)*$')",message="`projectRef.name` must be a DNS subdomain"
@@ -51,6 +53,12 @@ type WorkflowRunSpec struct {
 	// +kubebuilder:validation:XValidation:rule="!self.startsWith('../') && !self.contains('/../')",message="must not contain '..' path segments"
 	// +required
 	WorkflowPath string `json:"workflowPath"`
+
+	// CancelRequested asks the controller to cancel ordinary jobs while allowing
+	// jobs whose conditions handle cancellation to finish. Once set, it cannot be
+	// cleared.
+	// +optional
+	CancelRequested bool `json:"cancelRequested,omitempty"`
 
 	// TTLSecondsAfterFinished limits the lifetime of a WorkflowRun that has
 	// reached a terminal result. The timer starts at status.completionTime, or
@@ -361,6 +369,13 @@ type WorkflowRunJobStatus struct {
 	// +optional
 	Total int32 `json:"total,omitempty"`
 
+	// Waiting is the number of jobs waiting for dependencies to reach terminal
+	// results.
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=100000
+	// +optional
+	Waiting int32 `json:"waiting,omitempty"`
+
 	// Queued is the number of jobs waiting for a matching Runner.
 	// +kubebuilder:validation:Minimum=0
 	// +kubebuilder:validation:Maximum=100000
@@ -384,6 +399,19 @@ type WorkflowRunJobStatus struct {
 	// +kubebuilder:validation:Maximum=100000
 	// +optional
 	Failed int32 `json:"failed,omitempty"`
+
+	// Skipped is the number of jobs whose condition evaluated to false.
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=100000
+	// +optional
+	Skipped int32 `json:"skipped,omitempty"`
+
+	// Cancelled is the number of jobs cancelled before reaching a success or
+	// failure result.
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=100000
+	// +optional
+	Cancelled int32 `json:"cancelled,omitempty"`
 }
 
 // GitHubCheckRunStatus records the GitHub Check Run that reports this

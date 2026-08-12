@@ -20,6 +20,7 @@ func TestRun(t *testing.T) {
 		{name: "running", run: workflowRunWithCondition(metav1.ConditionUnknown, &started), want: "Running"},
 		{name: "succeeded", run: workflowRunWithCondition(metav1.ConditionTrue, &started), want: "Succeeded"},
 		{name: "failed", run: workflowRunWithCondition(metav1.ConditionFalse, &started), want: "Failed"},
+		{name: "cancelled", run: &actionsv1alpha1.WorkflowRun{Status: actionsv1alpha1.WorkflowRunStatus{Conditions: []metav1.Condition{{Type: actionsv1alpha1.WorkflowRunConditionSucceeded, Status: metav1.ConditionFalse, Reason: "JobCancelled"}}}}, want: "Cancelled"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			if got := Run(test.run); got != test.want {
@@ -36,9 +37,12 @@ func TestJob(t *testing.T) {
 		want string
 	}{
 		{name: "waiting", job: &actionsv1alpha1.WorkflowJob{}, want: "Queued"},
+		{name: "dependency waiting", job: &actionsv1alpha1.WorkflowJob{Spec: actionsv1alpha1.WorkflowJobSpec{Needs: []string{"build"}}, Status: actionsv1alpha1.WorkflowJobStatus{Conditions: []metav1.Condition{{Type: actionsv1alpha1.WorkflowJobConditionReady, Status: metav1.ConditionUnknown}}}}, want: "Waiting"},
 		{name: "running", job: &actionsv1alpha1.WorkflowJob{Status: actionsv1alpha1.WorkflowJobStatus{RunnerRef: &corev1.LocalObjectReference{Name: "runner"}}}, want: "Running"},
 		{name: "succeeded", job: workflowJobWithCondition(metav1.ConditionTrue), want: "Succeeded"},
 		{name: "failed", job: workflowJobWithCondition(metav1.ConditionFalse), want: "Failed"},
+		{name: "skipped", job: &actionsv1alpha1.WorkflowJob{Status: actionsv1alpha1.WorkflowJobStatus{Result: actionsv1alpha1.WorkflowJobResultSkipped}}, want: "Skipped"},
+		{name: "cancelled", job: &actionsv1alpha1.WorkflowJob{Status: actionsv1alpha1.WorkflowJobStatus{Result: actionsv1alpha1.WorkflowJobResultCancelled}}, want: "Cancelled"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			if got := Job(test.job); got != test.want {
@@ -49,6 +53,9 @@ func TestJob(t *testing.T) {
 }
 
 func TestJobTerminal(t *testing.T) {
+	if !JobTerminal(&actionsv1alpha1.WorkflowJob{Status: actionsv1alpha1.WorkflowJobStatus{Result: actionsv1alpha1.WorkflowJobResultSkipped}}) {
+		t.Fatal("skipped job is not terminal")
+	}
 	for _, test := range []struct {
 		status metav1.ConditionStatus
 		want   bool

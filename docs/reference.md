@@ -103,13 +103,19 @@ A `WorkflowRun` records provider-specific event data under its own immutable
 ID and the last report accepted by GitHub. For open pull requests,
 `spec.source.github.revision.sha` identifies the test merge commit used for
 execution, while `headSHA` identifies the pull request commit used for check
-reporting. A Runner's `spec.projectRef` is
+reporting. Set `spec.cancelRequested` to gracefully cancel ordinary jobs while
+allowing cancellation-aware reporting and cleanup jobs to finish. Deleting a
+WorkflowRun force-cancels and removes its child resources. A Runner's
+`spec.projectRef` is
 immutable, and changes to `spec.execution` apply only to Kubernetes Jobs created
 afterward. A `WorkflowJob` spec is immutable, and `status.runnerRef` identifies
-its one-time Runner assignment. After execution, `status.outputs` contains the
-non-secret outputs declared by that workflow job. The controller copies these
-values from the completed runner Pod before allowing native Job cleanup, so
-they remain available after controller restarts and Pod deletion.
+its one-time Runner assignment. `spec.needs` records direct workflow
+dependencies, `spec.if` records its scheduling condition, and `status.result`
+contains `success`, `failure`, `skipped`, or `cancelled` after completion. After
+execution, `status.outputs` contains the non-secret outputs declared by that
+workflow job. The controller copies these values from the completed runner Pod
+before allowing native Job cleanup, so they remain available after controller
+restarts and Pod deletion.
 
 Runner labels are canonical lowercase ASCII in Kubernetes resources. Workflow
 `runs-on` labels use the same representation. Each Runner is one reusable
@@ -172,14 +178,19 @@ The resources expose these condition contracts:
 | `WorkflowRun` | `Planned` | `True` | `JobsPlanned` |
 | `WorkflowRun` | `Planned` | `Unknown` | `WaitingForConcurrency`, `WaitingForConcurrencyCancellation`, `ProjectUnavailable`, `CredentialsUnavailable`, `GitHubAuthenticationFailed`, `WorkflowFetchFailed`, `ChildCreationFailed`, `ConcurrencyCheckFailed` |
 | `WorkflowRun` | `Planned` | `False` | `ProjectUnavailable`, `WorkflowFetchFailed`, `WorkflowInvalid`, `TriggerInvalid`, `ChildCreationFailed`, `ExecutionStateLost` |
-| `WorkflowRun` | `Succeeded` | `Unknown` | `JobsQueued`, `JobsRunning` |
+| `WorkflowRun` | `Succeeded` | `Unknown` | `JobsWaiting`, `JobsQueued`, `JobsRunning` |
 | `WorkflowRun` | `Succeeded` | `True` | `JobsSucceeded` |
-| `WorkflowRun` | `Succeeded` | `False` | `ProjectUnavailable`, `WorkflowFetchFailed`, `WorkflowInvalid`, `TriggerInvalid`, `ChildCreationFailed`, `JobFailed`, `ExecutionStateLost` |
+| `WorkflowRun` | `Succeeded` | `False` | `ProjectUnavailable`, `WorkflowFetchFailed`, `WorkflowInvalid`, `TriggerInvalid`, `ChildCreationFailed`, `JobFailed`, `JobCancelled`, `ExecutionStateLost` |
+| `WorkflowJob` | `Ready` | `Unknown` | `DependenciesPending` |
+| `WorkflowJob` | `Ready` | `True` | `ConditionPassed` |
+| `WorkflowJob` | `Ready` | `False` | `ConditionFalse`, `ConditionEvaluationFailed`, `CancellationRequested` |
 | `WorkflowJob` | `Scheduled` | `True` | `RunnerAssigned` |
-| `WorkflowJob` | `Scheduled` | `False` | `ProjectRecreated` |
+| `WorkflowJob` | `Scheduled` | `False` | `ConditionFalse`, `ConditionEvaluationFailed`, `CancellationRequested`, `ProjectRecreated` |
 | `WorkflowJob` | `Succeeded` | `Unknown` | `JobRunning` |
 | `WorkflowJob` | `Succeeded` | `True` | `JobSucceeded` |
-| `WorkflowJob` | `Succeeded` | `False` | `JobFailed`, `JobResultInvalid`, `PlanUnavailable`, `JobStartFailed`, `ExecutionStateLost`, `ProjectRecreated` |
+| `WorkflowJob` | `Succeeded` | `False` | `JobFailed`, `JobResultInvalid`, `ConditionEvaluationFailed`, `PlanUnavailable`, `JobStartFailed`, `ExecutionStateLost`, `CancellationRequested`, `ProjectRecreated` |
+| `WorkflowJob` | `CancellationRequested` | `True` | `CancellationRequested`, `ConditionEvaluationFailed` |
+| `WorkflowJob` | `CancellationRequested` | `False` | `ConditionPassed` |
 
 `Project/Configured` covers local Secret availability, private-key parsing, and
 installation uniqueness. It does not assert remote GitHub App or installation
@@ -246,6 +257,7 @@ evaluation when the corresponding execution feature has not supplied it.
 | Phase | Allowed contexts and functions | Currently supplied |
 | --- | --- | --- |
 | Workflow concurrency | `github`, `inputs`, `vars` | `github`, `inputs` |
+| Workflow job condition | `github`, `needs`, `vars`, `inputs`, and status functions | `github`, direct dependency results and outputs, `inputs`, and status functions |
 | Job name and runner labels | `github`, `needs`, `strategy`, `matrix`, `vars`, `inputs` | `github`, `inputs`, and `matrix` for matrix jobs |
 | Job environment | `github`, `needs`, `strategy`, `matrix`, `vars`, `secrets`, `inputs` | `github`, `inputs`, and `matrix` for matrix jobs |
 | Workflow step name, run script, working directory, environment, and inputs | `github`, `needs`, `strategy`, `matrix`, `job`, `runner`, `env`, `vars`, `secrets`, `steps`, `inputs` | `github`, `matrix`, `runner`, `env`, `inputs`, `steps` |
@@ -255,8 +267,8 @@ evaluation when the corresponding execution feature has not supplied it.
 | Composite step condition | Composite contexts and status functions | All listed contexts and functions |
 | Action input default | `github` | `github` |
 
-Dependency scheduling and its `needs` context, and repository secret and
-variable sources remain separate execution features. Values derived
+Repository secret and variable sources remain separate execution features.
+Values derived
 from `github.token` or the `secrets` context are marked sensitive through
 interpolation and function calls, and evaluation diagnostics do not include
 resolved values. The runner maps interrupt and termination signals to cancelled
@@ -282,16 +294,41 @@ The complete versioned job result is limited to 4 KiB and 100 outputs. Exceeding
 that bound fails the job without persisting a partial result. A successful job
 that declares outputs finishes with reason `JobResultInvalid` when its runner
 result is missing or malformed. Jobs without declared outputs do not require
-runner result metadata. Dependency jobs cannot consume these values until
-dependency graph scheduling supplies the `needs` context.
+runner result metadata.
+
+### Job dependencies and conditions
+
+`jobs.<id>.needs` accepts one job ID or a list of IDs. Planning rejects missing
+jobs, repeated dependencies, self-dependencies, and cycles. A WorkflowJob waits
+until every direct dependency has a terminal result before its condition is
+evaluated. Jobs without `needs` may run in parallel.
+
+An omitted job `if` condition uses the default `success()` gate. Conditions
+without an explicit status function also require successful ancestors.
+`failure()` includes failures anywhere in the transitive dependency chain,
+while the `needs` context contains only direct dependencies. Each direct entry
+supplies `needs.<job>.result` as `success`, `failure`, `skipped`, or `cancelled`
+and exposes persisted values through `needs.<job>.outputs`. A matrix dependency
+becomes terminal only after every expanded job finishes, and its child results
+are aggregated under the logical job ID. A false condition records the job as
+skipped without assigning a Runner. `always()`, `failure()`, and `cancelled()`
+can allow report or cleanup jobs to run after unsuccessful dependencies.
+
+Graceful cancellation sets `spec.cancelRequested`. Assigned jobs are cancelled
+unless their job condition still evaluates to true, and unassigned jobs are
+recorded as cancelled unless their condition permits cancellation-time work.
+Deleting the WorkflowRun remains the force-cancellation path and does not wait
+for graph cleanup jobs.
 
 ### Concurrency
 
 Concurrency groups are case-insensitive and scoped by Project and repository.
-One run may execute while one newer run waits. A newer waiting run supersedes
-the existing waiting run. When `cancel-in-progress` is `true`, it also cancels
-the executing run. A run waits for an older run in the same repository until
-that run has evaluated its workflow concurrency configuration.
+One run may execute while one newer run waits. A newer waiting run gracefully
+cancels the existing waiting run. When `cancel-in-progress` is `true`, it also
+requests graceful cancellation of the executing run. A replacement waits for
+cancellation-aware reporting and cleanup jobs before taking the group. A run
+waits for an older run in the same repository until that run has evaluated its
+workflow concurrency configuration.
 
 Concurrency expressions reject unavailable contexts and empty evaluated
 groups. Event properties that do not exist evaluate to an empty string. Use
@@ -470,7 +507,7 @@ than one plan version must emit the result version assigned to that plan, not
 always the latest result version supported by the runner binary.
 
 Docker and local actions, private cross-repository action authentication, job
-dependencies, matrix `include` and `exclude`, strategy `fail-fast`, service
+matrix `include` and `exclude`, strategy `fail-fast`, service
 containers, repository secret and variable sources, caches, and artifacts are
 not supported. Expressions outside the documented fields and runtime contexts
 are rejected during planning or execution and are never interpreted as literal

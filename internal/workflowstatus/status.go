@@ -11,6 +11,9 @@ const (
 	running   = "Running"
 	succeeded = "Succeeded"
 	failed    = "Failed"
+	skipped   = "Skipped"
+	cancelled = "Cancelled"
+	waiting   = "Waiting"
 )
 
 // Run returns the user-facing status derived from a WorkflowRun's conditions.
@@ -23,6 +26,9 @@ func Run(run *actionsv1alpha1.WorkflowRun) string {
 	case metav1.ConditionTrue:
 		return succeeded
 	case metav1.ConditionFalse:
+		if condition.Reason == "JobCancelled" {
+			return cancelled
+		}
 		return failed
 	default:
 		if run.Status.StartTime != nil {
@@ -34,6 +40,16 @@ func Run(run *actionsv1alpha1.WorkflowRun) string {
 
 // Job returns the user-facing status derived from a WorkflowJob's conditions and runner assignment.
 func Job(job *actionsv1alpha1.WorkflowJob) string {
+	switch job.Status.Result {
+	case actionsv1alpha1.WorkflowJobResultSuccess:
+		return succeeded
+	case actionsv1alpha1.WorkflowJobResultFailure:
+		return failed
+	case actionsv1alpha1.WorkflowJobResultSkipped:
+		return skipped
+	case actionsv1alpha1.WorkflowJobResultCancelled:
+		return cancelled
+	}
 	condition := meta.FindStatusCondition(job.Status.Conditions, actionsv1alpha1.WorkflowJobConditionSucceeded)
 	if condition != nil {
 		switch condition.Status {
@@ -46,11 +62,18 @@ func Job(job *actionsv1alpha1.WorkflowJob) string {
 	if job.Status.RunnerRef != nil {
 		return running
 	}
+	ready := meta.FindStatusCondition(job.Status.Conditions, actionsv1alpha1.WorkflowJobConditionReady)
+	if ready != nil && ready.Status != metav1.ConditionTrue {
+		return waiting
+	}
 	return queued
 }
 
 // JobTerminal reports whether a WorkflowJob has a terminal succeeded condition.
 func JobTerminal(job *actionsv1alpha1.WorkflowJob) bool {
+	if job.Status.Result != "" {
+		return true
+	}
 	condition := meta.FindStatusCondition(job.Status.Conditions, actionsv1alpha1.WorkflowJobConditionSucceeded)
 	return condition != nil && condition.Status != metav1.ConditionUnknown
 }
