@@ -347,8 +347,11 @@ func (e *Executor) executePlan(ctx context.Context, plan *Plan, workspace string
 			stepError = fmt.Errorf("step %d (%s): %w", index+1, name, stepError)
 			executionErrors = errors.Join(executionErrors, stepError)
 			cancelledDuringCommand := !cancelledBeforeCommand && ctx.Err() != nil
-			if !cancelledDuringCommand {
+			if cancelledDuringCommand {
+				e.logger.Info("cancelled workflow step", "job", plan.JobID, "step", index+1, "name", name)
+			} else {
 				failed = true
+				e.logger.Info("failed workflow step", "job", plan.JobID, "step", index+1, "name", name)
 			}
 			continue
 		}

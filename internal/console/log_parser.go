@@ -14,6 +14,7 @@ type logEntry struct {
 	Text       string            `json:"text,omitempty"`
 	Time       string            `json:"time,omitempty"`
 	Scope      string            `json:"scope,omitempty"`
+	Conclusion string            `json:"conclusion,omitempty"`
 	Properties map[string]string `json:"properties,omitempty"`
 }
 
@@ -115,7 +116,11 @@ func runnerLogEntry(record runnerLogRecord, timestamp string) (logEntry, bool) {
 		}
 		return logEntry{Kind: "group", Text: title, Time: timestamp, Scope: "workflow"}, true
 	case "completed workflow step":
-		return logEntry{Kind: "endgroup", Time: timestamp, Scope: "workflow"}, true
+		return logEntry{Kind: "endgroup", Time: timestamp, Scope: "workflow", Conclusion: "success"}, true
+	case "failed workflow step":
+		return logEntry{Kind: "endgroup", Time: timestamp, Scope: "workflow", Conclusion: "failure"}, true
+	case "cancelled workflow step":
+		return logEntry{Kind: "endgroup", Time: timestamp, Scope: "workflow", Conclusion: "cancelled"}, true
 	case "skipping workflow step":
 		title := record.Name
 		if record.Step > 0 {

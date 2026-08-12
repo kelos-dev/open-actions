@@ -212,7 +212,7 @@ func TestConsoleStructuresGitHubActionsLogs(t *testing.T) {
 		`"kind":"command","text":"Set output artifact"`,
 		`"kind":"output","text":"ordinary output"`,
 		`"kind":"step-output","text":"artifact"`,
-		`"kind":"endgroup"`,
+		`"scope":"workflow","conclusion":"success"`,
 		`"kind":"group","text":"Post actions/example@v1"`,
 	} {
 		if !strings.Contains(body, expected) {

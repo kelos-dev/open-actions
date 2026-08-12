@@ -115,8 +115,16 @@ func TestActionLogParserStructuresRunnerMessages(t *testing.T) {
 		t.Fatalf("start entry = %#v, %t", entry, visible)
 	}
 	entry, visible = parser.parse(`{"time":"2026-08-10T12:34:57Z","level":"INFO","msg":"completed workflow step","open_actions_runner":true,"job":"build","step":2,"name":"Test"}`)
-	if !visible || entry.Kind != "endgroup" {
+	if !visible || entry.Kind != "endgroup" || entry.Conclusion != "success" {
 		t.Fatalf("completion entry = %#v, %t", entry, visible)
+	}
+	entry, visible = parser.parse(`{"time":"2026-08-10T12:34:57Z","level":"INFO","msg":"failed workflow step","open_actions_runner":true,"job":"build","step":2,"name":"Test"}`)
+	if !visible || entry.Kind != "endgroup" || entry.Conclusion != "failure" {
+		t.Fatalf("failure entry = %#v, %t", entry, visible)
+	}
+	entry, visible = parser.parse(`{"time":"2026-08-10T12:34:57Z","level":"INFO","msg":"cancelled workflow step","open_actions_runner":true,"job":"build","step":2,"name":"Test"}`)
+	if !visible || entry.Kind != "endgroup" || entry.Conclusion != "cancelled" {
+		t.Fatalf("cancellation entry = %#v, %t", entry, visible)
 	}
 	entry, visible = parser.parse(`{"time":"2026-08-10T12:34:58Z","level":"INFO","msg":"skipping workflow step","open_actions_runner":true,"job":"build","step":3,"name":"Deploy"}`)
 	if !visible || entry.Kind != "runner" || entry.Text != "Skipped 3. Deploy" {
