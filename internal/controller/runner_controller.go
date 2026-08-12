@@ -52,7 +52,14 @@ const (
 	workflowJobQueuedIndex      = "actions.kelos.dev/workflow-job-queued"
 	workflowJobRunnerNameIndex  = "actions.kelos.dev/workflow-job-runner-name"
 	workflowJobProjectNameIndex = "actions.kelos.dev/workflow-job-project-name"
+	matrixFailFastReason        = "MatrixFailFast"
+	matrixFailFastMessage       = "Another matrix combination failed"
 )
+
+type workflowJobCancellation struct {
+	reason  string
+	message string
+}
 
 type RunnerReconciler struct {
 	client.Client
@@ -112,7 +119,25 @@ func (r *RunnerReconciler) Reconcile(ctx context.Context, request ctrl.Request) 
 				}
 				return ctrl.Result{Requeue: true}, nil
 			}
+			if cancellation := workflowJobCancellationCondition(workflowJob); cancellation != nil {
+				if err := r.cancelWorkflowJob(ctx, workflowJob, cancellation); err != nil {
+					return ctrl.Result{}, err
+				}
+				if err := r.updateRunnerStatus(ctx, runnerObject, metav1.ConditionTrue, "Ready", "Runner is operational", nil); err != nil {
+					return ctrl.Result{}, err
+				}
+				return ctrl.Result{Requeue: true}, nil
+			}
 			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+		}
+		if cancellation := workflowJobCancellationCondition(workflowJob); cancellation != nil {
+			if err := r.cancelWorkflowJob(ctx, workflowJob, cancellation); err != nil {
+				return ctrl.Result{}, err
+			}
+			if err := r.updateRunnerStatus(ctx, runnerObject, metav1.ConditionTrue, "Ready", "Runner is operational", nil); err != nil {
+				return ctrl.Result{}, err
+			}
+			return ctrl.Result{Requeue: true}, nil
 		}
 	}
 
@@ -257,11 +282,11 @@ func (r *RunnerReconciler) claimWorkflowJob(ctx context.Context, runnerObject *a
 		return nil, err
 	}
 	matrixActivity := map[string]int32{}
+	failedMatrixGroups := map[string]struct{}{}
 	for index := range jobs.Items {
-		matrix := jobs.Items[index].Spec.Matrix
-		if matrix != nil && matrix.MaxParallel > 0 {
+		if jobs.Items[index].Spec.Matrix != nil {
 			var err error
-			matrixActivity, err = r.activeMatrixJobs(ctx, runnerObject.Namespace, project)
+			matrixActivity, failedMatrixGroups, err = r.matrixJobState(ctx, runnerObject.Namespace, project)
 			if err != nil {
 				return nil, err
 			}
@@ -285,8 +310,14 @@ func (r *RunnerReconciler) claimWorkflowJob(ctx context.Context, runnerObject *a
 		if !runnerLabelsMatch(runnerObject.Spec.Labels, workflowJob.Spec.RunsOn) {
 			continue
 		}
-		if matrix := workflowJob.Spec.Matrix; matrix != nil && matrix.MaxParallel > 0 && matrixActivity[matrixJobGroup(workflowJob)] >= matrix.MaxParallel {
-			continue
+		if matrix := workflowJob.Spec.Matrix; matrix != nil {
+			group := matrixJobGroup(workflowJob)
+			if _, failed := failedMatrixGroups[group]; failed {
+				continue
+			}
+			if matrix.MaxParallel > 0 && matrixActivity[group] >= matrix.MaxParallel {
+				continue
+			}
 		}
 		runName := workflowJob.Spec.WorkflowRunRef.Name
 		if !loadedRuns[runName] {
@@ -343,19 +374,27 @@ func (r *RunnerReconciler) claimWorkflowJob(ctx context.Context, runnerObject *a
 	return workflowJob, nil
 }
 
-func (r *RunnerReconciler) activeMatrixJobs(ctx context.Context, namespace string, project *actionsv1alpha1.Project) (map[string]int32, error) {
+func (r *RunnerReconciler) matrixJobState(ctx context.Context, namespace string, project *actionsv1alpha1.Project) (map[string]int32, map[string]struct{}, error) {
 	jobs := &actionsv1alpha1.WorkflowJobList{}
 	if err := r.APIReader.List(ctx, jobs, client.InNamespace(namespace), client.MatchingLabels{actionsv1alpha1.LabelProjectUID: string(project.UID)}); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	active := make(map[string]int32)
+	failed := make(map[string]struct{})
 	for index := range jobs.Items {
 		job := &jobs.Items[index]
-		if job.Spec.Matrix != nil && job.Status.RunnerRef != nil && !terminalWorkflowJob(job) {
-			active[matrixJobGroup(job)]++
+		if job.Spec.Matrix == nil {
+			continue
+		}
+		group := matrixJobGroup(job)
+		if job.Status.RunnerRef != nil && !terminalWorkflowJob(job) {
+			active[group]++
+		}
+		if workflowJobFailureTriggersMatrixFailFast(job) {
+			failed[group] = struct{}{}
 		}
 	}
-	return active, nil
+	return active, failed, nil
 }
 
 func matrixJobGroup(job *actionsv1alpha1.WorkflowJob) string {
@@ -392,10 +431,10 @@ func (r *RunnerReconciler) executeWorkflowJob(ctx context.Context, runnerObject 
 	if err != nil || terminalNativeJob {
 		return terminalNativeJob, err
 	}
-	if canceled, err := r.workflowJobCancellationRequested(ctx, workflowJob, run); err != nil {
+	if cancellation, err := r.workflowJobCancellationRequested(ctx, workflowJob, run); err != nil {
 		return false, err
-	} else if canceled {
-		return true, r.cancelWorkflowJob(ctx, workflowJob)
+	} else if cancellation != nil {
+		return true, r.cancelWorkflowJob(ctx, workflowJob, cancellation)
 	}
 	if foundNativeJob {
 		return false, nil
@@ -434,10 +473,10 @@ func (r *RunnerReconciler) executeWorkflowJob(ctx context.Context, runnerObject 
 	if err != nil {
 		return false, err
 	}
-	if canceled, err := r.workflowJobCancellationRequested(ctx, workflowJob, run); err != nil {
+	if cancellation, err := r.workflowJobCancellationRequested(ctx, workflowJob, run); err != nil {
 		return false, err
-	} else if canceled {
-		return true, r.cancelWorkflowJob(ctx, workflowJob)
+	} else if cancellation != nil {
+		return true, r.cancelWorkflowJob(ctx, workflowJob, cancellation)
 	}
 	if err := r.ensureAuthSecret(ctx, workflowJob, installation.Token()); err != nil {
 		return false, err
@@ -446,10 +485,10 @@ func (r *RunnerReconciler) executeWorkflowJob(ctx context.Context, runnerObject 
 	if err != nil {
 		return false, err
 	}
-	if canceled, err := r.workflowJobCancellationRequested(ctx, workflowJob, run); err != nil {
+	if cancellation, err := r.workflowJobCancellationRequested(ctx, workflowJob, run); err != nil {
 		return false, err
-	} else if canceled {
-		return true, r.cancelWorkflowJob(ctx, workflowJob)
+	} else if cancellation != nil {
+		return true, r.cancelWorkflowJob(ctx, workflowJob, cancellation)
 	}
 	if err := r.Create(ctx, nativeJob); err != nil {
 		if apierrors.IsAlreadyExists(err) {
@@ -461,38 +500,56 @@ func (r *RunnerReconciler) executeWorkflowJob(ctx context.Context, runnerObject 
 	return false, r.updateWorkflowJobStatus(ctx, workflowJob, nativeJob, nil, false)
 }
 
-func (r *RunnerReconciler) workflowJobCancellationRequested(ctx context.Context, workflowJob *actionsv1alpha1.WorkflowJob, run *actionsv1alpha1.WorkflowRun) (bool, error) {
+func (r *RunnerReconciler) workflowJobCancellationRequested(ctx context.Context, workflowJob *actionsv1alpha1.WorkflowJob, run *actionsv1alpha1.WorkflowRun) (*workflowJobCancellation, error) {
 	currentWorkflowJob := &actionsv1alpha1.WorkflowJob{}
 	if err := r.APIReader.Get(ctx, client.ObjectKeyFromObject(workflowJob), currentWorkflowJob); err != nil {
 		if apierrors.IsNotFound(err) {
-			return true, nil
+			return &workflowJobCancellation{reason: "CancellationRequested", message: "WorkflowJob or WorkflowRun deletion was requested before execution started"}, nil
 		}
-		return false, err
+		return nil, err
 	}
 	if currentWorkflowJob.UID != workflowJob.UID {
-		return false, fmt.Errorf("WorkflowJob %q was recreated before execution started", workflowJob.Name)
+		return nil, fmt.Errorf("WorkflowJob %q was recreated before execution started", workflowJob.Name)
 	}
 	if !currentWorkflowJob.DeletionTimestamp.IsZero() {
-		return true, nil
+		return &workflowJobCancellation{reason: "CancellationRequested", message: "WorkflowJob or WorkflowRun deletion was requested before execution started"}, nil
 	}
-	cancellation := meta.FindStatusCondition(currentWorkflowJob.Status.Conditions, actionsv1alpha1.WorkflowJobConditionCancellationRequested)
-	if cancellation != nil && cancellation.Status == metav1.ConditionTrue {
-		return true, nil
+	if cancellation := workflowJobCancellationCondition(currentWorkflowJob); cancellation != nil {
+		return cancellation, nil
 	}
 	currentRun := &actionsv1alpha1.WorkflowRun{}
 	if err := r.APIReader.Get(ctx, client.ObjectKeyFromObject(run), currentRun); err != nil {
 		if apierrors.IsNotFound(err) {
-			return true, nil
+			return &workflowJobCancellation{reason: "CancellationRequested", message: "WorkflowJob or WorkflowRun deletion was requested before execution started"}, nil
 		}
-		return false, err
+		return nil, err
 	}
 	if currentRun.UID != run.UID {
-		return false, fmt.Errorf("WorkflowRun %q was recreated before execution started", run.Name)
+		return nil, fmt.Errorf("WorkflowRun %q was recreated before execution started", run.Name)
 	}
-	return !currentRun.DeletionTimestamp.IsZero(), nil
+	if !currentRun.DeletionTimestamp.IsZero() {
+		return &workflowJobCancellation{reason: "CancellationRequested", message: "WorkflowJob or WorkflowRun deletion was requested before execution started"}, nil
+	}
+	return nil, nil
 }
 
-func (r *RunnerReconciler) cancelWorkflowJob(ctx context.Context, workflowJob *actionsv1alpha1.WorkflowJob) error {
+func workflowJobCancellationCondition(workflowJob *actionsv1alpha1.WorkflowJob) *workflowJobCancellation {
+	condition := meta.FindStatusCondition(workflowJob.Status.Conditions, actionsv1alpha1.WorkflowJobConditionCancellationRequested)
+	if condition == nil || condition.Status != metav1.ConditionTrue {
+		return nil
+	}
+	reason := condition.Reason
+	if reason == "" {
+		reason = "CancellationRequested"
+	}
+	message := condition.Message
+	if message == "" {
+		message = "WorkflowJob or WorkflowRun cancellation was requested"
+	}
+	return &workflowJobCancellation{reason: reason, message: message}
+}
+
+func (r *RunnerReconciler) cancelWorkflowJob(ctx context.Context, workflowJob *actionsv1alpha1.WorkflowJob, cancellation *workflowJobCancellation) error {
 	nativeJob := &batchv1.Job{}
 	key := client.ObjectKey{Namespace: workflowJob.Namespace, Name: workflowJob.Name}
 	if err := r.Get(ctx, key, nativeJob); err != nil {
@@ -508,7 +565,7 @@ func (r *RunnerReconciler) cancelWorkflowJob(ctx context.Context, workflowJob *a
 			return err
 		}
 	}
-	err := r.completeAssignedWorkflowJob(ctx, workflowJob, actionsv1alpha1.WorkflowJobResultCancelled, "CancellationRequested", "WorkflowJob or WorkflowRun cancellation was requested")
+	err := r.completeAssignedWorkflowJob(ctx, workflowJob, actionsv1alpha1.WorkflowJobResultCancelled, cancellation.reason, cancellation.message)
 	if apierrors.IsNotFound(err) {
 		return r.cleanupAuthSecret(ctx, workflowJob)
 	}
@@ -1138,6 +1195,18 @@ func runnerLabelsMatch(available, requested []string) bool {
 
 func terminalWorkflowJob(workflowJob *actionsv1alpha1.WorkflowJob) bool {
 	return workflowJobTerminal(workflowJob)
+}
+
+func workflowJobFailureTriggersMatrixFailFast(workflowJob *actionsv1alpha1.WorkflowJob) bool {
+	if !matrixFailFastEnabled(workflowJob.Spec.Matrix) || workflowJobResult(workflowJob) != actionsv1alpha1.WorkflowJobResultFailure {
+		return false
+	}
+	condition := meta.FindStatusCondition(workflowJob.Status.Conditions, actionsv1alpha1.WorkflowJobConditionSucceeded)
+	return condition == nil || (condition.Reason != matrixFailFastReason && condition.Reason != "CancellationRequested")
+}
+
+func matrixFailFastEnabled(matrix *actionsv1alpha1.WorkflowJobMatrix) bool {
+	return matrix != nil && (matrix.FailFast == nil || *matrix.FailFast)
 }
 
 func nativeJobLabels(workflowJob *actionsv1alpha1.WorkflowJob, run *actionsv1alpha1.WorkflowRun, project *actionsv1alpha1.Project, runnerObject *actionsv1alpha1.Runner) map[string]string {

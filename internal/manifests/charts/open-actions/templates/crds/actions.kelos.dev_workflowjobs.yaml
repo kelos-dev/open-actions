@@ -91,6 +91,12 @@ spec:
                 description: Matrix describes the matrix combination represented by
                   this job.
                 properties:
+                  failFast:
+                    default: true
+                    description: |-
+                      FailFast requests cancellation of unfinished combinations in this logical
+                      job after one combination fails. It defaults to true.
+                    type: boolean
                   logicalJobID:
                     description: LogicalJobID is the workflow-local identifier before
                       matrix expansion.

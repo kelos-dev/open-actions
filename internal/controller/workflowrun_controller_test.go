@@ -550,7 +550,7 @@ func TestPlanWorkflowJobsExpandsArchitectureMatrix(t *testing.T) {
 	}
 	for index, arch := range []string{"amd64", "arm64"} {
 		job := planned[index]
-		if job.id != fmt.Sprintf("build-images-matrix-%d", index+1) || job.matrix == nil || job.matrix.LogicalJobID != "build-images" || job.matrix.Values["arch"] != arch || job.matrix.MaxParallel != 1 || job.resultVersion != jobResultVersion {
+		if job.id != fmt.Sprintf("build-images-matrix-%d", index+1) || job.matrix == nil || job.matrix.LogicalJobID != "build-images" || job.matrix.Values["arch"] != arch || job.matrix.MaxParallel != 1 || job.matrix.FailFast == nil || !*job.matrix.FailFast || job.resultVersion != jobResultVersion {
 			t.Errorf("planned job %d = %#v", index, job)
 		}
 		wantRunner := "ubuntu-latest"
@@ -567,6 +567,29 @@ func TestPlanWorkflowJobsExpandsArchitectureMatrix(t *testing.T) {
 		if plan.JobID != "build-images" || plan.Matrix["arch"] != arch || plan.Outputs["image"] != "${{ matrix.arch }}-${{ steps.build.outputs.image }}" {
 			t.Errorf("plan for %s = %#v", arch, plan)
 		}
+	}
+}
+
+func TestPlanWorkflowJobsPreservesDisabledMatrixFailFast(t *testing.T) {
+	reconciler := &WorkflowRunReconciler{}
+	run := &actionsv1alpha1.WorkflowRun{Spec: actionsv1alpha1.WorkflowRunSpec{Source: actionsv1alpha1.WorkflowRunSource{
+		Type: actionsv1alpha1.SourceTypeGitHub,
+		GitHub: &actionsv1alpha1.GitHubWorkflowRunSource{
+			Repository: actionsv1alpha1.GitHubRepository{ID: 1},
+			Event:      actionsv1alpha1.GitHubEvent{Name: "push", DeliveryID: "delivery"},
+			Revision:   actionsv1alpha1.GitRevision{SHA: strings.Repeat("a", 40), Ref: "refs/heads/main"},
+		},
+	}}}
+	definition, err := workflow.Parse([]byte("name: Release\non: push\njobs:\n  build:\n    strategy:\n      fail-fast: false\n      matrix:\n        arch: [amd64]\n    runs-on: ubuntu-latest\n    steps:\n      - run: make build\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	planned, err := reconciler.planWorkflowJobs(run, definition, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(planned) != 1 || planned[0].matrix == nil || planned[0].matrix.FailFast == nil || *planned[0].matrix.FailFast {
+		t.Fatalf("planned matrix strategy = %#v", planned)
 	}
 }
 
@@ -1906,6 +1929,7 @@ func TestWorkflowRunTerminalConclusions(t *testing.T) {
 		name            string
 		cancelRequested bool
 		results         []actionsv1alpha1.WorkflowJobResult
+		failFast        bool
 		wantStatus      metav1.ConditionStatus
 		wantReason      string
 		wantMessage     string
@@ -1915,6 +1939,7 @@ func TestWorkflowRunTerminalConclusions(t *testing.T) {
 		{name: "failure", results: []actionsv1alpha1.WorkflowJobResult{actionsv1alpha1.WorkflowJobResultSuccess, actionsv1alpha1.WorkflowJobResultFailure}, wantStatus: metav1.ConditionFalse, wantReason: "JobFailed", wantMessage: "At least one WorkflowJob failed"},
 		{name: "cancellation request takes precedence over failure", cancelRequested: true, results: []actionsv1alpha1.WorkflowJobResult{actionsv1alpha1.WorkflowJobResultSuccess, actionsv1alpha1.WorkflowJobResultFailure}, wantStatus: metav1.ConditionFalse, wantReason: "JobCancelled", wantMessage: "Workflow cancellation was requested"},
 		{name: "cancelled job takes precedence over failure", results: []actionsv1alpha1.WorkflowJobResult{actionsv1alpha1.WorkflowJobResultFailure, actionsv1alpha1.WorkflowJobResultCancelled}, wantStatus: metav1.ConditionFalse, wantReason: "JobCancelled", wantMessage: "At least one WorkflowJob was cancelled"},
+		{name: "matrix fail-fast preserves failure", results: []actionsv1alpha1.WorkflowJobResult{actionsv1alpha1.WorkflowJobResultFailure, actionsv1alpha1.WorkflowJobResultCancelled}, failFast: true, wantStatus: metav1.ConditionFalse, wantReason: "JobFailed", wantMessage: "At least one WorkflowJob failed"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			scheme := runtime.NewScheme()
@@ -1934,14 +1959,18 @@ func TestWorkflowRunTerminalConclusions(t *testing.T) {
 			objects := []client.Object{run}
 			for index, result := range test.results {
 				name := fmt.Sprintf("job-%d", index)
-				objects = append(objects, &actionsv1alpha1.WorkflowJob{
+				job := &actionsv1alpha1.WorkflowJob{
 					ObjectMeta: metav1.ObjectMeta{
 						Name: name, Namespace: run.Namespace,
 						Labels: map[string]string{actionsv1alpha1.LabelWorkflowRunUID: string(run.UID)},
 					},
 					Spec:   actionsv1alpha1.WorkflowJobSpec{JobID: name},
 					Status: actionsv1alpha1.WorkflowJobStatus{Result: result},
-				})
+				}
+				if test.failFast && result == actionsv1alpha1.WorkflowJobResultCancelled {
+					job.Status.Conditions = []metav1.Condition{{Type: actionsv1alpha1.WorkflowJobConditionScheduled, Status: metav1.ConditionFalse, Reason: matrixFailFastReason}}
+				}
+				objects = append(objects, job)
 			}
 			clusterClient := fake.NewClientBuilder().
 				WithScheme(scheme).
@@ -2029,5 +2058,101 @@ func TestCancelledWorkflowRunWaitsForTerminatingWorkloads(t *testing.T) {
 	condition = meta.FindStatusCondition(stored.Status.Conditions, actionsv1alpha1.WorkflowRunConditionSucceeded)
 	if condition == nil || condition.Status != metav1.ConditionFalse || condition.Reason != "JobCancelled" {
 		t.Fatalf("succeeded condition after Pod termination = %#v", condition)
+	}
+}
+
+func TestMatrixFailFastCancelsOnlyUnfinishedSiblings(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := actionsv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	run := &actionsv1alpha1.WorkflowRun{ObjectMeta: metav1.ObjectMeta{Name: "release", Namespace: "default", UID: "run-uid"}}
+	job := func(name, logicalID string, failFast *bool, runnerName string, result metav1.ConditionStatus, reason string) *actionsv1alpha1.WorkflowJob {
+		workflowJob := &actionsv1alpha1.WorkflowJob{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: name, Namespace: run.Namespace,
+				Labels: map[string]string{actionsv1alpha1.LabelWorkflowRunUID: string(run.UID)},
+			},
+			Spec: actionsv1alpha1.WorkflowJobSpec{
+				WorkflowRunRef: corev1.LocalObjectReference{Name: run.Name}, JobID: name,
+				Matrix: &actionsv1alpha1.WorkflowJobMatrix{LogicalJobID: logicalID, Values: map[string]string{"case": name}, FailFast: failFast},
+			},
+		}
+		if runnerName != "" {
+			workflowJob.Status.RunnerRef = &corev1.LocalObjectReference{Name: runnerName}
+		}
+		if result != "" {
+			workflowJob.Status.Conditions = []metav1.Condition{{
+				Type: actionsv1alpha1.WorkflowJobConditionSucceeded, Status: result, Reason: reason, Message: reason,
+			}}
+		}
+		return workflowJob
+	}
+
+	failed := job("build-failed", "build", nil, "runner-1", metav1.ConditionFalse, "JobFailed")
+	queued := job("build-queued", "build", nil, "", "", "")
+	active := job("build-active", "build", nil, "runner-2", metav1.ConditionUnknown, "JobRunning")
+	completed := job("build-completed", "build", nil, "runner-3", metav1.ConditionTrue, "JobSucceeded")
+	otherGroup := job("test-queued", "test", pointerTo(true), "", "", "")
+	otherRun := job("other-run-build-queued", "build", pointerTo(true), "", "", "")
+	otherRun.Labels[actionsv1alpha1.LabelWorkflowRunUID] = "other-run-uid"
+	disabledFailure := job("lint-failed", "lint", pointerTo(false), "runner-4", metav1.ConditionFalse, "JobFailed")
+	disabledQueued := job("lint-queued", "lint", pointerTo(false), "", "", "")
+	cancelledFailure := job("cancelled-failed", "cancelled", pointerTo(true), "runner-5", metav1.ConditionFalse, "CancellationRequested")
+	cancelledQueued := job("cancelled-queued", "cancelled", pointerTo(true), "", "", "")
+	objects := []client.Object{run, failed, queued, active, completed, otherGroup, otherRun, disabledFailure, disabledQueued, cancelledFailure, cancelledQueued}
+	clusterClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&actionsv1alpha1.WorkflowJob{}).WithObjects(objects...).Build()
+
+	reconciler := &WorkflowRunReconciler{Client: clusterClient, APIReader: clusterClient}
+	jobs := &actionsv1alpha1.WorkflowJobList{}
+	if err := clusterClient.List(context.Background(), jobs); err != nil {
+		t.Fatal(err)
+	}
+	pending, err := reconciler.reconcileMatrixFailFast(context.Background(), jobs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !pending {
+		t.Fatal("active matrix sibling did not keep fail-fast reconciliation pending")
+	}
+
+	jobs = &actionsv1alpha1.WorkflowJobList{}
+	if err := clusterClient.List(context.Background(), jobs); err != nil {
+		t.Fatal(err)
+	}
+	restarted := &WorkflowRunReconciler{Client: clusterClient, APIReader: clusterClient}
+	if pending, err := restarted.reconcileMatrixFailFast(context.Background(), jobs); err != nil || !pending {
+		t.Fatalf("restart reconciliation = pending %v, error %v", pending, err)
+	}
+
+	stored := func(name string) *actionsv1alpha1.WorkflowJob {
+		workflowJob := &actionsv1alpha1.WorkflowJob{}
+		if err := clusterClient.Get(context.Background(), client.ObjectKey{Namespace: run.Namespace, Name: name}, workflowJob); err != nil {
+			t.Fatal(err)
+		}
+		return workflowJob
+	}
+	queuedJob := stored(queued.Name)
+	if queuedJob.Status.Result != actionsv1alpha1.WorkflowJobResultCancelled || queuedJob.Status.CompletionTime == nil {
+		t.Fatalf("queued status = %#v", queuedJob.Status)
+	}
+	queuedScheduled := meta.FindStatusCondition(queuedJob.Status.Conditions, actionsv1alpha1.WorkflowJobConditionScheduled)
+	if queuedScheduled == nil || queuedScheduled.Status != metav1.ConditionFalse || queuedScheduled.Reason != matrixFailFastReason {
+		t.Fatalf("queued scheduled condition = %#v", queuedScheduled)
+	}
+	activeCancellation := meta.FindStatusCondition(stored(active.Name).Status.Conditions, actionsv1alpha1.WorkflowJobConditionCancellationRequested)
+	if activeCancellation == nil || activeCancellation.Status != metav1.ConditionTrue || activeCancellation.Reason != matrixFailFastReason {
+		t.Fatalf("active cancellation = %#v", activeCancellation)
+	}
+	if result := meta.FindStatusCondition(stored(completed.Name).Status.Conditions, actionsv1alpha1.WorkflowJobConditionSucceeded); result == nil || result.Status != metav1.ConditionTrue {
+		t.Fatalf("concurrently completed result = %#v", result)
+	}
+	for _, unaffected := range []*actionsv1alpha1.WorkflowJob{otherGroup, otherRun, disabledQueued, cancelledQueued} {
+		if result := meta.FindStatusCondition(stored(unaffected.Name).Status.Conditions, actionsv1alpha1.WorkflowJobConditionSucceeded); result != nil {
+			t.Errorf("unrelated WorkflowJob %q result = %#v", unaffected.Name, result)
+		}
+	}
+	if result := meta.FindStatusCondition(stored(failed.Name).Status.Conditions, actionsv1alpha1.WorkflowJobConditionSucceeded); result == nil || result.Reason != "JobFailed" {
+		t.Fatalf("triggering failure = %#v", result)
 	}
 }

@@ -361,6 +361,135 @@ func TestMatrixMaxParallelLimitsRunnerClaims(t *testing.T) {
 	}
 }
 
+func TestMatrixFailFastFailurePreventsNewClaims(t *testing.T) {
+	scheme := runnerTestScheme(t)
+	project := &actionsv1alpha1.Project{ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: "default", UID: types.UID("project-uid")}}
+	run := &actionsv1alpha1.WorkflowRun{
+		ObjectMeta: metav1.ObjectMeta{Name: "release", Namespace: "default", UID: types.UID("run-uid")},
+		Status: actionsv1alpha1.WorkflowRunStatus{Conditions: []metav1.Condition{
+			plannedCondition(metav1.ConditionTrue, "JobsPlanned"),
+		}},
+	}
+	runnerObject := &actionsv1alpha1.Runner{
+		ObjectMeta: metav1.ObjectMeta{Name: "runner-1", Namespace: "default", UID: "runner-1"},
+		Spec:       actionsv1alpha1.RunnerSpec{Labels: []string{"ubuntu-latest"}},
+	}
+	job := func(name, logicalID string, failFast *bool) *actionsv1alpha1.WorkflowJob {
+		return &actionsv1alpha1.WorkflowJob{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: name, Namespace: "default",
+				Labels:      map[string]string{actionsv1alpha1.LabelProjectUID: string(project.UID), actionsv1alpha1.LabelWorkflowRunUID: string(run.UID)},
+				Annotations: map[string]string{actionsv1alpha1.AnnotationProjectName: project.Name},
+			},
+			Spec: actionsv1alpha1.WorkflowJobSpec{
+				WorkflowRunRef: corev1.LocalObjectReference{Name: run.Name}, JobID: name, RunsOn: []string{"ubuntu-latest"},
+				Matrix: &actionsv1alpha1.WorkflowJobMatrix{LogicalJobID: logicalID, Values: map[string]string{"case": name}, MaxParallel: 1, FailFast: failFast},
+			},
+		}
+	}
+	failed := job("build-failed", "build", nil)
+	meta.SetStatusCondition(&failed.Status.Conditions, metav1.Condition{
+		Type: actionsv1alpha1.WorkflowJobConditionSucceeded, Status: metav1.ConditionFalse, Reason: "JobFailed", Message: "Failed",
+	})
+	blocked := job("build-queued", "build", nil)
+	unrelated := job("test-queued", "test", nil)
+	disabledFailed := job("lint-failed", "lint", pointerTo(false))
+	meta.SetStatusCondition(&disabledFailed.Status.Conditions, metav1.Condition{
+		Type: actionsv1alpha1.WorkflowJobConditionSucceeded, Status: metav1.ConditionFalse, Reason: "JobFailed", Message: "Failed",
+	})
+	disabledQueued := job("lint-queued", "lint", pointerTo(false))
+	clusterClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithIndex(&actionsv1alpha1.WorkflowJob{}, workflowJobQueuedIndex, indexQueuedWorkflowJob).
+		WithIndex(&actionsv1alpha1.WorkflowJob{}, workflowJobProjectNameIndex, indexWorkflowJobProjectName).
+		WithStatusSubresource(&actionsv1alpha1.Runner{}, &actionsv1alpha1.WorkflowJob{}).
+		WithObjects(project, run, runnerObject, failed, blocked, unrelated, disabledFailed, disabledQueued).
+		Build()
+	reconciler := &RunnerReconciler{Client: clusterClient, APIReader: clusterClient}
+
+	claimed, err := reconciler.claimWorkflowJob(context.Background(), runnerObject, project)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claimed == nil || claimed.Name != disabledQueued.Name {
+		t.Fatalf("claim after matrix failure = %#v", claimed)
+	}
+}
+
+func TestMatrixFailFastCancelsActiveNativeJobAndReleasesRunner(t *testing.T) {
+	scheme := runnerTestScheme(t)
+	run := &actionsv1alpha1.WorkflowRun{
+		TypeMeta:   metav1.TypeMeta{APIVersion: actionsv1alpha1.GroupVersion.String(), Kind: "WorkflowRun"},
+		ObjectMeta: metav1.ObjectMeta{Name: "release", Namespace: "default", UID: types.UID("run-uid")},
+	}
+	runnerObject := &actionsv1alpha1.Runner{
+		ObjectMeta: metav1.ObjectMeta{Name: "runner-1", Namespace: "default", UID: types.UID("runner-uid"), Finalizers: []string{runnerFinalizer}},
+		Status:     actionsv1alpha1.RunnerStatus{WorkflowJobRef: &corev1.LocalObjectReference{Name: "build-arm64"}},
+	}
+	workflowJob := &actionsv1alpha1.WorkflowJob{
+		TypeMeta: metav1.TypeMeta{APIVersion: actionsv1alpha1.GroupVersion.String(), Kind: "WorkflowJob"},
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "build-arm64", Namespace: "default", UID: types.UID("job-uid"),
+			Labels: map[string]string{actionsv1alpha1.LabelWorkflowRunUID: string(run.UID)},
+		},
+		Spec: actionsv1alpha1.WorkflowJobSpec{
+			WorkflowRunRef: corev1.LocalObjectReference{Name: run.Name}, JobID: "build-matrix-2", RunsOn: []string{"ubuntu-latest"},
+			Matrix: &actionsv1alpha1.WorkflowJobMatrix{LogicalJobID: "build", Values: map[string]string{"arch": "arm64"}},
+		},
+		Status: actionsv1alpha1.WorkflowJobStatus{
+			RunnerRef: &corev1.LocalObjectReference{Name: runnerObject.Name},
+			Conditions: []metav1.Condition{
+				{Type: actionsv1alpha1.WorkflowJobConditionScheduled, Status: metav1.ConditionTrue, Reason: "RunnerAssigned", Message: "Assigned"},
+				{Type: actionsv1alpha1.WorkflowJobConditionSucceeded, Status: metav1.ConditionUnknown, Reason: "JobRunning", Message: "Running"},
+				{Type: actionsv1alpha1.WorkflowJobConditionCancellationRequested, Status: metav1.ConditionTrue, Reason: matrixFailFastReason, Message: matrixFailFastMessage},
+			},
+		},
+	}
+	if err := controllerutil.SetControllerReference(run, workflowJob, scheme); err != nil {
+		t.Fatal(err)
+	}
+	nativeJob := &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: workflowJob.Name, Namespace: workflowJob.Namespace, UID: types.UID("native-job-uid")}}
+	if err := controllerutil.SetControllerReference(workflowJob, nativeJob, scheme); err != nil {
+		t.Fatal(err)
+	}
+	clusterClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithIndex(&actionsv1alpha1.WorkflowJob{}, workflowJobRunnerNameIndex, indexWorkflowJobRunnerName).
+		WithStatusSubresource(&actionsv1alpha1.Runner{}, &actionsv1alpha1.WorkflowJob{}, &batchv1.Job{}).
+		WithObjects(run, runnerObject, workflowJob, nativeJob).
+		Build()
+	reconciler := &RunnerReconciler{Client: clusterClient, APIReader: clusterClient}
+	request := ctrl.Request{NamespacedName: client.ObjectKeyFromObject(runnerObject)}
+
+	if _, err := reconciler.Reconcile(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	if err := clusterClient.Get(context.Background(), client.ObjectKeyFromObject(nativeJob), &batchv1.Job{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("native Job remains after cancellation request: %v", err)
+	}
+	if _, err := reconciler.Reconcile(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	storedJob := &actionsv1alpha1.WorkflowJob{}
+	if err := clusterClient.Get(context.Background(), client.ObjectKeyFromObject(workflowJob), storedJob); err != nil {
+		t.Fatal(err)
+	}
+	result := meta.FindStatusCondition(storedJob.Status.Conditions, actionsv1alpha1.WorkflowJobConditionSucceeded)
+	if result == nil || result.Status != metav1.ConditionFalse || result.Reason != matrixFailFastReason {
+		t.Fatalf("cancelled WorkflowJob result = %#v", result)
+	}
+	if storedJob.Status.Result != actionsv1alpha1.WorkflowJobResultCancelled {
+		t.Fatalf("cancelled WorkflowJob status result = %q", storedJob.Status.Result)
+	}
+	storedRunner := &actionsv1alpha1.Runner{}
+	if err := clusterClient.Get(context.Background(), client.ObjectKeyFromObject(runnerObject), storedRunner); err != nil {
+		t.Fatal(err)
+	}
+	if storedRunner.Status.WorkflowJobRef != nil {
+		t.Fatalf("runner assignment = %#v", storedRunner.Status.WorkflowJobRef)
+	}
+}
+
 func TestRunnerDoesNotClaimWorkflowJobBeforePlanningCompletes(t *testing.T) {
 	scheme := runnerTestScheme(t)
 	runnerObject := &actionsv1alpha1.Runner{
