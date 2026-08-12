@@ -28,11 +28,12 @@ import (
 )
 
 const (
-	sessionCookieName = "open_actions_console_session"
-	sessionLifetime   = 7 * 24 * time.Hour
-	streamHeartbeat   = 15 * time.Second
-	maxLogLineBytes   = 256 << 10
-	mainPageRunLimit  = 100
+	sessionCookieName  = "open_actions_console_session"
+	sessionLifetime    = 7 * 24 * time.Hour
+	streamHeartbeat    = 15 * time.Second
+	maxLogLineBytes    = 256 << 10
+	truncatedLogMarker = " … [log line truncated]"
+	mainPageRunLimit   = 100
 )
 
 var errLogsUnavailable = errors.New("logs are no longer available")
@@ -494,7 +495,13 @@ func readLogStream(ctx context.Context, stream io.Reader) <-chan logRead {
 				line = line[:maxLogLineBytes]
 				text := strings.ToValidUTF8(string(line), "�")
 				timestamp, content := splitLogTimestamp(strings.TrimSuffix(text, "\r"))
-				entry := logEntry{Kind: "output", Text: content + " … [log line truncated]", Time: timestamp}
+				entry := logEntry{Kind: "output", Text: content, Time: timestamp}
+				entry.Text, entry.Parts = parser.ansi.format(entry.Text)
+				parser.ansi.reset()
+				entry.Text += truncatedLogMarker
+				if entry.Parts != nil {
+					entry.Parts = append(entry.Parts, logTextPart{Text: truncatedLogMarker})
+				}
 				if !send(logRead{entry: &entry}) {
 					return
 				}

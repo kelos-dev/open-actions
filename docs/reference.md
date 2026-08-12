@@ -49,8 +49,11 @@ escaped command data and properties, and `stop-commands` markers. It also shows
 action input and output names without persisting their values and groups post
 actions separately. Workflow step headings show running, succeeded, failed, and
 cancelled states; succeeded steps collapse automatically, while failed and
-cancelled steps remain expanded. Log lines larger than 256 KiB are truncated so
-a workflow cannot retain unbounded Console memory.
+cancelled steps remain expanded. ANSI SGR foreground and background colors,
+including standard, bright, 256-color, and RGB values, are rendered along with
+bold, dim, italic, underline, and strike-through text. Other CSI control
+sequences are discarded. Log lines larger than 256 KiB are truncated so a
+workflow cannot retain unbounded Console memory.
 
 The runner accepts `::command::` and bracket-form `##[command]` syntax, with
 the property delimiters and escape rules defined for each form. It consumes

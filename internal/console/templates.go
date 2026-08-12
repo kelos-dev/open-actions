@@ -142,11 +142,15 @@ const logPageTemplate = `<!doctype html>
     const iconFor=kind=>({debug:'◆',notice:'●',warning:'▲',error:'✕',runner:'›',command:'$',input:'↳','step-output':'↳'})[kind]||'';
     const conclusionLabel=value=>({success:'Succeeded',failure:'Failed',cancelled:'Cancelled'})[value]||'Running';
     function setGroupConclusion(container,conclusion){const mark=container.status;if(!mark)return;mark.className='group-status '+conclusion;mark.setAttribute('aria-label',conclusionLabel(conclusion));mark.title=conclusionLabel(conclusion)}
+    function appendLogText(target,entry){
+      if(!entry.parts){target.textContent=entry.text||'';return}
+      for(const part of entry.parts){const span=document.createElement('span');span.textContent=part.text||'';if(part.foreground)span.style.color=part.foreground;if(part.background)span.style.backgroundColor=part.background;if(part.bold)span.style.fontWeight='700';if(part.dim)span.style.opacity='.65';if(part.italic)span.style.fontStyle='italic';const decoration=[];if(part.underline)decoration.push('underline');if(part.strike)decoration.push('line-through');if(decoration.length)span.style.textDecorationLine=decoration.join(' ');target.append(span)}
+    }
     function addLine(entry){
       if(entry.kind==='group'){
         if(entry.scope==='workflow'||entry.scope==='post')while(containers.length>1)containers.pop();
         const details=document.createElement('details');details.className='log-group';details.open=true;
-        const summary=document.createElement('summary');const label=document.createElement('span');label.textContent=entry.text||'Log group';
+        const summary=document.createElement('summary');const label=document.createElement('span');if(entry.text)appendLogText(label,entry);else label.textContent='Log group';
         let status;if(entry.scope==='workflow'){status=document.createElement('span');status.className='group-status running';status.setAttribute('aria-label','Running');status.title='Running';summary.append(status)}summary.append(label);
         if(entry.time){const time=document.createElement('span');time.className='group-time';time.textContent=timestamp(entry.time);summary.append(time)}
         const body=document.createElement('div');details.append(summary,body);current().append(details);containers.push({body,details,status,scope:entry.scope||'command'});return;
@@ -156,7 +160,7 @@ const logPageTemplate = `<!doctype html>
       const time=document.createElement('span');time.className='line-time';time.textContent=timestamp(entry.time);
       const icon=document.createElement('span');icon.className='line-icon';icon.textContent=iconFor(entry.kind);
       const text=document.createElement('span');text.className='line-text';
-      if(entry.kind==='input'||entry.kind==='step-output'){const key=document.createElement('span');key.className='metadata-key';key.textContent=(entry.kind==='input'?'with ':'output ')+(entry.text||'');text.append(key)}else{text.textContent=entry.text||''}
+      if(entry.kind==='input'||entry.kind==='step-output'){const key=document.createElement('span');key.className='metadata-key';key.textContent=(entry.kind==='input'?'with ':'output ')+(entry.text||'');text.append(key)}else{appendLogText(text,entry)}
       if(entry.properties){const detail=[];if(entry.properties.title)detail.push(entry.properties.title);let location=entry.properties.file||'';if(entry.properties.line)location+=(location?':':'line ')+entry.properties.line;if(entry.properties.col)location+=':'+entry.properties.col;if(entry.properties.endline){location+='-'+entry.properties.endline;if(entry.properties.endcolumn)location+=':'+entry.properties.endcolumn}else if(entry.properties.endcolumn){location+='-'+entry.properties.endcolumn}if(location)detail.push(location);if(detail.length){const annotation=document.createElement('small');annotation.className='annotation';annotation.textContent=detail.join(' · ');text.append(document.createElement('br'),annotation)}}
       line.append(time,icon,text);current().append(line);
       if(entry.kind==='debug'){debugLines++;debugCount.textContent=String(debugLines);debugCount.classList.add('visible')}

@@ -3,6 +3,7 @@ package console
 import (
 	"context"
 	"io"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -148,8 +149,57 @@ func TestActionLogParserStructuresRunnerMessages(t *testing.T) {
 	}
 }
 
+func TestActionLogParserFormatsANSIOutput(t *testing.T) {
+	parser := &actionLogParser{}
+	entry, visible := parser.parse("plain \x1b[38;5;243mgray \x1b[1mbold\x1b[0m end")
+	if !visible || entry.Text != "plain gray bold end" {
+		t.Fatalf("entry = %#v, %t", entry, visible)
+	}
+	want := []logTextPart{
+		{Text: "plain "},
+		{Text: "gray ", Foreground: "#767676"},
+		{Text: "bold", Foreground: "#767676", Bold: true},
+		{Text: " end"},
+	}
+	if !reflect.DeepEqual(entry.Parts, want) {
+		t.Fatalf("parts = %#v, want %#v", entry.Parts, want)
+	}
+
+	entry, visible = parser.parse("\x1b[38;2;12;34;56;48;5;196;3;4;9mstyled\x1b[22;23;24;29;39;49m plain")
+	if !visible || entry.Text != "styled plain" {
+		t.Fatalf("entry = %#v, %t", entry, visible)
+	}
+	want = []logTextPart{
+		{Text: "styled", Foreground: "#0c2238", Background: "#ff0000", Italic: true, Underline: true, Strike: true},
+		{Text: " plain"},
+	}
+	if !reflect.DeepEqual(entry.Parts, want) {
+		t.Fatalf("parts = %#v, want %#v", entry.Parts, want)
+	}
+}
+
+func TestActionLogParserCarriesANSIStyleAcrossLines(t *testing.T) {
+	parser := &actionLogParser{}
+	first, visible := parser.parse("\x1b[31mred")
+	if !visible || first.Text != "red" || !reflect.DeepEqual(first.Parts, []logTextPart{{Text: "red", Foreground: "#800000"}}) {
+		t.Fatalf("first entry = %#v, %t", first, visible)
+	}
+	second, visible := parser.parse("continued\x1b[0m plain")
+	want := []logTextPart{{Text: "continued", Foreground: "#800000"}, {Text: " plain"}}
+	if !visible || second.Text != "continued plain" || !reflect.DeepEqual(second.Parts, want) {
+		t.Fatalf("second entry = %#v, %t", second, visible)
+	}
+	third, visible := parser.parse("unstyled")
+	if !visible || third.Text != "unstyled" || third.Parts != nil {
+		t.Fatalf("third entry = %#v, %t", third, visible)
+	}
+}
+
 func TestReadLogStreamTruncatesOversizedLinesAndContinues(t *testing.T) {
-	stream := strings.NewReader(strings.Repeat("x", maxLogLineBytes+100) + "\n::debug::after\n")
+	prefix := "\x1b[31msome output "
+	incompleteEscape := "\x1b[3"
+	line := prefix + strings.Repeat("x", maxLogLineBytes-len(prefix)-len(incompleteEscape)) + incompleteEscape + "1mhidden\n"
+	stream := strings.NewReader(line + "::debug::after\n")
 	reads := readLogStream(context.Background(), stream)
 	var entries []logEntry
 	var finalError error
@@ -164,11 +214,18 @@ func TestReadLogStreamTruncatesOversizedLinesAndContinues(t *testing.T) {
 	if finalError != io.EOF {
 		t.Fatalf("final error = %v", finalError)
 	}
-	if len(entries) != 2 || !strings.HasSuffix(entries[0].Text, "[log line truncated]") || entries[1].Kind != "debug" || entries[1].Text != "after" {
+	if len(entries) != 2 || !strings.HasSuffix(entries[0].Text, truncatedLogMarker) || entries[1].Kind != "debug" || entries[1].Text != "after" {
 		t.Fatalf("entries = %#v", entries)
 	}
 	if len(entries[0].Text) > maxLogLineBytes+64 {
 		t.Fatalf("truncated line contains %d bytes", len(entries[0].Text))
+	}
+	if len(entries[0].Parts) != 2 {
+		t.Fatalf("ANSI parts = %#v", entries[0].Parts)
+	}
+	lastPart := entries[0].Parts[len(entries[0].Parts)-1]
+	if entries[0].Parts[0].Foreground != "#800000" || lastPart != (logTextPart{Text: truncatedLogMarker}) || entries[1].Parts != nil {
+		t.Fatalf("ANSI parts = %#v, %#v", entries[0].Parts, entries[1].Parts)
 	}
 }
 
