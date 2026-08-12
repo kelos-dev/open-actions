@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"net/url"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -426,6 +427,11 @@ func (h *Handler) streamJobLogs(writer http.ResponseWriter, request *http.Reques
 		h.writeResolutionError(writer, request, err)
 		return
 	}
+	lastLogID, err := parseLastEventID(request.Header.Get("Last-Event-ID"))
+	if err != nil {
+		http.Error(writer, "invalid Last-Event-ID", http.StatusBadRequest)
+		return
+	}
 	flusher, ok := writer.(http.Flusher)
 	if !ok {
 		http.Error(writer, "streaming is unsupported", http.StatusInternalServerError)
@@ -449,6 +455,8 @@ func (h *Handler) streamJobLogs(writer http.ResponseWriter, request *http.Reques
 	reads := readLogStream(request.Context(), stream)
 	heartbeat := time.NewTicker(streamHeartbeat)
 	defer heartbeat.Stop()
+	// Log IDs are positions in the currently retained Pod log, not durable offsets across log rotation.
+	var logID uint64
 	for {
 		select {
 		case result, ok := <-reads:
@@ -456,7 +464,10 @@ func (h *Handler) streamJobLogs(writer http.ResponseWriter, request *http.Reques
 				return
 			}
 			if result.entry != nil {
-				writeEvent(writer, flusher, "log", result.entry)
+				logID++
+				if logID > lastLogID {
+					writeLogEvent(writer, flusher, logID, result.entry)
+				}
 			}
 			if result.err == nil {
 				continue
@@ -473,6 +484,13 @@ func (h *Handler) streamJobLogs(writer http.ResponseWriter, request *http.Reques
 			return
 		}
 	}
+}
+
+func parseLastEventID(value string) (uint64, error) {
+	if value == "" {
+		return 0, nil
+	}
+	return strconv.ParseUint(value, 10, 64)
 }
 
 func readLogStream(ctx context.Context, stream io.Reader) <-chan logRead {
@@ -662,6 +680,12 @@ func sessionValue(token string) string {
 func writeEvent(writer io.Writer, flusher http.Flusher, event string, value any) {
 	encoded, _ := json.Marshal(value)
 	_, _ = fmt.Fprintf(writer, "event: %s\ndata: %s\n\n", event, encoded)
+	flusher.Flush()
+}
+
+func writeLogEvent(writer io.Writer, flusher http.Flusher, id uint64, value any) {
+	encoded, _ := json.Marshal(value)
+	_, _ = fmt.Fprintf(writer, "id: %d\nevent: log\ndata: %s\n\n", id, encoded)
 	flusher.Flush()
 }
 

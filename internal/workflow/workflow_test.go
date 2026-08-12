@@ -360,7 +360,10 @@ func TestParseDogfoodE2EWorkflow(t *testing.T) {
 	if got, want := []string(job.RunsOn), []string{"self-hosted", "linux", "x64", "docker"}; !slices.Equal(got, want) {
 		t.Errorf("runs-on = %v, want %v", got, want)
 	}
-	if len(job.Steps) < 3 || job.Steps[2].Uses != "helm/kind-action@v1" {
+	if len(job.Steps) < 4 || job.Steps[2].Uses != "azure/setup-helm@v4" || job.Steps[2].With["version"] != "3.20.1" {
+		t.Errorf("setup Helm step = %#v", job.Steps)
+	}
+	if len(job.Steps) < 4 || job.Steps[3].Uses != "helm/kind-action@v1" {
 		t.Errorf("kind action step = %#v", job.Steps)
 	}
 }

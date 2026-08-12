@@ -88,7 +88,7 @@ func TestConsoleAuthenticatesWithStaticTokenAndStreamsLogs(t *testing.T) {
 	streamRequest.AddCookie(sessionCookie)
 	streamResponse := httptest.NewRecorder()
 	handler.ServeHTTP(streamResponse, streamRequest)
-	if streamResponse.Code != http.StatusOK || !strings.Contains(streamResponse.Body.String(), "event: log") || !strings.Contains(streamResponse.Body.String(), "build output") {
+	if streamResponse.Code != http.StatusOK || !strings.Contains(streamResponse.Body.String(), "id: 1\nevent: log") || !strings.Contains(streamResponse.Body.String(), "build output") {
 		t.Fatalf("log stream = %d, %q", streamResponse.Code, streamResponse.Body.String())
 	}
 }
@@ -105,6 +105,22 @@ func TestConsoleKeepsTimestampedLogContentOnOneGridRow(t *testing.T) {
 	}
 	if !strings.Contains(response.Body.String(), ".show-time .log-line{grid-template-columns:auto auto auto minmax(0,1fr)}") {
 		t.Fatal("log page does not provide a fourth grid column for timestamps")
+	}
+}
+
+func TestConsoleResumesReconnectedLogStream(t *testing.T) {
+	handler := newTestHandler(t, false)
+	source := handler.logs.(*testLogSource)
+	source.logs = "first\nsecond\nthird\n"
+
+	request := httptest.NewRequest(http.MethodGet, "/runs/default/ci/jobs/build/stream", nil)
+	request.Header.Set("Authorization", "Bearer "+testConsoleToken)
+	request.Header.Set("Last-Event-ID", "2")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	body := response.Body.String()
+	if response.Code != http.StatusOK || strings.Contains(body, `"text":"first"`) || strings.Contains(body, `"text":"second"`) || !strings.Contains(body, "id: 3\nevent: log") || !strings.Contains(body, `"text":"third"`) {
+		t.Fatalf("resumed log stream = %d, %q", response.Code, body)
 	}
 }
 
