@@ -136,6 +136,7 @@ type Job struct {
 type Strategy struct {
 	Matrix         map[string][]any
 	MaxParallel    int32
+	FailFast       bool
 	configured     bool
 	maxParallelSet bool
 }
@@ -1091,6 +1092,7 @@ func lowerASCII(value string) string {
 
 func (s *Strategy) UnmarshalYAML(node *yaml.Node) error {
 	s.configured = true
+	s.FailFast = true
 	if node.Kind != yaml.MappingNode {
 		return fmt.Errorf("job strategy must be a mapping")
 	}
@@ -1114,6 +1116,10 @@ func (s *Strategy) UnmarshalYAML(node *yaml.Node) error {
 		case "max-parallel":
 			s.maxParallelSet = true
 			if err := value.Decode(&s.MaxParallel); err != nil {
+				return err
+			}
+		case "fail-fast":
+			if err := value.Decode(&s.FailFast); err != nil {
 				return err
 			}
 		default:

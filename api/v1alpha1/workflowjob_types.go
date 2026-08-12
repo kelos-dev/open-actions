@@ -82,7 +82,7 @@ type WorkflowJobSpec struct {
 }
 
 // WorkflowJobMatrix identifies one expanded combination of a logical workflow
-// job. The controller writes the same MaxParallel value to every combination
+// job. The controller writes the same strategy settings to every combination
 // of a logical job.
 type WorkflowJobMatrix struct {
 	// LogicalJobID is the workflow-local identifier before matrix expansion.
@@ -105,6 +105,12 @@ type WorkflowJobMatrix struct {
 	// +kubebuilder:validation:Minimum=1
 	// +optional
 	MaxParallel int32 `json:"maxParallel,omitempty"`
+
+	// FailFast requests cancellation of unfinished combinations in this logical
+	// job after one combination fails. It defaults to true.
+	// +kubebuilder:default=true
+	// +optional
+	FailFast *bool `json:"failFast,omitempty"`
 }
 
 // WorkflowJobStatus contains observations made while executing a workflow job.

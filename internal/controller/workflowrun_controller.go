@@ -570,6 +570,7 @@ func (r *WorkflowRunReconciler) planWorkflowJobs(run *actionsv1alpha1.WorkflowRu
 					LogicalJobID: id,
 					Values:       matrixStringValues(matrix),
 					MaxParallel:  definitionJob.Strategy.MaxParallel,
+					FailFast:     pointerTo(definitionJob.Strategy.FailFast),
 				}
 			}
 			if _, found := plannedIDs[expandedID]; found {
@@ -1015,10 +1016,15 @@ func (r *WorkflowRunReconciler) observeWorkflowJobs(ctx context.Context, run *ac
 	if err := reader.List(ctx, jobs, client.InNamespace(run.Namespace), client.MatchingLabels{actionsv1alpha1.LabelWorkflowRunUID: string(run.UID)}); err != nil {
 		return ctrl.Result{}, err
 	}
+	failFastPending, err := r.reconcileMatrixFailFast(ctx, jobs)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
 	status := &actionsv1alpha1.WorkflowRunJobStatus{Total: total}
 	var startTime *metav1.Time
 	lostState := ""
 	waitingForRuntimeState := false
+	hasNonFailFastCancellation := false
 	if int32(len(jobs.Items)) != total {
 		active, err := activeRuntimeWorkloads(ctx, reader, run)
 		if err != nil {
@@ -1078,6 +1084,9 @@ func (r *WorkflowRunReconciler) observeWorkflowJobs(ctx context.Context, run *ac
 			status.Skipped++
 		case result == actionsv1alpha1.WorkflowJobResultCancelled:
 			status.Cancelled++
+			if !workflowJobCancelledByMatrixFailFast(job) {
+				hasNonFailFastCancellation = true
+			}
 		case job.Status.RunnerRef != nil:
 			status.Active++
 		case workflowJobReady(job):
@@ -1142,7 +1151,7 @@ func (r *WorkflowRunReconciler) observeWorkflowJobs(ctx context.Context, run *ac
 		}
 	}
 	switch {
-	case terminal && status.Cancelled > 0:
+	case terminal && hasNonFailFastCancellation:
 		now := metav1.Now()
 		run.Status.CompletionTime = &now
 		meta.SetStatusCondition(&run.Status.Conditions, metav1.Condition{Type: actionsv1alpha1.WorkflowRunConditionSucceeded, Status: metav1.ConditionFalse, ObservedGeneration: run.Generation, Reason: "JobCancelled", Message: "At least one WorkflowJob was cancelled"})
@@ -1154,6 +1163,10 @@ func (r *WorkflowRunReconciler) observeWorkflowJobs(ctx context.Context, run *ac
 		now := metav1.Now()
 		run.Status.CompletionTime = &now
 		meta.SetStatusCondition(&run.Status.Conditions, metav1.Condition{Type: actionsv1alpha1.WorkflowRunConditionSucceeded, Status: metav1.ConditionFalse, ObservedGeneration: run.Generation, Reason: "JobFailed", Message: "At least one WorkflowJob failed"})
+	case terminal && status.Cancelled > 0:
+		now := metav1.Now()
+		run.Status.CompletionTime = &now
+		meta.SetStatusCondition(&run.Status.Conditions, metav1.Condition{Type: actionsv1alpha1.WorkflowRunConditionSucceeded, Status: metav1.ConditionFalse, ObservedGeneration: run.Generation, Reason: "JobCancelled", Message: "At least one WorkflowJob was cancelled"})
 	case terminal:
 		now := metav1.Now()
 		run.Status.CompletionTime = &now
@@ -1170,7 +1183,7 @@ func (r *WorkflowRunReconciler) observeWorkflowJobs(ctx context.Context, run *ac
 			return ctrl.Result{}, err
 		}
 	}
-	if waitingForRuntimeState {
+	if waitingForRuntimeState || failFastPending {
 		return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
 	}
 	return ctrl.Result{}, nil
@@ -1486,6 +1499,54 @@ func workflowJobResult(job *actionsv1alpha1.WorkflowJob) actionsv1alpha1.Workflo
 
 func workflowJobTerminal(job *actionsv1alpha1.WorkflowJob) bool {
 	return workflowJobResult(job) != ""
+}
+
+func workflowJobCancelledByMatrixFailFast(job *actionsv1alpha1.WorkflowJob) bool {
+	if workflowJobResult(job) != actionsv1alpha1.WorkflowJobResultCancelled {
+		return false
+	}
+	for _, condition := range job.Status.Conditions {
+		if condition.Reason == matrixFailFastReason {
+			return true
+		}
+	}
+	return false
+}
+
+func (r *WorkflowRunReconciler) reconcileMatrixFailFast(ctx context.Context, jobs *actionsv1alpha1.WorkflowJobList) (bool, error) {
+	failedGroups := map[string]struct{}{}
+	for index := range jobs.Items {
+		job := &jobs.Items[index]
+		if workflowJobFailureTriggersMatrixFailFast(job) {
+			failedGroups[matrixJobGroup(job)] = struct{}{}
+		}
+	}
+	if len(failedGroups) == 0 {
+		return false, nil
+	}
+
+	pending := false
+	for index := range jobs.Items {
+		job := &jobs.Items[index]
+		if job.Spec.Matrix == nil || workflowJobTerminal(job) {
+			continue
+		}
+		if _, found := failedGroups[matrixJobGroup(job)]; !found {
+			continue
+		}
+
+		if job.Status.RunnerRef == nil {
+			if err := r.completeUnscheduledWorkflowJob(ctx, job, actionsv1alpha1.WorkflowJobResultCancelled, matrixFailFastReason, matrixFailFastMessage); err != nil {
+				return false, err
+			}
+		} else {
+			if err := r.setWorkflowJobCancellationRequested(ctx, job, true, matrixFailFastReason, matrixFailFastMessage); err != nil {
+				return false, err
+			}
+		}
+		pending = true
+	}
+	return pending, nil
 }
 
 func workflowJobRuntimeStateExists(ctx context.Context, reader client.Reader, workflowJob *actionsv1alpha1.WorkflowJob) (bool, error) {

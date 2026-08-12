@@ -622,6 +622,9 @@ func TestParseAndExpandMatrixStrategy(t *testing.T) {
 	if strategy.MaxParallel != 1 {
 		t.Fatalf("max-parallel = %d, want 1", strategy.MaxParallel)
 	}
+	if !strategy.FailFast {
+		t.Fatal("fail-fast defaulted to false")
+	}
 	combinations := MatrixCombinations(strategy)
 	if len(combinations) != 4 {
 		t.Fatalf("matrix combinations = %d, want 4", len(combinations))
@@ -635,6 +638,25 @@ func TestParseAndExpandMatrixStrategy(t *testing.T) {
 	}
 }
 
+func TestParseMatrixFailFast(t *testing.T) {
+	for _, test := range []struct {
+		value string
+		want  bool
+	}{
+		{value: "true", want: true},
+		{value: "false", want: false},
+	} {
+		data := fmt.Sprintf("name: Release\non: push\njobs:\n  build:\n    strategy: {fail-fast: %s, matrix: {arch: [amd64]}}\n    runs-on: ubuntu-latest\n    steps:\n      - run: make image\n", test.value)
+		definition, err := Parse([]byte(data))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := definition.Jobs["build"].Strategy.FailFast; got != test.want {
+			t.Errorf("fail-fast %s = %t, want %t", test.value, got, test.want)
+		}
+	}
+}
+
 func TestParseRejectsInvalidMatrixStrategy(t *testing.T) {
 	strategies := []string{
 		"strategy: {}",
@@ -643,7 +665,7 @@ func TestParseRejectsInvalidMatrixStrategy(t *testing.T) {
 		"strategy: {matrix: {arch: [{name: arm64}]}}",
 		"strategy: {matrix: {arch: [" + strings.Repeat("a", maxMatrixValueLength+1) + "]}}",
 		"strategy: {max-parallel: 0, matrix: {arch: [amd64]}}",
-		"strategy: {fail-fast: false, matrix: {arch: [amd64]}}",
+		"strategy: {fail-fast: [true], matrix: {arch: [amd64]}}",
 	}
 	for _, strategy := range strategies {
 		data := fmt.Sprintf("name: Release\non: push\njobs:\n  build:\n    %s\n    runs-on: ubuntu-latest\n    steps:\n      - run: make image\n", strategy)

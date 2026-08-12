@@ -154,14 +154,22 @@ trusted. See
 [`config/samples/actions_v1alpha1_docker_runner.yaml`](../config/samples/actions_v1alpha1_docker_runner.yaml)
 for a Docker-enabled Runner.
 
-A job strategy may define scalar matrix axes and an optional positive
-`max-parallel`. The controller creates one `WorkflowJob` per Cartesian-product
-combination in deterministic order. Each child has a unique `spec.jobID`, while
-`spec.matrix.logicalJobID`, `values`, and `maxParallel` preserve its logical
-identity and scheduling group. `max-parallel` limits active children in that
-group independently of the number of matching Runners. A failed matrix child
-makes the completed WorkflowRun fail. Strategy `fail-fast` is not supported;
-remaining combinations continue to completion after a child fails.
+A job strategy may define scalar matrix axes, an optional positive
+`max-parallel`, and an optional Boolean `fail-fast`. The controller creates one
+`WorkflowJob` per Cartesian-product combination in deterministic order. Each
+child has a unique `spec.jobID`, while `spec.matrix.logicalJobID`, `values`,
+`maxParallel`, and `failFast` preserve its logical identity and strategy.
+`max-parallel` limits active children in that group independently of the number
+of matching Runners.
+
+`fail-fast` defaults to `true`. After a matrix child fails, queued combinations
+in the same WorkflowRun and logical matrix job finish with `MatrixFailFast`, and
+active combinations receive a cancellation request. Cancellation stops the
+active command while still allowing eligible `cancelled()` and `always()` steps
+and action post hooks to run. A fail-fast cancellation is terminal and does not
+start another queued combination, including when `max-parallel` is set.
+Independent jobs and other logical matrix jobs continue normally. Set
+`fail-fast: false` to let every combination reach its normal terminal result.
 
 ### Conditions
 
@@ -183,13 +191,13 @@ The resources expose these condition contracts:
 | `WorkflowRun` | `Succeeded` | `False` | `ProjectUnavailable`, `WorkflowFetchFailed`, `WorkflowInvalid`, `TriggerInvalid`, `ChildCreationFailed`, `JobFailed`, `JobCancelled`, `ExecutionStateLost` |
 | `WorkflowJob` | `Ready` | `Unknown` | `DependenciesPending` |
 | `WorkflowJob` | `Ready` | `True` | `ConditionPassed` |
-| `WorkflowJob` | `Ready` | `False` | `ConditionFalse`, `ConditionEvaluationFailed`, `CancellationRequested` |
+| `WorkflowJob` | `Ready` | `False` | `ConditionFalse`, `ConditionEvaluationFailed`, `CancellationRequested`, `MatrixFailFast` |
 | `WorkflowJob` | `Scheduled` | `True` | `RunnerAssigned` |
-| `WorkflowJob` | `Scheduled` | `False` | `ConditionFalse`, `ConditionEvaluationFailed`, `CancellationRequested`, `ProjectRecreated` |
+| `WorkflowJob` | `Scheduled` | `False` | `ConditionFalse`, `ConditionEvaluationFailed`, `CancellationRequested`, `MatrixFailFast`, `ProjectRecreated` |
 | `WorkflowJob` | `Succeeded` | `Unknown` | `JobRunning` |
 | `WorkflowJob` | `Succeeded` | `True` | `JobSucceeded` |
-| `WorkflowJob` | `Succeeded` | `False` | `JobFailed`, `JobResultInvalid`, `ConditionEvaluationFailed`, `PlanUnavailable`, `JobStartFailed`, `ExecutionStateLost`, `CancellationRequested`, `ProjectRecreated` |
-| `WorkflowJob` | `CancellationRequested` | `True` | `CancellationRequested`, `ConditionEvaluationFailed` |
+| `WorkflowJob` | `Succeeded` | `False` | `JobFailed`, `JobResultInvalid`, `ConditionEvaluationFailed`, `PlanUnavailable`, `JobStartFailed`, `ExecutionStateLost`, `CancellationRequested`, `MatrixFailFast`, `ProjectRecreated` |
+| `WorkflowJob` | `CancellationRequested` | `True` | `CancellationRequested`, `ConditionEvaluationFailed`, `MatrixFailFast` |
 | `WorkflowJob` | `CancellationRequested` | `False` | `ConditionPassed` |
 
 `Project/Configured` covers local Secret availability, private-key parsing, and
@@ -506,12 +514,11 @@ version also determines the runner result version. A runner that accepts more
 than one plan version must emit the result version assigned to that plan, not
 always the latest result version supported by the runner binary.
 
-Docker and local actions, private cross-repository action authentication, job
-matrix `include` and `exclude`, strategy `fail-fast`, service
-containers, repository secret and variable sources, caches, and artifacts are
-not supported. Expressions outside the documented fields and runtime contexts
-are rejected during planning or execution and are never interpreted as literal
-values.
+Docker and local actions, private cross-repository action authentication,
+matrix `include` and `exclude`, service containers, repository
+secret and variable sources, caches, and artifacts are not supported.
+Expressions outside the documented fields and runtime contexts are rejected
+during planning or execution and are never interpreted as literal values.
 `WorkflowJob` resources are not retried or reassigned when a Runner is removed.
 Native Jobs and their Pod logs are deleted one hour after completion. Completed
 WorkflowRuns are retained indefinitely unless `spec.ttlSecondsAfterFinished` is
