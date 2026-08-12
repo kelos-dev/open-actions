@@ -395,7 +395,11 @@ func workflowRunCheckReport(run *actionsv1alpha1.WorkflowRun) checkRunReport {
 		report.summaryFromCondition(succeeded)
 	case succeeded != nil && succeeded.Status == metav1.ConditionFalse:
 		report.Status = "completed"
-		report.Conclusion = "failure"
+		if succeeded.Reason == "JobCancelled" {
+			report.Conclusion = "cancelled"
+		} else {
+			report.Conclusion = "failure"
+		}
 		report.summaryFromCondition(succeeded)
 	case !run.DeletionTimestamp.IsZero():
 		report.Status = "completed"
@@ -422,7 +426,7 @@ func workflowRunCheckReport(run *actionsv1alpha1.WorkflowRun) checkRunReport {
 	}
 	if run.Status.Jobs != nil {
 		jobs := run.Status.Jobs
-		report.Output.Text = fmt.Sprintf("Jobs: %d total, %d queued, %d active, %d succeeded, %d failed.", jobs.Total, jobs.Queued, jobs.Active, jobs.Succeeded, jobs.Failed)
+		report.Output.Text = fmt.Sprintf("Jobs: %d total, %d waiting, %d queued, %d active, %d succeeded, %d failed, %d skipped, %d cancelled.", jobs.Total, jobs.Waiting, jobs.Queued, jobs.Active, jobs.Succeeded, jobs.Failed, jobs.Skipped, jobs.Cancelled)
 	}
 	return report
 }
@@ -465,6 +469,8 @@ type plannedWorkflowJob struct {
 	id            string
 	displayName   string
 	runsOn        []string
+	needs         []string
+	condition     string
 	matrix        *actionsv1alpha1.WorkflowJobMatrix
 	plan          string
 	resultVersion string
@@ -503,6 +509,8 @@ func (r *WorkflowRunReconciler) ensureWorkflowJobs(ctx context.Context, run *act
 				JobID:          id,
 				DisplayName:    item.displayName,
 				RunsOn:         append([]string(nil), item.runsOn...),
+				Needs:          append([]string(nil), item.needs...),
+				If:             item.condition,
 				Matrix:         item.matrix.DeepCopy(),
 			},
 		}
@@ -601,7 +609,14 @@ func (r *WorkflowRunReconciler) planWorkflowJobs(run *actionsv1alpha1.WorkflowRu
 				resultVersion = jobResultVersion
 			}
 			plannedJobs = append(plannedJobs, plannedWorkflowJob{
-				id: expandedID, displayName: displayName, runsOn: append([]string(nil), resolvedJob.RunsOn...), matrix: matrixSpec, plan: string(data), resultVersion: resultVersion,
+				id:            expandedID,
+				displayName:   displayName,
+				runsOn:        append([]string(nil), resolvedJob.RunsOn...),
+				needs:         append([]string(nil), resolvedJob.Needs...),
+				condition:     resolvedJob.If,
+				matrix:        matrixSpec,
+				plan:          string(data),
+				resultVersion: resultVersion,
 			})
 		}
 	}
@@ -1015,10 +1030,18 @@ func (r *WorkflowRunReconciler) observeWorkflowJobs(ctx context.Context, run *ac
 			lostState = fmt.Sprintf("expected %d WorkflowJobs, found %d", total, len(jobs.Items))
 		}
 	}
+	if int32(len(jobs.Items)) == total {
+		inputValues, err := r.workflowJobGraphInputValues(ctx, jobs.Items)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		if err := r.reconcileWorkflowJobGraph(ctx, run, workflowName, inputValues, jobs.Items); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
 	for index := range jobs.Items {
 		job := &jobs.Items[index]
-		condition := meta.FindStatusCondition(job.Status.Conditions, actionsv1alpha1.WorkflowJobConditionSucceeded)
-		if condition == nil || (condition.Status != metav1.ConditionTrue && condition.Status != metav1.ConditionFalse) {
+		if !workflowJobTerminal(job) {
 			plan := &corev1.ConfigMap{}
 			planKey := client.ObjectKey{Namespace: job.Namespace, Name: childName(job.Name, "plan")}
 			planError := ""
@@ -1045,15 +1068,22 @@ func (r *WorkflowRunReconciler) observeWorkflowJobs(ctx context.Context, run *ac
 		if job.Status.StartTime != nil && (startTime == nil || job.Status.StartTime.Before(startTime)) {
 			startTime = job.Status.StartTime.DeepCopy()
 		}
+		result := workflowJobResult(job)
 		switch {
-		case condition != nil && condition.Status == metav1.ConditionTrue:
+		case result == actionsv1alpha1.WorkflowJobResultSuccess:
 			status.Succeeded++
-		case condition != nil && condition.Status == metav1.ConditionFalse:
+		case result == actionsv1alpha1.WorkflowJobResultFailure:
 			status.Failed++
+		case result == actionsv1alpha1.WorkflowJobResultSkipped:
+			status.Skipped++
+		case result == actionsv1alpha1.WorkflowJobResultCancelled:
+			status.Cancelled++
 		case job.Status.RunnerRef != nil:
 			status.Active++
-		default:
+		case workflowJobReady(job):
 			status.Queued++
+		default:
+			status.Waiting++
 		}
 	}
 	if lostState != "" {
@@ -1100,16 +1130,36 @@ func (r *WorkflowRunReconciler) observeWorkflowJobs(ctx context.Context, run *ac
 		Reason:             "JobsPlanned",
 		Message:            "All WorkflowJobs have been created",
 	})
-	terminal := int32(len(jobs.Items)) == total && status.Succeeded+status.Failed == status.Total
+	terminal := int32(len(jobs.Items)) == total && status.Succeeded+status.Failed+status.Skipped+status.Cancelled == status.Total
+	if terminal && status.Cancelled > 0 {
+		active, err := activeRuntimeWorkloads(ctx, reader, run)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		if active {
+			terminal = false
+			waitingForRuntimeState = true
+		}
+	}
 	switch {
+	case terminal && status.Cancelled > 0:
+		now := metav1.Now()
+		run.Status.CompletionTime = &now
+		meta.SetStatusCondition(&run.Status.Conditions, metav1.Condition{Type: actionsv1alpha1.WorkflowRunConditionSucceeded, Status: metav1.ConditionFalse, ObservedGeneration: run.Generation, Reason: "JobCancelled", Message: "At least one WorkflowJob was cancelled"})
+	case terminal && status.Failed > 0 && run.Spec.CancelRequested:
+		now := metav1.Now()
+		run.Status.CompletionTime = &now
+		meta.SetStatusCondition(&run.Status.Conditions, metav1.Condition{Type: actionsv1alpha1.WorkflowRunConditionSucceeded, Status: metav1.ConditionFalse, ObservedGeneration: run.Generation, Reason: "JobCancelled", Message: "Workflow cancellation was requested"})
 	case terminal && status.Failed > 0:
 		now := metav1.Now()
 		run.Status.CompletionTime = &now
 		meta.SetStatusCondition(&run.Status.Conditions, metav1.Condition{Type: actionsv1alpha1.WorkflowRunConditionSucceeded, Status: metav1.ConditionFalse, ObservedGeneration: run.Generation, Reason: "JobFailed", Message: "At least one WorkflowJob failed"})
-	case terminal && status.Succeeded == status.Total:
+	case terminal:
 		now := metav1.Now()
 		run.Status.CompletionTime = &now
-		meta.SetStatusCondition(&run.Status.Conditions, metav1.Condition{Type: actionsv1alpha1.WorkflowRunConditionSucceeded, Status: metav1.ConditionTrue, ObservedGeneration: run.Generation, Reason: "JobsSucceeded", Message: "All WorkflowJobs succeeded"})
+		meta.SetStatusCondition(&run.Status.Conditions, metav1.Condition{Type: actionsv1alpha1.WorkflowRunConditionSucceeded, Status: metav1.ConditionTrue, ObservedGeneration: run.Generation, Reason: "JobsSucceeded", Message: "All required WorkflowJobs succeeded"})
+	case status.Waiting > 0:
+		meta.SetStatusCondition(&run.Status.Conditions, metav1.Condition{Type: actionsv1alpha1.WorkflowRunConditionSucceeded, Status: metav1.ConditionUnknown, ObservedGeneration: run.Generation, Reason: "JobsWaiting", Message: "WorkflowJobs are waiting for dependencies"})
 	case status.Queued > 0:
 		meta.SetStatusCondition(&run.Status.Conditions, metav1.Condition{Type: actionsv1alpha1.WorkflowRunConditionSucceeded, Status: metav1.ConditionUnknown, ObservedGeneration: run.Generation, Reason: "JobsQueued", Message: "WorkflowJobs are waiting for matching Runners"})
 	default:
@@ -1124,6 +1174,318 @@ func (r *WorkflowRunReconciler) observeWorkflowJobs(ctx context.Context, run *ac
 		return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
 	}
 	return ctrl.Result{}, nil
+}
+
+func (r *WorkflowRunReconciler) workflowJobGraphInputValues(ctx context.Context, jobs []actionsv1alpha1.WorkflowJob) (map[string]any, error) {
+	for index := range jobs {
+		job := &jobs[index]
+		if workflowJobTerminal(job) || strings.TrimSpace(job.Spec.If) == "" {
+			continue
+		}
+		plan := &corev1.ConfigMap{}
+		key := client.ObjectKey{Namespace: job.Namespace, Name: childName(job.Name, "plan")}
+		if err := r.APIReader.Get(ctx, key, plan); err != nil {
+			if apierrors.IsNotFound(err) {
+				continue
+			}
+			return nil, err
+		}
+		if !metav1.IsControlledBy(plan, job) {
+			continue
+		}
+		var decoded struct {
+			Inputs map[string]any `json:"inputs"`
+		}
+		if err := json.Unmarshal([]byte(plan.Data[jobPlanKey]), &decoded); err != nil {
+			return nil, fmt.Errorf("decode plan for WorkflowJob %q: %w", job.Name, err)
+		}
+		return decoded.Inputs, nil
+	}
+	return nil, nil
+}
+
+func (r *WorkflowRunReconciler) reconcileWorkflowJobGraph(ctx context.Context, run *actionsv1alpha1.WorkflowRun, workflowName string, inputValues map[string]any, jobs []actionsv1alpha1.WorkflowJob) error {
+	jobsByID := make(map[string]*actionsv1alpha1.WorkflowJob, len(jobs))
+	jobsByLogicalID := make(map[string][]*actionsv1alpha1.WorkflowJob, len(jobs))
+	for index := range jobs {
+		job := &jobs[index]
+		if existing := jobsByID[job.Spec.JobID]; existing != nil {
+			return fmt.Errorf("WorkflowJobs %q and %q both represent job %q in WorkflowRun %q", existing.Name, job.Name, job.Spec.JobID, run.Name)
+		}
+		jobsByID[job.Spec.JobID] = job
+		logicalID := job.Spec.JobID
+		if job.Spec.Matrix != nil {
+			logicalID = job.Spec.Matrix.LogicalJobID
+		}
+		jobsByLogicalID[logicalID] = append(jobsByLogicalID[logicalID], job)
+	}
+
+	for index := range jobs {
+		job := &jobs[index]
+		if workflowJobTerminal(job) {
+			continue
+		}
+		if job.Status.RunnerRef != nil {
+			if run.Spec.CancelRequested {
+				if err := r.reconcileAssignedWorkflowJobCancellation(ctx, run, workflowName, inputValues, job, jobsByLogicalID); err != nil {
+					return err
+				}
+			}
+			continue
+		}
+		if workflowJobReadyCondition(job) && !run.Spec.CancelRequested {
+			continue
+		}
+		dependenciesReady := true
+		for _, dependency := range job.Spec.Needs {
+			needed := jobsByLogicalID[dependency]
+			if len(needed) == 0 {
+				return fmt.Errorf("WorkflowJob %q needs missing job %q in WorkflowRun %q", job.Name, dependency, run.Name)
+			}
+			for _, dependencyJob := range needed {
+				if !workflowJobTerminal(dependencyJob) {
+					dependenciesReady = false
+				}
+			}
+		}
+		if !dependenciesReady {
+			if err := r.setWorkflowJobWaiting(ctx, job); err != nil {
+				return err
+			}
+			continue
+		}
+
+		expressionContext := workflowexpression.Context{Status: workflowJobAncestorStatus(job, jobsByLogicalID, run.Spec.CancelRequested)}
+		if strings.TrimSpace(job.Spec.If) != "" {
+			expressionContext = r.jobExpressionContext(run, workflowName, inputValues)
+			expressionContext.Values["needs"] = workflowNeedsContext(job, jobsByLogicalID)
+			expressionContext.Status = workflowJobAncestorStatus(job, jobsByLogicalID, run.Spec.CancelRequested)
+		}
+		runnable, err := workflow.EvaluateJobCondition(job.Spec.JobID, job.Spec.If, expressionContext)
+		if err != nil {
+			if statusErr := r.completeUnscheduledWorkflowJob(ctx, job, actionsv1alpha1.WorkflowJobResultFailure, "ConditionEvaluationFailed", err.Error()); statusErr != nil {
+				return statusErr
+			}
+			continue
+		}
+		if !runnable {
+			result := actionsv1alpha1.WorkflowJobResultSkipped
+			reason := "ConditionFalse"
+			message := "The workflow job condition evaluated to false"
+			if run.Spec.CancelRequested {
+				result = actionsv1alpha1.WorkflowJobResultCancelled
+				reason = "CancellationRequested"
+				message = "The workflow job was cancelled before Runner assignment"
+			}
+			if err := r.completeUnscheduledWorkflowJob(ctx, job, result, reason, message); err != nil {
+				return err
+			}
+			continue
+		}
+		if err := r.setWorkflowJobReady(ctx, job); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (r *WorkflowRunReconciler) reconcileAssignedWorkflowJobCancellation(ctx context.Context, run *actionsv1alpha1.WorkflowRun, workflowName string, inputValues map[string]any, job *actionsv1alpha1.WorkflowJob, jobs map[string][]*actionsv1alpha1.WorkflowJob) error {
+	expressionContext := workflowexpression.Context{Status: workflowJobAncestorStatus(job, jobs, true)}
+	if strings.TrimSpace(job.Spec.If) != "" {
+		expressionContext = r.jobExpressionContext(run, workflowName, inputValues)
+		expressionContext.Values["needs"] = workflowNeedsContext(job, jobs)
+		expressionContext.Status = workflowJobAncestorStatus(job, jobs, true)
+	}
+	continueRunning, err := workflow.EvaluateJobCondition(job.Spec.JobID, job.Spec.If, expressionContext)
+	if err != nil {
+		return r.setWorkflowJobCancellationRequested(ctx, job, true, "ConditionEvaluationFailed", err.Error())
+	}
+	if continueRunning {
+		return r.setWorkflowJobCancellationRequested(ctx, job, false, "ConditionPassed", "The workflow job condition permits execution during cancellation")
+	}
+	return r.setWorkflowJobCancellationRequested(ctx, job, true, "CancellationRequested", "The workflow job condition does not permit execution during cancellation")
+}
+
+func workflowNeedsContext(job *actionsv1alpha1.WorkflowJob, jobs map[string][]*actionsv1alpha1.WorkflowJob) map[string]any {
+	needs := make(map[string]any, len(job.Spec.Needs))
+	for _, dependency := range job.Spec.Needs {
+		dependencyJobs := append([]*actionsv1alpha1.WorkflowJob(nil), jobs[dependency]...)
+		sort.Slice(dependencyJobs, func(left, right int) bool {
+			return dependencyJobs[left].Spec.JobID < dependencyJobs[right].Spec.JobID
+		})
+		outputs := map[string]any{}
+		for _, dependencyJob := range dependencyJobs {
+			for name, value := range dependencyJob.Status.Outputs {
+				outputs[name] = value
+			}
+		}
+		needs[dependency] = map[string]any{
+			"result":  string(workflowJobGroupResult(dependencyJobs)),
+			"outputs": outputs,
+		}
+	}
+	return needs
+}
+
+func workflowJobGroupResult(jobs []*actionsv1alpha1.WorkflowJob) actionsv1alpha1.WorkflowJobResult {
+	result := actionsv1alpha1.WorkflowJobResultSuccess
+	for _, job := range jobs {
+		switch workflowJobResult(job) {
+		case actionsv1alpha1.WorkflowJobResultFailure:
+			return actionsv1alpha1.WorkflowJobResultFailure
+		case actionsv1alpha1.WorkflowJobResultCancelled:
+			result = actionsv1alpha1.WorkflowJobResultCancelled
+		case actionsv1alpha1.WorkflowJobResultSkipped:
+			if result == actionsv1alpha1.WorkflowJobResultSuccess {
+				result = actionsv1alpha1.WorkflowJobResultSkipped
+			}
+		case actionsv1alpha1.WorkflowJobResultSuccess:
+		default:
+			return ""
+		}
+	}
+	return result
+}
+
+func workflowJobAncestorStatus(job *actionsv1alpha1.WorkflowJob, jobs map[string][]*actionsv1alpha1.WorkflowJob, cancellationRequested bool) *workflowexpression.Status {
+	status := &workflowexpression.Status{Success: !cancellationRequested, Cancelled: cancellationRequested}
+	visited := map[string]bool{}
+	var visit func(string)
+	visit = func(id string) {
+		if visited[id] {
+			return
+		}
+		visited[id] = true
+		dependencies := jobs[id]
+		if len(dependencies) == 0 {
+			return
+		}
+		for _, dependency := range dependencies {
+			switch workflowJobResult(dependency) {
+			case actionsv1alpha1.WorkflowJobResultFailure:
+				status.Success = false
+				status.Failure = true
+			case actionsv1alpha1.WorkflowJobResultCancelled:
+				status.Success = false
+				status.Cancelled = true
+			case actionsv1alpha1.WorkflowJobResultSkipped:
+				status.Success = false
+			}
+			for _, ancestor := range dependency.Spec.Needs {
+				visit(ancestor)
+			}
+		}
+	}
+	for _, dependency := range job.Spec.Needs {
+		visit(dependency)
+	}
+	return status
+}
+
+func (r *WorkflowRunReconciler) setWorkflowJobCancellationRequested(ctx context.Context, job *actionsv1alpha1.WorkflowJob, requested bool, reason, message string) error {
+	before := job.Status.DeepCopy()
+	job.Status.ObservedGeneration = job.Generation
+	conditionStatus := metav1.ConditionFalse
+	if requested {
+		conditionStatus = metav1.ConditionTrue
+	}
+	meta.SetStatusCondition(&job.Status.Conditions, metav1.Condition{
+		Type: actionsv1alpha1.WorkflowJobConditionCancellationRequested, Status: conditionStatus,
+		ObservedGeneration: job.Generation, Reason: reason, Message: message,
+	})
+	if apiEquality.Semantic.DeepEqual(before, &job.Status) {
+		return nil
+	}
+	return r.Status().Update(ctx, job)
+}
+
+func (r *WorkflowRunReconciler) setWorkflowJobWaiting(ctx context.Context, job *actionsv1alpha1.WorkflowJob) error {
+	before := job.Status.DeepCopy()
+	job.Status.ObservedGeneration = job.Generation
+	meta.SetStatusCondition(&job.Status.Conditions, metav1.Condition{
+		Type: actionsv1alpha1.WorkflowJobConditionReady, Status: metav1.ConditionUnknown,
+		ObservedGeneration: job.Generation, Reason: "DependenciesPending", Message: "Required WorkflowJobs have not reached terminal results",
+	})
+	if apiEquality.Semantic.DeepEqual(before, &job.Status) {
+		return nil
+	}
+	return r.Status().Update(ctx, job)
+}
+
+func (r *WorkflowRunReconciler) setWorkflowJobReady(ctx context.Context, job *actionsv1alpha1.WorkflowJob) error {
+	before := job.Status.DeepCopy()
+	job.Status.ObservedGeneration = job.Generation
+	meta.SetStatusCondition(&job.Status.Conditions, metav1.Condition{
+		Type: actionsv1alpha1.WorkflowJobConditionReady, Status: metav1.ConditionTrue,
+		ObservedGeneration: job.Generation, Reason: "ConditionPassed", Message: "The workflow job is ready for Runner assignment",
+	})
+	if apiEquality.Semantic.DeepEqual(before, &job.Status) {
+		return nil
+	}
+	return r.Status().Update(ctx, job)
+}
+
+func (r *WorkflowRunReconciler) completeUnscheduledWorkflowJob(ctx context.Context, job *actionsv1alpha1.WorkflowJob, result actionsv1alpha1.WorkflowJobResult, reason, message string) error {
+	before := job.Status.DeepCopy()
+	now := metav1.Now()
+	job.Status.ObservedGeneration = job.Generation
+	job.Status.Result = result
+	job.Status.CompletionTime = &now
+	meta.SetStatusCondition(&job.Status.Conditions, metav1.Condition{
+		Type: actionsv1alpha1.WorkflowJobConditionReady, Status: metav1.ConditionFalse,
+		ObservedGeneration: job.Generation, Reason: reason, Message: message,
+	})
+	meta.SetStatusCondition(&job.Status.Conditions, metav1.Condition{
+		Type: actionsv1alpha1.WorkflowJobConditionScheduled, Status: metav1.ConditionFalse,
+		ObservedGeneration: job.Generation, Reason: reason, Message: "The workflow job completed without Runner assignment",
+	})
+	if result == actionsv1alpha1.WorkflowJobResultFailure {
+		meta.SetStatusCondition(&job.Status.Conditions, metav1.Condition{
+			Type: actionsv1alpha1.WorkflowJobConditionSucceeded, Status: metav1.ConditionFalse,
+			ObservedGeneration: job.Generation, Reason: reason, Message: message,
+		})
+	}
+	if apiEquality.Semantic.DeepEqual(before, &job.Status) {
+		return nil
+	}
+	return r.Status().Update(ctx, job)
+}
+
+func workflowJobReady(job *actionsv1alpha1.WorkflowJob) bool {
+	if workflowJobReadyCondition(job) {
+		return true
+	}
+	return len(job.Spec.Needs) == 0 && strings.TrimSpace(job.Spec.If) == ""
+}
+
+func workflowJobReadyCondition(job *actionsv1alpha1.WorkflowJob) bool {
+	condition := meta.FindStatusCondition(job.Status.Conditions, actionsv1alpha1.WorkflowJobConditionReady)
+	return condition != nil && condition.Status == metav1.ConditionTrue
+}
+
+func workflowJobResult(job *actionsv1alpha1.WorkflowJob) actionsv1alpha1.WorkflowJobResult {
+	if job == nil {
+		return ""
+	}
+	if job.Status.Result != "" {
+		return job.Status.Result
+	}
+	condition := meta.FindStatusCondition(job.Status.Conditions, actionsv1alpha1.WorkflowJobConditionSucceeded)
+	if condition == nil {
+		return ""
+	}
+	switch condition.Status {
+	case metav1.ConditionTrue:
+		return actionsv1alpha1.WorkflowJobResultSuccess
+	case metav1.ConditionFalse:
+		return actionsv1alpha1.WorkflowJobResultFailure
+	default:
+		return ""
+	}
+}
+
+func workflowJobTerminal(job *actionsv1alpha1.WorkflowJob) bool {
+	return workflowJobResult(job) != ""
 }
 
 func workflowJobRuntimeStateExists(ctx context.Context, reader client.Reader, workflowJob *actionsv1alpha1.WorkflowJob) (bool, error) {
@@ -1222,18 +1584,12 @@ func (r *WorkflowRunReconciler) handleConcurrency(ctx context.Context, run *acti
 }
 
 func (r *WorkflowRunReconciler) cancelWorkflowRun(ctx context.Context, run *actionsv1alpha1.WorkflowRun) error {
-	if !controllerutil.ContainsFinalizer(run, workflowRunCancellationFinalizer) {
-		before := run.DeepCopy()
-		controllerutil.AddFinalizer(run, workflowRunCancellationFinalizer)
-		if err := r.Patch(ctx, run, client.MergeFrom(before)); err != nil {
-			return err
-		}
+	if run.Spec.CancelRequested {
+		return nil
 	}
-	policy := metav1.DeletePropagationForeground
-	if err := r.Delete(ctx, run, &client.DeleteOptions{PropagationPolicy: &policy}); err != nil && !apierrors.IsNotFound(err) {
-		return err
-	}
-	return nil
+	before := run.DeepCopy()
+	run.Spec.CancelRequested = true
+	return r.Patch(ctx, run, client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{}))
 }
 
 func (r *WorkflowRunReconciler) finalizeCanceledWorkflowRun(ctx context.Context, run *actionsv1alpha1.WorkflowRun) (ctrl.Result, error) {

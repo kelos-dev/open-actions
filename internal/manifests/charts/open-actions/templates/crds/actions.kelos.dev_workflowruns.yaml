@@ -63,8 +63,15 @@ spec:
             description: |-
               WorkflowRunSpec describes one workflow execution. ProjectRef, Source, and
               WorkflowPath are immutable.
-              Deleting a WorkflowRun requests cancellation of its child resources.
+              Set CancelRequested to request graceful cancellation. Deleting a WorkflowRun
+              force-cancels and removes its child resources.
             properties:
+              cancelRequested:
+                description: |-
+                  CancelRequested asks the controller to cancel ordinary jobs while allowing
+                  jobs whose conditions handle cancellation to finish. Once set, it cannot be
+                  cleared.
+                type: boolean
               projectRef:
                 description: ProjectRef identifies a Project in the same namespace.
                 properties:
@@ -612,6 +619,9 @@ spec:
             - message: projectRef, source, and workflowPath are immutable
               rule: self.projectRef == oldSelf.projectRef && self.source == oldSelf.source
                 && self.workflowPath == oldSelf.workflowPath
+            - message: cancelRequested cannot be cleared
+              rule: '!has(oldSelf.cancelRequested) || !oldSelf.cancelRequested ||
+                (has(self.cancelRequested) && self.cancelRequested)'
             - message: '`projectRef.name` must be specified'
               rule: size(self.projectRef.name) > 0
             - message: '`projectRef.name` must be no more than 253 characters'
@@ -704,6 +714,14 @@ spec:
                     maximum: 100000
                     minimum: 0
                     type: integer
+                  cancelled:
+                    description: |-
+                      Cancelled is the number of jobs cancelled before reaching a success or
+                      failure result.
+                    format: int32
+                    maximum: 100000
+                    minimum: 0
+                    type: integer
                   failed:
                     description: Failed is the number of jobs with a failed terminal
                       condition.
@@ -718,6 +736,13 @@ spec:
                     maximum: 100000
                     minimum: 0
                     type: integer
+                  skipped:
+                    description: Skipped is the number of jobs whose condition evaluated
+                      to false.
+                    format: int32
+                    maximum: 100000
+                    minimum: 0
+                    type: integer
                   succeeded:
                     description: Succeeded is the number of jobs with a successful
                       terminal condition.
@@ -727,6 +752,14 @@ spec:
                     type: integer
                   total:
                     description: Total is the number of jobs defined by the workflow.
+                    format: int32
+                    maximum: 100000
+                    minimum: 0
+                    type: integer
+                  waiting:
+                    description: |-
+                      Waiting is the number of jobs waiting for dependencies to reach terminal
+                      results.
                     format: int32
                     maximum: 100000
                     minimum: 0

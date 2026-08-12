@@ -273,7 +273,7 @@ func (r *RunnerReconciler) claimWorkflowJob(ctx context.Context, runnerObject *a
 	loadedRuns := map[string]bool{}
 	for index := range jobs.Items {
 		workflowJob := &jobs.Items[index]
-		if !workflowJob.DeletionTimestamp.IsZero() || terminalWorkflowJob(workflowJob) {
+		if !workflowJob.DeletionTimestamp.IsZero() || workflowJobTerminal(workflowJob) || !workflowJobReady(workflowJob) {
 			continue
 		}
 		if workflowJob.Labels[actionsv1alpha1.LabelProjectUID] != string(project.UID) {
@@ -315,6 +315,14 @@ func (r *RunnerReconciler) claimWorkflowJob(ctx context.Context, runnerObject *a
 		return candidates[left].CreationTimestamp.Time.Before(candidates[right].CreationTimestamp.Time)
 	})
 	workflowJob := candidates[0]
+	currentWorkflowJob := &actionsv1alpha1.WorkflowJob{}
+	if err := r.APIReader.Get(ctx, client.ObjectKeyFromObject(workflowJob), currentWorkflowJob); err != nil {
+		return nil, client.IgnoreNotFound(err)
+	}
+	if currentWorkflowJob.UID != workflowJob.UID || !currentWorkflowJob.DeletionTimestamp.IsZero() || workflowJobTerminal(currentWorkflowJob) || !workflowJobReady(currentWorkflowJob) || currentWorkflowJob.Status.RunnerRef != nil {
+		return nil, nil
+	}
+	workflowJob = currentWorkflowJob
 	jobRef := &corev1.LocalObjectReference{Name: workflowJob.Name}
 	currentRunner := &actionsv1alpha1.Runner{}
 	if err := r.APIReader.Get(ctx, client.ObjectKeyFromObject(runnerObject), currentRunner); err != nil {
@@ -380,13 +388,17 @@ func (r *RunnerReconciler) executeWorkflowJob(ctx context.Context, runnerObject 
 	if !metav1.IsControlledBy(workflowJob, run) {
 		return false, fmt.Errorf("WorkflowJob %q is not controlled by WorkflowRun %q", workflowJob.Name, run.Name)
 	}
-	if found, terminal, err := r.observeNativeJob(ctx, workflowJob); err != nil || found {
-		return terminal, err
+	foundNativeJob, terminalNativeJob, err := r.observeNativeJob(ctx, workflowJob)
+	if err != nil || terminalNativeJob {
+		return terminalNativeJob, err
 	}
 	if canceled, err := r.workflowJobCancellationRequested(ctx, workflowJob, run); err != nil {
 		return false, err
 	} else if canceled {
 		return true, r.cancelWorkflowJob(ctx, workflowJob)
+	}
+	if foundNativeJob {
+		return false, nil
 	}
 	if workflowJob.Labels[actionsv1alpha1.LabelProjectUID] != string(project.UID) {
 		return true, r.failAssignedWorkflowJob(ctx, workflowJob, "ProjectRecreated", fmt.Sprintf("Project %q was recreated before execution started", project.Name))
@@ -463,6 +475,10 @@ func (r *RunnerReconciler) workflowJobCancellationRequested(ctx context.Context,
 	if !currentWorkflowJob.DeletionTimestamp.IsZero() {
 		return true, nil
 	}
+	cancellation := meta.FindStatusCondition(currentWorkflowJob.Status.Conditions, actionsv1alpha1.WorkflowJobConditionCancellationRequested)
+	if cancellation != nil && cancellation.Status == metav1.ConditionTrue {
+		return true, nil
+	}
 	currentRun := &actionsv1alpha1.WorkflowRun{}
 	if err := r.APIReader.Get(ctx, client.ObjectKeyFromObject(run), currentRun); err != nil {
 		if apierrors.IsNotFound(err) {
@@ -477,7 +493,22 @@ func (r *RunnerReconciler) workflowJobCancellationRequested(ctx context.Context,
 }
 
 func (r *RunnerReconciler) cancelWorkflowJob(ctx context.Context, workflowJob *actionsv1alpha1.WorkflowJob) error {
-	err := r.failAssignedWorkflowJob(ctx, workflowJob, "CancellationRequested", "WorkflowJob or WorkflowRun deletion was requested before execution started")
+	nativeJob := &batchv1.Job{}
+	key := client.ObjectKey{Namespace: workflowJob.Namespace, Name: workflowJob.Name}
+	if err := r.Get(ctx, key, nativeJob); err != nil {
+		if !apierrors.IsNotFound(err) {
+			return err
+		}
+	} else {
+		if !metav1.IsControlledBy(nativeJob, workflowJob) {
+			return fmt.Errorf("native Job %q is not controlled by WorkflowJob %q", nativeJob.Name, workflowJob.Name)
+		}
+		policy := metav1.DeletePropagationBackground
+		if err := r.Delete(ctx, nativeJob, &client.DeleteOptions{PropagationPolicy: &policy}); err != nil && !apierrors.IsNotFound(err) {
+			return err
+		}
+	}
+	err := r.completeAssignedWorkflowJob(ctx, workflowJob, actionsv1alpha1.WorkflowJobResultCancelled, "CancellationRequested", "WorkflowJob or WorkflowRun cancellation was requested")
 	if apierrors.IsNotFound(err) {
 		return r.cleanupAuthSecret(ctx, workflowJob)
 	}
@@ -792,6 +823,7 @@ func (r *RunnerReconciler) updateWorkflowJobStatus(ctx context.Context, workflow
 	}
 	switch jobResult(nativeJob) {
 	case metav1.ConditionTrue:
+		workflowJob.Status.Result = actionsv1alpha1.WorkflowJobResultSuccess
 		workflowJob.Status.CompletionTime = completionTime(nativeJob)
 		if resultInvalid || executionResult == nil {
 			meta.SetStatusCondition(&workflowJob.Status.Conditions, metav1.Condition{Type: actionsv1alpha1.WorkflowJobConditionSucceeded, Status: metav1.ConditionFalse, ObservedGeneration: workflowJob.Generation, Reason: "JobResultInvalid", Message: "The workflow job completed without valid output metadata"})
@@ -800,6 +832,7 @@ func (r *RunnerReconciler) updateWorkflowJobStatus(ctx context.Context, workflow
 			meta.SetStatusCondition(&workflowJob.Status.Conditions, metav1.Condition{Type: actionsv1alpha1.WorkflowJobConditionSucceeded, Status: metav1.ConditionTrue, ObservedGeneration: workflowJob.Generation, Reason: "JobSucceeded", Message: "The workflow job succeeded"})
 		}
 	case metav1.ConditionFalse:
+		workflowJob.Status.Result = actionsv1alpha1.WorkflowJobResultFailure
 		workflowJob.Status.CompletionTime = completionTime(nativeJob)
 		if !resultInvalid && executionResult != nil {
 			workflowJob.Status.Outputs = copyStringMap(executionResult.Outputs)
@@ -826,11 +859,16 @@ func copyStringMap(values map[string]string) map[string]string {
 }
 
 func (r *RunnerReconciler) failAssignedWorkflowJob(ctx context.Context, workflowJob *actionsv1alpha1.WorkflowJob, reason, message string) error {
+	return r.completeAssignedWorkflowJob(ctx, workflowJob, actionsv1alpha1.WorkflowJobResultFailure, reason, message)
+}
+
+func (r *RunnerReconciler) completeAssignedWorkflowJob(ctx context.Context, workflowJob *actionsv1alpha1.WorkflowJob, result actionsv1alpha1.WorkflowJobResult, reason, message string) error {
 	before := workflowJob.Status.DeepCopy()
 	if err := setWorkflowJobScheduled(workflowJob); err != nil {
 		return err
 	}
 	now := metav1.Now()
+	workflowJob.Status.Result = result
 	workflowJob.Status.CompletionTime = &now
 	meta.SetStatusCondition(&workflowJob.Status.Conditions, metav1.Condition{
 		Type:               actionsv1alpha1.WorkflowJobConditionSucceeded,
@@ -850,6 +888,7 @@ func (r *RunnerReconciler) failAssignedWorkflowJob(ctx context.Context, workflow
 func (r *RunnerReconciler) failQueuedWorkflowJob(ctx context.Context, workflowJob *actionsv1alpha1.WorkflowJob, reason, message string) error {
 	before := workflowJob.Status.DeepCopy()
 	workflowJob.Status.ObservedGeneration = workflowJob.Generation
+	workflowJob.Status.Result = actionsv1alpha1.WorkflowJobResultFailure
 	now := metav1.Now()
 	workflowJob.Status.CompletionTime = &now
 	meta.SetStatusCondition(&workflowJob.Status.Conditions, metav1.Condition{
@@ -997,7 +1036,7 @@ func (r *RunnerReconciler) runnersForWorkflowRun(ctx context.Context, object cli
 
 func indexQueuedWorkflowJob(object client.Object) []string {
 	workflowJob := object.(*actionsv1alpha1.WorkflowJob)
-	if workflowJob.DeletionTimestamp.IsZero() && workflowJob.Status.RunnerRef == nil && !terminalWorkflowJob(workflowJob) {
+	if workflowJob.DeletionTimestamp.IsZero() && workflowJob.Status.RunnerRef == nil && workflowJobReady(workflowJob) && !workflowJobTerminal(workflowJob) {
 		return []string{"true"}
 	}
 	return nil
@@ -1041,6 +1080,9 @@ func (r *RunnerReconciler) runnersForWorkflowJob(ctx context.Context, object cli
 	}
 	if workflowJob.Status.RunnerRef != nil {
 		return []reconcile.Request{{NamespacedName: client.ObjectKey{Namespace: workflowJob.Namespace, Name: workflowJob.Status.RunnerRef.Name}}}
+	}
+	if !workflowJobReady(workflowJob) || workflowJobTerminal(workflowJob) {
+		return nil
 	}
 	run := &actionsv1alpha1.WorkflowRun{}
 	if err := r.Get(ctx, client.ObjectKey{Namespace: workflowJob.Namespace, Name: workflowJob.Spec.WorkflowRunRef.Name}, run); err != nil {
@@ -1095,8 +1137,7 @@ func runnerLabelsMatch(available, requested []string) bool {
 }
 
 func terminalWorkflowJob(workflowJob *actionsv1alpha1.WorkflowJob) bool {
-	condition := meta.FindStatusCondition(workflowJob.Status.Conditions, actionsv1alpha1.WorkflowJobConditionSucceeded)
-	return condition != nil && (condition.Status == metav1.ConditionTrue || condition.Status == metav1.ConditionFalse)
+	return workflowJobTerminal(workflowJob)
 }
 
 func nativeJobLabels(workflowJob *actionsv1alpha1.WorkflowJob, run *actionsv1alpha1.WorkflowRun, project *actionsv1alpha1.Project, runnerObject *actionsv1alpha1.Runner) map[string]string {

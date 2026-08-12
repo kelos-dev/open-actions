@@ -103,10 +103,13 @@ var _ = Describe("Console", func() {
 			g.Expect(clusterClient.List(ctx, jobs, client.InNamespace(e2eNamespace), client.MatchingLabels{
 				actionsv1alpha1.LabelWorkflowRunUID: string(run.UID),
 			})).To(Succeed())
-			g.Expect(jobs.Items).To(HaveLen(1))
-			if len(jobs.Items) == 1 {
-				workflowJob = jobs.Items[0]
+			g.Expect(jobs.Items).To(HaveLen(2))
+			for index := range jobs.Items {
+				if jobs.Items[index].Spec.JobID == "test" {
+					workflowJob = jobs.Items[index]
+				}
 			}
+			g.Expect(workflowJob.Name).NotTo(BeEmpty())
 		}, 30*time.Second, time.Second).Should(Succeed())
 
 		webClient := authenticateConsole(run)

@@ -55,6 +55,12 @@ jobs:
           docker build --tag open-actions-e2e --file Dockerfile.docker-e2e .
           test "$(docker run --rm open-actions-e2e)" = "open actions docker e2e works"
           printf 'Docker execution works\n'
+  report:
+    needs: test
+    if: always() && needs.test.result == 'success'
+    runs-on: [ubuntu-latest, docker]
+    steps:
+      - run: printf 'dependency graph e2e works\n'
 `
 
 const unsupportedTriggerWorkflowData = `name: Unsupported trigger

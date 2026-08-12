@@ -49,21 +49,41 @@ var _ = Describe("Runner", func() {
 		Expect(clusterClient.Create(ctx, run)).To(Succeed())
 
 		var workflowJobName string
+		var reportWorkflowJobName string
 		Eventually(func(g Gomega) {
 			jobs := &actionsv1alpha1.WorkflowJobList{}
 			g.Expect(clusterClient.List(ctx, jobs, client.InNamespace(e2eNamespace))).To(Succeed())
-			g.Expect(jobs.Items).To(HaveLen(1))
-			if len(jobs.Items) != 1 {
+			g.Expect(jobs.Items).To(HaveLen(2))
+			if len(jobs.Items) != 2 {
 				return
 			}
-			workflowJob := jobs.Items[0]
-			workflowJobName = workflowJob.Name
-			g.Expect(workflowJob.Spec.RunsOn).To(ConsistOf("ubuntu-latest", "docker"))
-			g.Expect(workflowJob.Status.RunnerRef).NotTo(BeNil())
-			if workflowJob.Status.RunnerRef != nil {
-				g.Expect(workflowJob.Status.RunnerRef.Name).To(Equal("runner-1"))
+			for index := range jobs.Items {
+				workflowJob := &jobs.Items[index]
+				switch workflowJob.Spec.JobID {
+				case "test":
+					workflowJobName = workflowJob.Name
+					g.Expect(workflowJob.Spec.RunsOn).To(ConsistOf("ubuntu-latest", "docker"))
+					g.Expect(workflowJob.Status.RunnerRef).NotTo(BeNil())
+					if workflowJob.Status.RunnerRef != nil {
+						g.Expect(workflowJob.Status.RunnerRef.Name).To(Equal("runner-1"))
+					}
+					g.Expect(meta.IsStatusConditionTrue(workflowJob.Status.Conditions, actionsv1alpha1.WorkflowJobConditionScheduled)).To(BeTrue())
+				case "report":
+					reportWorkflowJobName = workflowJob.Name
+					g.Expect(workflowJob.Spec.Needs).To(Equal([]string{"test"}))
+					g.Expect(workflowJob.Status.RunnerRef).To(BeNil())
+					ready := meta.FindStatusCondition(workflowJob.Status.Conditions, actionsv1alpha1.WorkflowJobConditionReady)
+					g.Expect(ready).NotTo(BeNil())
+					if ready != nil {
+						g.Expect(ready.Status).To(Equal(metav1.ConditionUnknown))
+						g.Expect(ready.Reason).To(Equal("DependenciesPending"))
+					}
+				default:
+					g.Expect(workflowJob.Spec.JobID).To(BeElementOf("test", "report"))
+				}
 			}
-			g.Expect(meta.IsStatusConditionTrue(workflowJob.Status.Conditions, actionsv1alpha1.WorkflowJobConditionScheduled)).To(BeTrue())
+			g.Expect(workflowJobName).NotTo(BeEmpty())
+			g.Expect(reportWorkflowJobName).NotTo(BeEmpty())
 		}, 60*time.Second, time.Second).Should(Succeed())
 
 		var jobName string
@@ -129,6 +149,11 @@ var _ = Describe("Runner", func() {
 		workflowJob := &actionsv1alpha1.WorkflowJob{}
 		Expect(clusterClient.Get(ctx, client.ObjectKey{Namespace: e2eNamespace, Name: workflowJobName}, workflowJob)).To(Succeed())
 		Expect(meta.IsStatusConditionTrue(workflowJob.Status.Conditions, actionsv1alpha1.WorkflowJobConditionSucceeded)).To(BeTrue())
+		reportWorkflowJob := &actionsv1alpha1.WorkflowJob{}
+		Expect(clusterClient.Get(ctx, client.ObjectKey{Namespace: e2eNamespace, Name: reportWorkflowJobName}, reportWorkflowJob)).To(Succeed())
+		Expect(reportWorkflowJob.Status.Result).To(Equal(actionsv1alpha1.WorkflowJobResultSuccess))
+		Expect(meta.IsStatusConditionTrue(reportWorkflowJob.Status.Conditions, actionsv1alpha1.WorkflowJobConditionScheduled)).To(BeTrue())
+		Expect(meta.IsStatusConditionTrue(reportWorkflowJob.Status.Conditions, actionsv1alpha1.WorkflowJobConditionSucceeded)).To(BeTrue())
 		Eventually(func(g Gomega) {
 			runnerObject := &actionsv1alpha1.Runner{}
 			g.Expect(clusterClient.Get(ctx, client.ObjectKey{Namespace: e2eNamespace, Name: "runner-1"}, runnerObject)).To(Succeed())

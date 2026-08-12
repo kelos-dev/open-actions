@@ -643,6 +643,11 @@ func (in *WorkflowJobSpec) DeepCopyInto(out *WorkflowJobSpec) {
 		*out = make([]string, len(*in))
 		copy(*out, *in)
 	}
+	if in.Needs != nil {
+		in, out := &in.Needs, &out.Needs
+		*out = make([]string, len(*in))
+		copy(*out, *in)
+	}
 	if in.Matrix != nil {
 		in, out := &in.Matrix, &out.Matrix
 		*out = new(WorkflowJobMatrix)

@@ -429,7 +429,7 @@ func TestRunnerDoesNotClaimAnotherJobWhenLiveStatusIsBusy(t *testing.T) {
 		WithIndex(&actionsv1alpha1.WorkflowJob{}, workflowJobProjectNameIndex, indexWorkflowJobProjectName).
 		WithStatusSubresource(&actionsv1alpha1.Runner{}, &actionsv1alpha1.WorkflowJob{}).
 		WithObjects(runnerObject, project, run, workflowJob).Build()
-	liveReader := fake.NewClientBuilder().WithScheme(scheme).WithObjects(liveRunner, run).Build()
+	liveReader := fake.NewClientBuilder().WithScheme(scheme).WithObjects(liveRunner, run, workflowJob).Build()
 	reconciler := &RunnerReconciler{Client: cachedClient, APIReader: liveReader}
 
 	claimed, err := reconciler.claimWorkflowJob(context.Background(), runnerObject, project)
@@ -515,6 +515,18 @@ func TestDeletingWorkflowJobIsNotQueued(t *testing.T) {
 	workflowJob := &actionsv1alpha1.WorkflowJob{ObjectMeta: metav1.ObjectMeta{DeletionTimestamp: &deletionTime}}
 	if values := indexQueuedWorkflowJob(workflowJob); len(values) != 0 {
 		t.Fatalf("queue index = %#v", values)
+	}
+}
+
+func TestDependencyBlockedWorkflowJobIsNotQueued(t *testing.T) {
+	workflowJob := &actionsv1alpha1.WorkflowJob{
+		Spec: actionsv1alpha1.WorkflowJobSpec{Needs: []string{"build"}},
+		Status: actionsv1alpha1.WorkflowJobStatus{Conditions: []metav1.Condition{{
+			Type: actionsv1alpha1.WorkflowJobConditionReady, Status: metav1.ConditionUnknown,
+		}}},
+	}
+	if values := indexQueuedWorkflowJob(workflowJob); len(values) != 0 {
+		t.Fatalf("queued index = %v", values)
 	}
 }
 
@@ -978,12 +990,71 @@ func TestDeletingWorkflowRunStopsAssignedJobBeforeExecution(t *testing.T) {
 	if condition == nil || condition.Status != metav1.ConditionFalse || condition.Reason != "CancellationRequested" {
 		t.Fatalf("succeeded condition = %#v", condition)
 	}
+	if stored.Status.Result != actionsv1alpha1.WorkflowJobResultCancelled {
+		t.Fatalf("result = %q, want cancelled", stored.Status.Result)
+	}
 	if err := clusterClient.Get(context.Background(), client.ObjectKeyFromObject(workflowJob), &batchv1.Job{}); !apierrors.IsNotFound(err) {
 		t.Fatalf("native Job exists: %v", err)
 	}
 	secretKey := client.ObjectKey{Namespace: workflowJob.Namespace, Name: childName(workflowJob.Name, "auth")}
 	if err := clusterClient.Get(context.Background(), secretKey, &corev1.Secret{}); !apierrors.IsNotFound(err) {
 		t.Fatalf("authentication Secret exists: %v", err)
+	}
+}
+
+func TestCancellationRequestStopsActiveNativeJob(t *testing.T) {
+	scheme := runnerTestScheme(t)
+	run := &actionsv1alpha1.WorkflowRun{
+		ObjectMeta: metav1.ObjectMeta{Name: "ci", Namespace: "default", UID: types.UID("run-uid")},
+		Spec:       actionsv1alpha1.WorkflowRunSpec{ProjectRef: corev1.LocalObjectReference{Name: "project"}},
+	}
+	workflowJob := &actionsv1alpha1.WorkflowJob{
+		ObjectMeta: metav1.ObjectMeta{Name: "build", Namespace: "default", UID: types.UID("job-uid")},
+		Spec:       actionsv1alpha1.WorkflowJobSpec{WorkflowRunRef: corev1.LocalObjectReference{Name: run.Name}},
+		Status: actionsv1alpha1.WorkflowJobStatus{
+			RunnerRef: &corev1.LocalObjectReference{Name: "runner"},
+			Conditions: []metav1.Condition{{
+				Type: actionsv1alpha1.WorkflowJobConditionCancellationRequested, Status: metav1.ConditionTrue,
+			}},
+		},
+	}
+	if err := controllerutil.SetControllerReference(run, workflowJob, scheme); err != nil {
+		t.Fatal(err)
+	}
+	nativeJob := &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{Name: workflowJob.Name, Namespace: workflowJob.Namespace},
+		Status:     batchv1.JobStatus{Active: 1, StartTime: pointerTo(metav1.Now())},
+	}
+	if err := controllerutil.SetControllerReference(workflowJob, nativeJob, scheme); err != nil {
+		t.Fatal(err)
+	}
+	clusterClient := fake.NewClientBuilder().WithScheme(scheme).
+		WithStatusSubresource(&actionsv1alpha1.WorkflowJob{}, &batchv1.Job{}).
+		WithObjects(run, workflowJob, nativeJob).Build()
+	writeClient := &recordingDeleteClient{Client: clusterClient}
+	reconciler := &RunnerReconciler{Client: writeClient, APIReader: clusterClient}
+	project := &actionsv1alpha1.Project{ObjectMeta: metav1.ObjectMeta{Name: "project", Namespace: "default"}}
+	runnerObject := &actionsv1alpha1.Runner{ObjectMeta: metav1.ObjectMeta{Name: "runner", Namespace: "default"}}
+
+	terminal, err := reconciler.executeWorkflowJob(context.Background(), runnerObject, workflowJob, project)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !terminal {
+		t.Fatal("active native Job remained active after cancellation was requested")
+	}
+	stored := &actionsv1alpha1.WorkflowJob{}
+	if err := clusterClient.Get(context.Background(), client.ObjectKeyFromObject(workflowJob), stored); err != nil {
+		t.Fatal(err)
+	}
+	if stored.Status.Result != actionsv1alpha1.WorkflowJobResultCancelled {
+		t.Fatalf("result = %q, want cancelled", stored.Status.Result)
+	}
+	if err := clusterClient.Get(context.Background(), client.ObjectKeyFromObject(nativeJob), &batchv1.Job{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("native Job exists: %v", err)
+	}
+	if writeClient.deleteOptions == nil || writeClient.deleteOptions.PropagationPolicy == nil || *writeClient.deleteOptions.PropagationPolicy != metav1.DeletePropagationBackground {
+		t.Fatalf("native Job delete options = %#v, want background propagation", writeClient.deleteOptions)
 	}
 }
 

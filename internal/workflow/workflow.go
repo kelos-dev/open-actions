@@ -209,6 +209,7 @@ var (
 	workflowConcurrencyAvailability = expression.NewAvailability("github", "inputs", "vars")
 	jobNameAvailability             = expression.NewAvailability("github", "needs", "strategy", "matrix", "vars", "inputs")
 	jobEnvironmentAvailability      = expression.NewAvailability("github", "needs", "strategy", "matrix", "vars", "secrets", "inputs")
+	jobConditionAvailability        = expression.NewAvailability("github", "needs", "vars", "inputs").WithStatusFunctions()
 	stepAvailability                = expression.NewAvailability("github", "needs", "strategy", "matrix", "job", "runner", "env", "vars", "secrets", "steps", "inputs")
 	stepConditionAvailability       = expression.NewAvailability("github", "needs", "strategy", "matrix", "job", "runner", "env", "vars", "steps", "inputs").WithStatusFunctions()
 )
@@ -271,6 +272,9 @@ func Parse(data []byte) (*Definition, error) {
 		}
 		definition.Jobs[id] = job
 	}
+	if err := validateJobGraph(definition.Jobs); err != nil {
+		return nil, err
+	}
 	return definition, nil
 }
 
@@ -317,13 +321,35 @@ func validateJob(id string, job *Job) error {
 		labels[key] = struct{}{}
 		job.RunsOn[index] = key
 	}
-	if len(job.Needs) > 0 {
-		return fmt.Errorf("job %q uses unsupported needs", id)
+	needs := make(map[string]struct{}, len(job.Needs))
+	for _, dependency := range job.Needs {
+		if !jobIDPattern.MatchString(dependency) || len(dependency) > maxJobIDLength {
+			return fmt.Errorf("job %q needs invalid job ID %q", id, dependency)
+		}
+		if dependency == id {
+			return fmt.Errorf("job %q cannot need itself", id)
+		}
+		if _, found := needs[dependency]; found {
+			return fmt.Errorf("job %q repeats needed job %q", id, dependency)
+		}
+		needs[dependency] = struct{}{}
 	}
 	if err := validateStrategy(id, job.Strategy); err != nil {
 		return err
 	}
-	if job.Container.Kind != 0 || job.Services.Kind != 0 || job.If != "" {
+	if job.If != "" {
+		if len(job.If) > MaxConditionBytes {
+			return fmt.Errorf("job %q if exceeds %d bytes", id, MaxConditionBytes)
+		}
+		condition, err := expression.ParseCondition(job.If)
+		if err != nil {
+			return fmt.Errorf("job %q if: %w", id, err)
+		}
+		if err := condition.Validate(jobConditionAvailability); err != nil {
+			return fmt.Errorf("job %q if: %w", id, err)
+		}
+	}
+	if job.Container.Kind != 0 || job.Services.Kind != 0 {
 		return fmt.Errorf("job %q uses an unsupported job feature", id)
 	}
 	if len(job.Steps) == 0 {
@@ -332,7 +358,10 @@ func validateJob(id string, job *Job) error {
 	if len(job.Steps) > maxSteps {
 		return fmt.Errorf("job %q defines %d steps; maximum is %d", id, len(job.Steps), maxSteps)
 	}
-	contentBytes := len(job.Name)
+	contentBytes := len(job.Name) + len(job.If)
+	for _, dependency := range job.Needs {
+		contentBytes += len(dependency)
+	}
 	envBytes, err := validateEnvironmentMap(fmt.Sprintf("job %q env", id), job.Env, jobEnvironmentAvailability)
 	if err != nil {
 		return err
@@ -455,6 +484,55 @@ func validateStrategy(id string, strategy Strategy) error {
 	}
 	if strategy.maxParallelSet && strategy.MaxParallel < 1 {
 		return fmt.Errorf("job %q strategy max-parallel must be greater than zero", id)
+	}
+	return nil
+}
+
+func validateJobGraph(jobs map[string]Job) error {
+	jobIDs := make([]string, 0, len(jobs))
+	for id := range jobs {
+		jobIDs = append(jobIDs, id)
+	}
+	sort.Strings(jobIDs)
+	for _, id := range jobIDs {
+		job := jobs[id]
+		for _, dependency := range job.Needs {
+			if _, found := jobs[dependency]; !found {
+				return fmt.Errorf("job %q needs missing job %q", id, dependency)
+			}
+		}
+	}
+
+	state := make(map[string]uint8, len(jobs))
+	stack := make([]string, 0, len(jobs))
+	var visit func(string) error
+	visit = func(id string) error {
+		switch state[id] {
+		case 1:
+			start := 0
+			for stack[start] != id {
+				start++
+			}
+			cycle := append(append([]string(nil), stack[start:]...), id)
+			return fmt.Errorf("workflow job dependency cycle: %s", strings.Join(cycle, " -> "))
+		case 2:
+			return nil
+		}
+		state[id] = 1
+		stack = append(stack, id)
+		for _, dependency := range jobs[id].Needs {
+			if err := visit(dependency); err != nil {
+				return err
+			}
+		}
+		stack = stack[:len(stack)-1]
+		state[id] = 2
+		return nil
+	}
+	for _, id := range jobIDs {
+		if err := visit(id); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -610,6 +688,32 @@ func EvaluateJob(id string, job Job, context expression.Context) (Job, error) {
 		job.RunsOn[index] = label
 	}
 	return job, nil
+}
+
+// EvaluateJobCondition evaluates a job condition with GitHub's implicit
+// success gate for conditions that do not call a status function.
+func EvaluateJobCondition(id, input string, context expression.Context) (bool, error) {
+	status := context.Status
+	if status == nil {
+		status = &expression.Status{Success: true}
+		context.Status = status
+	}
+	if strings.TrimSpace(input) == "" {
+		return status.Success, nil
+	}
+	program, err := expression.ParseCondition(input)
+	if err != nil {
+		return false, fmt.Errorf("job %q if: %w", id, err)
+	}
+	if !program.UsesStatusFunction() && !status.Success {
+		return false, nil
+	}
+	context.Availability = jobConditionAvailability
+	result, err := program.Evaluate(context)
+	if err != nil {
+		return false, fmt.Errorf("job %q if: %w", id, err)
+	}
+	return result.Bool(), nil
 }
 
 func EvaluateConcurrency(definition *Definition, event Event) (string, bool, error) {
