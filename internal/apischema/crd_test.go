@@ -546,6 +546,13 @@ func TestCRDConventions(t *testing.T) {
 					t.Error("spec.execution.docker.image is not required")
 				}
 			}
+			if tt.kind == "Project" {
+				validateSample(t, crd, "actions_v1alpha1_project-environment.yaml")
+				environments := spec.Properties["environments"]
+				if environments.MaxItems == nil || *environments.MaxItems != 100 || environments.XListType == nil || *environments.XListType != "map" || !slices.Contains(environments.XListMapKeys, "name") {
+					t.Errorf("spec.environments schema = %#v", environments)
+				}
+			}
 			if tt.kind == "WorkflowJob" {
 				outputs := status.Properties["outputs"]
 				if outputs.MaxProperties == nil || *outputs.MaxProperties != 100 {
@@ -553,6 +560,10 @@ func TestCRDConventions(t *testing.T) {
 				}
 				if len(outputs.XValidations) != 2 {
 					t.Errorf("status.outputs validation rules = %d, want 2", len(outputs.XValidations))
+				}
+				environment := spec.Properties["environment"]
+				if !slices.Contains(environment.Required, "name") {
+					t.Error("spec.environment.name is not required")
 				}
 			}
 			if tt.kind == "WorkflowRun" {
@@ -562,6 +573,10 @@ func TestCRDConventions(t *testing.T) {
 				}
 				if ttl.Format != "int32" || ttl.Minimum == nil || *ttl.Minimum != 0 || ttl.Maximum == nil || *ttl.Maximum != 2147483647 {
 					t.Errorf("spec.ttlSecondsAfterFinished schema = %#v", ttl)
+				}
+				waiting := status.Properties["jobs"].Properties["waitingForApproval"]
+				if waiting.Minimum == nil || *waiting.Minimum != 0 || waiting.Maximum == nil || *waiting.Maximum != 100000 {
+					t.Errorf("status.jobs.waitingForApproval schema = %#v", waiting)
 				}
 			}
 		})
@@ -595,6 +610,30 @@ func TestCRDRejectsInvalidCELValues(t *testing.T) {
 			crd:  "actions.kelos.dev_projects.yaml", sample: "actions_v1alpha1_project.yaml",
 			mutate: func(object map[string]any) {
 				object["spec"].(map[string]any)["workflowDirectory"] = ".open-actions/workflows/"
+			},
+		},
+		{
+			name: "Project environment secret reference with empty DNS label",
+			crd:  "actions.kelos.dev_projects.yaml", sample: "actions_v1alpha1_project-environment.yaml",
+			mutate: func(object map[string]any) {
+				environments := object["spec"].(map[string]any)["environments"].([]any)
+				environments[0].(map[string]any)["secretRef"].(map[string]any)["name"] = "invalid..name"
+			},
+		},
+		{
+			name: "Project environment name with control character",
+			crd:  "actions.kelos.dev_projects.yaml", sample: "actions_v1alpha1_project-environment.yaml",
+			mutate: func(object map[string]any) {
+				environments := object["spec"].(map[string]any)["environments"].([]any)
+				environments[0].(map[string]any)["name"] = "invalid\nenvironment"
+			},
+		},
+		{
+			name: "Project environment names duplicated with different case",
+			crd:  "actions.kelos.dev_projects.yaml", sample: "actions_v1alpha1_project-environment.yaml",
+			mutate: func(object map[string]any) {
+				environments := object["spec"].(map[string]any)["environments"].([]any)
+				object["spec"].(map[string]any)["environments"] = append(environments, map[string]any{"name": "OK-TO-TEST"})
 			},
 		},
 		{
@@ -742,6 +781,13 @@ func TestCRDRejectsInvalidCELValues(t *testing.T) {
 			crd:  "actions.kelos.dev_workflowjobs.yaml", sample: "actions_v1alpha1_workflowjob.yaml",
 			mutate: func(object map[string]any) {
 				object["status"] = map[string]any{"outputs": map[string]any{"invalid.name": "value"}}
+			},
+		},
+		{
+			name: "WorkflowJob environment secret reference with empty DNS label",
+			crd:  "actions.kelos.dev_workflowjobs.yaml", sample: "actions_v1alpha1_workflowjob.yaml",
+			mutate: func(object map[string]any) {
+				object["spec"].(map[string]any)["environment"].(map[string]any)["secretRef"].(map[string]any)["name"] = "invalid..name"
 			},
 		},
 		{

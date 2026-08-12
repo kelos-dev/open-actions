@@ -8,6 +8,7 @@ import (
 
 const (
 	queued    = "Queued"
+	waiting   = "Waiting for approval"
 	running   = "Running"
 	succeeded = "Succeeded"
 	failed    = "Failed"
@@ -45,6 +46,9 @@ func Job(job *actionsv1alpha1.WorkflowJob) string {
 	}
 	if job.Status.RunnerRef != nil {
 		return running
+	}
+	if job.Spec.Environment != nil && !meta.IsStatusConditionTrue(job.Status.Conditions, actionsv1alpha1.WorkflowJobConditionEnvironmentApproved) {
+		return waiting
 	}
 	return queued
 }

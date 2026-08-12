@@ -6,8 +6,9 @@ import (
 )
 
 const (
-	WorkflowJobConditionScheduled = "Scheduled"
-	WorkflowJobConditionSucceeded = "Succeeded"
+	WorkflowJobConditionEnvironmentApproved = "EnvironmentApproved"
+	WorkflowJobConditionScheduled           = "Scheduled"
+	WorkflowJobConditionSucceeded           = "Succeeded"
 )
 
 // WorkflowJobSpec describes one immutable job expanded from a WorkflowRun.
@@ -52,6 +53,37 @@ type WorkflowJobSpec struct {
 	// Matrix describes the matrix combination represented by this job.
 	// +optional
 	Matrix *WorkflowJobMatrix `json:"matrix,omitempty"`
+
+	// Environment contains the selected workflow environment and the Project
+	// policy resolved for this job.
+	// +optional
+	Environment *WorkflowJobEnvironment `json:"environment,omitempty"`
+}
+
+// WorkflowJobEnvironment contains the environment configuration frozen when a
+// WorkflowJob is planned.
+type WorkflowJobEnvironment struct {
+	// Name is the configured Project environment name.
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=255
+	// +kubebuilder:validation:Pattern=`^[^\x00-\x1f\x7f]+$`
+	// +required
+	Name string `json:"name"`
+
+	// URL is the optional deployment target URL resolved from the workflow.
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=2048
+	// +optional
+	URL string `json:"url,omitempty"`
+
+	// SecretRef identifies the Project Secret whose data keys are available to
+	// this job through the secrets expression context.
+	// +optional
+	SecretRef *EnvironmentSecretReference `json:"secretRef,omitempty"`
+
+	// Protection is the Project environment gate resolved for this job.
+	// +optional
+	Protection *EnvironmentProtection `json:"protection,omitempty"`
 }
 
 // WorkflowJobMatrix identifies one expanded combination of a logical workflow
@@ -110,9 +142,10 @@ type WorkflowJobStatus struct {
 	// +optional
 	Outputs map[string]string `json:"outputs,omitempty"`
 
-	// Conditions describe Runner assignment and the terminal result. Scheduled
-	// is true after the scheduler assigns status.runnerRef. Known condition types
-	// are Scheduled and Succeeded.
+	// Conditions describe environment approval, Runner assignment, and the
+	// terminal result. EnvironmentApproved is present for jobs that select an
+	// environment. Scheduled is true after the scheduler assigns status.runnerRef.
+	// Known condition types are EnvironmentApproved, Scheduled, and Succeeded.
 	// +listType=map
 	// +listMapKey=type
 	// +kubebuilder:validation:MaxItems=16
@@ -126,6 +159,8 @@ type WorkflowJobStatus struct {
 // +kubebuilder:printcolumn:name="Job",type=string,JSONPath=`.spec.displayName`
 // +kubebuilder:printcolumn:name="WorkflowRun",type=string,JSONPath=`.spec.workflowRunRef.name`
 // +kubebuilder:printcolumn:name="Runner",type=string,JSONPath=`.status.runnerRef.name`
+// +kubebuilder:printcolumn:name="Environment",type=string,JSONPath=`.spec.environment.name`
+// +kubebuilder:printcolumn:name="Approved",type=string,JSONPath=`.status.conditions[?(@.type=="EnvironmentApproved")].status`
 // +kubebuilder:printcolumn:name="Scheduled",type=string,JSONPath=`.status.conditions[?(@.type=="Scheduled")].status`
 // +kubebuilder:printcolumn:name="Succeeded",type=string,JSONPath=`.status.conditions[?(@.type=="Succeeded")].status`
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`

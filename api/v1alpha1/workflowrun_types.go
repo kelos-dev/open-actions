@@ -361,6 +361,13 @@ type WorkflowRunJobStatus struct {
 	// +optional
 	Total int32 `json:"total,omitempty"`
 
+	// WaitingForApproval is the number of jobs blocked by an environment
+	// approval gate and therefore not yet queued for a Runner.
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=100000
+	// +optional
+	WaitingForApproval int32 `json:"waitingForApproval,omitempty"`
+
 	// Queued is the number of jobs waiting for a matching Runner.
 	// +kubebuilder:validation:Minimum=0
 	// +kubebuilder:validation:Maximum=100000

@@ -5,6 +5,7 @@ import (
 
 	actionsv1alpha1 "github.com/kelos-dev/open-actions/api/v1alpha1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -36,6 +37,7 @@ func TestJob(t *testing.T) {
 		want string
 	}{
 		{name: "waiting", job: &actionsv1alpha1.WorkflowJob{}, want: "Queued"},
+		{name: "waiting for approval", job: workflowJobWaitingForApproval(), want: "Waiting for approval"},
 		{name: "running", job: &actionsv1alpha1.WorkflowJob{Status: actionsv1alpha1.WorkflowJobStatus{RunnerRef: &corev1.LocalObjectReference{Name: "runner"}}}, want: "Running"},
 		{name: "succeeded", job: workflowJobWithCondition(metav1.ConditionTrue), want: "Succeeded"},
 		{name: "failed", job: workflowJobWithCondition(metav1.ConditionFalse), want: "Failed"},
@@ -46,6 +48,12 @@ func TestJob(t *testing.T) {
 			}
 		})
 	}
+}
+
+func workflowJobWaitingForApproval() *actionsv1alpha1.WorkflowJob {
+	job := &actionsv1alpha1.WorkflowJob{Spec: actionsv1alpha1.WorkflowJobSpec{Environment: &actionsv1alpha1.WorkflowJobEnvironment{Name: "production"}}}
+	meta.SetStatusCondition(&job.Status.Conditions, metav1.Condition{Type: actionsv1alpha1.WorkflowJobConditionEnvironmentApproved, Status: metav1.ConditionFalse, Reason: "ApprovalRequired"})
+	return job
 }
 
 func TestJobTerminal(t *testing.T) {

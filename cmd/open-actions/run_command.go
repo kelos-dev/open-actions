@@ -376,7 +376,7 @@ func writeWorkflowRun(writer io.Writer, run *actionsv1alpha1.WorkflowRun, jobs [
 	fmt.Fprintf(table, "Started:\t%s\n", optionalTime(run.Status.StartTime))
 	fmt.Fprintf(table, "Completed:\t%s\n", optionalTime(run.Status.CompletionTime))
 	fmt.Fprintln(table)
-	fmt.Fprintln(table, "JOB\tRESOURCE\tDISPLAY NAME\tSTATUS\tRUNNER\tSTARTED\tCOMPLETED")
+	fmt.Fprintln(table, "JOB\tRESOURCE\tDISPLAY NAME\tENVIRONMENT\tSTATUS\tRUNNER\tSTARTED\tCOMPLETED")
 	for index := range jobs {
 		job := &jobs[index]
 		displayName := job.Spec.DisplayName
@@ -384,13 +384,18 @@ func writeWorkflowRun(writer io.Writer, run *actionsv1alpha1.WorkflowRun, jobs [
 			displayName = "-"
 		}
 		runnerName := "-"
+		environmentName := "-"
+		if job.Spec.Environment != nil {
+			environmentName = job.Spec.Environment.Name
+		}
 		if job.Status.RunnerRef != nil {
 			runnerName = job.Status.RunnerRef.Name
 		}
-		fmt.Fprintf(table, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+		fmt.Fprintf(table, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
 			job.Spec.JobID,
 			job.Name,
 			tableCell(displayName),
+			tableCell(environmentName),
 			workflowstatus.Job(job),
 			runnerName,
 			optionalTime(job.Status.StartTime),

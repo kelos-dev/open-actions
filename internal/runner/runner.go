@@ -23,7 +23,7 @@ import (
 
 const (
 	minimumPlanVersion = 1
-	PlanVersion        = 4
+	PlanVersion        = 5
 	ContainerName      = "runner"
 )
 
@@ -120,6 +120,7 @@ type Step struct {
 type ExecutorConfig struct {
 	Logger      *slog.Logger
 	GitHubToken string
+	Secrets     map[string]string
 	Environment []string
 	Stdout      io.Writer
 	Stderr      io.Writer
@@ -128,6 +129,7 @@ type ExecutorConfig struct {
 type Executor struct {
 	logger      *slog.Logger
 	githubToken string
+	secrets     map[string]string
 	environment []string
 	stdout      io.Writer
 	stderr      io.Writer
@@ -142,6 +144,7 @@ type executionState struct {
 	temporaryDirectory string
 	environment        []string
 	githubToken        string
+	secrets            map[string]string
 	resolver           *actionResolver
 	posts              []*actionInvocation
 	compositeStack     map[string]bool
@@ -155,15 +158,42 @@ func NewExecutor(config ExecutorConfig) (*Executor, error) {
 	}
 	masker := newOutputMasker(config.GitHubToken)
 	masker.add(base64.StdEncoding.EncodeToString([]byte("x-access-token:" + config.GitHubToken)))
+	secrets := make(map[string]string, len(config.Secrets))
+	for name, value := range config.Secrets {
+		if len(value) > maxMaskValueBytes {
+			return nil, fmt.Errorf("workflow job secret %q exceeds %d bytes", name, maxMaskValueBytes)
+		}
+		secrets[name] = value
+		masker.add(value)
+	}
 	return &Executor{
 		logger:      config.Logger.With(runnerLogMarker, true),
 		githubToken: config.GitHubToken,
+		secrets:     secrets,
 		environment: append([]string(nil), config.Environment...),
 		stdout:      config.Stdout,
 		stderr:      config.Stderr,
 		masker:      masker,
 		commands:    newWorkflowCommandState(),
 	}, nil
+}
+
+// LoadSecrets reads the environment-scoped secret values supplied separately
+// from the non-secret workflow plan.
+func LoadSecrets(path string) (map[string]string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read workflow job secrets: %w", err)
+	}
+	secrets := map[string]string{}
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	if err := decoder.Decode(&secrets); err != nil {
+		return nil, fmt.Errorf("decode workflow job secrets: %w", err)
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		return nil, errors.New("decode workflow job secrets: trailing JSON value")
+	}
+	return secrets, nil
 }
 
 func LoadPlan(path string) (*Plan, error) {
@@ -264,7 +294,7 @@ func (e *Executor) executePlan(ctx context.Context, plan *Plan, workspace string
 		"RUNNER_TEMP="+filepath.Join(temporaryDirectory, "temp"),
 		"RUNNER_TOOL_CACHE="+filepath.Join(temporaryDirectory, "tool-cache"),
 	)
-	jobEnvironment, err := resolveJobEnvironment(plan.Env, plan, environment, e.githubToken)
+	jobEnvironment, err := resolveJobEnvironment(plan.Env, plan, environment, e.githubToken, e.secrets)
 	if err != nil {
 		return emptyResult, fmt.Errorf("resolve job environment: %w", err)
 	}
@@ -282,6 +312,7 @@ func (e *Executor) executePlan(ctx context.Context, plan *Plan, workspace string
 		temporaryDirectory: temporaryDirectory,
 		environment:        environment,
 		githubToken:        e.githubToken,
+		secrets:            e.secrets,
 		resolver:           newActionResolver(plan.Repository.ActionCloneBaseURL, filepath.Join(temporaryDirectory, "actions"), environment, e.executeCommand),
 		compositeStack:     map[string]bool{},
 		stepOutputs:        map[string]map[string]any{},

@@ -391,10 +391,47 @@ func TestResolvedStepBytesEnforcesFieldLimits(t *testing.T) {
 
 func TestExecuteRejectsUnavailableExpressionContext(t *testing.T) {
 	plan := testPlan()
-	plan.Env = map[string]string{"TOKEN": "${{ secrets.TOKEN }}"}
+	plan.Steps[0].If = "${{ secrets.TOKEN }}"
 	err := testExecutor(t, io.Discard, io.Discard).Execute(context.Background(), plan, t.TempDir())
 	if err == nil || !strings.Contains(err.Error(), `context "secrets" is unavailable`) {
 		t.Fatalf("error = %v, want unavailable secrets context", err)
+	}
+}
+
+func TestExecuteResolvesAndMasksEnvironmentSecrets(t *testing.T) {
+	plan := testPlan()
+	plan.Env = map[string]string{
+		"DEPLOY_TOKEN":  "${{ secrets.DEPLOY_TOKEN }}",
+		"GITHUB_SECRET": "${{ secrets.GITHUB_TOKEN }}",
+	}
+	plan.Steps = []Step{{Run: `printf '%s %s\n' "$DEPLOY_TOKEN" "$GITHUB_SECRET"`}}
+	var output bytes.Buffer
+	executor, err := NewExecutor(ExecutorConfig{
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)), GitHubToken: "installation-token",
+		Secrets: map[string]string{"DEPLOY_TOKEN": "environment-token"}, Environment: os.Environ(), Stdout: &output, Stderr: &output,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := executor.Execute(context.Background(), plan, t.TempDir()); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(output.String(), "environment-token") || strings.Contains(output.String(), "installation-token") || !strings.Contains(output.String(), "***") {
+		t.Fatalf("secret output was not masked: %q", output.String())
+	}
+}
+
+func TestLoadSecrets(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "secrets.json")
+	if err := os.WriteFile(path, []byte(`{"DEPLOY_TOKEN":"value"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	secrets, err := LoadSecrets(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if secrets["DEPLOY_TOKEN"] != "value" {
+		t.Fatalf("secrets = %#v", secrets)
 	}
 }
 
@@ -421,7 +458,7 @@ func TestExpressionContextsPreserveTriggerInputTypes(t *testing.T) {
 	plan := testPlan()
 	plan.Inputs = map[string]any{"enabled": false, "retries": float64(2)}
 	plan.Event.Schedule = "0 6 * * *"
-	context := expressionContext(plan, nil, "", nil, runnerConditionAvailability, nil, "token")
+	context := expressionContext(plan, nil, "", nil, runnerConditionAvailability, nil, "token", nil)
 	enabled, err := evaluateCondition("${{ inputs.enabled }}", context, true)
 	if err != nil {
 		t.Fatal(err)
@@ -534,6 +571,16 @@ func TestNewExecutorRequiresGitHubToken(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("NewExecutor() accepted an empty GitHub token")
+	}
+}
+
+func TestNewExecutorRejectsSecretTooLargeToMask(t *testing.T) {
+	_, err := NewExecutor(ExecutorConfig{
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)), GitHubToken: "token",
+		Secrets: map[string]string{"TOKEN": strings.Repeat("x", maxMaskValueBytes+1)}, Environment: os.Environ(), Stdout: io.Discard, Stderr: io.Discard,
+	})
+	if err == nil || !strings.Contains(err.Error(), "exceeds") {
+		t.Fatalf("NewExecutor() error = %v", err)
 	}
 }
 

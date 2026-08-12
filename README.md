@@ -15,7 +15,8 @@ Kubernetes 1.29 or newer is required.
 Open Actions supports event, manual, and scheduled triggers; independent jobs
 selected by runner labels; Bash steps; step and declared job outputs; Node 20,
 Node 24, and composite actions; expressions and concurrency; optional
-job-scoped Docker; GitHub Check Runs; and live logs. See the
+job-scoped Docker; approval-gated environments and environment secrets; GitHub
+Check Runs; and live logs. See the
 [Workflow API](docs/reference.md#workflow-api) for the exact supported syntax
 and execution constraints. Unsupported workflows fail explicitly rather than
 run with different semantics.

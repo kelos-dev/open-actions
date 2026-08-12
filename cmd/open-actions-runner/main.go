@@ -26,6 +26,7 @@ func main() {
 func run(ctx context.Context, arguments []string) error {
 	flags := flag.NewFlagSet("open-actions-runner", flag.ContinueOnError)
 	jobFile := flags.String("job-file", "/var/run/open-actions/job.json", "Path to the workflow job plan")
+	secretsFile := flags.String("secrets-file", "/var/run/open-actions-credentials/secrets.json", "Path to the environment-scoped workflow job secrets")
 	resultFile := flags.String("result-file", "/dev/termination-log", "Path used to report the workflow job result")
 	workspace := flags.String("workspace", "/workspace", "Path to the job workspace")
 	if err := flags.Parse(arguments); err != nil {
@@ -35,10 +36,19 @@ func run(ctx context.Context, arguments []string) error {
 	if err != nil {
 		return err
 	}
+	secrets, err := runner.LoadSecrets(*secretsFile)
+	if err != nil {
+		if plan.Version < runner.PlanVersion && errors.Is(err, os.ErrNotExist) {
+			secrets = map[string]string{}
+		} else {
+			return err
+		}
+	}
 	githubToken := os.Getenv("OPEN_ACTIONS_GITHUB_TOKEN")
 	executor, err := runner.NewExecutor(runner.ExecutorConfig{
 		Logger:      slog.New(slog.NewJSONHandler(os.Stdout, nil)),
 		GitHubToken: githubToken,
+		Secrets:     secrets,
 		Environment: withoutEnvironmentVariable(os.Environ(), "OPEN_ACTIONS_GITHUB_TOKEN"),
 		Stdout:      os.Stdout,
 		Stderr:      os.Stderr,
