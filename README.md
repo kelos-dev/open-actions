@@ -1,39 +1,27 @@
 # Open Actions
 
-Open Actions is an open, Kubernetes-native alternative to GitHub Actions. It is
-a self-hosted control plane for high-volume automation workloads, built for
-teams whose CI demand is growing faster than a hosted scheduler can comfortably
-handle. Source events trigger supported workflows, while Open Actions schedules
-their jobs in the team's own Kubernetes cluster. GitHub webhooks are the first
-source integration. Workflow planning, scheduling, and execution belong to Open
-Actions and run on self-hosted infrastructure.
+Open Actions is an open, Kubernetes-native alternative to the GitHub Actions
+control plane. It is designed for high-volume automation workloads whose
+workflow requests can saturate that control plane even when runner capacity is
+available. GitHub webhooks trigger supported workflows, which Open Actions
+plans, schedules, and executes in the team's own Kubernetes cluster. GitHub
+webhooks are the first source integration.
 
 ![Open Actions Console showing live workflow runner logs](docs/open-actions-console.png)
 
-Kubernetes 1.29 or newer is required.
-
-Open Actions supports event, manual, and scheduled triggers; independent jobs
-selected by runner labels; Bash steps; step and declared job outputs; Node 20,
-Node 24, and composite actions; expressions and concurrency; optional
-job-scoped Docker; GitHub Check Runs; and live logs. See the
-[Workflow API](docs/reference.md#workflow-api) for the exact supported syntax
-and execution constraints. Unsupported workflows fail explicitly rather than
-run with different semantics.
+Open Actions implements a documented subset of GitHub Actions. See the
+[Workflow API](docs/reference.md#workflow-api) for supported syntax and
+constraints. Unsupported workflows fail explicitly.
 
 ## Architecture
 
 ![Open Actions controller, Console, and execution flow](docs/architecture.drawio.svg)
 
-The `open-actions-controller` accepts GitHub webhooks, discovers workflows, and
-creates `WorkflowRun` and `WorkflowJob` resources. It assigns queued jobs to
-matching `Runner` resources, which execute the workflow steps in Kubernetes
-Jobs. The controller also reports WorkflowRun state through GitHub Check Runs.
-The `open-actions-console` serves an authenticated cluster-wide run overview,
-run and job pages, and runner Pod logs. The runner interprets GitHub Actions
-workflow commands and problem matchers, while the Console presents groups,
-commands, annotations, masked action inputs and outputs, debug messages, and
-post actions. A `Project` defines the execution domain and its GitHub App
-integration.
+The controller receives GitHub webhooks, creates `WorkflowRun` and `WorkflowJob`
+resources, schedules jobs on matching `Runner` resources, and reports status
+through GitHub Check Runs. Runners execute steps in Kubernetes Jobs. The Console
+shows runs, jobs, and live logs. Each `Project` defines an execution domain and
+its GitHub App integration.
 
 ## Migrate from GitHub Actions
 
