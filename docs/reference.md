@@ -116,6 +116,71 @@ Runner labels are canonical lowercase ASCII in Kubernetes resources. Workflow
 execution slot and accepts one queued `WorkflowJob` from its `spec.projectRef`
 whose `runs-on` labels are all present in `spec.labels`.
 
+### Environments and environment secrets
+
+`Project.spec.environments` is the allow-list of environments that workflows
+may select. Names contain 1 to 255 characters, are matched without regard to
+ASCII case, and must be unique under that comparison. A workflow job may use
+either GitHub form:
+
+```yaml
+environment: staging
+```
+
+```yaml
+environment:
+  name: ${{ inputs.environment-name }}
+  url: https://deploy.example/${{ matrix.arch }}
+```
+
+The name and optional URL accept the planning contexts `github`, `inputs`, and
+`matrix`. The evaluated name must match a configured Project environment;
+otherwise planning fails. The controller writes the configured spelling,
+optional URL, Secret reference, and protection policy to the immutable
+`WorkflowJob.spec.environment`. This prevents an expression or untrusted
+workflow input from selecting an unconfigured secret source or bypassing the
+configured policy.
+
+An environment's optional `secretRef` selects one Kubernetes Secret in the
+Project namespace. Its data keys populate the `secrets` expression context only
+for jobs assigned to that environment. Keys follow GitHub secret naming rules,
+are unique ignoring ASCII case, may not start with `GITHUB_`, and are limited to
+100 entries and 8,192 UTF-8 bytes per value. `secrets.GITHUB_TOKEN` remains the
+job's repository-scoped installation token. The controller copies environment
+values into a job-owned Secret only after the approval gate and Runner
+assignment, mounts it only in that job's runner container, masks the values in
+runner output, and deletes the copy when the job is finalized. Environment
+secrets are not stored in the ConfigMap job plan or `WorkflowJob.status`.
+
+Open Actions does not import or evaluate GitHub Environment protection rules.
+Its Kubernetes-native equivalent is
+`Project.spec.environments[].protection.requiredApproval`. When enabled, every
+expanded WorkflowJob remains in `Waiting for approval` and is excluded from the
+Runner queue. An operator with Kubernetes permission to update WorkflowJobs
+approves that exact immutable job by setting this annotation to its environment
+name:
+
+```console
+kubectl annotate workflowjob WORKFLOW_JOB \
+  --namespace PROJECT_NAMESPACE \
+  actions.kelos.dev/environment-approved=ok-to-test
+```
+
+Kubernetes authorization and audit logging define who may perform this action;
+do not grant untrusted workflow identities permission to update WorkflowJobs.
+Approval applies only to that WorkflowJob, so a new delivery, revision, or
+matrix child requires its own approval. Removing the annotation before Runner
+assignment revokes the gate. After assignment, delete the WorkflowJob or its
+WorkflowRun to cancel it.
+
+The `EnvironmentApproved` condition records `ApprovalRequired`,
+`EnvironmentApproved`, or `ApprovalNotRequired`. The WorkflowRun job summary
+counts `waitingForApproval` separately from `queued`, and the Console and GitHub
+Check show the selected environments and approval state.
+See
+[`config/samples/actions_v1alpha1_project-environment.yaml`](../config/samples/actions_v1alpha1_project-environment.yaml)
+for a complete Project example.
+
 ### Docker execution
 
 `spec.execution.docker` enables a job-scoped Docker daemon. Its required
@@ -164,7 +229,7 @@ The resources expose these condition contracts:
 | Resource | Condition | Status | Reasons |
 | --- | --- | --- | --- |
 | `Project` | `Configured` | `True` | `ConfigurationValid` |
-| `Project` | `Configured` | `False` | `DuplicateInstallation`, `CredentialsUnavailable`, `InvalidCredentials` |
+| `Project` | `Configured` | `False` | `DuplicateInstallation`, `CredentialsUnavailable`, `InvalidCredentials`, `EnvironmentInvalid`, `EnvironmentSecretsUnavailable` |
 | `Runner` | `Ready` | `True` | `Ready` |
 | `Runner` | `Ready` | `False` | `ProjectUnavailable`, `ProjectNotConfigured` |
 | `Runner` | `Busy` | `False` | `Idle` |
@@ -172,11 +237,13 @@ The resources expose these condition contracts:
 | `WorkflowRun` | `Planned` | `True` | `JobsPlanned` |
 | `WorkflowRun` | `Planned` | `Unknown` | `WaitingForConcurrency`, `WaitingForConcurrencyCancellation`, `ProjectUnavailable`, `CredentialsUnavailable`, `GitHubAuthenticationFailed`, `WorkflowFetchFailed`, `ChildCreationFailed`, `ConcurrencyCheckFailed` |
 | `WorkflowRun` | `Planned` | `False` | `ProjectUnavailable`, `WorkflowFetchFailed`, `WorkflowInvalid`, `TriggerInvalid`, `ChildCreationFailed`, `ExecutionStateLost` |
-| `WorkflowRun` | `Succeeded` | `Unknown` | `JobsQueued`, `JobsRunning` |
+| `WorkflowRun` | `Succeeded` | `Unknown` | `JobsWaitingForApproval`, `JobsQueued`, `JobsRunning` |
 | `WorkflowRun` | `Succeeded` | `True` | `JobsSucceeded` |
 | `WorkflowRun` | `Succeeded` | `False` | `ProjectUnavailable`, `WorkflowFetchFailed`, `WorkflowInvalid`, `TriggerInvalid`, `ChildCreationFailed`, `JobFailed`, `ExecutionStateLost` |
 | `WorkflowJob` | `Scheduled` | `True` | `RunnerAssigned` |
 | `WorkflowJob` | `Scheduled` | `False` | `ProjectRecreated` |
+| `WorkflowJob` | `EnvironmentApproved` | `True` | `EnvironmentApproved`, `ApprovalNotRequired` |
+| `WorkflowJob` | `EnvironmentApproved` | `False` | `ApprovalRequired` |
 | `WorkflowJob` | `Succeeded` | `Unknown` | `JobRunning` |
 | `WorkflowJob` | `Succeeded` | `True` | `JobSucceeded` |
 | `WorkflowJob` | `Succeeded` | `False` | `JobFailed`, `JobResultInvalid`, `PlanUnavailable`, `JobStartFailed`, `ExecutionStateLost`, `ProjectRecreated` |
@@ -205,6 +272,9 @@ distinguished from the original object. Workflow jobs that declare outputs,
 and their native Jobs and Pods, carry the
 `actions.kelos.dev/runner-result-version` annotation. Its value identifies the
 runner result format required to complete that job.
+The `actions.kelos.dev/environment-approved` annotation is the operator-owned
+approval input for protected environments; workflow definitions cannot set
+resource metadata on their controller-owned WorkflowJobs.
 
 Webhook-created WorkflowRuns use the workflow filename followed by a stable
 20-character digest of the project, delivery replay, and workflow path.
@@ -247,8 +317,9 @@ evaluation when the corresponding execution feature has not supplied it.
 | --- | --- | --- |
 | Workflow concurrency | `github`, `inputs`, `vars` | `github`, `inputs` |
 | Job name and runner labels | `github`, `needs`, `strategy`, `matrix`, `vars`, `inputs` | `github`, `inputs`, and `matrix` for matrix jobs |
-| Job environment | `github`, `needs`, `strategy`, `matrix`, `vars`, `secrets`, `inputs` | `github`, `inputs`, and `matrix` for matrix jobs |
-| Workflow step name, run script, working directory, environment, and inputs | `github`, `needs`, `strategy`, `matrix`, `job`, `runner`, `env`, `vars`, `secrets`, `steps`, `inputs` | `github`, `matrix`, `runner`, `env`, `inputs`, `steps` |
+| Environment name and URL | `github`, `needs`, `strategy`, `matrix`, `vars`, `inputs` | `github`, `inputs`, and `matrix` for matrix jobs |
+| Job `env` values | `github`, `needs`, `strategy`, `matrix`, `vars`, `secrets`, `inputs` | `github`, `inputs`, `secrets`, and `matrix` for matrix jobs |
+| Workflow step name, run script, working directory, environment, and inputs | `github`, `needs`, `strategy`, `matrix`, `job`, `runner`, `env`, `vars`, `secrets`, `steps`, `inputs` | `github`, `matrix`, `runner`, `env`, `inputs`, `secrets`, and `steps` |
 | Workflow step condition | Step contexts except `secrets`, plus status functions | `github`, `matrix`, `runner`, `env`, `inputs`, `steps`, and status functions |
 | Job outputs | Workflow step contexts | `github`, `matrix`, `runner`, `env`, `inputs`, `steps` |
 | Composite step fields and outputs | `github`, `runner`, `env`, `inputs`, `steps` | All listed contexts |
@@ -256,7 +327,9 @@ evaluation when the corresponding execution feature has not supplied it.
 | Action input default | `github` | `github` |
 
 Dependency scheduling and its `needs` context, and repository secret and
-variable sources remain separate execution features. Values derived
+variable sources remain separate execution features. The `secrets` context
+contains the selected environment's Kubernetes Secret plus the automatic
+`GITHUB_TOKEN`; it does not merge repository or organization secrets. Values derived
 from `github.token` or the `secrets` context are marked sensitive through
 interpolation and function calls, and evaluation diagnostics do not include
 resolved values. The runner maps interrupt and termination signals to cancelled
@@ -461,8 +534,8 @@ reusable inputs, the selected cron expression, and revision fields used by the
 supported event. Actions that require other fields from GitHub's raw webhook
 payload are not supported.
 
-The controller emits job-plan version 4, and the runner accepts versions 1
-through 4. When a release changes the job-plan version, update every Runner
+The controller emits job-plan version 5, and the runner accepts versions 1
+through 5. When a release changes the job-plan version, update every Runner
 `spec.execution.image` to an image that accepts both the installed and target
 controller versions before upgrading the controller. The received job-plan
 version also determines the runner result version. A runner that accepts more

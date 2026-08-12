@@ -731,6 +731,14 @@ spec:
                     maximum: 100000
                     minimum: 0
                     type: integer
+                  waitingForApproval:
+                    description: |-
+                      WaitingForApproval is the number of jobs blocked by an environment
+                      approval gate and therefore not yet queued for a Runner.
+                    format: int32
+                    maximum: 100000
+                    minimum: 0
+                    type: integer
                 type: object
               observedGeneration:
                 description: |-

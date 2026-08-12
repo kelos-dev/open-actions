@@ -11,3 +11,9 @@ spec:
   displayName: Build and test
   runsOn:
     - ubuntu-latest
+  environment:
+    name: ok-to-test
+    secretRef:
+      name: open-actions-e2e-secrets
+    protection:
+      requiredApproval: true

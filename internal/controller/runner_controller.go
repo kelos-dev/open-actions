@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sort"
@@ -33,10 +34,13 @@ var (
 
 const (
 	jobPlanVolume            = "open-actions-job"
+	jobCredentialsVolume     = "open-actions-credentials"
 	workspaceVolume          = "open-actions-workspace"
 	dockerSocketVolume       = "open-actions-docker-socket"
 	dockerStorageVolume      = "open-actions-docker-storage"
 	jobPlanMountPath         = "/var/run/open-actions"
+	jobCredentialsMountPath  = "/var/run/open-actions-credentials"
+	jobSecretsKey            = "secrets.json"
 	workspaceVolumeMountPath = "/workspace"
 	jobResultPath            = "/dev/termination-log"
 	dockerSocketDirectory    = "/var/run/open-actions-docker"
@@ -391,6 +395,9 @@ func (r *RunnerReconciler) executeWorkflowJob(ctx context.Context, runnerObject 
 	if workflowJob.Labels[actionsv1alpha1.LabelProjectUID] != string(project.UID) {
 		return true, r.failAssignedWorkflowJob(ctx, workflowJob, "ProjectRecreated", fmt.Sprintf("Project %q was recreated before execution started", project.Name))
 	}
+	if !workflowJobEnvironmentApproved(workflowJob) {
+		return false, fmt.Errorf("WorkflowJob %q environment is not approved", workflowJob.Name)
+	}
 	if workflowJobStarted(workflowJob) {
 		active, err := r.activeWorkflowJobPods(ctx, workflowJob)
 		if err != nil {
@@ -427,7 +434,15 @@ func (r *RunnerReconciler) executeWorkflowJob(ctx context.Context, runnerObject 
 	} else if canceled {
 		return true, r.cancelWorkflowJob(ctx, workflowJob)
 	}
-	if err := r.ensureAuthSecret(ctx, workflowJob, installation.Token()); err != nil {
+	var secretsReference *actionsv1alpha1.EnvironmentSecretReference
+	if workflowJob.Spec.Environment != nil {
+		secretsReference = workflowJob.Spec.Environment.SecretRef
+	}
+	environmentSecrets, err := environmentSecretValues(ctx, r.APIReader, project.Namespace, secretsReference)
+	if err != nil {
+		return false, fmt.Errorf("read environment secrets for WorkflowJob %q: %w", workflowJob.Name, err)
+	}
+	if err := r.ensureAuthSecret(ctx, workflowJob, installation.Token(), environmentSecrets); err != nil {
 		return false, err
 	}
 	nativeJob, err := r.buildJob(workflowJob, run, project, runnerObject)
@@ -615,7 +630,11 @@ func (r *RunnerReconciler) cleanupAuthSecret(ctx context.Context, workflowJob *a
 	return nil
 }
 
-func (r *RunnerReconciler) ensureAuthSecret(ctx context.Context, workflowJob *actionsv1alpha1.WorkflowJob, token string) error {
+func (r *RunnerReconciler) ensureAuthSecret(ctx context.Context, workflowJob *actionsv1alpha1.WorkflowJob, token string, environmentSecrets map[string]string) error {
+	secretsData, err := json.Marshal(environmentSecrets)
+	if err != nil {
+		return fmt.Errorf("encode environment secrets for WorkflowJob %q: %w", workflowJob.Name, err)
+	}
 	secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{
 		Name:      childName(workflowJob.Name, "auth"),
 		Namespace: workflowJob.Namespace,
@@ -623,7 +642,7 @@ func (r *RunnerReconciler) ensureAuthSecret(ctx context.Context, workflowJob *ac
 			actionsv1alpha1.LabelWorkflowRunUID: workflowJob.Labels[actionsv1alpha1.LabelWorkflowRunUID],
 			actionsv1alpha1.LabelWorkflowJobUID: string(workflowJob.UID),
 		},
-	}, Data: map[string][]byte{"token": []byte(token)}}
+	}, Data: map[string][]byte{"token": []byte(token), jobSecretsKey: secretsData}}
 	if err := controllerutil.SetControllerReference(workflowJob, secret, r.Scheme()); err != nil {
 		return err
 	}
@@ -651,6 +670,7 @@ func (r *RunnerReconciler) ensureAuthSecret(ctx context.Context, workflowJob *ac
 		existing.Data = map[string][]byte{}
 	}
 	existing.Data["token"] = []byte(token)
+	existing.Data[jobSecretsKey] = secretsData
 	if apiEquality.Semantic.DeepEqual(before, existing) {
 		return nil
 	}
@@ -703,11 +723,13 @@ func (r *RunnerReconciler) buildJob(workflowJob *actionsv1alpha1.WorkflowJob, ru
 				}},
 				VolumeMounts: []corev1.VolumeMount{
 					{Name: jobPlanVolume, MountPath: jobPlanMountPath, ReadOnly: true},
+					{Name: jobCredentialsVolume, MountPath: jobCredentialsMountPath, ReadOnly: true},
 					{Name: workspaceVolume, MountPath: workspaceVolumeMountPath},
 				},
 			}},
 			Volumes: []corev1.Volume{
 				{Name: jobPlanVolume, VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{LocalObjectReference: corev1.LocalObjectReference{Name: childName(workflowJob.Name, "plan")}}}},
+				{Name: jobCredentialsVolume, VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{SecretName: childName(workflowJob.Name, "auth")}}},
 				{Name: workspaceVolume, VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
 			},
 		},
@@ -997,10 +1019,17 @@ func (r *RunnerReconciler) runnersForWorkflowRun(ctx context.Context, object cli
 
 func indexQueuedWorkflowJob(object client.Object) []string {
 	workflowJob := object.(*actionsv1alpha1.WorkflowJob)
-	if workflowJob.DeletionTimestamp.IsZero() && workflowJob.Status.RunnerRef == nil && !terminalWorkflowJob(workflowJob) {
+	if workflowJob.DeletionTimestamp.IsZero() && workflowJob.Status.RunnerRef == nil && !terminalWorkflowJob(workflowJob) && workflowJobEnvironmentApproved(workflowJob) {
 		return []string{"true"}
 	}
 	return nil
+}
+
+func workflowJobEnvironmentApproved(workflowJob *actionsv1alpha1.WorkflowJob) bool {
+	if workflowJob.Spec.Environment == nil {
+		return true
+	}
+	return meta.IsStatusConditionTrue(workflowJob.Status.Conditions, actionsv1alpha1.WorkflowJobConditionEnvironmentApproved)
 }
 
 func indexWorkflowJobRunnerName(object client.Object) []string {

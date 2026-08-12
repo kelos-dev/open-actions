@@ -53,6 +53,55 @@ spec:
             description: ProjectSpec describes the workflow source for an Open Actions
               Project.
             properties:
+              environments:
+                description: |-
+                  Environments defines the environment names workflows may select. Each
+                  environment may expose one Secret and require approval before its jobs can
+                  be assigned to a Runner.
+                items:
+                  description: |-
+                    ProjectEnvironment configures one workflow environment. Environment names
+                    are matched without regard to ASCII case.
+                  properties:
+                    name:
+                      description: Name is the GitHub-compatible environment name
+                        selected by a workflow job.
+                      maxLength: 255
+                      minLength: 1
+                      pattern: ^[^\x00-\x1f\x7f]+$
+                      type: string
+                    protection:
+                      description: Protection configures the gate enforced before
+                        a job can be assigned.
+                      properties:
+                        requiredApproval:
+                          description: |-
+                            RequiredApproval requires an authorized user to approve each WorkflowJob
+                            before a Runner can claim it.
+                          type: boolean
+                      type: object
+                    secretRef:
+                      description: |-
+                        SecretRef identifies a Secret in the Project namespace whose data keys
+                        populate the secrets expression context for jobs in this environment.
+                      properties:
+                        name:
+                          description: Name is the Secret resource name.
+                          maxLength: 253
+                          minLength: 1
+                          pattern: ^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?([.][a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?)*$
+                          type: string
+                      required:
+                      - name
+                      type: object
+                  required:
+                  - name
+                  type: object
+                maxItems: 100
+                type: array
+                x-kubernetes-list-map-keys:
+                - name
+                x-kubernetes-list-type: map
               source:
                 description: Source selects and configures the external workflow source.
                 properties:
@@ -202,6 +251,10 @@ spec:
             required:
             - source
             type: object
+            x-kubernetes-validations:
+            - message: environment names must be unique ignoring ASCII case
+              rule: '!has(self.environments) || self.environments.all(e, self.environments.exists_one(other,
+                e.name.lowerAscii() == other.name.lowerAscii()))'
           status:
             description: ProjectStatus contains observations made by the project controller.
             properties:

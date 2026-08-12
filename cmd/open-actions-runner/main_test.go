@@ -37,8 +37,12 @@ func TestRunWritesWorkflowJobResult(t *testing.T) {
 		t.Fatal(err)
 	}
 	resultPath := filepath.Join(directory, "result.json")
+	secretsPath := filepath.Join(directory, "secrets.json")
+	if err := os.WriteFile(secretsPath, []byte(`{}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	t.Setenv("OPEN_ACTIONS_GITHUB_TOKEN", "installation-token")
-	if err := run(context.Background(), []string{"--job-file=" + planPath, "--result-file=" + resultPath, "--workspace=" + filepath.Join(directory, "workspace")}); err != nil {
+	if err := run(context.Background(), []string{"--job-file=" + planPath, "--secrets-file=" + secretsPath, "--result-file=" + resultPath, "--workspace=" + filepath.Join(directory, "workspace")}); err != nil {
 		t.Fatal(err)
 	}
 	resultData, err := os.ReadFile(resultPath)
@@ -65,5 +69,35 @@ func TestWithoutEnvironmentVariable(t *testing.T) {
 	}
 	if !slices.Contains(environment, "PATH=/usr/bin") || !slices.Contains(environment, "OPEN_ACTIONS_GITHUB_TOKEN_BACKUP=preserved") {
 		t.Fatalf("filtered environment = %#v", environment)
+	}
+}
+
+func TestRunCompatiblePlanWithoutSecretsFile(t *testing.T) {
+	directory := t.TempDir()
+	plan := runner.Plan{
+		Version: runner.PlanVersion - 1,
+		Repository: runner.Repository{
+			ID: 1, Owner: "acme", Name: "example", ServerURL: "https://github.com", APIURL: "https://api.github.com", ActionCloneBaseURL: "https://github.com",
+		},
+		Event: runner.Event{Name: "push", DeliveryID: "delivery"}, Revision: runner.Revision{SHA: strings.Repeat("a", 40), Ref: "refs/heads/main", RefName: "main"},
+		WorkflowName: "CI", JobID: "build", Steps: []runner.Step{{Run: "true"}},
+	}
+	planData, err := json.Marshal(plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	planPath := filepath.Join(directory, "plan.json")
+	if err := os.WriteFile(planPath, planData, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("OPEN_ACTIONS_GITHUB_TOKEN", "installation-token")
+	err = run(context.Background(), []string{
+		"--job-file=" + planPath,
+		"--secrets-file=" + filepath.Join(directory, "missing.json"),
+		"--result-file=" + filepath.Join(directory, "result.json"),
+		"--workspace=" + filepath.Join(directory, "workspace"),
+	})
+	if err != nil {
+		t.Fatal(err)
 	}
 }

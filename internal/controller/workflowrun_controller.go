@@ -284,7 +284,11 @@ func (r *WorkflowRunReconciler) reconcileGitHubCheck(ctx context.Context, run *a
 	if !r.githubCheckEnabled(run) {
 		return nil
 	}
-	report := workflowRunCheckReport(run)
+	jobs := &actionsv1alpha1.WorkflowJobList{}
+	if err := r.APIReader.List(ctx, jobs, client.InNamespace(run.Namespace), client.MatchingLabels{actionsv1alpha1.LabelWorkflowRunUID: string(run.UID)}); err != nil {
+		return fmt.Errorf("list WorkflowJobs for WorkflowRun %q GitHub check: %w", run.Name, err)
+	}
+	report := workflowRunCheckReportWithJobs(run, jobs.Items)
 	project := &actionsv1alpha1.Project{}
 	projectKey := client.ObjectKey{Namespace: run.Namespace, Name: run.Spec.ProjectRef.Name}
 	if err := r.APIReader.Get(ctx, projectKey, project); err != nil {
@@ -376,6 +380,10 @@ func checkRunReportDigest(request githubclient.CreateCheckRunRequest) string {
 }
 
 func workflowRunCheckReport(run *actionsv1alpha1.WorkflowRun) checkRunReport {
+	return workflowRunCheckReportWithJobs(run, nil)
+}
+
+func workflowRunCheckReportWithJobs(run *actionsv1alpha1.WorkflowRun, workflowJobs []actionsv1alpha1.WorkflowJob) checkRunReport {
 	title := run.Status.WorkflowName
 	if title == "" {
 		title = run.Spec.WorkflowPath
@@ -422,9 +430,57 @@ func workflowRunCheckReport(run *actionsv1alpha1.WorkflowRun) checkRunReport {
 	}
 	if run.Status.Jobs != nil {
 		jobs := run.Status.Jobs
-		report.Output.Text = fmt.Sprintf("Jobs: %d total, %d queued, %d active, %d succeeded, %d failed.", jobs.Total, jobs.Queued, jobs.Active, jobs.Succeeded, jobs.Failed)
+		report.Output.Text = fmt.Sprintf("Jobs: %d total, %d waiting for approval, %d queued, %d active, %d succeeded, %d failed.", jobs.Total, jobs.WaitingForApproval, jobs.Queued, jobs.Active, jobs.Succeeded, jobs.Failed)
+	}
+	if environmentText := checkRunEnvironmentText(workflowJobs); environmentText != "" {
+		if report.Output.Text != "" {
+			report.Output.Text += "\n\n"
+		}
+		report.Output.Text += environmentText
 	}
 	return report
+}
+
+func checkRunEnvironmentText(workflowJobs []actionsv1alpha1.WorkflowJob) string {
+	type environmentState struct {
+		name     string
+		required bool
+		waiting  bool
+	}
+	states := map[string]environmentState{}
+	for index := range workflowJobs {
+		job := &workflowJobs[index]
+		if job.Spec.Environment == nil {
+			continue
+		}
+		key := strings.ToLower(job.Spec.Environment.Name)
+		state := states[key]
+		state.name = job.Spec.Environment.Name
+		state.required = state.required || job.Spec.Environment.Protection != nil && job.Spec.Environment.Protection.RequiredApproval
+		state.waiting = state.waiting || !workflowJobEnvironmentApproved(job)
+		states[key] = state
+	}
+	if len(states) == 0 {
+		return ""
+	}
+	keys := make([]string, 0, len(states))
+	for key := range states {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	lines := make([]string, 0, len(keys))
+	for _, key := range keys {
+		state := states[key]
+		approval := "approval not required"
+		if state.required {
+			approval = "approved"
+		}
+		if state.waiting {
+			approval = "waiting for approval"
+		}
+		lines = append(lines, fmt.Sprintf("Environment %q: %s.", state.name, approval))
+	}
+	return strings.Join(lines, "\n")
 }
 
 func (r *checkRunReport) summaryFromCondition(condition *metav1.Condition) {
@@ -466,6 +522,7 @@ type plannedWorkflowJob struct {
 	displayName   string
 	runsOn        []string
 	matrix        *actionsv1alpha1.WorkflowJobMatrix
+	environment   *workflow.JobEnvironment
 	plan          string
 	resultVersion string
 }
@@ -486,6 +543,10 @@ func (r *WorkflowRunReconciler) ensureWorkflowJobs(ctx context.Context, run *act
 
 	for _, item := range plannedJobs {
 		id := item.id
+		environment, err := workflowJobEnvironment(project, item.environment)
+		if err != nil {
+			return &terminalPlanningError{cause: fmt.Errorf("job %q: %w", id, err)}
+		}
 		labels := workflowJobLabels(run, project, id)
 		annotations := map[string]string{actionsv1alpha1.AnnotationProjectName: project.Name}
 		if item.resultVersion != "" {
@@ -504,6 +565,7 @@ func (r *WorkflowRunReconciler) ensureWorkflowJobs(ctx context.Context, run *act
 				DisplayName:    item.displayName,
 				RunsOn:         append([]string(nil), item.runsOn...),
 				Matrix:         item.matrix.DeepCopy(),
+				Environment:    environment,
 			},
 		}
 		if err := controllerutil.SetControllerReference(run, workflowJob, r.Scheme()); err != nil {
@@ -531,8 +593,69 @@ func (r *WorkflowRunReconciler) ensureWorkflowJobs(ctx context.Context, run *act
 		if err := r.ensurePlanConfigMap(ctx, workflowJob, item.plan); err != nil {
 			return err
 		}
+		if err := r.reconcileEnvironmentApproval(ctx, workflowJob); err != nil {
+			return err
+		}
 	}
 	return nil
+}
+
+func workflowJobEnvironment(project *actionsv1alpha1.Project, requested *workflow.JobEnvironment) (*actionsv1alpha1.WorkflowJobEnvironment, error) {
+	if requested == nil {
+		return nil, nil
+	}
+	var matched *actionsv1alpha1.ProjectEnvironment
+	for index := range project.Spec.Environments {
+		configured := &project.Spec.Environments[index]
+		if !strings.EqualFold(configured.Name, requested.Name) {
+			continue
+		}
+		if matched != nil {
+			return nil, fmt.Errorf("environment %q is configured more than once on Project %q", requested.Name, project.Name)
+		}
+		matched = configured
+	}
+	if matched != nil {
+		return &actionsv1alpha1.WorkflowJobEnvironment{
+			Name: matched.Name, URL: requested.URL,
+			SecretRef: matched.SecretRef.DeepCopy(), Protection: matched.Protection.DeepCopy(),
+		}, nil
+	}
+	return nil, fmt.Errorf("environment %q is not configured on Project %q", requested.Name, project.Name)
+}
+
+func (r *WorkflowRunReconciler) reconcileEnvironmentApproval(ctx context.Context, workflowJob *actionsv1alpha1.WorkflowJob) error {
+	environment := workflowJob.Spec.Environment
+	if environment == nil {
+		return nil
+	}
+	required := environment.Protection != nil && environment.Protection.RequiredApproval
+	approved := !required || strings.EqualFold(workflowJob.Annotations[actionsv1alpha1.AnnotationEnvironmentApproved], environment.Name)
+	current := meta.FindStatusCondition(workflowJob.Status.Conditions, actionsv1alpha1.WorkflowJobConditionEnvironmentApproved)
+	if workflowJob.Status.RunnerRef != nil && current != nil && current.Status == metav1.ConditionTrue {
+		approved = true
+	}
+	status := metav1.ConditionFalse
+	reason := "ApprovalRequired"
+	message := fmt.Sprintf("Environment %q requires approval", environment.Name)
+	if approved {
+		status = metav1.ConditionTrue
+		reason = "EnvironmentApproved"
+		message = fmt.Sprintf("Environment %q was approved", environment.Name)
+		if !required {
+			reason = "ApprovalNotRequired"
+			message = fmt.Sprintf("Environment %q does not require approval", environment.Name)
+		}
+	}
+	before := workflowJob.Status.DeepCopy()
+	meta.SetStatusCondition(&workflowJob.Status.Conditions, metav1.Condition{
+		Type: actionsv1alpha1.WorkflowJobConditionEnvironmentApproved, Status: status,
+		ObservedGeneration: workflowJob.Generation, Reason: reason, Message: message,
+	})
+	if apiEquality.Semantic.DeepEqual(before, &workflowJob.Status) {
+		return nil
+	}
+	return r.Status().Update(ctx, workflowJob)
 }
 
 func (r *WorkflowRunReconciler) planWorkflowJobs(run *actionsv1alpha1.WorkflowRun, definition *workflow.Definition, inputValues map[string]any) ([]plannedWorkflowJob, error) {
@@ -601,7 +724,8 @@ func (r *WorkflowRunReconciler) planWorkflowJobs(run *actionsv1alpha1.WorkflowRu
 				resultVersion = jobResultVersion
 			}
 			plannedJobs = append(plannedJobs, plannedWorkflowJob{
-				id: expandedID, displayName: displayName, runsOn: append([]string(nil), resolvedJob.RunsOn...), matrix: matrixSpec, plan: string(data), resultVersion: resultVersion,
+				id: expandedID, displayName: displayName, runsOn: append([]string(nil), resolvedJob.RunsOn...), matrix: matrixSpec,
+				environment: resolvedJob.Environment, plan: string(data), resultVersion: resultVersion,
 			})
 		}
 	}
@@ -1017,6 +1141,9 @@ func (r *WorkflowRunReconciler) observeWorkflowJobs(ctx context.Context, run *ac
 	}
 	for index := range jobs.Items {
 		job := &jobs.Items[index]
+		if err := r.reconcileEnvironmentApproval(ctx, job); err != nil {
+			return ctrl.Result{}, err
+		}
 		condition := meta.FindStatusCondition(job.Status.Conditions, actionsv1alpha1.WorkflowJobConditionSucceeded)
 		if condition == nil || (condition.Status != metav1.ConditionTrue && condition.Status != metav1.ConditionFalse) {
 			plan := &corev1.ConfigMap{}
@@ -1052,6 +1179,8 @@ func (r *WorkflowRunReconciler) observeWorkflowJobs(ctx context.Context, run *ac
 			status.Failed++
 		case job.Status.RunnerRef != nil:
 			status.Active++
+		case !workflowJobEnvironmentApproved(job):
+			status.WaitingForApproval++
 		default:
 			status.Queued++
 		}
@@ -1110,6 +1239,8 @@ func (r *WorkflowRunReconciler) observeWorkflowJobs(ctx context.Context, run *ac
 		now := metav1.Now()
 		run.Status.CompletionTime = &now
 		meta.SetStatusCondition(&run.Status.Conditions, metav1.Condition{Type: actionsv1alpha1.WorkflowRunConditionSucceeded, Status: metav1.ConditionTrue, ObservedGeneration: run.Generation, Reason: "JobsSucceeded", Message: "All WorkflowJobs succeeded"})
+	case status.WaitingForApproval > 0:
+		meta.SetStatusCondition(&run.Status.Conditions, metav1.Condition{Type: actionsv1alpha1.WorkflowRunConditionSucceeded, Status: metav1.ConditionUnknown, ObservedGeneration: run.Generation, Reason: "JobsWaitingForApproval", Message: "WorkflowJobs are waiting for environment approval"})
 	case status.Queued > 0:
 		meta.SetStatusCondition(&run.Status.Conditions, metav1.Condition{Type: actionsv1alpha1.WorkflowRunConditionSucceeded, Status: metav1.ConditionUnknown, ObservedGeneration: run.Generation, Reason: "JobsQueued", Message: "WorkflowJobs are waiting for matching Runners"})
 	default:

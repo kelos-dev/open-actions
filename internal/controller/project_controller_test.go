@@ -6,6 +6,7 @@ import (
 	"crypto/rsa"
 	"crypto/x509"
 	"encoding/pem"
+	"strings"
 	"testing"
 	"time"
 
@@ -40,7 +41,7 @@ func TestProjectConfiguredConditionDescribesLocalValidation(t *testing.T) {
 				PrivateKeySecretRef: corev1.SecretKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: "github"}, Key: "private-key"},
 				WebhookSecretRef:    corev1.SecretKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: "github"}, Key: "webhook-secret"},
 			},
-		}},
+		}, Environments: []actionsv1alpha1.ProjectEnvironment{{Name: "production", SecretRef: &actionsv1alpha1.EnvironmentSecretReference{Name: "production-secrets"}}}},
 	}
 	secret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{Name: "github", Namespace: "default"},
@@ -49,7 +50,8 @@ func TestProjectConfiguredConditionDescribesLocalValidation(t *testing.T) {
 			"webhook-secret": []byte("secret"),
 		},
 	}
-	clusterClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&actionsv1alpha1.Project{}).WithObjects(project, secret).Build()
+	environmentSecret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "production-secrets", Namespace: "default"}, Data: map[string][]byte{"DEPLOY_TOKEN": []byte("secret")}}
+	clusterClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&actionsv1alpha1.Project{}).WithObjects(project, secret, environmentSecret).Build()
 	reconciler := &ProjectReconciler{Client: clusterClient, APIReader: clusterClient}
 	if _, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "default"}}); err != nil {
 		t.Fatal(err)
@@ -61,6 +63,19 @@ func TestProjectConfiguredConditionDescribesLocalValidation(t *testing.T) {
 	configured := meta.FindStatusCondition(stored.Status.Conditions, actionsv1alpha1.ProjectConditionConfigured)
 	if configured == nil || configured.Status != metav1.ConditionTrue || configured.Reason != "ConfigurationValid" {
 		t.Fatalf("configured condition = %#v", configured)
+	}
+}
+
+func TestProjectRejectsInvalidEnvironmentSecrets(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "environment", Namespace: "default"}, Data: map[string][]byte{"GITHUB_TOKEN": []byte("override")}}
+	clusterClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(secret).Build()
+	_, err := environmentSecretValues(context.Background(), clusterClient, "default", &actionsv1alpha1.EnvironmentSecretReference{Name: secret.Name})
+	if err == nil || !strings.Contains(err.Error(), `invalid GitHub secret name "GITHUB_TOKEN"`) {
+		t.Fatalf("environmentSecretValues() error = %v", err)
 	}
 }
 

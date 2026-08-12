@@ -13,6 +13,7 @@ const SourceTypeGitHub SourceType = "GitHub"
 type SourceType string
 
 // ProjectSpec describes the workflow source for an Open Actions Project.
+// +kubebuilder:validation:XValidation:rule="!has(self.environments) || self.environments.all(e, self.environments.exists_one(other, e.name.lowerAscii() == other.name.lowerAscii()))",message="environment names must be unique ignoring ASCII case"
 type ProjectSpec struct {
 	// Source selects and configures the external workflow source.
 	// +required
@@ -27,6 +28,53 @@ type ProjectSpec struct {
 	// +kubebuilder:validation:XValidation:rule="self != '..' && !self.startsWith('../') && !self.contains('/../') && !self.endsWith('/..')",message="must not contain '..' path segments"
 	// +optional
 	WorkflowDirectory string `json:"workflowDirectory,omitempty"`
+
+	// Environments defines the environment names workflows may select. Each
+	// environment may expose one Secret and require approval before its jobs can
+	// be assigned to a Runner.
+	// +listType=map
+	// +listMapKey=name
+	// +kubebuilder:validation:MaxItems=100
+	// +optional
+	Environments []ProjectEnvironment `json:"environments,omitempty"`
+}
+
+// ProjectEnvironment configures one workflow environment. Environment names
+// are matched without regard to ASCII case.
+type ProjectEnvironment struct {
+	// Name is the GitHub-compatible environment name selected by a workflow job.
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=255
+	// +kubebuilder:validation:Pattern=`^[^\x00-\x1f\x7f]+$`
+	// +required
+	Name string `json:"name"`
+
+	// SecretRef identifies a Secret in the Project namespace whose data keys
+	// populate the secrets expression context for jobs in this environment.
+	// +optional
+	SecretRef *EnvironmentSecretReference `json:"secretRef,omitempty"`
+
+	// Protection configures the gate enforced before a job can be assigned.
+	// +optional
+	Protection *EnvironmentProtection `json:"protection,omitempty"`
+}
+
+// EnvironmentSecretReference identifies a Secret in the same namespace.
+type EnvironmentSecretReference struct {
+	// Name is the Secret resource name.
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=253
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?([.][a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?)*$`
+	// +required
+	Name string `json:"name"`
+}
+
+// EnvironmentProtection configures the Open Actions environment gate.
+type EnvironmentProtection struct {
+	// RequiredApproval requires an authorized user to approve each WorkflowJob
+	// before a Runner can claim it.
+	// +optional
+	RequiredApproval bool `json:"requiredApproval,omitempty"`
 }
 
 // ProjectSource is a discriminated union of supported workflow sources.

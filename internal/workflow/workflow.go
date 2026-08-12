@@ -27,6 +27,8 @@ const (
 	maxMatrixValueLength      = 1024
 	maxJobIDLength            = 256
 	maxJobNameLength          = 256
+	maxEnvironmentNameLength  = 255
+	maxEnvironmentURLLength   = 2048
 	maxRunnerLabels           = 16
 	maxSteps                  = 100
 	MaxStepIDLength           = 256
@@ -121,16 +123,57 @@ func (schedule *Schedule) UnmarshalYAML(node *yaml.Node) error {
 }
 
 type Job struct {
-	Name      string         `yaml:"name"`
-	RunsOn    StringList     `yaml:"runs-on"`
-	Needs     StringList     `yaml:"needs"`
-	Outputs   map[string]any `yaml:"outputs"`
-	Steps     []Step         `yaml:"steps"`
-	Strategy  Strategy       `yaml:"strategy"`
-	Container yaml.Node      `yaml:"container"`
-	Services  yaml.Node      `yaml:"services"`
-	If        string         `yaml:"if"`
-	Env       map[string]any `yaml:"env"`
+	Name        string          `yaml:"name"`
+	RunsOn      StringList      `yaml:"runs-on"`
+	Needs       StringList      `yaml:"needs"`
+	Outputs     map[string]any  `yaml:"outputs"`
+	Steps       []Step          `yaml:"steps"`
+	Strategy    Strategy        `yaml:"strategy"`
+	Container   yaml.Node       `yaml:"container"`
+	Services    yaml.Node       `yaml:"services"`
+	If          string          `yaml:"if"`
+	Env         map[string]any  `yaml:"env"`
+	Environment *JobEnvironment `yaml:"environment"`
+}
+
+// JobEnvironment is the environment selected by a workflow job.
+type JobEnvironment struct {
+	Name   string `yaml:"name"`
+	URL    string `yaml:"url"`
+	urlSet bool
+}
+
+func (environment *JobEnvironment) UnmarshalYAML(node *yaml.Node) error {
+	switch node.Kind {
+	case yaml.ScalarNode:
+		if err := node.Decode(&environment.Name); err != nil {
+			return fmt.Errorf("environment must be a string or mapping")
+		}
+		return nil
+	case yaml.MappingNode:
+		if err := rejectDuplicateMappingKeys(node, "environment"); err != nil {
+			return err
+		}
+		for index := 0; index < len(node.Content); index += 2 {
+			name := node.Content[index].Value
+			switch name {
+			case "name":
+				if err := node.Content[index+1].Decode(&environment.Name); err != nil {
+					return fmt.Errorf("environment name must be a string")
+				}
+			case "url":
+				environment.urlSet = true
+				if err := node.Content[index+1].Decode(&environment.URL); err != nil {
+					return fmt.Errorf("environment url must be a string")
+				}
+			default:
+				return fmt.Errorf("unsupported environment field %q", name)
+			}
+		}
+		return nil
+	default:
+		return fmt.Errorf("environment must be a string or mapping")
+	}
 }
 
 type Strategy struct {
@@ -208,6 +251,8 @@ type Repository struct {
 var (
 	workflowConcurrencyAvailability = expression.NewAvailability("github", "inputs", "vars")
 	jobNameAvailability             = expression.NewAvailability("github", "needs", "strategy", "matrix", "vars", "inputs")
+	jobEnvironmentNameAvailability  = expression.NewAvailability("github", "needs", "strategy", "matrix", "vars", "inputs")
+	jobEnvironmentURLAvailability   = expression.NewAvailability("github", "needs", "strategy", "matrix", "vars", "inputs")
 	jobEnvironmentAvailability      = expression.NewAvailability("github", "needs", "strategy", "matrix", "vars", "secrets", "inputs")
 	stepAvailability                = expression.NewAvailability("github", "needs", "strategy", "matrix", "job", "runner", "env", "vars", "secrets", "steps", "inputs")
 	stepConditionAvailability       = expression.NewAvailability("github", "needs", "strategy", "matrix", "job", "runner", "env", "vars", "steps", "inputs").WithStatusFunctions()
@@ -286,6 +331,26 @@ func validateJob(id string, job *Job) error {
 	}
 	if err := validateTemplate(fmt.Sprintf("job %q name", id), job.Name, jobNameAvailability); err != nil {
 		return err
+	}
+	if job.Environment != nil {
+		if job.Environment.Name == "" {
+			return fmt.Errorf("job %q environment name must not be empty", id)
+		}
+		if utf8.RuneCountInString(job.Environment.Name) > maxEnvironmentNameLength {
+			return fmt.Errorf("job %q environment name exceeds %d characters", id, maxEnvironmentNameLength)
+		}
+		if err := validateTemplate(fmt.Sprintf("job %q environment name", id), job.Environment.Name, jobEnvironmentNameAvailability); err != nil {
+			return err
+		}
+		if job.Environment.urlSet && job.Environment.URL == "" {
+			return fmt.Errorf("job %q environment url must not be empty", id)
+		}
+		if utf8.RuneCountInString(job.Environment.URL) > maxEnvironmentURLLength {
+			return fmt.Errorf("job %q environment url exceeds %d characters", id, maxEnvironmentURLLength)
+		}
+		if err := validateTemplate(fmt.Sprintf("job %q environment url", id), job.Environment.URL, jobEnvironmentURLAvailability); err != nil {
+			return err
+		}
 	}
 	if len(job.RunsOn) == 0 {
 		return fmt.Errorf("job %q must define runs-on", id)
@@ -583,6 +648,28 @@ func EvaluateJob(id string, job Job, context expression.Context) (Job, error) {
 	if utf8.RuneCountInString(job.Name) > maxJobNameLength {
 		return Job{}, fmt.Errorf("job %q evaluated name exceeds %d characters", id, maxJobNameLength)
 	}
+	if job.Environment != nil {
+		environment := *job.Environment
+		name, err := evaluateTemplateString(environment.Name, context)
+		if err != nil {
+			return Job{}, fmt.Errorf("job %q environment name: %w", id, err)
+		}
+		if name == "" || utf8.RuneCountInString(name) > maxEnvironmentNameLength {
+			return Job{}, fmt.Errorf("job %q evaluated an invalid environment name", id)
+		}
+		environment.Name = name
+		if environment.URL != "" {
+			url, err := evaluateTemplateString(environment.URL, context)
+			if err != nil {
+				return Job{}, fmt.Errorf("job %q environment url: %w", id, err)
+			}
+			if url == "" || utf8.RuneCountInString(url) > maxEnvironmentURLLength {
+				return Job{}, fmt.Errorf("job %q evaluated an invalid environment url", id)
+			}
+			environment.URL = url
+		}
+		job.Environment = &environment
+	}
 
 	job.RunsOn = append(StringList(nil), job.RunsOn...)
 	labels := make(map[string]struct{}, len(job.RunsOn))
@@ -610,6 +697,18 @@ func EvaluateJob(id string, job Job, context expression.Context) (Job, error) {
 		job.RunsOn[index] = label
 	}
 	return job, nil
+}
+
+func evaluateTemplateString(input string, context expression.Context) (string, error) {
+	program, err := expression.Parse(input)
+	if err != nil {
+		return "", err
+	}
+	result, err := program.Evaluate(context)
+	if err != nil {
+		return "", err
+	}
+	return result.String()
 }
 
 func EvaluateConcurrency(definition *Definition, event Event) (string, bool, error) {

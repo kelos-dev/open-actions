@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"slices"
@@ -115,7 +116,7 @@ func TestRunnerBuildsOwnedJob(t *testing.T) {
 		container.SecurityContext.Capabilities == nil || !slices.Equal(container.SecurityContext.Capabilities.Drop, []corev1.Capability{"ALL"}) {
 		t.Errorf("container security context = %#v", container.SecurityContext)
 	}
-	if len(job.Spec.Template.Spec.Volumes) != 2 {
+	if len(job.Spec.Template.Spec.Volumes) != 3 {
 		t.Errorf("volumes = %#v", job.Spec.Template.Spec.Volumes)
 	}
 }
@@ -178,6 +179,7 @@ func TestRunnerBuildsDockerEnabledJob(t *testing.T) {
 	}
 	expectedRunnerMounts := []corev1.VolumeMount{
 		{Name: jobPlanVolume, MountPath: jobPlanMountPath, ReadOnly: true},
+		{Name: jobCredentialsVolume, MountPath: jobCredentialsMountPath, ReadOnly: true},
 		{Name: workspaceVolume, MountPath: workspaceVolumeMountPath},
 		{Name: dockerSocketVolume, MountPath: dockerSocketDirectory},
 	}
@@ -515,6 +517,26 @@ func TestDeletingWorkflowJobIsNotQueued(t *testing.T) {
 	workflowJob := &actionsv1alpha1.WorkflowJob{ObjectMeta: metav1.ObjectMeta{DeletionTimestamp: &deletionTime}}
 	if values := indexQueuedWorkflowJob(workflowJob); len(values) != 0 {
 		t.Fatalf("queue index = %#v", values)
+	}
+}
+
+func TestEnvironmentApprovalControlsWorkflowJobQueue(t *testing.T) {
+	workflowJob := &actionsv1alpha1.WorkflowJob{Spec: actionsv1alpha1.WorkflowJobSpec{
+		Environment: &actionsv1alpha1.WorkflowJobEnvironment{
+			Name: "ok-to-test", Protection: &actionsv1alpha1.EnvironmentProtection{RequiredApproval: true},
+		},
+	}}
+	meta.SetStatusCondition(&workflowJob.Status.Conditions, metav1.Condition{
+		Type: actionsv1alpha1.WorkflowJobConditionEnvironmentApproved, Status: metav1.ConditionFalse, Reason: "ApprovalRequired",
+	})
+	if values := indexQueuedWorkflowJob(workflowJob); len(values) != 0 {
+		t.Fatalf("unapproved WorkflowJob queue index = %v", values)
+	}
+	meta.SetStatusCondition(&workflowJob.Status.Conditions, metav1.Condition{
+		Type: actionsv1alpha1.WorkflowJobConditionEnvironmentApproved, Status: metav1.ConditionTrue, Reason: "EnvironmentApproved",
+	})
+	if values := indexQueuedWorkflowJob(workflowJob); !slices.Equal(values, []string{"true"}) {
+		t.Fatalf("approved WorkflowJob queue index = %v", values)
 	}
 }
 
@@ -1119,7 +1141,7 @@ func TestEnsureAuthSecretRejectsUnownedCollision(t *testing.T) {
 	}
 	clusterClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(workflowJob, secret).Build()
 	reconciler := &RunnerReconciler{Client: clusterClient, APIReader: clusterClient}
-	if err := reconciler.ensureAuthSecret(context.Background(), workflowJob, "replacement"); err == nil {
+	if err := reconciler.ensureAuthSecret(context.Background(), workflowJob, "replacement", nil); err == nil {
 		t.Fatal("unowned authentication Secret was accepted")
 	}
 	stored := &corev1.Secret{}
@@ -1128,6 +1150,30 @@ func TestEnsureAuthSecretRejectsUnownedCollision(t *testing.T) {
 	}
 	if string(stored.Data["token"]) != "existing" {
 		t.Fatalf("unowned Secret token = %q", stored.Data["token"])
+	}
+}
+
+func TestEnsureAuthSecretStoresEnvironmentSecretsSeparatelyFromToken(t *testing.T) {
+	scheme := runnerTestScheme(t)
+	workflowJob := &actionsv1alpha1.WorkflowJob{
+		TypeMeta:   metav1.TypeMeta{APIVersion: actionsv1alpha1.GroupVersion.String(), Kind: "WorkflowJob"},
+		ObjectMeta: metav1.ObjectMeta{Name: "build", Namespace: "default", UID: types.UID("job-uid")},
+	}
+	clusterClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(workflowJob).Build()
+	reconciler := &RunnerReconciler{Client: clusterClient, APIReader: clusterClient}
+	if err := reconciler.ensureAuthSecret(context.Background(), workflowJob, "installation-token", map[string]string{"DEPLOY_TOKEN": "environment-token"}); err != nil {
+		t.Fatal(err)
+	}
+	stored := &corev1.Secret{}
+	if err := clusterClient.Get(context.Background(), client.ObjectKey{Namespace: "default", Name: childName(workflowJob.Name, "auth")}, stored); err != nil {
+		t.Fatal(err)
+	}
+	secrets := map[string]string{}
+	if err := json.Unmarshal(stored.Data[jobSecretsKey], &secrets); err != nil {
+		t.Fatal(err)
+	}
+	if string(stored.Data["token"]) != "installation-token" || secrets["DEPLOY_TOKEN"] != "environment-token" {
+		t.Fatalf("authentication Secret data = %#v, secrets = %#v", stored.Data, secrets)
 	}
 }
 

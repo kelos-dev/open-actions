@@ -13,6 +13,7 @@ import (
 
 	actionsv1alpha1 "github.com/kelos-dev/open-actions/api/v1alpha1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -72,7 +73,7 @@ func TestConsoleAuthenticatesWithStaticTokenAndStreamsLogs(t *testing.T) {
 	runRequest.AddCookie(sessionCookie)
 	runResponse := httptest.NewRecorder()
 	handler.ServeHTTP(runResponse, runRequest)
-	if runResponse.Code != http.StatusOK || !strings.Contains(runResponse.Body.String(), "CI") || !strings.Contains(runResponse.Body.String(), "build") || !strings.Contains(runResponse.Body.String(), "Workflow run Queued") {
+	if runResponse.Code != http.StatusOK || !strings.Contains(runResponse.Body.String(), "CI") || !strings.Contains(runResponse.Body.String(), "build") || !strings.Contains(runResponse.Body.String(), "Workflow run Queued") || !strings.Contains(runResponse.Body.String(), "ok-to-test") || !strings.Contains(runResponse.Body.String(), "Waiting for approval") {
 		t.Fatalf("run page = %d, %q", runResponse.Code, runResponse.Body.String())
 	}
 
@@ -302,8 +303,12 @@ func newTestHandler(t *testing.T, secureCookie bool) *Handler {
 	job := &actionsv1alpha1.WorkflowJob{
 		TypeMeta:   metav1.TypeMeta{APIVersion: actionsv1alpha1.GroupVersion.String(), Kind: "WorkflowJob"},
 		ObjectMeta: metav1.ObjectMeta{Name: "build", Namespace: "default", UID: "job-uid", Labels: map[string]string{actionsv1alpha1.LabelWorkflowRunUID: string(run.UID)}},
-		Spec:       actionsv1alpha1.WorkflowJobSpec{WorkflowRunRef: corev1.LocalObjectReference{Name: run.Name}, JobID: "build"},
+		Spec: actionsv1alpha1.WorkflowJobSpec{
+			WorkflowRunRef: corev1.LocalObjectReference{Name: run.Name}, JobID: "build",
+			Environment: &actionsv1alpha1.WorkflowJobEnvironment{Name: "ok-to-test"},
+		},
 	}
+	meta.SetStatusCondition(&job.Status.Conditions, metav1.Condition{Type: actionsv1alpha1.WorkflowJobConditionEnvironmentApproved, Status: metav1.ConditionFalse, Reason: "ApprovalRequired"})
 	if err := controllerutil.SetControllerReference(run, job, scheme); err != nil {
 		t.Fatal(err)
 	}

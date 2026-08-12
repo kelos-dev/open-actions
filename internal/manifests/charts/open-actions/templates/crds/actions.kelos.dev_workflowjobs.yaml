@@ -25,6 +25,12 @@ spec:
     - jsonPath: .status.runnerRef.name
       name: Runner
       type: string
+    - jsonPath: .spec.environment.name
+      name: Environment
+      type: string
+    - jsonPath: .status.conditions[?(@.type=="EnvironmentApproved")].status
+      name: Approved
+      type: string
     - jsonPath: .status.conditions[?(@.type=="Scheduled")].status
       name: Scheduled
       type: string
@@ -71,6 +77,50 @@ spec:
                 maxLength: 256
                 minLength: 1
                 type: string
+              environment:
+                description: |-
+                  Environment contains the selected workflow environment and the Project
+                  policy resolved for this job.
+                properties:
+                  name:
+                    description: Name is the configured Project environment name.
+                    maxLength: 255
+                    minLength: 1
+                    pattern: ^[^\x00-\x1f\x7f]+$
+                    type: string
+                  protection:
+                    description: Protection is the Project environment gate resolved
+                      for this job.
+                    properties:
+                      requiredApproval:
+                        description: |-
+                          RequiredApproval requires an authorized user to approve each WorkflowJob
+                          before a Runner can claim it.
+                        type: boolean
+                    type: object
+                  secretRef:
+                    description: |-
+                      SecretRef identifies the Project Secret whose data keys are available to
+                      this job through the secrets expression context.
+                    properties:
+                      name:
+                        description: Name is the Secret resource name.
+                        maxLength: 253
+                        minLength: 1
+                        pattern: ^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?([.][a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?)*$
+                        type: string
+                    required:
+                    - name
+                    type: object
+                  url:
+                    description: URL is the optional deployment target URL resolved
+                      from the workflow.
+                    maxLength: 2048
+                    minLength: 1
+                    type: string
+                required:
+                - name
+                type: object
               jobID:
                 description: |-
                   JobID is the stable workflow-local identifier of this expanded job. For a
@@ -170,9 +220,10 @@ spec:
                 type: string
               conditions:
                 description: |-
-                  Conditions describe Runner assignment and the terminal result. Scheduled
-                  is true after the scheduler assigns status.runnerRef. Known condition types
-                  are Scheduled and Succeeded.
+                  Conditions describe environment approval, Runner assignment, and the
+                  terminal result. EnvironmentApproved is present for jobs that select an
+                  environment. Scheduled is true after the scheduler assigns status.runnerRef.
+                  Known condition types are EnvironmentApproved, Scheduled, and Succeeded.
                 items:
                   description: Condition contains details for one aspect of the current
                     state of this API Resource.

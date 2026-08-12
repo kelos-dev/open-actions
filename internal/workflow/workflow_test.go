@@ -36,6 +36,51 @@ func TestParseRemainingKelosTriggers(t *testing.T) {
 	}
 }
 
+func TestJobEnvironmentScalarAndMappingForms(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		value    string
+		wantName string
+		wantURL  string
+	}{
+		{name: "scalar", value: "staging", wantName: "staging"},
+		{name: "mapping", value: "\n      name: ${{ inputs.environment }}-${{ matrix.arch }}\n      url: https://deploy.example/${{ matrix.arch }}", wantName: "production-arm64", wantURL: "https://deploy.example/arm64"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			definition, err := Parse([]byte("name: Deploy\non: push\njobs:\n  deploy:\n    runs-on: ubuntu-latest\n    environment: " + test.value + "\n    strategy:\n      matrix:\n        arch: [arm64]\n    steps:\n      - run: deploy\n"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			job, err := EvaluateJob("deploy", definition.Jobs["deploy"], workflowexpression.Context{
+				Availability: workflowexpression.NewAvailability("github", "inputs", "matrix"),
+				Values: map[string]any{
+					"github": map[string]any{}, "inputs": map[string]any{"environment": "production"}, "matrix": map[string]any{"arch": "arm64"},
+				},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if job.Environment == nil || job.Environment.Name != test.wantName || job.Environment.URL != test.wantURL {
+				t.Fatalf("environment = %#v, want name %q url %q", job.Environment, test.wantName, test.wantURL)
+			}
+		})
+	}
+}
+
+func TestJobEnvironmentRejectsInvalidForms(t *testing.T) {
+	for _, environment := range []string{
+		"{}",
+		"{name: production, unknown: value}",
+		"{name: production, name: staging}",
+		"${{ secrets.ENVIRONMENT }}",
+	} {
+		workflowText := "name: Deploy\non: push\njobs:\n  deploy:\n    runs-on: ubuntu-latest\n    environment: " + environment + "\n    steps:\n      - run: deploy\n"
+		if _, err := Parse([]byte(workflowText)); err == nil {
+			t.Fatalf("Parse() accepted environment %q", environment)
+		}
+	}
+}
+
 func TestMatchWorkflowRunFilters(t *testing.T) {
 	definition, err := Parse([]byte("name: Deploy\non:\n  workflow_run:\n    workflows: [Release]\n    types: [completed]\n    branches: [main]\n" + minimalJob))
 	if err != nil {

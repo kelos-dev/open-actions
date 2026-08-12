@@ -3,10 +3,12 @@ package controller
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	actionsv1alpha1 "github.com/kelos-dev/open-actions/api/v1alpha1"
 	githubclient "github.com/kelos-dev/open-actions/internal/github"
+	corev1 "k8s.io/api/core/v1"
 	apiEquality "k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -64,13 +66,28 @@ func (r *ProjectReconciler) validate(ctx context.Context, project *actionsv1alph
 	github := project.Spec.Source.GitHub
 	privateKey, err := secretValue(ctx, r.APIReader, project.Namespace, github.PrivateKeySecretRef)
 	if err != nil {
-		return "CredentialsUnavailable", err
+		return "CredentialsUnavailable", fmt.Errorf("validate Project %q credentials: %w", project.Name, err)
 	}
 	if err := githubclient.ValidatePrivateKey(privateKey); err != nil {
-		return "InvalidCredentials", fmt.Errorf("validate GitHub App private key: %w", err)
+		return "InvalidCredentials", fmt.Errorf("validate Project %q GitHub App private key: %w", project.Name, err)
 	}
 	if _, err := secretValue(ctx, r.APIReader, project.Namespace, github.WebhookSecretRef); err != nil {
-		return "CredentialsUnavailable", err
+		return "CredentialsUnavailable", fmt.Errorf("validate Project %q credentials: %w", project.Name, err)
+	}
+	environments := make(map[string]string, len(project.Spec.Environments))
+	for index := range project.Spec.Environments {
+		environment := &project.Spec.Environments[index]
+		canonicalName := strings.ToLower(environment.Name)
+		if other := environments[canonicalName]; other != "" {
+			return "EnvironmentInvalid", fmt.Errorf("Project %q contains case-insensitive duplicate environments %q and %q", project.Name, other, environment.Name)
+		}
+		environments[canonicalName] = environment.Name
+		if environment.SecretRef != nil && environment.SecretRef.Name == "" {
+			return "EnvironmentInvalid", fmt.Errorf("Project %q environment %q has an empty secretRef name", project.Name, environment.Name)
+		}
+		if _, err := environmentSecretValues(ctx, r.APIReader, project.Namespace, environment.SecretRef); err != nil {
+			return "EnvironmentSecretsUnavailable", fmt.Errorf("validate Project %q environment %q: %w", project.Name, environment.Name, err)
+		}
 	}
 	return "", nil
 }
@@ -110,7 +127,29 @@ func (r *ProjectReconciler) SetupWithManager(manager ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(manager).
 		For(&actionsv1alpha1.Project{}).
 		Watches(&actionsv1alpha1.Project{}, handler.EnqueueRequestsFromMapFunc(r.projectsForInstallation)).
+		Watches(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(r.projectsForSecret)).
 		Complete(r)
+}
+
+func (r *ProjectReconciler) projectsForSecret(ctx context.Context, object client.Object) []reconcile.Request {
+	projects := &actionsv1alpha1.ProjectList{}
+	if err := r.List(ctx, projects, client.InNamespace(object.GetNamespace())); err != nil {
+		return nil
+	}
+	requests := []reconcile.Request{}
+	for index := range projects.Items {
+		project := &projects.Items[index]
+		github := project.Spec.Source.GitHub
+		matched := github != nil && (github.PrivateKeySecretRef.Name == object.GetName() || github.WebhookSecretRef.Name == object.GetName())
+		for environmentIndex := range project.Spec.Environments {
+			reference := project.Spec.Environments[environmentIndex].SecretRef
+			matched = matched || reference != nil && reference.Name == object.GetName()
+		}
+		if matched {
+			requests = append(requests, requestFor(project))
+		}
+	}
+	return requests
 }
 
 func (r *ProjectReconciler) projectsForInstallation(ctx context.Context, object client.Object) []reconcile.Request {

@@ -12,4 +12,5 @@ const (
 	AnnotationRunnerName             = "actions.kelos.dev/runner-name"
 	AnnotationRunnerResultVersion    = "actions.kelos.dev/runner-result-version"
 	AnnotationProjectName            = "actions.kelos.dev/project-name"
+	AnnotationEnvironmentApproved    = "actions.kelos.dev/environment-approved"
 )

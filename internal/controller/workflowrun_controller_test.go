@@ -22,6 +22,7 @@ import (
 	"github.com/kelos-dev/open-actions/internal/workflow"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	apiEquality "k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -523,6 +524,22 @@ func TestWorkflowRunCheckReportMapsLifecycle(t *testing.T) {
 	}
 }
 
+func TestWorkflowRunCheckReportIncludesEnvironmentApproval(t *testing.T) {
+	run := &actionsv1alpha1.WorkflowRun{Status: actionsv1alpha1.WorkflowRunStatus{Jobs: &actionsv1alpha1.WorkflowRunJobStatus{Total: 1, WaitingForApproval: 1}}}
+	job := actionsv1alpha1.WorkflowJob{Spec: actionsv1alpha1.WorkflowJobSpec{Environment: &actionsv1alpha1.WorkflowJobEnvironment{
+		Name: "ok-to-test", Protection: &actionsv1alpha1.EnvironmentProtection{RequiredApproval: true},
+	}}}
+	report := workflowRunCheckReportWithJobs(run, []actionsv1alpha1.WorkflowJob{job})
+	if !strings.Contains(report.Output.Text, "1 waiting for approval") || !strings.Contains(report.Output.Text, `Environment "ok-to-test": waiting for approval.`) {
+		t.Fatalf("check output = %q", report.Output.Text)
+	}
+	meta.SetStatusCondition(&job.Status.Conditions, metav1.Condition{Type: actionsv1alpha1.WorkflowJobConditionEnvironmentApproved, Status: metav1.ConditionTrue, Reason: "EnvironmentApproved"})
+	report = workflowRunCheckReportWithJobs(run, []actionsv1alpha1.WorkflowJob{job})
+	if !strings.Contains(report.Output.Text, `Environment "ok-to-test": approved.`) {
+		t.Fatalf("approved check output = %q", report.Output.Text)
+	}
+}
+
 func TestCompletedWorkflowRunTTL(t *testing.T) {
 	now := time.Date(2026, time.August, 10, 12, 0, 0, 0, time.UTC)
 	completedAt := metav1.NewTime(now.Add(-2 * time.Hour))
@@ -1021,6 +1038,81 @@ func TestEnsureWorkflowJobsCreatesReadableNames(t *testing.T) {
 	}
 }
 
+func TestEnsureWorkflowJobsFreezesEnvironmentAndRequiresApproval(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := actionsv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	run := &actionsv1alpha1.WorkflowRun{ObjectMeta: metav1.ObjectMeta{Name: "deploy", Namespace: "default", UID: "run-uid"}}
+	project := &actionsv1alpha1.Project{
+		ObjectMeta: metav1.ObjectMeta{Name: "project", Namespace: "default", UID: "project-uid"},
+		Spec: actionsv1alpha1.ProjectSpec{Environments: []actionsv1alpha1.ProjectEnvironment{{
+			Name: "ok-to-test", SecretRef: &actionsv1alpha1.EnvironmentSecretReference{Name: "e2e-secrets"},
+			Protection: &actionsv1alpha1.EnvironmentProtection{RequiredApproval: true},
+		}}},
+	}
+	clusterClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&actionsv1alpha1.WorkflowJob{}).WithObjects(run, project).Build()
+	reconciler := &WorkflowRunReconciler{Client: clusterClient, APIReader: clusterClient}
+	planned := []plannedWorkflowJob{{
+		id: "e2e", displayName: "E2E", runsOn: []string{"linux"}, plan: "{}",
+		environment: &workflow.JobEnvironment{Name: "OK-TO-TEST", URL: "https://deploy.example/e2e"},
+	}}
+	if err := reconciler.ensureWorkflowJobs(context.Background(), run, project, planned); err != nil {
+		t.Fatal(err)
+	}
+	job := &actionsv1alpha1.WorkflowJob{}
+	if err := clusterClient.Get(context.Background(), client.ObjectKey{Namespace: run.Namespace, Name: workflowJobName(run.Name, "e2e")}, job); err != nil {
+		t.Fatal(err)
+	}
+	if job.Spec.Environment == nil || job.Spec.Environment.Name != "ok-to-test" || job.Spec.Environment.URL != "https://deploy.example/e2e" || job.Spec.Environment.SecretRef == nil || job.Spec.Environment.SecretRef.Name != "e2e-secrets" {
+		t.Fatalf("WorkflowJob environment = %#v", job.Spec.Environment)
+	}
+	approved := meta.FindStatusCondition(job.Status.Conditions, actionsv1alpha1.WorkflowJobConditionEnvironmentApproved)
+	if approved == nil || approved.Status != metav1.ConditionFalse || approved.Reason != "ApprovalRequired" {
+		t.Fatalf("environment approval condition = %#v", approved)
+	}
+	beforeSpec := job.Spec.DeepCopy()
+	if job.Annotations == nil {
+		job.Annotations = map[string]string{}
+	}
+	job.Annotations[actionsv1alpha1.AnnotationEnvironmentApproved] = "ok-to-test"
+	if err := clusterClient.Update(context.Background(), job); err != nil {
+		t.Fatal(err)
+	}
+	if err := reconciler.reconcileEnvironmentApproval(context.Background(), job); err != nil {
+		t.Fatal(err)
+	}
+	if !meta.IsStatusConditionTrue(job.Status.Conditions, actionsv1alpha1.WorkflowJobConditionEnvironmentApproved) {
+		t.Fatalf("environment approval condition = %#v", job.Status.Conditions)
+	}
+	if !apiEquality.Semantic.DeepEqual(beforeSpec, &job.Spec) {
+		t.Fatalf("approval changed immutable WorkflowJob spec: %#v", job.Spec)
+	}
+}
+
+func TestEnsureWorkflowJobsRejectsUnconfiguredEnvironment(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := actionsv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	run := &actionsv1alpha1.WorkflowRun{ObjectMeta: metav1.ObjectMeta{Name: "deploy", Namespace: "default", UID: "run-uid"}}
+	project := &actionsv1alpha1.Project{ObjectMeta: metav1.ObjectMeta{Name: "project", Namespace: "default", UID: "project-uid"}}
+	clusterClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(run, project).Build()
+	reconciler := &WorkflowRunReconciler{Client: clusterClient, APIReader: clusterClient}
+	err := reconciler.ensureWorkflowJobs(context.Background(), run, project, []plannedWorkflowJob{{
+		id: "deploy", runsOn: []string{"linux"}, plan: "{}", environment: &workflow.JobEnvironment{Name: "production"},
+	}})
+	if err == nil || !strings.Contains(err.Error(), `environment "production" is not configured on Project "project"`) {
+		t.Fatalf("ensureWorkflowJobs() error = %v", err)
+	}
+}
+
 func TestEnsureWorkflowJobsPreservesMatrixIdentity(t *testing.T) {
 	scheme := runtime.NewScheme()
 	if err := actionsv1alpha1.AddToScheme(scheme); err != nil {
@@ -1188,6 +1280,48 @@ func TestPlannedWorkflowRunIsObservedWithoutPlanningDependencies(t *testing.T) {
 	}
 	if stored.Status.Jobs == nil || stored.Status.Jobs.Queued != 1 {
 		t.Fatalf("job summary = %#v", stored.Status.Jobs)
+	}
+}
+
+func TestPlannedWorkflowRunReportsEnvironmentApprovalWait(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := actionsv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	run := &actionsv1alpha1.WorkflowRun{
+		ObjectMeta: metav1.ObjectMeta{Name: "ci", Namespace: "default", UID: types.UID("run-uid")},
+		Status: actionsv1alpha1.WorkflowRunStatus{
+			WorkflowName: "CI", Jobs: &actionsv1alpha1.WorkflowRunJobStatus{Total: 1},
+			Conditions: []metav1.Condition{plannedCondition(metav1.ConditionTrue, "JobsPlanned")},
+		},
+	}
+	job := &actionsv1alpha1.WorkflowJob{
+		ObjectMeta: metav1.ObjectMeta{Name: "e2e", Namespace: "default", UID: types.UID("job-uid"), Labels: map[string]string{actionsv1alpha1.LabelWorkflowRunUID: string(run.UID)}},
+		Spec: actionsv1alpha1.WorkflowJobSpec{Environment: &actionsv1alpha1.WorkflowJobEnvironment{
+			Name: "ok-to-test", Protection: &actionsv1alpha1.EnvironmentProtection{RequiredApproval: true},
+		}},
+	}
+	plan := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: childName(job.Name, "plan"), Namespace: job.Namespace}}
+	if err := controllerutil.SetControllerReference(job, plan, scheme); err != nil {
+		t.Fatal(err)
+	}
+	clusterClient := fake.NewClientBuilder().WithScheme(scheme).
+		WithStatusSubresource(&actionsv1alpha1.WorkflowRun{}, &actionsv1alpha1.WorkflowJob{}).
+		WithObjects(run, job, plan).Build()
+	reconciler := &WorkflowRunReconciler{Client: clusterClient, APIReader: clusterClient}
+	if _, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(run)}); err != nil {
+		t.Fatal(err)
+	}
+	stored := &actionsv1alpha1.WorkflowRun{}
+	if err := clusterClient.Get(context.Background(), client.ObjectKeyFromObject(run), stored); err != nil {
+		t.Fatal(err)
+	}
+	condition := meta.FindStatusCondition(stored.Status.Conditions, actionsv1alpha1.WorkflowRunConditionSucceeded)
+	if stored.Status.Jobs == nil || stored.Status.Jobs.WaitingForApproval != 1 || stored.Status.Jobs.Queued != 0 || condition == nil || condition.Reason != "JobsWaitingForApproval" {
+		t.Fatalf("WorkflowRun status = %#v", stored.Status)
 	}
 }
 

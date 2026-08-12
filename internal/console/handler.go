@@ -105,6 +105,7 @@ type runPageData struct {
 type jobPageData struct {
 	ID          string
 	DisplayName string
+	Environment string
 	Runner      string
 	Status      string
 	StatusClass string
@@ -121,6 +122,7 @@ type logPageData struct {
 	Status        string
 	JobName       string
 	Runner        string
+	Environment   string
 	Duration      string
 	RunURL        string
 	StreamURL     string
@@ -372,6 +374,9 @@ func (h *Handler) loadRunPageData(ctx context.Context, run *actionsv1alpha1.Work
 	for index := range jobs.Items {
 		job := &jobs.Items[index]
 		item := jobPageData{ID: job.Spec.JobID, DisplayName: job.Spec.DisplayName, Status: workflowstatus.Job(job), URL: runPath(run) + "/jobs/" + url.PathEscape(job.Name)}
+		if job.Spec.Environment != nil {
+			item.Environment = job.Spec.Environment.Name
+		}
 		if item.DisplayName == "" {
 			item.DisplayName = item.ID
 		}
@@ -409,13 +414,20 @@ func (h *Handler) jobLogs(writer http.ResponseWriter, request *http.Request, run
 		runData.Jobs[index].Selected = runData.Jobs[index].ID == job.Spec.JobID
 	}
 	runnerName := "Waiting for a runner"
+	environmentName := ""
+	if job.Spec.Environment != nil {
+		environmentName = job.Spec.Environment.Name
+		if jobStatus == "Waiting for approval" {
+			runnerName = "Environment approval required"
+		}
+	}
 	if job.Status.RunnerRef != nil {
 		runnerName = job.Status.RunnerRef.Name
 	}
 	h.writeHTML(writer, h.logPage, logPageData{
 		Repository: runData.Repository, WorkflowName: runData.WorkflowName,
 		ShortRevision: runData.ShortRevision, Status: jobStatus,
-		JobName: displayName, Runner: runnerName, Duration: elapsedTime(job.Status.StartTime, job.Status.CompletionTime),
+		JobName: displayName, Runner: runnerName, Environment: environmentName, Duration: elapsedTime(job.Status.StartTime, job.Status.CompletionTime),
 		RunURL: path, StreamURL: path + "/jobs/" + url.PathEscape(job.Name) + "/stream", Jobs: runData.Jobs,
 	})
 }
@@ -586,7 +598,7 @@ func (h *Handler) waitForPod(ctx context.Context, job *actionsv1alpha1.WorkflowJ
 }
 
 func statusClass(status string) string {
-	return strings.ToLower(status)
+	return strings.ReplaceAll(strings.ToLower(status), " ", "-")
 }
 
 func shortRevision(revision string) string {
