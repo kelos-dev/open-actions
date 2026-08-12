@@ -148,14 +148,41 @@ trusted. See
 [`config/samples/actions_v1alpha1_docker_runner.yaml`](../config/samples/actions_v1alpha1_docker_runner.yaml)
 for a Docker-enabled Runner.
 
-A job strategy may define scalar matrix axes and an optional positive
-`max-parallel`. The controller creates one `WorkflowJob` per Cartesian-product
-combination in deterministic order. Each child has a unique `spec.jobID`, while
-`spec.matrix.logicalJobID`, `values`, and `maxParallel` preserve its logical
-identity and scheduling group. `max-parallel` limits active children in that
-group independently of the number of matching Runners. A failed matrix child
-makes the completed WorkflowRun fail. Strategy `fail-fast` is not supported;
-remaining combinations continue to completion after a child fails.
+A job strategy may define scalar matrix axes, `include` and `exclude`
+transformations, and an optional positive `max-parallel`. `exclude` mappings
+remove every Cartesian-product combination that partially matches their values.
+The controller then applies `include` mappings in declaration order. An include
+augments every compatible original combination and may overwrite values added by
+an earlier include, but it does not overwrite original axis values. An include
+that matches no original combination is appended as a standalone combination.
+A matrix may consist only of `include` mappings.
+
+```yaml
+strategy:
+  max-parallel: 2
+  matrix:
+    os: [linux, darwin]
+    version: [1, 2]
+    exclude:
+      - os: darwin
+        version: 1
+    include:
+      - os: linux
+        coverage: true
+      - os: windows
+        version: 2
+```
+
+The controller creates one `WorkflowJob` per transformed combination. Axis and
+value declaration order determines the order of Cartesian-product combinations,
+followed by standalone includes in declaration order. Each child has a unique
+`spec.jobID`, while `spec.matrix.logicalJobID`, `values`, and `maxParallel`
+preserve its logical identity and scheduling group. Every scalar axis or include
+value is available through the `matrix` expression context and persisted in
+`spec.matrix.values`. `max-parallel` limits active children in that group
+independently of the number of matching Runners. A failed matrix child makes the
+completed WorkflowRun fail. Strategy `fail-fast` is not supported; remaining
+combinations continue to completion after a child fails.
 
 ### Conditions
 
@@ -424,10 +451,13 @@ Workflow definitions must satisfy these limits:
   65,535 characters.
 - A `schedule` trigger may contain at most 20 cron expressions, each at most
   256 characters.
-- A matrix may define at most 100 axes and expand one logical job into at most
-  256 jobs. A workflow may expand to at most 1,000 jobs in total.
-- Matrix axis names contain at most 256 characters, and scalar matrix values
-  contain at most 1,024 characters.
+- A matrix may define at most 100 axes. Its `include` and `exclude` lists may
+  each contain at most 256 mappings, with at most 100 values per mapping. The
+  final transformed matrix must contain 1 to 256 jobs, and a workflow may expand
+  to at most 1,000 jobs in total.
+- Matrix keys contain at most 256 characters, scalar matrix values contain at
+  most 1,024 characters, and each transformed combination contains at most 100
+  values.
 - A job may contain at most 100 steps and 100,000 bytes of aggregate planned
   content.
 - A completed job result may contain at most 100 outputs and 4 KiB of encoded
@@ -470,11 +500,10 @@ than one plan version must emit the result version assigned to that plan, not
 always the latest result version supported by the runner binary.
 
 Docker and local actions, private cross-repository action authentication, job
-dependencies, matrix `include` and `exclude`, strategy `fail-fast`, service
-containers, repository secret and variable sources, caches, and artifacts are
-not supported. Expressions outside the documented fields and runtime contexts
-are rejected during planning or execution and are never interpreted as literal
-values.
+dependencies, strategy `fail-fast`, service containers, repository secret and
+variable sources, caches, and artifacts are not supported. Expressions outside
+the documented fields and runtime contexts are rejected during planning or
+execution and are never interpreted as literal values.
 `WorkflowJob` resources are not retried or reassigned when a Runner is removed.
 Native Jobs and their Pod logs are deleted one hour after completion. Completed
 WorkflowRuns are retained indefinitely unless `spec.ttlSecondsAfterFinished` is

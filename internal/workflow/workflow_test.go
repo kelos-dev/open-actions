@@ -568,12 +568,125 @@ func TestParseAndExpandMatrixStrategy(t *testing.T) {
 	}
 }
 
+func TestParseAndExpandIncludeOnlyMatrix(t *testing.T) {
+	definition, err := Parse([]byte("name: Deploy\non: push\njobs:\n  deploy:\n    strategy:\n      max-parallel: 1\n      matrix:\n        include:\n          - site: production\n            datacenter: site-a\n          - site: staging\n            datacenter: site-b\n    runs-on: ubuntu-latest\n    steps:\n      - run: deploy '${{ matrix.site }}' '${{ matrix.datacenter }}'\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	combinations := MatrixCombinations(definition.Jobs["deploy"].Strategy)
+	want := []map[string]any{
+		{"site": "production", "datacenter": "site-a"},
+		{"site": "staging", "datacenter": "site-b"},
+	}
+	if len(combinations) != len(want) {
+		t.Fatalf("matrix combinations = %d, want %d", len(combinations), len(want))
+	}
+	for index := range want {
+		if !maps.Equal(combinations[index], want[index]) {
+			t.Errorf("combination %d = %v, want %v", index, combinations[index], want[index])
+		}
+	}
+}
+
+func TestMatrixIncludesAugmentOriginalCombinationsInOrder(t *testing.T) {
+	definition, err := Parse([]byte("name: Test\non: push\njobs:\n  test:\n    strategy:\n      matrix:\n        fruit: [apple, pear]\n        animal: [cat, dog]\n        include:\n          - color: green\n          - color: pink\n            animal: cat\n          - fruit: apple\n            shape: circle\n          - fruit: banana\n          - fruit: banana\n            animal: cat\n    runs-on: ubuntu-latest\n    steps:\n      - run: make test\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	combinations := MatrixCombinations(definition.Jobs["test"].Strategy)
+	want := []map[string]any{
+		{"fruit": "apple", "animal": "cat", "color": "pink", "shape": "circle"},
+		{"fruit": "apple", "animal": "dog", "color": "green", "shape": "circle"},
+		{"fruit": "pear", "animal": "cat", "color": "pink"},
+		{"fruit": "pear", "animal": "dog", "color": "green"},
+		{"fruit": "banana"},
+		{"fruit": "banana", "animal": "cat"},
+	}
+	if len(combinations) != len(want) {
+		t.Fatalf("matrix combinations = %d, want %d", len(combinations), len(want))
+	}
+	for index := range want {
+		if !maps.Equal(combinations[index], want[index]) {
+			t.Errorf("combination %d = %v, want %v", index, combinations[index], want[index])
+		}
+	}
+}
+
+func TestMatrixExcludesPartialAndFullMatchesBeforeIncludes(t *testing.T) {
+	definition, err := Parse([]byte("name: Test\non: push\njobs:\n  test:\n    strategy:\n      matrix:\n        os: [macos, windows]\n        version: [12, 14, 16]\n        environment: [staging, production]\n        exclude:\n          - os: macos\n            version: 12\n            environment: production\n          - os: windows\n            version: 16\n        include:\n          - os: windows\n            version: 16\n            environment: production\n            restored: true\n    runs-on: ubuntu-latest\n    steps:\n      - run: make test\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	combinations := MatrixCombinations(definition.Jobs["test"].Strategy)
+	if len(combinations) != 10 {
+		t.Fatalf("matrix combinations = %d, want 10", len(combinations))
+	}
+	for _, combination := range combinations[:len(combinations)-1] {
+		if combination["os"] == "windows" && combination["version"] == 16 {
+			t.Errorf("partial exclusion retained %v", combination)
+		}
+		if combination["os"] == "macos" && combination["version"] == 12 && combination["environment"] == "production" {
+			t.Errorf("full exclusion retained %v", combination)
+		}
+	}
+	wantRestored := map[string]any{"os": "windows", "version": 16, "environment": "production", "restored": true}
+	if !maps.Equal(combinations[len(combinations)-1], wantRestored) {
+		t.Errorf("restored combination = %v, want %v", combinations[len(combinations)-1], wantRestored)
+	}
+}
+
+func TestMatrixExpansionUsesAxisDeclarationOrder(t *testing.T) {
+	definition, err := Parse([]byte("name: Test\non: push\njobs:\n  test:\n    strategy:\n      matrix:\n        version: [1, 2]\n        os: [linux, darwin]\n    runs-on: ubuntu-latest\n    steps:\n      - run: make test\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	combinations := MatrixCombinations(definition.Jobs["test"].Strategy)
+	want := []string{"1/linux", "1/darwin", "2/linux", "2/darwin"}
+	for index, combination := range combinations {
+		got := fmt.Sprintf("%v/%v", combination["version"], combination["os"])
+		if got != want[index] {
+			t.Errorf("combination %d = %q, want %q", index, got, want[index])
+		}
+	}
+}
+
+func TestMatrixExpansionLimitAppliesAfterExclusionsAndIncludes(t *testing.T) {
+	values := make([]string, maxMatrixJobs+1)
+	for index := range values {
+		values[index] = fmt.Sprint(index)
+	}
+	base := "name: Test\non: push\njobs:\n  test:\n    strategy:\n      matrix:\n        item: [" + strings.Join(values, ", ") + "]\n"
+	job := "    runs-on: ubuntu-latest\n    steps:\n      - run: make test\n"
+
+	definition, err := Parse([]byte(base + "        exclude:\n          - item: 256\n" + job))
+	if err != nil {
+		t.Fatalf("Parse() rejected matrix reduced to the limit: %v", err)
+	}
+	if got := len(MatrixCombinations(definition.Jobs["test"].Strategy)); got != maxMatrixJobs {
+		t.Fatalf("matrix combinations = %d, want %d", got, maxMatrixJobs)
+	}
+
+	if _, err := Parse([]byte(base + job)); err == nil || !strings.Contains(err.Error(), "more than 256 jobs") {
+		t.Fatalf("Parse() oversized base matrix error = %v", err)
+	}
+	values = values[:maxMatrixJobs]
+	base = "name: Test\non: push\njobs:\n  test:\n    strategy:\n      matrix:\n        item: [" + strings.Join(values, ", ") + "]\n"
+	if _, err := Parse([]byte(base + "        include:\n          - item: 256\n" + job)); err == nil || !strings.Contains(err.Error(), "more than 256 jobs") {
+		t.Fatalf("Parse() oversized transformed matrix error = %v", err)
+	}
+}
+
 func TestParseRejectsInvalidMatrixStrategy(t *testing.T) {
 	strategies := []string{
 		"strategy: {}",
 		"strategy: {matrix: {}}",
 		"strategy: {matrix: {arch: []}}",
 		"strategy: {matrix: {arch: [{name: arm64}]}}",
+		"strategy: {matrix: {include: value}}",
+		"strategy: {matrix: {include: [value]}}",
+		"strategy: {matrix: {include: [{}]}}",
+		"strategy: {matrix: {include: [{arch: {name: arm64}}]}}",
+		"strategy: {matrix: {arch: [amd64], exclude: [{arch: amd64}]}}",
 		"strategy: {matrix: {arch: [" + strings.Repeat("a", maxMatrixValueLength+1) + "]}}",
 		"strategy: {max-parallel: 0, matrix: {arch: [amd64]}}",
 		"strategy: {fail-fast: false, matrix: {arch: [amd64]}}",

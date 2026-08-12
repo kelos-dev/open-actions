@@ -102,8 +102,9 @@ spec:
                     additionalProperties:
                       type: string
                     description: |-
-                      Values contains the scalar matrix axis values for this combination.
-                      Values are represented using their workflow string form.
+                      Values contains the scalar matrix values for this combination, including
+                      values added by an include transformation. Values are represented using
+                      their workflow string form.
                     maxProperties: 100
                     minProperties: 1
                     type: object

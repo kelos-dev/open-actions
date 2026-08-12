@@ -65,8 +65,9 @@ type WorkflowJobMatrix struct {
 	// +required
 	LogicalJobID string `json:"logicalJobID"`
 
-	// Values contains the scalar matrix axis values for this combination.
-	// Values are represented using their workflow string form.
+	// Values contains the scalar matrix values for this combination, including
+	// values added by an include transformation. Values are represented using
+	// their workflow string form.
 	// +kubebuilder:validation:MinProperties=1
 	// +kubebuilder:validation:MaxProperties=100
 	// +kubebuilder:validation:XValidation:rule="self.all(k, size(k) > 0 && size(k) <= 256 && size(self[k]) <= 1024)",message="matrix keys must contain 1 to 256 characters and values must contain at most 1024 characters"

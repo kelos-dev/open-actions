@@ -134,10 +134,13 @@ type Job struct {
 }
 
 type Strategy struct {
-	Matrix         map[string][]any
-	MaxParallel    int32
-	configured     bool
-	maxParallelSet bool
+	Matrix          map[string][]any
+	Include         []map[string]any
+	Exclude         []map[string]any
+	MaxParallel     int32
+	matrixAxisOrder []string
+	configured      bool
+	maxParallelSet  bool
 }
 
 type Step struct {
@@ -425,13 +428,12 @@ func validateStrategy(id string, strategy Strategy) error {
 	if !strategy.configured {
 		return nil
 	}
-	if len(strategy.Matrix) == 0 {
-		return fmt.Errorf("job %q strategy must define a matrix", id)
+	if len(strategy.Matrix) == 0 && len(strategy.Include) == 0 {
+		return fmt.Errorf("job %q strategy matrix must define at least one axis or include combination", id)
 	}
 	if len(strategy.Matrix) > maxMapEntries {
 		return fmt.Errorf("job %q matrix defines %d axes; maximum is %d", id, len(strategy.Matrix), maxMapEntries)
 	}
-	combinations := 1
 	for name, values := range strategy.Matrix {
 		if name == "" || utf8.RuneCountInString(name) > maxMapKeyLength {
 			return fmt.Errorf("job %q matrix axis %q must contain 1 to %d characters", id, name, maxMapKeyLength)
@@ -439,53 +441,306 @@ func validateStrategy(id string, strategy Strategy) error {
 		if len(values) == 0 {
 			return fmt.Errorf("job %q matrix axis %q must define at least one value", id, name)
 		}
-		if len(values) > maxMatrixJobs || combinations > maxMatrixJobs/len(values) {
-			return fmt.Errorf("job %q matrix expands to more than %d jobs", id, maxMatrixJobs)
-		}
-		combinations *= len(values)
 		for _, value := range values {
-			scalar, ok := scalarString(value)
-			if !ok {
-				return fmt.Errorf("job %q matrix axis %q values must be scalars", id, name)
-			}
-			if utf8.RuneCountInString(scalar) > maxMatrixValueLength {
-				return fmt.Errorf("job %q matrix axis %q value exceeds %d characters", id, name, maxMatrixValueLength)
+			if err := validateMatrixValue(fmt.Sprintf("job %q matrix axis %q", id, name), value); err != nil {
+				return err
 			}
 		}
+	}
+	if err := validateMatrixMappings(id, "include", strategy.Include); err != nil {
+		return err
+	}
+	if err := validateMatrixMappings(id, "exclude", strategy.Exclude); err != nil {
+		return err
 	}
 	if strategy.maxParallelSet && strategy.MaxParallel < 1 {
 		return fmt.Errorf("job %q strategy max-parallel must be greater than zero", id)
 	}
+	combinations, exceeded := matrixCombinations(strategy, maxMatrixJobs)
+	if exceeded {
+		return fmt.Errorf("job %q matrix expands to more than %d jobs", id, maxMatrixJobs)
+	}
+	if len(combinations) == 0 {
+		return fmt.Errorf("job %q matrix must expand to at least one job", id)
+	}
+	for _, combination := range combinations {
+		if len(combination) > maxMapEntries {
+			return fmt.Errorf("job %q matrix combination defines %d values; maximum is %d", id, len(combination), maxMapEntries)
+		}
+	}
 	return nil
 }
 
-// MatrixCombinations returns matrix values in stable axis and value order.
-func MatrixCombinations(strategy Strategy) []map[string]any {
-	if len(strategy.Matrix) == 0 {
-		return nil
+func validateMatrixMappings(id, transformation string, mappings []map[string]any) error {
+	if len(mappings) > maxMatrixJobs {
+		return fmt.Errorf("job %q matrix %s defines %d combinations; maximum is %d", id, transformation, len(mappings), maxMatrixJobs)
 	}
-	axisNames := make([]string, 0, len(strategy.Matrix))
-	for name := range strategy.Matrix {
-		axisNames = append(axisNames, name)
-	}
-	sort.Strings(axisNames)
-	combinations := []map[string]any{{}}
-	for _, name := range axisNames {
-		values := strategy.Matrix[name]
-		next := make([]map[string]any, 0, len(combinations)*len(values))
-		for _, combination := range combinations {
-			for _, value := range values {
-				item := make(map[string]any, len(combination)+1)
-				for existingName, existingValue := range combination {
-					item[existingName] = existingValue
-				}
-				item[name] = value
-				next = append(next, item)
+	for index, mapping := range mappings {
+		field := fmt.Sprintf("job %q matrix %s combination %d", id, transformation, index+1)
+		if len(mapping) == 0 {
+			return fmt.Errorf("%s must define at least one value", field)
+		}
+		if len(mapping) > maxMapEntries {
+			return fmt.Errorf("%s defines %d values; maximum is %d", field, len(mapping), maxMapEntries)
+		}
+		for name, value := range mapping {
+			if name == "" || utf8.RuneCountInString(name) > maxMapKeyLength {
+				return fmt.Errorf("%s key %q must contain 1 to %d characters", field, name, maxMapKeyLength)
+			}
+			if err := validateMatrixValue(fmt.Sprintf("%s value %q", field, name), value); err != nil {
+				return err
 			}
 		}
-		combinations = next
 	}
+	return nil
+}
+
+func validateMatrixValue(field string, value any) error {
+	scalar, ok := scalarString(value)
+	if !ok {
+		return fmt.Errorf("%s must be a scalar", field)
+	}
+	if utf8.RuneCountInString(scalar) > maxMatrixValueLength {
+		return fmt.Errorf("%s exceeds %d characters", field, maxMatrixValueLength)
+	}
+	return nil
+}
+
+// MatrixCombinations returns transformed matrix values in deterministic order.
+func MatrixCombinations(strategy Strategy) []map[string]any {
+	combinations, _ := matrixCombinations(strategy, maxMatrixJobs)
 	return combinations
+}
+
+func matrixCombinations(strategy Strategy, limit int) ([]map[string]any, bool) {
+	if len(strategy.Matrix) == 0 {
+		if len(strategy.Include) > limit {
+			return nil, true
+		}
+		combinations := make([]map[string]any, 0, len(strategy.Include))
+		for _, included := range strategy.Include {
+			combinations = append(combinations, cloneMatrixValues(included))
+		}
+		return combinations, false
+	}
+
+	base, exceeded := baseMatrixCombinations(strategy, limit)
+	if exceeded {
+		return nil, true
+	}
+	combinations := make([]map[string]any, len(base))
+	for index := range base {
+		combinations[index] = cloneMatrixValues(base[index].values)
+	}
+	for _, included := range strategy.Include {
+		applied := false
+		for index := range base {
+			if matrixIncludeMatches(base[index].values, included) {
+				for name, value := range included {
+					combinations[index][name] = value
+				}
+				applied = true
+			}
+		}
+		if !applied {
+			if len(combinations) == limit {
+				return nil, true
+			}
+			combinations = append(combinations, cloneMatrixValues(included))
+		}
+	}
+	return combinations, false
+}
+
+type matrixCombination struct {
+	values  map[string]any
+	indices []int
+}
+
+func baseMatrixCombinations(strategy Strategy, limit int) ([]matrixCombination, bool) {
+	axisNames := matrixAxisNames(strategy)
+	axisPositions := make(map[string]int, len(axisNames))
+	for index, name := range axisNames {
+		axisPositions[name] = index
+	}
+
+	exclusions := make([]map[string]any, 0, len(strategy.Exclude))
+	for _, excluded := range strategy.Exclude {
+		applicable := true
+		for name := range excluded {
+			if _, found := axisPositions[name]; !found {
+				applicable = false
+				break
+			}
+		}
+		if applicable {
+			exclusions = append(exclusions, excluded)
+		}
+	}
+	expansionOrder := matrixExpansionOrder(axisNames, exclusions)
+	values := make(map[string]any, len(axisNames))
+	indices := make([]int, len(axisNames))
+	combinations := make([]matrixCombination, 0, min(limit, maxMatrixJobs))
+	exceeded := false
+
+	var expandRemaining func(int)
+	expandRemaining = func(depth int) {
+		if exceeded {
+			return
+		}
+		if depth == len(expansionOrder) {
+			if len(combinations) == limit {
+				exceeded = true
+				return
+			}
+			combinations = append(combinations, matrixCombination{values: cloneMatrixValues(values), indices: append([]int(nil), indices...)})
+			return
+		}
+		name := expansionOrder[depth]
+		for valueIndex, value := range strategy.Matrix[name] {
+			values[name] = value
+			indices[axisPositions[name]] = valueIndex
+			expandRemaining(depth + 1)
+			if exceeded {
+				return
+			}
+		}
+		delete(values, name)
+	}
+
+	var expand func(int, []map[string]any)
+	expand = func(depth int, possibleExclusions []map[string]any) {
+		if exceeded {
+			return
+		}
+		if len(possibleExclusions) == 0 {
+			expandRemaining(depth)
+			return
+		}
+		if depth == len(expansionOrder) {
+			return
+		}
+		name := expansionOrder[depth]
+		for valueIndex, value := range strategy.Matrix[name] {
+			values[name] = value
+			indices[axisPositions[name]] = valueIndex
+			nextExclusions := make([]map[string]any, 0, len(possibleExclusions))
+			excluded := false
+			for _, exclusion := range possibleExclusions {
+				expected, constrainsAxis := exclusion[name]
+				if constrainsAxis && !matrixValuesEqual(expected, value) {
+					continue
+				}
+				complete := true
+				for excludedName := range exclusion {
+					if _, assigned := values[excludedName]; !assigned {
+						complete = false
+						break
+					}
+				}
+				if complete {
+					excluded = true
+					break
+				}
+				nextExclusions = append(nextExclusions, exclusion)
+			}
+			if !excluded {
+				expand(depth+1, nextExclusions)
+			}
+			if exceeded {
+				return
+			}
+		}
+		delete(values, name)
+	}
+
+	expand(0, exclusions)
+	if exceeded {
+		return nil, true
+	}
+	sort.SliceStable(combinations, func(left, right int) bool {
+		for index := range combinations[left].indices {
+			if combinations[left].indices[index] != combinations[right].indices[index] {
+				return combinations[left].indices[index] < combinations[right].indices[index]
+			}
+		}
+		return false
+	})
+	return combinations, false
+}
+
+func matrixAxisNames(strategy Strategy) []string {
+	if len(strategy.matrixAxisOrder) == len(strategy.Matrix) {
+		return append([]string(nil), strategy.matrixAxisOrder...)
+	}
+	names := make([]string, 0, len(strategy.Matrix))
+	for name := range strategy.Matrix {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+func matrixExpansionOrder(axisNames []string, exclusions []map[string]any) []string {
+	order := append([]string(nil), axisNames...)
+	frequency := make(map[string]int, len(axisNames))
+	for _, exclusion := range exclusions {
+		for name := range exclusion {
+			frequency[name]++
+		}
+	}
+	positions := make(map[string]int, len(axisNames))
+	for index, name := range axisNames {
+		positions[name] = index
+	}
+	sort.SliceStable(order, func(left, right int) bool {
+		if frequency[order[left]] != frequency[order[right]] {
+			return frequency[order[left]] > frequency[order[right]]
+		}
+		return positions[order[left]] < positions[order[right]]
+	})
+	return order
+}
+
+func matrixIncludeMatches(original, included map[string]any) bool {
+	for name, includedValue := range included {
+		if originalValue, found := original[name]; found && !matrixValuesEqual(originalValue, includedValue) {
+			return false
+		}
+	}
+	return true
+}
+
+func matrixValuesEqual(left, right any) bool {
+	leftNumber, leftIsNumber := matrixNumber(left)
+	rightNumber, rightIsNumber := matrixNumber(right)
+	if leftIsNumber || rightIsNumber {
+		return leftIsNumber && rightIsNumber && leftNumber == rightNumber
+	}
+	return left == right
+}
+
+func matrixNumber(value any) (float64, bool) {
+	switch typed := value.(type) {
+	case int:
+		return float64(typed), true
+	case int64:
+		return float64(typed), true
+	case uint64:
+		return float64(typed), true
+	case float64:
+		return typed, true
+	default:
+		return 0, false
+	}
+}
+
+func cloneMatrixValues(values map[string]any) map[string]any {
+	cloned := make(map[string]any, len(values))
+	for name, value := range values {
+		cloned[name] = value
+	}
+	return cloned
 }
 
 func validateJobOutputs(jobID string, outputs map[string]any) (int, error) {
@@ -1004,8 +1259,31 @@ func (s *Strategy) UnmarshalYAML(node *yaml.Node) error {
 			if err := rejectDuplicateMappingKeys(value, "job strategy matrix"); err != nil {
 				return err
 			}
-			if err := value.Decode(&s.Matrix); err != nil {
-				return err
+			s.Matrix = make(map[string][]any, len(value.Content)/2)
+			for matrixIndex := 0; matrixIndex < len(value.Content); matrixIndex += 2 {
+				matrixName := value.Content[matrixIndex].Value
+				matrixValue := value.Content[matrixIndex+1]
+				switch matrixName {
+				case "include":
+					mappings, err := decodeMatrixMappings(matrixValue, "include")
+					if err != nil {
+						return err
+					}
+					s.Include = mappings
+				case "exclude":
+					mappings, err := decodeMatrixMappings(matrixValue, "exclude")
+					if err != nil {
+						return err
+					}
+					s.Exclude = mappings
+				default:
+					values := []any{}
+					if err := matrixValue.Decode(&values); err != nil {
+						return fmt.Errorf("decode matrix axis %q: %w", matrixName, err)
+					}
+					s.Matrix[matrixName] = values
+					s.matrixAxisOrder = append(s.matrixAxisOrder, matrixName)
+				}
 			}
 		case "max-parallel":
 			s.maxParallelSet = true
@@ -1017,6 +1295,28 @@ func (s *Strategy) UnmarshalYAML(node *yaml.Node) error {
 		}
 	}
 	return nil
+}
+
+func decodeMatrixMappings(node *yaml.Node, transformation string) ([]map[string]any, error) {
+	if node.Kind != yaml.SequenceNode {
+		return nil, fmt.Errorf("job strategy matrix %s must be a list", transformation)
+	}
+	mappings := make([]map[string]any, 0, len(node.Content))
+	for index, child := range node.Content {
+		field := fmt.Sprintf("job strategy matrix %s combination %d", transformation, index+1)
+		if child.Kind != yaml.MappingNode {
+			return nil, fmt.Errorf("%s must be a mapping", field)
+		}
+		if err := rejectDuplicateMappingKeys(child, field); err != nil {
+			return nil, err
+		}
+		mapping := map[string]any{}
+		if err := child.Decode(&mapping); err != nil {
+			return nil, fmt.Errorf("decode %s: %w", field, err)
+		}
+		mappings = append(mappings, mapping)
+	}
+	return mappings, nil
 }
 
 func (c *Concurrency) UnmarshalYAML(node *yaml.Node) error {

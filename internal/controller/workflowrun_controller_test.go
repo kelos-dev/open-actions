@@ -246,7 +246,7 @@ func TestPlanWorkflowJobsExpandsArchitectureMatrix(t *testing.T) {
 			Revision:   actionsv1alpha1.GitRevision{SHA: strings.Repeat("a", 40), Ref: "refs/heads/main"},
 		},
 	}}}
-	definition, err := workflow.Parse([]byte("name: Release\non: push\njobs:\n  build-images:\n    strategy:\n      max-parallel: 1\n      matrix:\n        arch: [amd64, arm64]\n    runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}\n    outputs:\n      image: ${{ matrix.arch }}-${{ steps.build.outputs.image }}\n    steps:\n      - id: build\n        run: make image IMAGE_PLATFORMS=linux/${{ matrix.arch }}\n"))
+	definition, err := workflow.Parse([]byte("name: Release\non: push\njobs:\n  build-images:\n    strategy:\n      max-parallel: 1\n      matrix:\n        arch: [amd64, arm64]\n        include:\n          - variant: release\n    runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}\n    outputs:\n      image: ${{ matrix.arch }}-${{ matrix.variant }}-${{ steps.build.outputs.image }}\n    steps:\n      - id: build\n        run: make image IMAGE_PLATFORMS=linux/${{ matrix.arch }}\n"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -260,7 +260,7 @@ func TestPlanWorkflowJobsExpandsArchitectureMatrix(t *testing.T) {
 	}
 	for index, arch := range []string{"amd64", "arm64"} {
 		job := planned[index]
-		if job.id != fmt.Sprintf("build-images-matrix-%d", index+1) || job.matrix == nil || job.matrix.LogicalJobID != "build-images" || job.matrix.Values["arch"] != arch || job.matrix.MaxParallel != 1 || job.resultVersion != jobResultVersion {
+		if job.id != fmt.Sprintf("build-images-matrix-%d", index+1) || job.matrix == nil || job.matrix.LogicalJobID != "build-images" || job.matrix.Values["arch"] != arch || job.matrix.Values["variant"] != "release" || job.matrix.MaxParallel != 1 || job.resultVersion != jobResultVersion {
 			t.Errorf("planned job %d = %#v", index, job)
 		}
 		wantRunner := "ubuntu-latest"
@@ -274,7 +274,7 @@ func TestPlanWorkflowJobsExpandsArchitectureMatrix(t *testing.T) {
 		if err := json.Unmarshal([]byte(job.plan), plan); err != nil {
 			t.Fatal(err)
 		}
-		if plan.JobID != "build-images" || plan.Matrix["arch"] != arch || plan.Outputs["image"] != "${{ matrix.arch }}-${{ steps.build.outputs.image }}" {
+		if plan.JobID != "build-images" || plan.Matrix["arch"] != arch || plan.Matrix["variant"] != "release" || plan.Outputs["image"] != "${{ matrix.arch }}-${{ matrix.variant }}-${{ steps.build.outputs.image }}" {
 			t.Errorf("plan for %s = %#v", arch, plan)
 		}
 	}
