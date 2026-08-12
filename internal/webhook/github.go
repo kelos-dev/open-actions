@@ -21,6 +21,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/validation"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
@@ -100,6 +101,14 @@ type payload struct {
 		TagName string `json:"tag_name"`
 		Draft   bool   `json:"draft"`
 	} `json:"release"`
+	CheckRun struct {
+		ID         int64  `json:"id"`
+		HeadSHA    string `json:"head_sha"`
+		ExternalID string `json:"external_id"`
+		App        struct {
+			ID int64 `json:"id"`
+		} `json:"app"`
+	} `json:"check_run"`
 }
 
 type normalizedRepository struct {
@@ -156,6 +165,12 @@ type normalizedEvent struct {
 	Review        *normalizedReview      `json:"review,omitempty"`
 }
 
+type normalizedRerun struct {
+	CheckRunID int64  `json:"checkRunID"`
+	RootRunUID string `json:"rootRunUID"`
+	HeadSHA    string `json:"headSHA"`
+}
+
 func (h *GitHubHandler) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	if request.Method != http.MethodPost {
 		writer.Header().Set("Allow", http.MethodPost)
@@ -193,6 +208,29 @@ func (h *GitHubHandler) ServeHTTP(writer http.ResponseWriter, request *http.Requ
 		http.Error(writer, "invalid webhook signature", http.StatusUnauthorized)
 		return
 	}
+	if eventName == "check_run" {
+		rerun, supported, err := normalizeRerun(project, parsed)
+		if err != nil {
+			http.Error(writer, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if !supported {
+			writeJSON(writer, http.StatusAccepted, map[string]any{"accepted": true, "queued": false})
+			return
+		}
+		if err := h.enqueueRerunDelivery(request.Context(), project, parsed, rerun, deliveryID); err != nil {
+			h.Logger.Error("failed to enqueue GitHub check rerun", "delivery_id", deliveryID, "check_run_id", rerun.CheckRunID, "error", err)
+			if apierrors.IsConflict(err) {
+				http.Error(writer, "webhook replay conflict", http.StatusConflict)
+				return
+			}
+			http.Error(writer, "enqueue webhook delivery failed", http.StatusInternalServerError)
+			return
+		}
+		h.Logger.Info("accepted GitHub check rerun", "delivery_id", deliveryID, "check_run_id", rerun.CheckRunID)
+		writeJSON(writer, http.StatusAccepted, map[string]any{"accepted": true, "queued": true})
+		return
+	}
 	normalized, supported, err := normalize(eventName, parsed)
 	if err != nil {
 		http.Error(writer, err.Error(), http.StatusBadRequest)
@@ -213,6 +251,20 @@ func (h *GitHubHandler) ServeHTTP(writer http.ResponseWriter, request *http.Requ
 	}
 	h.Logger.Info("accepted GitHub webhook", "delivery_id", deliveryID, "event", eventName)
 	writeJSON(writer, http.StatusAccepted, map[string]any{"accepted": true, "queued": true})
+}
+
+func normalizeRerun(project *actionsv1alpha1.Project, event *payload) (*normalizedRerun, bool, error) {
+	if event.Action != "rerequested" {
+		return nil, false, nil
+	}
+	github := project.Spec.Source.GitHub
+	if github == nil || event.CheckRun.App.ID != github.AppID {
+		return nil, false, errors.New("GitHub check run was not created by this Project's app")
+	}
+	if event.CheckRun.ID < 1 || event.CheckRun.ExternalID == "" || len(validation.IsValidLabelValue(event.CheckRun.ExternalID)) > 0 || !validGitSHA(event.CheckRun.HeadSHA) {
+		return nil, false, errors.New("GitHub check run event is incomplete")
+	}
+	return &normalizedRerun{CheckRunID: event.CheckRun.ID, RootRunUID: event.CheckRun.ExternalID, HeadSHA: event.CheckRun.HeadSHA}, true, nil
 }
 
 func (h *GitHubHandler) projectForInstallation(ctx context.Context, installationID int64) (*actionsv1alpha1.Project, []byte, error) {

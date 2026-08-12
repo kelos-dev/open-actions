@@ -710,7 +710,11 @@ func testGitHubCheckRunLifecycle(t *testing.T, executionSHA, headSHA, checkHeadS
 			}
 			fmt.Fprint(writer, `{"token":"checks-token"}`)
 		case request.Method == http.MethodGet && request.URL.Path == "/repos/acme/example/commits/"+checkHeadSHA+"/check-runs":
-			fmt.Fprint(writer, `{"total_count":0,"check_runs":[]}`)
+			if created == 0 {
+				fmt.Fprint(writer, `{"total_count":0,"check_runs":[]}`)
+			} else {
+				fmt.Fprint(writer, `{"total_count":1,"check_runs":[{"id":17,"external_id":"run-uid","status":"completed","conclusion":"success"}]}`)
+			}
 		case request.Method == http.MethodPost && request.URL.Path == "/repos/acme/example/check-runs":
 			body := githubclient.CreateCheckRunRequest{}
 			if err := json.NewDecoder(request.Body).Decode(&body); err != nil || body.ExternalID != "run-uid" || body.Status != "queued" || body.HeadSHA != checkHeadSHA {
@@ -734,6 +738,11 @@ func testGitHubCheckRunLifecycle(t *testing.T, executionSHA, headSHA, checkHeadS
 			case 1:
 				if body.Status != "completed" || body.Conclusion != "success" {
 					http.Error(writer, "unexpected completed check update", http.StatusBadRequest)
+					return
+				}
+			case 2:
+				if body.Status != "queued" || body.ExternalID != "run-uid" || body.Output == nil || body.Output.Title != "CI (attempt 2)" {
+					http.Error(writer, "unexpected rerun check update", http.StatusBadRequest)
 					return
 				}
 			default:
@@ -768,7 +777,7 @@ func testGitHubCheckRunLifecycle(t *testing.T, executionSHA, headSHA, checkHeadS
 	}
 	secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "github", Namespace: "default"}, Data: map[string][]byte{"private-key": privateKeyData}}
 	run := &actionsv1alpha1.WorkflowRun{
-		ObjectMeta: metav1.ObjectMeta{Name: "ci", Namespace: "default", UID: "run-uid"},
+		ObjectMeta: metav1.ObjectMeta{Name: "ci", Namespace: "default", UID: "run-uid", Labels: map[string]string{actionsv1alpha1.LabelWorkflowRunRootUID: "run-uid"}},
 		Spec: actionsv1alpha1.WorkflowRunSpec{
 			ProjectRef:   corev1.LocalObjectReference{Name: project.Name},
 			WorkflowPath: ".open-actions/workflows/ci.yaml",
@@ -811,6 +820,43 @@ func testGitHubCheckRunLifecycle(t *testing.T, executionSHA, headSHA, checkHeadS
 	if updated != 2 || workflowRunCheckRunStatus(stored).Conclusion != "success" {
 		t.Fatalf("updates = %d, check run = %#v", updated, workflowRunCheckRunStatus(stored))
 	}
+
+	retry := &actionsv1alpha1.WorkflowRun{
+		ObjectMeta: metav1.ObjectMeta{Name: "ci-attempt-2", Namespace: stored.Namespace, UID: "retry-uid", Labels: map[string]string{actionsv1alpha1.LabelWorkflowRunRootUID: "run-uid"}},
+		Spec:       *stored.Spec.DeepCopy(),
+		Status:     actionsv1alpha1.WorkflowRunStatus{WorkflowName: "CI"},
+	}
+	retry.Spec.Rerun = &actionsv1alpha1.WorkflowRunRerun{
+		OriginalRunRef: actionsv1alpha1.WorkflowRunReference{Name: stored.Name, UID: stored.UID},
+		PreviousRunRef: actionsv1alpha1.WorkflowRunReference{Name: stored.Name, UID: stored.UID},
+		Attempt:        2,
+		JobIDs:         []string{"unit"},
+	}
+	if err := clusterClient.Create(context.Background(), retry); err != nil {
+		t.Fatal(err)
+	}
+	if err := reconciler.reconcileGitHubCheck(context.Background(), retry); err != nil {
+		t.Fatal(err)
+	}
+	if err := clusterClient.Get(context.Background(), client.ObjectKeyFromObject(retry), retry); err != nil {
+		t.Fatal(err)
+	}
+	if created != 1 || updated != 3 || workflowRunCheckRunStatus(retry) == nil || workflowRunCheckRunStatus(retry).ID != 17 {
+		t.Fatalf("rerun creates = %d, updates = %d, check run = %#v", created, updated, workflowRunCheckRunStatus(retry))
+	}
+	reconciler.APIReader = &workflowRunListErrorReader{Reader: clusterClient, err: errors.New("unexpected WorkflowRun list")}
+	if err := reconciler.reconcileGitHubCheck(context.Background(), retry); err != nil {
+		t.Fatalf("unchanged check report listed WorkflowRuns: %v", err)
+	}
+	reconciler.APIReader = clusterClient
+	stale := stored.DeepCopy()
+	stale.Status.Source.GitHub.CheckRun.ReportDigest = ""
+	if err := reconciler.reconcileGitHubCheck(context.Background(), stale); err != nil {
+		t.Fatal(err)
+	}
+	if updated != 3 {
+		t.Fatalf("older attempt updated the shared check; updates = %d", updated)
+	}
 }
 
 func TestWorkflowRunCheckReportMapsLifecycle(t *testing.T) {
@@ -837,6 +883,180 @@ func TestWorkflowRunCheckReportMapsLifecycle(t *testing.T) {
 	canceled := &actionsv1alpha1.WorkflowRun{ObjectMeta: metav1.ObjectMeta{DeletionTimestamp: &deletionTime}}
 	if report := workflowRunCheckReport(canceled); report.Status != "completed" || report.Conclusion != "cancelled" || report.CompletedAt != deletionTime.UTC().Format(time.RFC3339) {
 		t.Fatalf("canceled report = %#v", report)
+	}
+}
+
+func TestRerunWorkflowJobSelectionAndCheckIdentity(t *testing.T) {
+	run := &actionsv1alpha1.WorkflowRun{Spec: actionsv1alpha1.WorkflowRunSpec{
+		WorkflowPath: ".open-actions/workflows/ci.yaml",
+		Rerun: &actionsv1alpha1.WorkflowRunRerun{
+			OriginalRunRef: actionsv1alpha1.WorkflowRunReference{Name: "ci", UID: "original-uid"},
+			PreviousRunRef: actionsv1alpha1.WorkflowRunReference{Name: "ci", UID: "original-uid"},
+			Attempt:        2,
+			JobIDs:         []string{"unit-matrix-2", "integration"},
+		},
+	}}
+	planned := []plannedWorkflowJob{
+		{id: "setup"},
+		{id: "integration", needs: []string{"setup"}},
+		{id: "unit-matrix-1", matrix: &actionsv1alpha1.WorkflowJobMatrix{LogicalJobID: "unit"}},
+		{id: "unit-matrix-2", needs: []string{"setup"}, matrix: &actionsv1alpha1.WorkflowJobMatrix{LogicalJobID: "unit"}},
+	}
+
+	selected, err := selectRerunWorkflowJobs(run, planned)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(selected) != 3 || selected[0].id != "setup" || selected[1].id != "integration" || selected[2].id != "unit-matrix-2" {
+		t.Fatalf("selected jobs = %#v", selected)
+	}
+	if externalID := workflowRunCheckExternalID(run); externalID != "original-uid" {
+		t.Fatalf("check external ID = %q", externalID)
+	}
+	report := workflowRunCheckReport(run)
+	if report.Output.Title != ".open-actions/workflows/ci.yaml (attempt 2)" || !strings.Contains(report.Output.Text, "2 requested jobs plus required dependencies") {
+		t.Fatalf("rerun check report = %#v", report)
+	}
+
+	run.Spec.Rerun.JobIDs = []string{"missing"}
+	if _, err := selectRerunWorkflowJobs(run, planned); err == nil || !strings.Contains(err.Error(), "missing") {
+		t.Fatalf("missing job selection error = %v", err)
+	}
+}
+
+func TestValidateWorkflowRunRerun(t *testing.T) {
+	terminalConditions := []metav1.Condition{{
+		Type: actionsv1alpha1.WorkflowRunConditionSucceeded, Status: metav1.ConditionTrue, Reason: "JobsSucceeded",
+	}}
+	tests := []struct {
+		name         string
+		omitPrevious bool
+		mutate       func(*actionsv1alpha1.WorkflowRun, *actionsv1alpha1.WorkflowRun)
+		wantError    string
+	}{
+		{name: "valid"},
+		{name: "missing previous", omitPrevious: true, wantError: "does not exist"},
+		{name: "UID mismatch", mutate: func(_ *actionsv1alpha1.WorkflowRun, run *actionsv1alpha1.WorkflowRun) {
+			run.Spec.Rerun.PreviousRunRef.UID = "recreated-uid"
+		}, wantError: "different UID"},
+		{name: "previous still running", mutate: func(previous, _ *actionsv1alpha1.WorkflowRun) {
+			previous.Status.Conditions = nil
+		}, wantError: "is not complete"},
+		{name: "spec mismatch", mutate: func(_ *actionsv1alpha1.WorkflowRun, run *actionsv1alpha1.WorkflowRun) {
+			run.Spec.WorkflowPath = ".open-actions/workflows/other.yaml"
+		}, wantError: "does not match previous"},
+		{name: "original mismatch", mutate: func(_ *actionsv1alpha1.WorkflowRun, run *actionsv1alpha1.WorkflowRun) {
+			run.Spec.Rerun.OriginalRunRef.Name = "other"
+		}, wantError: "does not identify previous"},
+		{name: "previous rerun lineage mismatch", mutate: func(previous, run *actionsv1alpha1.WorkflowRun) {
+			previous.Spec.Rerun = &actionsv1alpha1.WorkflowRunRerun{
+				OriginalRunRef: actionsv1alpha1.WorkflowRunReference{Name: "root", UID: "root-uid"},
+				PreviousRunRef: actionsv1alpha1.WorkflowRunReference{Name: "root", UID: "root-uid"},
+				Attempt:        2,
+			}
+			run.Spec.Rerun.Attempt = 3
+		}, wantError: "does not match previous"},
+		{name: "wrong attempt", mutate: func(_ *actionsv1alpha1.WorkflowRun, run *actionsv1alpha1.WorkflowRun) {
+			run.Spec.Rerun.Attempt = 3
+		}, wantError: "must follow attempt 1"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			scheme := runtime.NewScheme()
+			if err := actionsv1alpha1.AddToScheme(scheme); err != nil {
+				t.Fatal(err)
+			}
+			previous := &actionsv1alpha1.WorkflowRun{
+				ObjectMeta: metav1.ObjectMeta{Name: "ci", Namespace: "default", UID: "previous-uid"},
+				Spec: actionsv1alpha1.WorkflowRunSpec{
+					ProjectRef: corev1.LocalObjectReference{Name: "project"}, WorkflowPath: ".open-actions/workflows/ci.yaml",
+				},
+				Status: actionsv1alpha1.WorkflowRunStatus{Conditions: append([]metav1.Condition(nil), terminalConditions...)},
+			}
+			run := &actionsv1alpha1.WorkflowRun{
+				ObjectMeta: metav1.ObjectMeta{Name: "ci-attempt-2", Namespace: previous.Namespace, UID: "attempt-uid"},
+				Spec:       *previous.Spec.DeepCopy(),
+			}
+			run.Spec.Rerun = &actionsv1alpha1.WorkflowRunRerun{
+				OriginalRunRef: actionsv1alpha1.WorkflowRunReference{Name: previous.Name, UID: previous.UID},
+				PreviousRunRef: actionsv1alpha1.WorkflowRunReference{Name: previous.Name, UID: previous.UID},
+				Attempt:        2,
+			}
+			if test.mutate != nil {
+				test.mutate(previous, run)
+			}
+			objects := []client.Object{}
+			if !test.omitPrevious {
+				objects = append(objects, previous)
+			}
+			clusterClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objects...).Build()
+			reconciler := &WorkflowRunReconciler{Client: clusterClient, APIReader: clusterClient}
+
+			err := reconciler.validateWorkflowRunRerun(context.Background(), run)
+			if test.wantError == "" && err != nil {
+				t.Fatalf("valid rerun rejected: %v", err)
+			}
+			if test.wantError != "" && (err == nil || !strings.Contains(err.Error(), test.wantError)) {
+				t.Fatalf("validation error = %v, want substring %q", err, test.wantError)
+			}
+		})
+	}
+}
+
+func TestInvalidWorkflowRunRerunBecomesTerminal(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := actionsv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	run := &actionsv1alpha1.WorkflowRun{
+		ObjectMeta: metav1.ObjectMeta{Name: "ci-attempt-2", Namespace: "default", UID: "attempt-uid"},
+		Spec: actionsv1alpha1.WorkflowRunSpec{Rerun: &actionsv1alpha1.WorkflowRunRerun{
+			OriginalRunRef: actionsv1alpha1.WorkflowRunReference{Name: "ci", UID: "root-uid"},
+			PreviousRunRef: actionsv1alpha1.WorkflowRunReference{Name: "ci", UID: "root-uid"},
+			Attempt:        2,
+		}},
+	}
+	clusterClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&actionsv1alpha1.WorkflowRun{}).WithObjects(run).Build()
+	reconciler := &WorkflowRunReconciler{Client: clusterClient, APIReader: clusterClient}
+	if _, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(run)}); err != nil {
+		t.Fatal(err)
+	}
+	stored := &actionsv1alpha1.WorkflowRun{}
+	if err := clusterClient.Get(context.Background(), client.ObjectKeyFromObject(run), stored); err != nil {
+		t.Fatal(err)
+	}
+	planned := meta.FindStatusCondition(stored.Status.Conditions, actionsv1alpha1.WorkflowRunConditionPlanned)
+	succeeded := meta.FindStatusCondition(stored.Status.Conditions, actionsv1alpha1.WorkflowRunConditionSucceeded)
+	if planned == nil || planned.Status != metav1.ConditionFalse || planned.Reason != "RerunInvalid" || succeeded == nil || succeeded.Status != metav1.ConditionFalse || succeeded.Reason != "RerunInvalid" {
+		t.Fatalf("invalid rerun conditions = %#v", stored.Status.Conditions)
+	}
+}
+
+func TestWorkflowRunLineageLabelUsesOriginalUID(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := actionsv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	run := &actionsv1alpha1.WorkflowRun{
+		ObjectMeta: metav1.ObjectMeta{Name: "ci-attempt-2", Namespace: "default", UID: "attempt-uid"},
+		Spec: actionsv1alpha1.WorkflowRunSpec{Rerun: &actionsv1alpha1.WorkflowRunRerun{
+			OriginalRunRef: actionsv1alpha1.WorkflowRunReference{Name: "ci", UID: "original-uid"},
+			PreviousRunRef: actionsv1alpha1.WorkflowRunReference{Name: "ci", UID: "original-uid"},
+			Attempt:        2,
+		}},
+	}
+	clusterClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(run).Build()
+	reconciler := &WorkflowRunReconciler{Client: clusterClient}
+
+	if err := reconciler.ensureWorkflowRunLineageLabel(context.Background(), run); err != nil {
+		t.Fatal(err)
+	}
+	stored := &actionsv1alpha1.WorkflowRun{}
+	if err := clusterClient.Get(context.Background(), client.ObjectKeyFromObject(run), stored); err != nil {
+		t.Fatal(err)
+	}
+	if value := stored.Labels[actionsv1alpha1.LabelWorkflowRunRootUID]; value != "original-uid" {
+		t.Fatalf("lineage label = %q", value)
 	}
 }
 
@@ -951,6 +1171,18 @@ func TestCompletedWorkflowRunTTLUsesCurrentSpecBeforeDeleting(t *testing.T) {
 type recordingDeleteClient struct {
 	client.Client
 	deleteOptions *client.DeleteOptions
+}
+
+type workflowRunListErrorReader struct {
+	client.Reader
+	err error
+}
+
+func (r *workflowRunListErrorReader) List(ctx context.Context, list client.ObjectList, options ...client.ListOption) error {
+	if _, ok := list.(*actionsv1alpha1.WorkflowRunList); ok {
+		return r.err
+	}
+	return r.Reader.List(ctx, list, options...)
 }
 
 func (c *recordingDeleteClient) Delete(ctx context.Context, object client.Object, options ...client.DeleteOption) error {

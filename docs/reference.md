@@ -117,6 +117,17 @@ workflow job. The controller copies these values from the completed runner Pod
 before allowing native Job cleanup, so they remain available after controller
 restarts and Pod deletion.
 
+`spec.rerun` identifies a repeated attempt. `originalRunRef` anchors the
+attempt lineage, `previousRunRef` names the immediately preceding completed
+attempt, and `attempt` starts at 2. Both references include the WorkflowRun UID
+to reject names that were deleted and recreated. `requestID` is an optional
+idempotency identity and contains the webhook delivery ID for GitHub
+rerequests. `jobIDs` is an optional set of expanded WorkflowJob IDs; the
+controller also includes their prerequisite jobs so the dependency graph is
+complete. Omitting `jobIDs` reruns every job. The rerun fields are immutable.
+The controller also requires the project, source, workflow path, lineage, and
+attempt number to match the previous run before it executes a rerun.
+
 Runner labels are canonical lowercase ASCII in Kubernetes resources. Workflow
 `runs-on` labels use the same representation. Each Runner is one reusable
 execution slot and accepts one queued `WorkflowJob` from its `spec.projectRef`
@@ -185,10 +196,10 @@ The resources expose these condition contracts:
 | `Runner` | `Busy` | `True` | `JobAssigned` |
 | `WorkflowRun` | `Planned` | `True` | `JobsPlanned` |
 | `WorkflowRun` | `Planned` | `Unknown` | `WaitingForConcurrency`, `WaitingForConcurrencyCancellation`, `ProjectUnavailable`, `CredentialsUnavailable`, `GitHubAuthenticationFailed`, `WorkflowFetchFailed`, `ChildCreationFailed`, `ConcurrencyCheckFailed` |
-| `WorkflowRun` | `Planned` | `False` | `ProjectUnavailable`, `WorkflowFetchFailed`, `WorkflowInvalid`, `TriggerInvalid`, `ChildCreationFailed`, `ExecutionStateLost` |
+| `WorkflowRun` | `Planned` | `False` | `ProjectUnavailable`, `WorkflowFetchFailed`, `WorkflowInvalid`, `TriggerInvalid`, `RerunInvalid`, `ChildCreationFailed`, `ExecutionStateLost` |
 | `WorkflowRun` | `Succeeded` | `Unknown` | `JobsWaiting`, `JobsQueued`, `JobsRunning` |
 | `WorkflowRun` | `Succeeded` | `True` | `JobsSucceeded` |
-| `WorkflowRun` | `Succeeded` | `False` | `ProjectUnavailable`, `WorkflowFetchFailed`, `WorkflowInvalid`, `TriggerInvalid`, `ChildCreationFailed`, `JobFailed`, `JobCancelled`, `ExecutionStateLost` |
+| `WorkflowRun` | `Succeeded` | `False` | `ProjectUnavailable`, `WorkflowFetchFailed`, `WorkflowInvalid`, `TriggerInvalid`, `RerunInvalid`, `ChildCreationFailed`, `JobFailed`, `JobCancelled`, `ExecutionStateLost` |
 | `WorkflowJob` | `Ready` | `Unknown` | `DependenciesPending` |
 | `WorkflowJob` | `Ready` | `True` | `ConditionPassed` |
 | `WorkflowJob` | `Ready` | `False` | `ConditionFalse`, `ConditionEvaluationFailed`, `CancellationRequested`, `MatrixFailFast` |
@@ -209,7 +220,9 @@ an assignment.
 ### Resource metadata
 
 Child resources carry `actions.kelos.dev/project-uid`, `runner-uid`,
-`workflow-run-uid`, and `workflow-job-uid` labels where applicable. The
+`workflow-run-uid`, and `workflow-job-uid` labels where applicable. WorkflowRun
+objects carry `actions.kelos.dev/workflow-run-root-uid`, which groups attempts
+in the same rerun lineage. The
 `actions.kelos.dev/workflow-job` label contains the workflow job ID when it is a
 valid Kubernetes label value, or the full SHA-256 digest encoded as lowercase
 unpadded base32 otherwise. The original job ID, user-facing job display name,
@@ -231,7 +244,9 @@ WorkflowJobs and their native Jobs append the workflow job ID and a stable
 16-character digest. Readable portions are truncated as needed to keep names
 within the 63-character Kubernetes limit; retries of the same delivery reuse
 the same names, while different signed payloads create distinct runs. The full
-replay-and-path digest form is also recognized as an idempotency alias.
+replay-and-path digest form is also recognized as an idempotency alias. Rerun
+names contain their attempt number and a stable digest of the original
+WorkflowRun UID.
 
 ## Workflow API
 
@@ -523,7 +538,9 @@ during planning or execution and are never interpreted as literal values.
 Native Jobs and their Pod logs are deleted one hour after completion. Completed
 WorkflowRuns are retained indefinitely unless `spec.ttlSecondsAfterFinished` is
 set. When that TTL expires, the WorkflowRun and any remaining owned resources
-are deleted. Open Actions does not archive logs.
+are deleted. GitHub reruns require the original and latest WorkflowRuns, and
+failed-job reruns also require the latest run's WorkflowJobs, to remain
+available. Open Actions does not archive logs.
 
 ## Webhook API
 
@@ -539,7 +556,23 @@ eligible `pull_request_target` workflows are discovered independently.
 Unavailable or superseded test merge revisions produce a `Failed` delivery
 after that wait.
 
+For a Check Run created by Open Actions, GitHub's **Re-run** action sends a
+`check_run.rerequested` delivery. Open Actions authenticates the delivery,
+verifies the App, repository, check ID, external ID, and reported commit, and
+creates a new immutable WorkflowRun attempt. A run that failed because one or
+more jobs failed reruns the failed expanded job IDs, their transitive
+dependents, and the prerequisite jobs needed to make that selected dependency
+graph complete. Matrix failures select the failed combinations until a
+dependent needs the logical matrix job, in which case every combination is a
+required prerequisite. A successful or cancelled run, or a run that failed
+before job results were available, reruns every job. The new attempt clears any
+prior cancellation request, updates the original GitHub Check Run instead of
+creating another check, and points its details URL to the new attempt. Open
+Actions does not call GitHub's Actions rerun API because these jobs are executed
+as Open Actions resources rather than GitHub Actions jobs.
+
 Queued deliveries are processed asynchronously. Invalid or unsupported workflow
 definitions fail the whole delivery before any `WorkflowRun` resources are
 created. Repeated deliveries with the same signed body are deduplicated for 24
-hours.
+hours. Check rerun deliveries are deduplicated by `X-GitHub-Delivery`, so two
+separate user rerequests remain distinct intents.

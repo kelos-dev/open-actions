@@ -3,6 +3,7 @@ package v1alpha1
 import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 )
 
 const (
@@ -27,12 +28,13 @@ const (
 // GitHubEventName identifies a supported GitHub-compatible workflow trigger.
 type GitHubEventName string
 
-// WorkflowRunSpec describes one workflow execution. ProjectRef, Source, and
-// WorkflowPath are immutable.
+// WorkflowRunSpec describes one workflow execution. ProjectRef, Source,
+// WorkflowPath, and Rerun are immutable.
 // Set CancelRequested to request graceful cancellation. Deleting a WorkflowRun
 // force-cancels and removes its child resources.
 // +kubebuilder:validation:XValidation:rule="self.projectRef == oldSelf.projectRef && self.source == oldSelf.source && self.workflowPath == oldSelf.workflowPath",message="projectRef, source, and workflowPath are immutable"
 // +kubebuilder:validation:XValidation:rule="!has(oldSelf.cancelRequested) || !oldSelf.cancelRequested || (has(self.cancelRequested) && self.cancelRequested)",message="cancelRequested cannot be cleared"
+// +kubebuilder:validation:XValidation:rule="has(self.rerun) == has(oldSelf.rerun) && (!has(self.rerun) || self.rerun == oldSelf.rerun)",message="rerun is immutable"
 // +kubebuilder:validation:XValidation:rule="size(self.projectRef.name) > 0",message="`projectRef.name` must be specified"
 // +kubebuilder:validation:XValidation:rule="size(self.projectRef.name) <= 253",message="`projectRef.name` must be no more than 253 characters"
 // +kubebuilder:validation:XValidation:rule="self.projectRef.name.matches('^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?([.][a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?)*$')",message="`projectRef.name` must be a DNS subdomain"
@@ -60,6 +62,11 @@ type WorkflowRunSpec struct {
 	// +optional
 	CancelRequested bool `json:"cancelRequested,omitempty"`
 
+	// Rerun identifies an earlier attempt and optionally limits execution to
+	// selected expanded job IDs. Omit it for the first attempt.
+	// +optional
+	Rerun *WorkflowRunRerun `json:"rerun,omitempty"`
+
 	// TTLSecondsAfterFinished limits the lifetime of a WorkflowRun that has
 	// reached a terminal result. The timer starts at status.completionTime, or
 	// the terminal Succeeded condition's lastTransitionTime when completionTime
@@ -71,6 +78,62 @@ type WorkflowRunSpec struct {
 	// +kubebuilder:validation:Maximum=2147483647
 	// +optional
 	TTLSecondsAfterFinished *int32 `json:"ttlSecondsAfterFinished,omitempty"`
+}
+
+// WorkflowRunRerun identifies the lineage and selected jobs for a repeated
+// workflow attempt.
+type WorkflowRunRerun struct {
+	// OriginalRunRef identifies the first WorkflowRun in this attempt lineage.
+	// +required
+	OriginalRunRef WorkflowRunReference `json:"originalRunRef"`
+
+	// PreviousRunRef identifies the immediately preceding WorkflowRun attempt.
+	// +required
+	PreviousRunRef WorkflowRunReference `json:"previousRunRef"`
+
+	// Attempt is the one-based attempt number. The original WorkflowRun is
+	// implicitly attempt 1, so reruns start at attempt 2.
+	// +kubebuilder:validation:Minimum=2
+	// +kubebuilder:validation:Maximum=2147483647
+	// +required
+	Attempt int32 `json:"attempt"`
+
+	// RequestID is an optional idempotency identity for the request that created
+	// this attempt. GitHub rerequests use the webhook delivery ID.
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=128
+	// +kubebuilder:validation:Pattern=`^[A-Za-z0-9-]+$`
+	// +optional
+	RequestID string `json:"requestID,omitempty"`
+
+	// JobIDs selects expanded WorkflowJob IDs to rerun. The controller also
+	// includes their prerequisite jobs so the dependency graph is complete.
+	// Omit it to execute every job in the workflow.
+	// +listType=set
+	// +kubebuilder:validation:MaxItems=1000
+	// +kubebuilder:validation:items:MinLength=1
+	// +kubebuilder:validation:items:MaxLength=256
+	// +kubebuilder:validation:items:Pattern=`^[A-Za-z_][A-Za-z0-9_-]*$`
+	// +optional
+	JobIDs []string `json:"jobIDs,omitempty"`
+}
+
+// WorkflowRunReference identifies a WorkflowRun by name and immutable UID.
+type WorkflowRunReference struct {
+	// Name is the WorkflowRun name in the same namespace.
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=253
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?([.][a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?)*$`
+	// +required
+	Name string `json:"name"`
+
+	// UID is the immutable identity of the referenced WorkflowRun.
+	// +kubebuilder:validation:Type=string
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=128
+	// +kubebuilder:validation:Pattern=`^[A-Za-z0-9][A-Za-z0-9._-]*$`
+	// +required
+	UID types.UID `json:"uid"`
 }
 
 // WorkflowRunSource is a discriminated union of supported workflow event

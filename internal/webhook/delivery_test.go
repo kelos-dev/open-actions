@@ -138,6 +138,183 @@ func TestQueuedDeliveryReadsRepositoryFromPayload(t *testing.T) {
 	}
 }
 
+func TestRerequestedCheckCreatesFailedJobRerun(t *testing.T) {
+	scheme := deliveryTestScheme(t)
+	project := &actionsv1alpha1.Project{ObjectMeta: metav1.ObjectMeta{Name: "project", Namespace: "default", UID: "project-uid"}}
+	root := &actionsv1alpha1.WorkflowRun{
+		ObjectMeta: metav1.ObjectMeta{Name: "ci", Namespace: project.Namespace, UID: "root-uid", Labels: map[string]string{actionsv1alpha1.LabelWorkflowRunRootUID: "root-uid"}},
+		Spec: actionsv1alpha1.WorkflowRunSpec{
+			ProjectRef:   corev1.LocalObjectReference{Name: project.Name},
+			WorkflowPath: ".open-actions/workflows/ci.yaml",
+			Source: actionsv1alpha1.WorkflowRunSource{Type: actionsv1alpha1.SourceTypeGitHub, GitHub: &actionsv1alpha1.GitHubWorkflowRunSource{
+				Repository: actionsv1alpha1.GitHubRepository{ID: 1, Owner: "acme", Name: "example"},
+				Event:      actionsv1alpha1.GitHubEvent{Name: actionsv1alpha1.GitHubEventNamePush, DeliveryID: "original-delivery"},
+				Revision:   actionsv1alpha1.GitRevision{SHA: strings.Repeat("a", 40), Ref: "refs/heads/main"},
+			}},
+		},
+		Status: actionsv1alpha1.WorkflowRunStatus{
+			Source:     &actionsv1alpha1.WorkflowRunSourceStatus{GitHub: &actionsv1alpha1.GitHubWorkflowRunStatus{CheckRun: &actionsv1alpha1.GitHubCheckRunStatus{ID: 42}}},
+			Jobs:       &actionsv1alpha1.WorkflowRunJobStatus{Total: 3},
+			Conditions: []metav1.Condition{{Type: actionsv1alpha1.WorkflowRunConditionSucceeded, Status: metav1.ConditionFalse, Reason: "JobFailed"}},
+		},
+	}
+	failed := &actionsv1alpha1.WorkflowJob{
+		ObjectMeta: metav1.ObjectMeta{Name: "failed", Namespace: project.Namespace, Labels: map[string]string{actionsv1alpha1.LabelWorkflowRunUID: string(root.UID)}},
+		Spec:       actionsv1alpha1.WorkflowJobSpec{JobID: "unit-matrix-2", Matrix: &actionsv1alpha1.WorkflowJobMatrix{LogicalJobID: "unit", Values: map[string]string{"os": "linux"}}},
+		Status:     actionsv1alpha1.WorkflowJobStatus{Result: actionsv1alpha1.WorkflowJobResultFailure, Conditions: []metav1.Condition{{Type: actionsv1alpha1.WorkflowJobConditionSucceeded, Status: metav1.ConditionFalse}}},
+	}
+	succeeded := &actionsv1alpha1.WorkflowJob{
+		ObjectMeta: metav1.ObjectMeta{Name: "succeeded", Namespace: project.Namespace, Labels: map[string]string{actionsv1alpha1.LabelWorkflowRunUID: string(root.UID)}},
+		Spec:       actionsv1alpha1.WorkflowJobSpec{JobID: "lint"},
+		Status:     actionsv1alpha1.WorkflowJobStatus{Result: actionsv1alpha1.WorkflowJobResultSuccess, Conditions: []metav1.Condition{{Type: actionsv1alpha1.WorkflowJobConditionSucceeded, Status: metav1.ConditionTrue}}},
+	}
+	dependent := &actionsv1alpha1.WorkflowJob{
+		ObjectMeta: metav1.ObjectMeta{Name: "report", Namespace: project.Namespace, Labels: map[string]string{actionsv1alpha1.LabelWorkflowRunUID: string(root.UID)}},
+		Spec:       actionsv1alpha1.WorkflowJobSpec{JobID: "report", Needs: []string{"unit"}},
+		Status:     actionsv1alpha1.WorkflowJobStatus{Result: actionsv1alpha1.WorkflowJobResultSkipped},
+	}
+	delivery := queuedDelivery{
+		ProjectName: project.Name,
+		ProjectUID:  string(project.UID),
+		Repository:  deliveryRepository{ID: 1, Owner: "acme", Name: "example"},
+		Rerun:       &normalizedRerun{CheckRunID: 42, RootRunUID: string(root.UID), HeadSHA: strings.Repeat("a", 40)},
+		ReplayID:    "rerun-replay",
+		DeliveryID:  "rerun-delivery",
+	}
+	data, err := json.Marshal(delivery)
+	if err != nil {
+		t.Fatal(err)
+	}
+	controller := true
+	queued := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{
+		Name: "delivery-rerun", Namespace: project.Namespace, Labels: map[string]string{deliveryLabel: "true"},
+		OwnerReferences: []metav1.OwnerReference{{APIVersion: actionsv1alpha1.GroupVersion.String(), Kind: "Project", Name: project.Name, UID: project.UID, Controller: &controller}},
+	}, Data: map[string]string{deliveryDataKey: string(data)}}
+	clusterClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(project, root, failed, succeeded, dependent, queued).Build()
+	reconciler := &DeliveryReconciler{Client: clusterClient, APIReader: clusterClient, Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
+
+	if _, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(queued)}); err != nil {
+		t.Fatal(err)
+	}
+	retry := &actionsv1alpha1.WorkflowRun{}
+	retryKey := client.ObjectKey{Namespace: project.Namespace, Name: rerunWorkflowRunName(root, 2)}
+	if err := clusterClient.Get(context.Background(), retryKey, retry); err != nil {
+		t.Fatal(err)
+	}
+	if retry.Spec.Rerun == nil || retry.Spec.Rerun.Attempt != 2 || retry.Spec.Rerun.RequestID != delivery.DeliveryID || retry.Spec.Rerun.OriginalRunRef.UID != root.UID || retry.Spec.Rerun.PreviousRunRef.UID != root.UID || len(retry.Spec.Rerun.JobIDs) != 2 || retry.Spec.Rerun.JobIDs[0] != "report" || retry.Spec.Rerun.JobIDs[1] != "unit-matrix-2" {
+		t.Fatalf("rerun WorkflowRun = %#v", retry.Spec.Rerun)
+	}
+	storedDelivery := &corev1.ConfigMap{}
+	if err := clusterClient.Get(context.Background(), client.ObjectKeyFromObject(queued), storedDelivery); err != nil {
+		t.Fatal(err)
+	}
+	if storedDelivery.Data[deliveryStateKey] != deliveryStateCompleted || storedDelivery.Data[deliveryRunCountKey] != "1" {
+		t.Fatalf("delivery state = %#v", storedDelivery.Data)
+	}
+}
+
+func TestConcurrentRerunRequestsDoNotShareAnAttempt(t *testing.T) {
+	scheme := deliveryTestScheme(t)
+	root := &actionsv1alpha1.WorkflowRun{
+		ObjectMeta: metav1.ObjectMeta{Name: "ci", Namespace: "default", UID: "root-uid"},
+		Spec:       actionsv1alpha1.WorkflowRunSpec{CancelRequested: true},
+	}
+	clusterClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+	reconciler := &DeliveryReconciler{Client: clusterClient, APIReader: clusterClient}
+
+	if err := reconciler.createRerunWorkflowRun(context.Background(), root, root, 2, "delivery-a", []string{"unit"}); err != nil {
+		t.Fatal(err)
+	}
+	retry := &actionsv1alpha1.WorkflowRun{}
+	if err := clusterClient.Get(context.Background(), client.ObjectKey{Namespace: root.Namespace, Name: rerunWorkflowRunName(root, 2)}, retry); err != nil {
+		t.Fatal(err)
+	}
+	if retry.Spec.CancelRequested {
+		t.Fatal("rerun retained the previous cancellation request")
+	}
+	if err := reconciler.createRerunWorkflowRun(context.Background(), root, root, 2, "delivery-b", []string{"unit"}); !errors.Is(err, errRerunAttemptClaimed) {
+		t.Fatalf("second rerun error = %v", err)
+	}
+}
+
+func TestLatestRerunAttemptDoesNotRequireIntermediateAttempt(t *testing.T) {
+	root := &actionsv1alpha1.WorkflowRun{
+		ObjectMeta: metav1.ObjectMeta{Name: "ci", Namespace: "default", UID: "root-uid"},
+		Spec: actionsv1alpha1.WorkflowRunSpec{
+			ProjectRef: corev1.LocalObjectReference{Name: "project"}, WorkflowPath: ".open-actions/workflows/ci.yaml",
+		},
+	}
+	attempt3 := &actionsv1alpha1.WorkflowRun{
+		ObjectMeta: metav1.ObjectMeta{Name: "ci-attempt-3", Namespace: root.Namespace, UID: "attempt-3-uid"},
+		Spec:       *root.Spec.DeepCopy(),
+	}
+	attempt3.Spec.Rerun = &actionsv1alpha1.WorkflowRunRerun{
+		OriginalRunRef: actionsv1alpha1.WorkflowRunReference{Name: root.Name, UID: root.UID},
+		PreviousRunRef: actionsv1alpha1.WorkflowRunReference{Name: "ci-attempt-2", UID: "attempt-2-uid"},
+		Attempt:        3,
+	}
+
+	latest, err := latestWorkflowRunAttempt(root, []actionsv1alpha1.WorkflowRun{*root, *attempt3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if latest.Name != attempt3.Name {
+		t.Fatalf("latest attempt = %q, want %q", latest.Name, attempt3.Name)
+	}
+}
+
+func TestRerunWaitsForPreUpgradeLineageLabel(t *testing.T) {
+	scheme := deliveryTestScheme(t)
+	now := time.Date(2026, 8, 12, 12, 0, 0, 0, time.UTC)
+	project := &actionsv1alpha1.Project{ObjectMeta: metav1.ObjectMeta{Name: "project", Namespace: "default", UID: "project-uid"}}
+	delivery := queuedDelivery{
+		ProjectName: project.Name,
+		ProjectUID:  string(project.UID),
+		Repository:  deliveryRepository{ID: 1, Owner: "acme", Name: "example"},
+		Rerun:       &normalizedRerun{CheckRunID: 42, RootRunUID: "root-uid", HeadSHA: strings.Repeat("a", 40)},
+		ReplayID:    "rerun-replay",
+		DeliveryID:  "rerun-delivery",
+	}
+	data, err := json.Marshal(delivery)
+	if err != nil {
+		t.Fatal(err)
+	}
+	controller := true
+	queued := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{
+		Name: "delivery-rerun", Namespace: project.Namespace, CreationTimestamp: metav1.NewTime(now), Labels: map[string]string{deliveryLabel: "true"},
+		OwnerReferences: []metav1.OwnerReference{{APIVersion: actionsv1alpha1.GroupVersion.String(), Kind: "Project", Name: project.Name, UID: project.UID, Controller: &controller}},
+	}, Data: map[string]string{deliveryDataKey: string(data)}}
+	clusterClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(project, queued).Build()
+	currentTime := now
+	reconciler := &DeliveryReconciler{Client: clusterClient, APIReader: clusterClient, Now: func() time.Time { return currentTime }}
+
+	result, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(queued)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.RequeueAfter != 2*time.Second {
+		t.Fatalf("initial requeue after = %v, want 2s", result.RequeueAfter)
+	}
+	stored := &corev1.ConfigMap{}
+	if err := clusterClient.Get(context.Background(), client.ObjectKeyFromObject(queued), stored); err != nil {
+		t.Fatal(err)
+	}
+	if stored.Data[deliveryStateKey] != "" {
+		t.Fatalf("waiting delivery state = %q", stored.Data[deliveryStateKey])
+	}
+
+	currentTime = now.Add(rerunRootWaitTimeout)
+	if _, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(queued)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := clusterClient.Get(context.Background(), client.ObjectKeyFromObject(queued), stored); err != nil {
+		t.Fatal(err)
+	}
+	if stored.Data[deliveryStateKey] != deliveryStateFailed || !strings.Contains(stored.Data[deliveryMessageKey], "root-uid") {
+		t.Fatalf("expired delivery state = %#v", stored.Data)
+	}
+}
+
 func TestCreateWorkflowRunIsIdempotent(t *testing.T) {
 	scheme := deliveryTestScheme(t)
 	project := &actionsv1alpha1.Project{ObjectMeta: metav1.ObjectMeta{Name: "project", Namespace: "default", UID: "project-uid"}}

@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net/http"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -20,6 +21,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
@@ -46,6 +48,7 @@ const (
 	maxWorkflowFiles          = 100
 	maxWorkflowJobs           = 1000
 	mergeRefWaitTimeout       = 2 * time.Minute
+	rerunRootWaitTimeout      = 2 * time.Minute
 	resourceNameMaxLength     = 63
 	workflowRunDigestLength   = 20
 	deliveryRetention         = 24 * time.Hour
@@ -56,6 +59,7 @@ type queuedDelivery struct {
 	ProjectUID  string             `json:"projectUID"`
 	Repository  deliveryRepository `json:"repository"`
 	Event       normalizedEvent    `json:"event"`
+	Rerun       *normalizedRerun   `json:"rerun,omitempty"`
 	ReplayID    string             `json:"replayID"`
 	DeliveryID  string             `json:"deliveryID"`
 }
@@ -73,6 +77,7 @@ func (delivery *queuedDelivery) UnmarshalJSON(data []byte) error {
 		Repository  deliveryRepository `json:"repository"`
 		Payload     *payload           `json:"payload"`
 		Event       normalizedEvent    `json:"event"`
+		Rerun       *normalizedRerun   `json:"rerun,omitempty"`
 		ReplayID    string             `json:"replayID"`
 		DeliveryID  string             `json:"deliveryID"`
 	}{}
@@ -94,7 +99,7 @@ func (delivery *queuedDelivery) UnmarshalJSON(data []byte) error {
 	}
 	*delivery = queuedDelivery{
 		ProjectName: document.ProjectName, ProjectUID: document.ProjectUID, Repository: document.Repository,
-		Event: document.Event, ReplayID: document.ReplayID, DeliveryID: document.DeliveryID,
+		Event: document.Event, Rerun: document.Rerun, ReplayID: document.ReplayID, DeliveryID: document.DeliveryID,
 	}
 	return nil
 }
@@ -124,6 +129,25 @@ func (h *GitHubHandler) enqueueDelivery(ctx context.Context, project *actionsv1a
 		ReplayID:   webhookReplayID(signedBody),
 		DeliveryID: deliveryID,
 	}
+	return h.enqueueQueuedDelivery(ctx, project, delivery, signedBody)
+}
+
+func (h *GitHubHandler) enqueueRerunDelivery(ctx context.Context, project *actionsv1alpha1.Project, event *payload, rerun *normalizedRerun, deliveryID string) error {
+	identity := []byte(deliveryID)
+	delivery := queuedDelivery{
+		ProjectName: project.Name,
+		ProjectUID:  string(project.UID),
+		Repository: deliveryRepository{
+			ID: event.Repository.ID, Owner: event.Repository.Owner.Login, Name: event.Repository.Name,
+		},
+		Rerun:      rerun,
+		ReplayID:   webhookReplayID(identity),
+		DeliveryID: deliveryID,
+	}
+	return h.enqueueQueuedDelivery(ctx, project, delivery, identity)
+}
+
+func (h *GitHubHandler) enqueueQueuedDelivery(ctx context.Context, project *actionsv1alpha1.Project, delivery queuedDelivery, identity []byte) error {
 	data, err := json.Marshal(delivery)
 	if err != nil {
 		return err
@@ -132,7 +156,7 @@ func (h *GitHubHandler) enqueueDelivery(ctx context.Context, project *actionsv1a
 		return fmt.Errorf("normalized webhook delivery exceeds %d bytes", maxDeliveryBytes)
 	}
 	object := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{
-		Name:      webhookDeliveryName(signedBody),
+		Name:      webhookDeliveryName(identity),
 		Namespace: project.Namespace,
 		Labels:    map[string]string{deliveryLabel: "true"},
 	}, Data: map[string]string{deliveryDataKey: string(data)}}
@@ -312,6 +336,9 @@ func (r *DeliveryReconciler) Reconcile(ctx context.Context, request ctrl.Request
 	if string(project.UID) != delivery.ProjectUID || !metav1.IsControlledBy(object, project) {
 		return ctrl.Result{}, r.finish(ctx, object, deliveryStateFailed, 0, "Project was recreated")
 	}
+	if delivery.Rerun != nil {
+		return r.reconcileRerun(ctx, object, project, &delivery)
+	}
 	githubConfig := project.Spec.Source.GitHub
 	privateKey, err := readSecretValue(ctx, reader, project.Namespace, githubConfig.PrivateKeySecretRef)
 	if err != nil {
@@ -482,6 +509,253 @@ func workflowFilesAtRevision(ctx context.Context, installation *githubclient.Ins
 
 func terminalWorkflowRunCreationError(err error) bool {
 	return apierrors.IsConflict(err) || apierrors.IsInvalid(err)
+}
+
+func (r *DeliveryReconciler) reconcileRerun(ctx context.Context, object *corev1.ConfigMap, project *actionsv1alpha1.Project, delivery *queuedDelivery) (ctrl.Result, error) {
+	runs := &actionsv1alpha1.WorkflowRunList{}
+	if err := r.APIReader.List(ctx, runs, client.InNamespace(project.Namespace), client.MatchingLabels{actionsv1alpha1.LabelWorkflowRunRootUID: delivery.Rerun.RootRunUID}); err != nil {
+		return ctrl.Result{}, err
+	}
+	root := workflowRunByUID(runs.Items, delivery.Rerun.RootRunUID)
+	if root == nil {
+		age := r.deliveryAge(object)
+		if age < rerunRootWaitTimeout {
+			retryAfter := 2 * time.Second
+			if remaining := rerunRootWaitTimeout - age; remaining < retryAfter {
+				retryAfter = remaining
+			}
+			return ctrl.Result{RequeueAfter: retryAfter}, nil
+		}
+		return ctrl.Result{}, r.finish(ctx, object, deliveryStateFailed, 0, fmt.Sprintf("original WorkflowRun with UID %q is unavailable", delivery.Rerun.RootRunUID))
+	}
+	if err := validateRerunCheck(project, delivery, root); err != nil {
+		return ctrl.Result{}, r.finish(ctx, object, deliveryStateFailed, 0, err.Error())
+	}
+	latest, err := latestWorkflowRunAttempt(root, runs.Items)
+	if err != nil {
+		return ctrl.Result{}, r.finish(ctx, object, deliveryStateFailed, 0, err.Error())
+	}
+	if workflowRunAttemptForRequest(root, runs.Items, delivery.DeliveryID) != nil {
+		return ctrl.Result{}, r.finish(ctx, object, deliveryStateCompleted, 1, "")
+	}
+	if !workflowRunTerminal(latest) {
+		return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+	}
+	if latest.Spec.Rerun != nil && latest.Spec.Rerun.Attempt == 2147483647 {
+		return ctrl.Result{}, r.finish(ctx, object, deliveryStateFailed, 0, "WorkflowRun rerun attempt limit reached")
+	}
+
+	jobIDs, err := r.rerunWorkflowJobIDs(ctx, latest)
+	if err != nil {
+		return ctrl.Result{}, r.finish(ctx, object, deliveryStateFailed, 0, err.Error())
+	}
+	attempt := int32(2)
+	if latest.Spec.Rerun != nil {
+		attempt = latest.Spec.Rerun.Attempt + 1
+	}
+	if err := r.createRerunWorkflowRun(ctx, root, latest, attempt, delivery.DeliveryID, jobIDs); err != nil {
+		if errors.Is(err, errRerunAttemptClaimed) {
+			return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+		}
+		if terminalWorkflowRunCreationError(err) {
+			return ctrl.Result{}, r.finish(ctx, object, deliveryStateFailed, 0, err.Error())
+		}
+		return ctrl.Result{}, err
+	}
+	r.Logger.Info("created WorkflowRun rerun", "delivery_id", delivery.DeliveryID, "original_run", root.Name, "previous_run", latest.Name, "attempt", attempt, "jobs", len(jobIDs))
+	return ctrl.Result{}, r.finish(ctx, object, deliveryStateCompleted, 1, "")
+}
+
+var errRerunAttemptClaimed = errors.New("rerun attempt was claimed by another request")
+
+func workflowRunByUID(runs []actionsv1alpha1.WorkflowRun, uid string) *actionsv1alpha1.WorkflowRun {
+	for index := range runs {
+		if string(runs[index].UID) == uid {
+			return &runs[index]
+		}
+	}
+	return nil
+}
+
+func workflowRunAttemptForRequest(root *actionsv1alpha1.WorkflowRun, runs []actionsv1alpha1.WorkflowRun, requestID string) *actionsv1alpha1.WorkflowRun {
+	for index := range runs {
+		candidate := &runs[index]
+		if candidate.Spec.Rerun != nil && candidate.Spec.Rerun.RequestID == requestID &&
+			candidate.Spec.Rerun.OriginalRunRef.Name == root.Name && candidate.Spec.Rerun.OriginalRunRef.UID == root.UID {
+			return candidate
+		}
+	}
+	return nil
+}
+
+func validateRerunCheck(project *actionsv1alpha1.Project, delivery *queuedDelivery, root *actionsv1alpha1.WorkflowRun) error {
+	if root.Spec.Rerun != nil {
+		return fmt.Errorf("WorkflowRun %q is not an original attempt", root.Name)
+	}
+	if root.Spec.ProjectRef.Name != project.Name || root.Spec.Source.Type != actionsv1alpha1.SourceTypeGitHub || root.Spec.Source.GitHub == nil {
+		return fmt.Errorf("WorkflowRun %q does not belong to Project %q", root.Name, project.Name)
+	}
+	source := root.Spec.Source.GitHub
+	repository := delivery.Repository
+	if source.Repository.ID != repository.ID || source.Repository.Owner != repository.Owner || source.Repository.Name != repository.Name {
+		return fmt.Errorf("WorkflowRun %q does not match the check-run repository", root.Name)
+	}
+	headSHA := source.Revision.SHA
+	if source.Event.Name == actionsv1alpha1.GitHubEventNamePullRequest && source.Revision.HeadSHA != "" {
+		headSHA = source.Revision.HeadSHA
+	}
+	if headSHA != delivery.Rerun.HeadSHA {
+		return fmt.Errorf("WorkflowRun %q does not match the check-run revision", root.Name)
+	}
+	if root.Status.Source == nil || root.Status.Source.GitHub == nil || root.Status.Source.GitHub.CheckRun == nil || root.Status.Source.GitHub.CheckRun.ID != delivery.Rerun.CheckRunID {
+		return fmt.Errorf("WorkflowRun %q does not identify GitHub check run %d", root.Name, delivery.Rerun.CheckRunID)
+	}
+	return nil
+}
+
+func latestWorkflowRunAttempt(root *actionsv1alpha1.WorkflowRun, runs []actionsv1alpha1.WorkflowRun) (*actionsv1alpha1.WorkflowRun, error) {
+	latest := root
+	attempts := map[int32]struct{}{1: {}}
+	for index := range runs {
+		candidate := &runs[index]
+		rerun := candidate.Spec.Rerun
+		if rerun == nil || rerun.OriginalRunRef.Name != root.Name || rerun.OriginalRunRef.UID != root.UID {
+			continue
+		}
+		if candidate.Spec.ProjectRef != root.Spec.ProjectRef || candidate.Spec.WorkflowPath != root.Spec.WorkflowPath || !apiequality.Semantic.DeepEqual(candidate.Spec.Source, root.Spec.Source) {
+			continue
+		}
+		planned := meta.FindStatusCondition(candidate.Status.Conditions, actionsv1alpha1.WorkflowRunConditionPlanned)
+		if planned != nil && planned.Status == metav1.ConditionFalse && planned.Reason == "RerunInvalid" {
+			continue
+		}
+		if _, found := attempts[rerun.Attempt]; found {
+			return nil, fmt.Errorf("WorkflowRun rerun lineage has multiple attempt %d objects", rerun.Attempt)
+		}
+		attempts[rerun.Attempt] = struct{}{}
+		if latest.Spec.Rerun == nil || rerun.Attempt > latest.Spec.Rerun.Attempt {
+			latest = candidate
+		}
+	}
+	return latest, nil
+}
+
+func workflowRunTerminal(run *actionsv1alpha1.WorkflowRun) bool {
+	condition := meta.FindStatusCondition(run.Status.Conditions, actionsv1alpha1.WorkflowRunConditionSucceeded)
+	return condition != nil && (condition.Status == metav1.ConditionTrue || condition.Status == metav1.ConditionFalse)
+}
+
+func (r *DeliveryReconciler) rerunWorkflowJobIDs(ctx context.Context, run *actionsv1alpha1.WorkflowRun) ([]string, error) {
+	condition := meta.FindStatusCondition(run.Status.Conditions, actionsv1alpha1.WorkflowRunConditionSucceeded)
+	if condition == nil || condition.Status != metav1.ConditionFalse || condition.Reason != "JobFailed" {
+		return nil, nil
+	}
+	jobs := &actionsv1alpha1.WorkflowJobList{}
+	if err := r.APIReader.List(ctx, jobs, client.InNamespace(run.Namespace), client.MatchingLabels{actionsv1alpha1.LabelWorkflowRunUID: string(run.UID)}); err != nil {
+		return nil, err
+	}
+	if run.Status.Jobs == nil || int32(len(jobs.Items)) != run.Status.Jobs.Total {
+		return nil, fmt.Errorf("WorkflowRun %q does not have its complete WorkflowJob history", run.Name)
+	}
+	selected := make(map[string]struct{})
+	selectedLogicalIDs := make(map[string]struct{})
+	for index := range jobs.Items {
+		job := &jobs.Items[index]
+		succeeded := meta.FindStatusCondition(job.Status.Conditions, actionsv1alpha1.WorkflowJobConditionSucceeded)
+		if job.Status.Result == actionsv1alpha1.WorkflowJobResultFailure || (job.Status.Result == "" && succeeded != nil && succeeded.Status == metav1.ConditionFalse) {
+			selected[job.Spec.JobID] = struct{}{}
+			selectedLogicalIDs[workflowJobLogicalID(job)] = struct{}{}
+		}
+	}
+	if len(selected) == 0 {
+		return nil, fmt.Errorf("WorkflowRun %q reports failed jobs but no failed WorkflowJobs are available", run.Name)
+	}
+	for changed := true; changed; {
+		changed = false
+		for index := range jobs.Items {
+			job := &jobs.Items[index]
+			if _, found := selected[job.Spec.JobID]; found || !needsSelectedJob(job.Spec.Needs, selectedLogicalIDs) {
+				continue
+			}
+			selected[job.Spec.JobID] = struct{}{}
+			selectedLogicalIDs[workflowJobLogicalID(job)] = struct{}{}
+			changed = true
+		}
+	}
+	jobIDs := make([]string, 0, len(selected))
+	for id := range selected {
+		jobIDs = append(jobIDs, id)
+	}
+	sort.Strings(jobIDs)
+	return jobIDs, nil
+}
+
+func workflowJobLogicalID(job *actionsv1alpha1.WorkflowJob) string {
+	if job.Spec.Matrix != nil {
+		return job.Spec.Matrix.LogicalJobID
+	}
+	return job.Spec.JobID
+}
+
+func needsSelectedJob(needs []string, selectedLogicalIDs map[string]struct{}) bool {
+	for _, dependency := range needs {
+		if _, found := selectedLogicalIDs[dependency]; found {
+			return true
+		}
+	}
+	return false
+}
+
+func (r *DeliveryReconciler) createRerunWorkflowRun(ctx context.Context, root, previous *actionsv1alpha1.WorkflowRun, attempt int32, requestID string, jobIDs []string) error {
+	desired := &actionsv1alpha1.WorkflowRun{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: rerunWorkflowRunName(root, attempt), Namespace: root.Namespace,
+			Labels: map[string]string{actionsv1alpha1.LabelWorkflowRunRootUID: string(root.UID)},
+		},
+		Spec: *previous.Spec.DeepCopy(),
+	}
+	desired.Spec.CancelRequested = false
+	desired.Spec.Rerun = &actionsv1alpha1.WorkflowRunRerun{
+		OriginalRunRef: actionsv1alpha1.WorkflowRunReference{Name: root.Name, UID: root.UID},
+		PreviousRunRef: actionsv1alpha1.WorkflowRunReference{Name: previous.Name, UID: previous.UID},
+		Attempt:        attempt,
+		RequestID:      requestID,
+		JobIDs:         append([]string(nil), jobIDs...),
+	}
+	if err := r.Create(ctx, desired); err != nil {
+		if !apierrors.IsAlreadyExists(err) {
+			return err
+		}
+		existing := &actionsv1alpha1.WorkflowRun{}
+		if err := r.APIReader.Get(ctx, client.ObjectKeyFromObject(desired), existing); err != nil {
+			return err
+		}
+		if matchingRerunRequest(existing, desired) {
+			return errRerunAttemptClaimed
+		}
+		return matchingWorkflowRun(existing, desired)
+	}
+	return nil
+}
+
+func matchingRerunRequest(existing, desired *actionsv1alpha1.WorkflowRun) bool {
+	if existing.Spec.Rerun == nil || desired.Spec.Rerun == nil || existing.Spec.Rerun.RequestID == desired.Spec.Rerun.RequestID {
+		return false
+	}
+	existingCopy := existing.DeepCopy()
+	desiredCopy := desired.DeepCopy()
+	existingCopy.Spec.Rerun.RequestID = desiredCopy.Spec.Rerun.RequestID
+	return matchingWorkflowRun(existingCopy, desiredCopy) == nil
+}
+
+func rerunWorkflowRunName(root *actionsv1alpha1.WorkflowRun, attempt int32) string {
+	digest := sha256.Sum256([]byte(root.UID))
+	suffix := fmt.Sprintf("-attempt-%d-%s", attempt, strings.ToLower(digestEncoding.EncodeToString(digest[:]))[:8])
+	base := sanitizeName(root.Name)
+	if len(base) > resourceNameMaxLength-len(suffix) {
+		base = strings.Trim(base[:resourceNameMaxLength-len(suffix)], "-")
+	}
+	return base + suffix
 }
 
 func (r *DeliveryReconciler) createWorkflowRun(ctx context.Context, project *actionsv1alpha1.Project, delivery *queuedDelivery, selection workflowSelection) error {
