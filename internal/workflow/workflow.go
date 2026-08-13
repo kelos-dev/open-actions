@@ -770,6 +770,8 @@ func eventExpressionValue(event Event) map[string]any {
 		pullRequest := pullRequestExpressionValue(event.PullRequest)
 		if event.Name == "pull_request" {
 			pullRequest["merge_commit_sha"] = event.SHA
+		} else if event.Name == "pull_request_target" {
+			pullRequest["base"].(map[string]any)["sha"] = event.SHA
 		}
 		eventValues["pull_request"] = pullRequest
 	} else if event.Name == "pull_request" {

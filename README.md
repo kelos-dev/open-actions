@@ -56,6 +56,11 @@ with the public webhook URL and a webhook secret. Configure it with:
 - events: Push, Pull request, Merge group, Workflow run, Issues, Issue comment,
   Pull request review comment, Pull request review, Release, and Check run
 
+Trusted fork workflows load definitions and `refs/pull/<number>/merge` from the
+base repository with Contents read permission. The App does not need to be
+installed on a public fork for that path. Checks read and write reports run
+state; no GitHub App permission by itself makes fork code safe to execute.
+
 Generate a private key, [install the App](https://docs.github.com/en/apps/using-github-apps/installing-your-own-github-app)
 on the repositories to run, and record the App ID and installation ID. Then
 create the Kubernetes Secret, replacing `WEBHOOK_SECRET` with the secret from

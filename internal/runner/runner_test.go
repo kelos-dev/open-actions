@@ -645,13 +645,23 @@ func TestNewExecutorRequiresGitHubToken(t *testing.T) {
 
 func TestActionCloneTokenIsLimitedToWorkflowRepository(t *testing.T) {
 	plan := testPlan()
+	plan.Event = Event{
+		Name: "pull_request_target",
+		PullRequest: &PullRequest{
+			HeadRepository: EventRepository{ID: 2, Owner: "contributor", Name: "example"},
+		},
+	}
 	sameRepository := actionref.Reference{Owner: "ACME", Repository: "Example"}
 	otherRepository := actionref.Reference{Owner: "actions", Repository: "checkout"}
+	headRepository := actionref.Reference{Owner: "contributor", Repository: "example"}
 	if got := actionCloneToken(sameRepository, plan, "installation-token"); got != "installation-token" {
 		t.Fatalf("same-repository clone token = %q", got)
 	}
 	if got := actionCloneToken(otherRepository, plan, "installation-token"); got != "" {
 		t.Fatalf("cross-repository clone token = %q", got)
+	}
+	if got := actionCloneToken(headRepository, plan, "installation-token"); got != "" {
+		t.Fatalf("fork repository clone token = %q", got)
 	}
 
 	environment := actionDownloadEnvironment([]string{"PATH=/usr/bin"}, "https://github.example/acme/example", "installation-token")
@@ -732,6 +742,13 @@ func TestGitHubEventDocumentContainsNormalizedContext(t *testing.T) {
 			}
 			if event.Name == "pull_request_target" && pullRequestDocument["merge_commit_sha"] != nil {
 				t.Fatalf("trusted target document exposes execution SHA as merge SHA: %#v", pullRequestDocument)
+			}
+			base := pullRequestDocument["base"].(map[string]any)
+			if event.Name == "pull_request_target" && base["sha"] != plan.Revision.SHA {
+				t.Fatalf("trusted target base SHA = %#v, want %q", base["sha"], plan.Revision.SHA)
+			}
+			if event.Name != "pull_request_target" && base["sha"] != nil {
+				t.Fatalf("non-target event exposes execution SHA as base SHA: %#v", pullRequestDocument)
 			}
 			if event.Name == "pull_request" && pullRequestDocument["merge_commit_sha"] != plan.Revision.SHA {
 				t.Fatalf("pull request merge_commit_sha = %#v, want %q", pullRequestDocument["merge_commit_sha"], plan.Revision.SHA)

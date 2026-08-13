@@ -490,6 +490,10 @@ func githubPullRequestEvent(plan *Plan) map[string]any {
 		}
 		return nil
 	}
+	base := map[string]any{"ref": plan.Event.PullRequest.BaseRef}
+	if plan.Event.Name == "pull_request_target" {
+		base["sha"] = plan.Revision.SHA
+	}
 	pullRequest := map[string]any{
 		"number": plan.Event.PullRequest.Number, "body": plan.Event.PullRequest.Body, "html_url": plan.Event.PullRequest.HTMLURL,
 		"merge_ref": fmt.Sprintf("refs/pull/%d/merge", plan.Event.PullRequest.Number),
@@ -503,7 +507,7 @@ func githubPullRequestEvent(plan *Plan) map[string]any {
 				"owner":     map[string]any{"login": plan.Event.PullRequest.HeadRepository.Owner},
 			},
 		},
-		"base": map[string]any{"ref": plan.Event.PullRequest.BaseRef},
+		"base": base,
 	}
 	if plan.Event.Name == "pull_request" {
 		pullRequest["merge_commit_sha"] = plan.Revision.SHA
