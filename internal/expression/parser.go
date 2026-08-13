@@ -25,6 +25,7 @@ const (
 	rightBracketToken
 	dotToken
 	commaToken
+	wildcardToken
 	notToken
 	equalToken
 	notEqualToken
@@ -74,6 +75,9 @@ func (l *lexer) next() (token, error) {
 	case ',':
 		l.pos++
 		return token{kind: commaToken, text: ",", pos: start}, nil
+	case '*':
+		l.pos++
+		return token{kind: wildcardToken, text: "*", pos: start}, nil
 	case '!':
 		l.pos++
 		if l.consume('=') {
@@ -340,6 +344,20 @@ func (p *parser) parsePostfix() (node, error) {
 			if err := p.advance(); err != nil {
 				return nil, err
 			}
+			if p.current.kind == wildcardToken {
+				wildcard, err := p.addNode(wildcardNode{})
+				if err != nil {
+					return nil, err
+				}
+				if err := p.advance(); err != nil {
+					return nil, err
+				}
+				result, err = p.addNode(indexNode{target: result, index: wildcard})
+				if err != nil {
+					return nil, err
+				}
+				continue
+			}
 			if p.current.kind != identifierToken {
 				return nil, fmt.Errorf("expected property name at column %d", p.current.pos+1)
 			}
@@ -355,9 +373,20 @@ func (p *parser) parsePostfix() (node, error) {
 			if err := p.advance(); err != nil {
 				return nil, err
 			}
-			index, err := p.parseNested(p.parseOr)
-			if err != nil {
-				return nil, err
+			var index node
+			if p.current.kind == wildcardToken {
+				index, err = p.addNode(wildcardNode{})
+				if err != nil {
+					return nil, err
+				}
+				if err := p.advance(); err != nil {
+					return nil, err
+				}
+			} else {
+				index, err = p.parseNested(p.parseOr)
+				if err != nil {
+					return nil, err
+				}
 			}
 			if p.current.kind != rightBracketToken {
 				return nil, fmt.Errorf("expected ] at column %d", p.current.pos+1)

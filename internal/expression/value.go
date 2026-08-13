@@ -5,6 +5,7 @@ import (
 	"math"
 	"reflect"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 )
@@ -31,12 +32,15 @@ type value struct {
 }
 
 type arrayValue struct {
-	items []value
+	items    []value
+	filtered bool
 }
 
 type objectValue struct {
 	fields  map[string]value
 	resolve func(string) (value, bool, error)
+	load    func() (map[string]value, error)
+	loaded  bool
 }
 
 var jsonNumberPattern = regexp.MustCompile(`^-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?$`)
@@ -48,6 +52,13 @@ type SensitiveValue struct {
 
 // DeferredObject resolves an object property only when an expression reads it.
 type DeferredObject func(name string) (value any, found bool, err error)
+
+// DeferredObjectMap resolves individual properties lazily and can enumerate
+// the complete object for wildcard access and JSON serialization.
+type DeferredObjectMap struct {
+	Resolve DeferredObject
+	Values  func() (map[string]any, error)
+}
 
 // Secret marks a value and every result derived from it as secret.
 func Secret(input any) SensitiveValue {
@@ -131,14 +142,23 @@ func normalize(input any, sensitive bool) value {
 		}
 		return value{kind: objectKind, object: &objectValue{fields: fields}, sensitive: sensitive}
 	case DeferredObject:
-		resolver := func(name string) (value, bool, error) {
-			resolved, found, err := typed(name)
-			if err != nil || !found {
-				return value{}, found, err
+		return deferredObjectValue(typed, nil, sensitive)
+	case DeferredObjectMap:
+		var load func() (map[string]value, error)
+		if typed.Values != nil {
+			load = func() (map[string]value, error) {
+				resolved, err := typed.Values()
+				if err != nil {
+					return nil, err
+				}
+				fields := make(map[string]value, len(resolved))
+				for name, item := range resolved {
+					fields[name] = normalize(item, sensitive)
+				}
+				return fields, nil
 			}
-			return normalize(resolved, sensitive), true, nil
 		}
-		return value{kind: objectKind, object: &objectValue{fields: map[string]value{}, resolve: resolver}, sensitive: sensitive}
+		return deferredObjectValue(typed.Resolve, load, sensitive)
 	case []any:
 		items := make([]value, len(typed))
 		for index, item := range typed {
@@ -175,31 +195,75 @@ func normalize(input any, sensitive bool) value {
 	return value{kind: stringKind, text: fmt.Sprint(input), sensitive: sensitive}
 }
 
-func (v value) interfaceValue() any {
+func deferredObjectValue(resolve DeferredObject, load func() (map[string]value, error), sensitive bool) value {
+	var resolver func(string) (value, bool, error)
+	if resolve != nil {
+		resolver = func(name string) (value, bool, error) {
+			resolved, found, err := resolve(name)
+			if err != nil || !found {
+				return value{}, found, err
+			}
+			return normalize(resolved, sensitive), true, nil
+		}
+	}
+	return value{
+		kind:      objectKind,
+		object:    &objectValue{fields: map[string]value{}, resolve: resolver, load: load},
+		sensitive: sensitive,
+	}
+}
+
+func (v value) interfaceValue() (any, error) {
 	switch v.kind {
 	case nullKind:
-		return nil
+		return nil, nil
 	case boolKind:
-		return v.boolean
+		return v.boolean, nil
 	case numberKind:
-		return v.number
+		return v.number, nil
 	case stringKind:
-		return v.text
+		return v.text, nil
 	case arrayKind:
 		result := make([]any, len(v.array.items))
 		for index, item := range v.array.items {
-			result[index] = item.interfaceValue()
+			resolved, err := item.interfaceValue()
+			if err != nil {
+				return nil, err
+			}
+			result[index] = resolved
 		}
-		return result
+		return result, nil
 	case objectKind:
+		if err := v.object.loadFields(); err != nil {
+			return nil, err
+		}
 		result := make(map[string]any, len(v.object.fields))
 		for name, item := range v.object.fields {
-			result[name] = item.interfaceValue()
+			resolved, err := item.interfaceValue()
+			if err != nil {
+				return nil, err
+			}
+			result[name] = resolved
 		}
-		return result
+		return result, nil
 	default:
+		return nil, nil
+	}
+}
+
+func (o *objectValue) loadFields() error {
+	if o == nil || o.load == nil || o.loaded {
 		return nil
 	}
+	fields, err := o.load()
+	if err != nil {
+		return err
+	}
+	for name, item := range fields {
+		o.fields[name] = item
+	}
+	o.loaded = true
+	return nil
 }
 
 func (v value) truthy() bool {
@@ -232,6 +296,17 @@ func (v value) stringValue() (string, error) {
 	}
 }
 
+func (v value) joinStringValue() string {
+	text, err := v.stringValue()
+	if err == nil {
+		return text
+	}
+	if v.kind == arrayKind {
+		return "Array"
+	}
+	return "Object"
+}
+
 func (v value) numberValue() float64 {
 	switch v.kind {
 	case nullKind:
@@ -262,31 +337,126 @@ func (v value) numberValue() float64 {
 }
 
 func (v value) property(name string) (value, error) {
+	if v.kind == arrayKind && v.array.filtered {
+		return v.filteredIndex(value{kind: stringKind, text: name})
+	}
+	item, found, err := v.lookupProperty(name)
+	if err != nil {
+		return value{}, err
+	}
+	if found {
+		return item, nil
+	}
+	return value{kind: stringKind, sensitive: v.sensitive}, nil
+}
+
+func (v value) lookupProperty(name string) (value, bool, error) {
 	if v.kind != objectKind || v.object == nil {
-		return value{kind: stringKind, sensitive: v.sensitive}, nil
+		return value{}, false, nil
 	}
 	if item, found := v.object.fields[name]; found {
 		item.sensitive = item.sensitive || v.sensitive
-		return item, nil
+		return item, true, nil
 	}
 	for candidate, item := range v.object.fields {
 		if strings.EqualFold(candidate, name) {
 			item.sensitive = item.sensitive || v.sensitive
-			return item, nil
+			return item, true, nil
 		}
 	}
 	if v.object.resolve != nil {
 		item, found, err := v.object.resolve(name)
 		if err != nil {
-			return value{}, err
+			return value{}, false, err
 		}
 		if found {
 			v.object.fields[name] = item
 			item.sensitive = item.sensitive || v.sensitive
-			return item, nil
+			return item, true, nil
 		}
 	}
-	return value{kind: stringKind, sensitive: v.sensitive}, nil
+	return value{}, false, nil
+}
+
+func (v value) wildcard() (value, error) {
+	var items []value
+	switch v.kind {
+	case arrayKind:
+		if v.array.filtered {
+			for _, candidate := range v.array.items {
+				filtered, err := candidate.wildcard()
+				if err != nil {
+					return value{}, err
+				}
+				items = append(items, filtered.array.items...)
+			}
+		} else {
+			items = append(items, v.array.items...)
+		}
+	case objectKind:
+		if err := v.object.loadFields(); err != nil {
+			return value{}, err
+		}
+		names := make([]string, 0, len(v.object.fields))
+		for name := range v.object.fields {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			items = append(items, v.object.fields[name])
+		}
+	}
+	return value{kind: arrayKind, array: &arrayValue{items: items, filtered: true}, sensitive: v.sensitive}, nil
+}
+
+func (v value) filteredIndex(index value) (value, error) {
+	items := make([]value, 0, len(v.array.items))
+	for _, candidate := range v.array.items {
+		switch candidate.kind {
+		case objectKind:
+			name, err := index.stringValue()
+			if err != nil {
+				continue
+			}
+			item, found, err := candidate.lookupProperty(name)
+			if err != nil {
+				return value{}, err
+			}
+			if found {
+				items = append(items, item)
+			}
+		case arrayKind:
+			if index.kind != numberKind || index.number != math.Trunc(index.number) {
+				continue
+			}
+			position := int(index.number)
+			if position >= 0 && position < len(candidate.array.items) {
+				items = append(items, candidate.array.items[position])
+			}
+		}
+	}
+	return value{kind: arrayKind, array: &arrayValue{items: items, filtered: true}, sensitive: v.sensitive || index.sensitive}, nil
+}
+
+func (v value) containsSensitive() bool {
+	if v.sensitive {
+		return true
+	}
+	switch v.kind {
+	case arrayKind:
+		for _, item := range v.array.items {
+			if item.containsSensitive() {
+				return true
+			}
+		}
+	case objectKind:
+		for _, item := range v.object.fields {
+			if item.containsSensitive() {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func equal(left, right value) bool {

@@ -12,10 +12,10 @@ import (
 var (
 	runnerJobAvailability          = workflowexpression.NewAvailability("github", "matrix", "vars", "secrets", "inputs")
 	actionDefaultAvailability      = workflowexpression.NewAvailability("github")
-	runnerStepAvailability         = workflowexpression.NewAvailability("github", "matrix", "runner", "env", "vars", "secrets", "inputs", "steps")
-	runnerConditionAvailability    = workflowexpression.NewAvailability("github", "matrix", "runner", "env", "vars", "inputs", "steps").WithStatusFunctions()
-	compositeAvailability          = workflowexpression.NewAvailability("github", "runner", "env", "inputs", "steps")
-	compositeConditionAvailability = workflowexpression.NewAvailability("github", "runner", "env", "inputs", "steps").WithStatusFunctions()
+	runnerStepAvailability         = workflowexpression.NewAvailability("github", "matrix", "runner", "env", "vars", "secrets", "inputs", "steps").WithHashFiles()
+	runnerConditionAvailability    = workflowexpression.NewAvailability("github", "matrix", "runner", "env", "vars", "inputs", "steps").WithStatusFunctions().WithHashFiles()
+	compositeAvailability          = workflowexpression.NewAvailability("github", "runner", "env", "inputs", "steps").WithHashFiles()
+	compositeConditionAvailability = workflowexpression.NewAvailability("github", "runner", "env", "inputs", "steps").WithStatusFunctions().WithHashFiles()
 )
 
 func resolveJobEnvironment(values map[string]string, plan *Plan, environment []string, token string, secrets, variables map[string]string) (map[string]string, error) {
@@ -65,14 +65,29 @@ func workflowStepCondition(input string, environment map[string]string, status w
 	context := workflowExpressionContext(state, state.environment, runnerConditionAvailability, &status)
 	environmentContext := workflowExpressionContext(state, state.environment, runnerStepAvailability, nil)
 	baseEnvironment := context.Values["env"].(map[string]any)
-	context.Values["env"] = workflowexpression.DeferredObject(func(name string) (any, bool, error) {
+	resolveEnvironment := func(name string) (any, bool, error) {
 		if input, found := stringMapValue(environment, name); found {
 			resolved, err := resolveMapExpression(input, environmentContext)
 			return resolved, true, err
 		}
 		value, found := anyMapValue(baseEnvironment, name)
 		return value, found, nil
-	})
+	}
+	allEnvironment := func() (map[string]any, error) {
+		result := make(map[string]any, len(baseEnvironment)+len(environment))
+		for name, value := range baseEnvironment {
+			result[name] = value
+		}
+		for name, input := range environment {
+			resolved, err := resolveMapExpression(input, environmentContext)
+			if err != nil {
+				return nil, err
+			}
+			result[name] = resolved
+		}
+		return result, nil
+	}
+	context.Values["env"] = workflowexpression.DeferredObjectMap{Resolve: resolveEnvironment, Values: allEnvironment}
 	return evaluateCondition(input, context, status.Success)
 }
 

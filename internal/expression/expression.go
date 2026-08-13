@@ -1,7 +1,10 @@
 package expression
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
+	"io"
 	"math"
 	"strconv"
 	"strings"
@@ -14,6 +17,7 @@ const maxEvaluationStringBytes = 100_000
 type Availability struct {
 	contexts        map[string]struct{}
 	statusFunctions bool
+	hashFiles       bool
 }
 
 // NewAvailability returns an availability set for the named contexts.
@@ -32,6 +36,18 @@ func (a Availability) WithStatusFunctions() Availability {
 		result.contexts[name] = struct{}{}
 	}
 	result.statusFunctions = true
+	result.hashFiles = a.hashFiles
+	return result
+}
+
+// WithHashFiles permits hashFiles in runner-backed step expressions.
+func (a Availability) WithHashFiles() Availability {
+	result := NewAvailability()
+	for name := range a.contexts {
+		result.contexts[name] = struct{}{}
+	}
+	result.statusFunctions = a.statusFunctions
+	result.hashFiles = true
 	return result
 }
 
@@ -177,7 +193,7 @@ func (p *Program) UsesStatusFunction() bool {
 
 func usesStatusFunction(input node) bool {
 	switch typed := input.(type) {
-	case nil, literalNode, contextNode:
+	case nil, literalNode, contextNode, wildcardNode:
 		return false
 	case propertyNode:
 		return usesStatusFunction(typed.target)
@@ -215,7 +231,11 @@ func (p *Program) Evaluate(context Context) (Result, error) {
 		if result.kind == stringKind && len(result.text) > maxEvaluationStringBytes {
 			return Result{}, evaluationSizeError()
 		}
-		return Result{Value: result.interfaceValue(), Secret: result.sensitive}, nil
+		resolved, err := result.interfaceValue()
+		if err != nil {
+			return Result{}, err
+		}
+		return Result{Value: resolved, Secret: result.containsSensitive()}, nil
 	}
 	var result strings.Builder
 	sensitive := false
@@ -292,6 +312,13 @@ type contextNode struct {
 	name string
 }
 
+type wildcardNode struct{}
+
+func (wildcardNode) validate(Availability) error { return nil }
+func (wildcardNode) evaluate(*evaluation) (value, error) {
+	return value{}, fmt.Errorf("wildcard is only valid in property access")
+}
+
 func (n contextNode) validate(availability Availability) error {
 	if !availability.allowsContext(n.name) {
 		return fmt.Errorf("context %q is unavailable", n.name)
@@ -337,9 +364,15 @@ func (n indexNode) evaluate(evaluation *evaluation) (value, error) {
 	if err != nil {
 		return value{}, err
 	}
+	if _, wildcard := n.index.(wildcardNode); wildcard {
+		return target.wildcard()
+	}
 	index, err := n.index.evaluate(evaluation)
 	if err != nil {
 		return value{}, err
+	}
+	if target.kind == arrayKind && target.array.filtered {
+		return target.filteredIndex(index)
 	}
 	if target.kind == arrayKind && index.kind == numberKind && index.number == math.Trunc(index.number) {
 		position := int(index.number)
@@ -457,10 +490,19 @@ func (n callNode) validate(availability Availability) error {
 	name := strings.ToLower(n.name)
 	minimum, maximum := 0, 0
 	switch name {
-	case "contains", "startswith":
+	case "contains", "startswith", "endswith":
 		minimum, maximum = 2, 2
 	case "format":
 		minimum, maximum = 2, int(^uint(0)>>1)
+	case "join":
+		minimum, maximum = 1, 2
+	case "tojson", "fromjson":
+		minimum, maximum = 1, 1
+	case "hashfiles":
+		if !availability.hashFiles {
+			return fmt.Errorf("function %q is unavailable", n.name)
+		}
+		minimum, maximum = 1, int(^uint(0)>>1)
 	case "success", "always", "failure", "cancelled":
 		if !availability.statusFunctions {
 			return fmt.Errorf("function %q is unavailable", n.name)
@@ -513,8 +555,18 @@ func (n callNode) evaluate(evaluation *evaluation) (value, error) {
 		return evaluateContains(arguments)
 	case "startswith":
 		return evaluateStartsWith(arguments)
+	case "endswith":
+		return evaluateEndsWith(arguments)
 	case "format":
 		return evaluateFormat(arguments)
+	case "join":
+		return evaluateJoin(arguments)
+	case "tojson":
+		return evaluateToJSON(arguments)
+	case "fromjson":
+		return evaluateFromJSON(arguments)
+	case "hashfiles":
+		return evaluateHashFiles(arguments, evaluation)
 	default:
 		return value{}, fmt.Errorf("unsupported function %q", n.name)
 	}
@@ -558,6 +610,99 @@ func evaluateStartsWith(arguments []value) (value, error) {
 		boolean:   strings.HasPrefix(strings.ToLower(search), strings.ToLower(prefix)),
 		sensitive: arguments[0].sensitive || arguments[1].sensitive,
 	}, nil
+}
+
+func evaluateEndsWith(arguments []value) (value, error) {
+	search, err := arguments[0].stringValue()
+	if err != nil {
+		return value{kind: boolKind, sensitive: arguments[0].sensitive || arguments[1].sensitive}, nil
+	}
+	suffix, err := arguments[1].stringValue()
+	if err != nil {
+		return value{kind: boolKind, sensitive: arguments[0].sensitive || arguments[1].sensitive}, nil
+	}
+	return value{
+		kind:      boolKind,
+		boolean:   strings.HasSuffix(strings.ToLower(search), strings.ToLower(suffix)),
+		sensitive: arguments[0].sensitive || arguments[1].sensitive,
+	}, nil
+}
+
+func evaluateJoin(arguments []value) (value, error) {
+	items := arguments[0]
+	if items.kind != arrayKind {
+		text, err := items.stringValue()
+		if err != nil {
+			return value{kind: stringKind, sensitive: items.sensitive}, nil
+		}
+		return value{kind: stringKind, text: text, sensitive: items.sensitive}, nil
+	}
+	separator := ","
+	sensitive := items.sensitive
+	if len(items.array.items) > 1 && len(arguments) == 2 {
+		var err error
+		separator, err = arguments[1].stringValue()
+		if err != nil {
+			separator = ","
+		}
+		sensitive = sensitive || arguments[1].sensitive
+	}
+	var result strings.Builder
+	for index, item := range items.array.items {
+		if index > 0 {
+			if err := appendEvaluationString(&result, separator); err != nil {
+				return value{}, err
+			}
+		}
+		text := item.joinStringValue()
+		if err := appendEvaluationString(&result, text); err != nil {
+			return value{}, err
+		}
+		sensitive = sensitive || item.sensitive
+	}
+	return value{kind: stringKind, text: result.String(), sensitive: sensitive}, nil
+}
+
+func evaluateToJSON(arguments []value) (value, error) {
+	var result bytes.Buffer
+	encoder := json.NewEncoder(&result)
+	encoder.SetEscapeHTML(false)
+	encoder.SetIndent("", "  ")
+	input, err := arguments[0].interfaceValue()
+	if err != nil {
+		return value{}, err
+	}
+	if err := encoder.Encode(input); err != nil {
+		return value{}, fmt.Errorf("serialize value as JSON: %w", err)
+	}
+	text := strings.TrimSuffix(result.String(), "\n")
+	if len(text) > maxEvaluationStringBytes {
+		return value{}, evaluationSizeError()
+	}
+	return value{kind: stringKind, text: text, sensitive: arguments[0].containsSensitive()}, nil
+}
+
+func evaluateFromJSON(arguments []value) (value, error) {
+	input, err := arguments[0].stringValue()
+	if err != nil {
+		return value{}, fmt.Errorf("fromJSON value must be a scalar")
+	}
+	if len(input) > maxEvaluationStringBytes {
+		return value{}, evaluationSizeError()
+	}
+	decoder := json.NewDecoder(strings.NewReader(input))
+	var decoded any
+	if err := decoder.Decode(&decoded); err != nil {
+		return value{}, fmt.Errorf("parse JSON: %w", err)
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		if err == nil {
+			return value{}, fmt.Errorf("parse JSON: multiple values are not allowed")
+		}
+		return value{}, fmt.Errorf("parse JSON: %w", err)
+	}
+	return normalize(decoded, arguments[0].sensitive), nil
 }
 
 func evaluateFormat(arguments []value) (value, error) {

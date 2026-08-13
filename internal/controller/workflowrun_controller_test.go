@@ -517,9 +517,16 @@ func TestPlanWorkflowJobsResolvesOnlyPlanningVariables(t *testing.T) {
 		t.Fatalf("runtime variable value was persisted in the plan: %s", planned[0].plan)
 	}
 	for range 2 {
-		if _, found, err := variablesContext("MISSING"); err != nil || found {
+		if _, found, err := variablesContext.Resolve("MISSING"); err != nil || found {
 			t.Fatalf("missing variable = found %t, error %v", found, err)
 		}
+	}
+	allVariables, err := variablesContext.Values()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(allVariables) != 2 || allVariables["ENVIRONMENT"] != "production" || allVariables["RUNNER"] != "ubuntu-latest" {
+		t.Fatalf("variables = %#v", allVariables)
 	}
 	if reader.getCount != 1 {
 		t.Fatalf("ConfigMap reads = %d, want 1", reader.getCount)

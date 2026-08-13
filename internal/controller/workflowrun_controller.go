@@ -982,25 +982,30 @@ func (r *WorkflowRunReconciler) jobExpressionContext(run *actionsv1alpha1.Workfl
 	}
 }
 
-func (r *WorkflowRunReconciler) projectVariableContext(ctx context.Context, project *actionsv1alpha1.Project) workflowexpression.DeferredObject {
+func (r *WorkflowRunReconciler) projectVariableContext(ctx context.Context, project *actionsv1alpha1.Project) workflowexpression.DeferredObjectMap {
 	var values map[string]string
 	var loadError error
 	loaded := false
-	return func(name string) (any, bool, error) {
-		name = strings.ToUpper(name)
+	load := func() {
+		if loaded {
+			return
+		}
+		loaded = true
 		if project.Spec.Variables == nil {
-			return nil, false, nil
+			values = map[string]string{}
+			return
 		}
-		if !loaded {
-			loaded = true
-			configMapName := project.Spec.Variables.ConfigMapRef.Name
-			configMap := &corev1.ConfigMap{}
-			if err := r.APIReader.Get(ctx, client.ObjectKey{Namespace: project.Namespace, Name: configMapName}, configMap); err != nil {
-				loadError = fmt.Errorf("Project %q: get ConfigMap %q: %w", project.Name, configMapName, err)
-			} else {
-				values = configMap.Data
-			}
+		configMapName := project.Spec.Variables.ConfigMapRef.Name
+		configMap := &corev1.ConfigMap{}
+		if err := r.APIReader.Get(ctx, client.ObjectKey{Namespace: project.Namespace, Name: configMapName}, configMap); err != nil {
+			loadError = fmt.Errorf("Project %q: get ConfigMap %q: %w", project.Name, configMapName, err)
+		} else {
+			values = configMap.Data
 		}
+	}
+	resolve := func(name string) (any, bool, error) {
+		name = strings.ToUpper(name)
+		load()
 		if loadError != nil {
 			return nil, true, &projectValuesUnavailableError{cause: loadError}
 		}
@@ -1015,13 +1020,32 @@ func (r *WorkflowRunReconciler) projectVariableContext(ctx context.Context, proj
 		}
 		return value, true, nil
 	}
+	all := func() (map[string]any, error) {
+		load()
+		if loadError != nil {
+			return nil, &projectValuesUnavailableError{cause: loadError}
+		}
+		result := make(map[string]any, len(values))
+		for name, value := range values {
+			if len(value) > projectvalue.MaxValueBytes {
+				configMapName := project.Spec.Variables.ConfigMapRef.Name
+				cause := fmt.Errorf("Project %q ConfigMap %q key %q exceeds %d bytes", project.Name, configMapName, name, projectvalue.MaxValueBytes)
+				return nil, &projectValuesUnavailableError{cause: cause}
+			}
+			result[name] = value
+		}
+		return result, nil
+	}
+	return workflowexpression.DeferredObjectMap{Resolve: resolve, Values: all}
 }
 
-func (r *WorkflowRunReconciler) workflowRunVariableContext(ctx context.Context, run *actionsv1alpha1.WorkflowRun) workflowexpression.DeferredObject {
-	var variables workflowexpression.DeferredObject
+func (r *WorkflowRunReconciler) workflowRunVariableContext(ctx context.Context, run *actionsv1alpha1.WorkflowRun) workflowexpression.DeferredObjectMap {
+	var variables workflowexpression.DeferredObjectMap
 	var loadError error
-	return func(name string) (any, bool, error) {
-		if variables == nil && loadError == nil {
+	loaded := false
+	load := func() {
+		if !loaded {
+			loaded = true
 			project := &actionsv1alpha1.Project{}
 			key := client.ObjectKey{Namespace: run.Namespace, Name: run.Spec.ProjectRef.Name}
 			if err := r.APIReader.Get(ctx, key, project); err != nil {
@@ -1030,11 +1054,22 @@ func (r *WorkflowRunReconciler) workflowRunVariableContext(ctx context.Context, 
 				variables = r.projectVariableContext(ctx, project)
 			}
 		}
+	}
+	resolve := func(name string) (any, bool, error) {
+		load()
 		if loadError != nil {
 			return nil, true, &projectValuesUnavailableError{cause: loadError}
 		}
-		return variables(name)
+		return variables.Resolve(name)
 	}
+	all := func() (map[string]any, error) {
+		load()
+		if loadError != nil {
+			return nil, &projectValuesUnavailableError{cause: loadError}
+		}
+		return variables.Values()
+	}
+	return workflowexpression.DeferredObjectMap{Resolve: resolve, Values: all}
 }
 
 func githubEventExpressionValue(source *actionsv1alpha1.GitHubWorkflowRunSource, inputValues map[string]any) map[string]any {

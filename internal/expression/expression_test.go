@@ -1,7 +1,11 @@
 package expression
 
 import (
+	"crypto/sha256"
 	"fmt"
+	"os"
+	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -100,6 +104,29 @@ func TestDeferredObjectOnlyResolvesReadProperties(t *testing.T) {
 	}
 }
 
+func TestDeferredObjectMapEnumeratesValues(t *testing.T) {
+	loaded := 0
+	context := Context{
+		Availability: NewAvailability("vars"),
+		Values: map[string]any{
+			"vars": DeferredObjectMap{
+				Resolve: func(name string) (any, bool, error) {
+					return nil, false, nil
+				},
+				Values: func() (map[string]any, error) {
+					loaded++
+					return map[string]any{"ENVIRONMENT": "production", "RUNNER": "ubuntu-latest"}, nil
+				},
+			},
+		},
+	}
+	result := evaluateForTest(t, "${{ toJSON(vars) }}", context)
+	want := "{\n  \"ENVIRONMENT\": \"production\",\n  \"RUNNER\": \"ubuntu-latest\"\n}"
+	if result.Value != want || loaded != 1 {
+		t.Fatalf("result = %#v, loads = %d", result, loaded)
+	}
+}
+
 func TestFunctions(t *testing.T) {
 	status := &Status{Failure: true}
 	context := Context{
@@ -116,7 +143,13 @@ func TestFunctions(t *testing.T) {
 		{expression: "contains('Hello World', 'world')", want: true},
 		{expression: "contains(github.labels, 'BUG')", want: true},
 		{expression: "startsWith(github.ref, 'REFS/TAGS/V')", want: true},
+		{expression: "endsWith(github.ref, 'V1.2.3')", want: true},
 		{expression: "format('{0}/{1}', 'kelos-dev', 'kelos')", want: "kelos-dev/kelos"},
+		{expression: "join(github.labels)", want: "bug,help wanted"},
+		{expression: "join(github.labels, ' | ')", want: "bug | help wanted"},
+		{expression: "join(fromJSON('[{\"name\":\"bug\"},[1]]'))", want: "Object,Array"},
+		{expression: "fromJSON('[1, 2, 3]')[1]", want: float64(2)},
+		{expression: "toJSON(fromJSON('{\"enabled\":true,\"retries\":2}'))", want: "{\n  \"enabled\": true,\n  \"retries\": 2\n}"},
 		{expression: "success()", want: false},
 		{expression: "always()", want: true},
 		{expression: "failure()", want: true},
@@ -136,6 +169,126 @@ func TestFunctions(t *testing.T) {
 				t.Fatalf("value = %#v, want %#v", result.Value, tt.want)
 			}
 		})
+	}
+}
+
+func TestObjectFilters(t *testing.T) {
+	context := Context{
+		Availability: NewAvailability("github"),
+		Values: map[string]any{
+			"github": map[string]any{
+				"labels": []any{
+					map[string]any{"name": "bug"},
+					map[string]any{"color": "red"},
+					map[string]any{"name": "help wanted"},
+				},
+				"groups": map[string]any{
+					"first":  map[string]any{"members": []any{map[string]any{"name": "alice"}}},
+					"second": map[string]any{"members": []any{map[string]any{"name": "bob"}}},
+				},
+			},
+		},
+	}
+	tests := []struct {
+		expression string
+		want       any
+	}{
+		{expression: "github.labels.*.name", want: []any{"bug", "help wanted"}},
+		{expression: "github.labels[*].name", want: []any{"bug", "help wanted"}},
+		{expression: "github.groups.*.members.*.name", want: []any{"alice", "bob"}},
+		{expression: "join(github.labels.*.name, ', ')", want: "bug, help wanted"},
+		{expression: "github.missing.*.name", want: []any{}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.expression, func(t *testing.T) {
+			result := evaluateForTest(t, "${{ "+tt.expression+" }}", context)
+			if !reflect.DeepEqual(result.Value, tt.want) {
+				t.Fatalf("value = %#v, want %#v", result.Value, tt.want)
+			}
+		})
+	}
+	secretResult := evaluateForTest(t, "${{ github.labels.*.name }}", Context{
+		Availability: NewAvailability("github"),
+		Values: map[string]any{
+			"github": map[string]any{"labels": []any{map[string]any{"name": Secret("private")}}},
+		},
+	})
+	if !secretResult.Secret {
+		t.Fatal("object filter discarded sensitivity")
+	}
+}
+
+func TestHashFiles(t *testing.T) {
+	workspace := t.TempDir()
+	writeExpressionTestFile(t, filepath.Join(workspace, "a.txt"), "alpha")
+	writeExpressionTestFile(t, filepath.Join(workspace, "sub", "b.txt"), "beta")
+	writeExpressionTestFile(t, filepath.Join(workspace, "vendor", "c.txt"), "vendor")
+	writeExpressionTestFile(t, filepath.Join(workspace, "ignored.log"), "ignored")
+	context := Context{
+		Availability: NewAvailability("github").WithHashFiles(),
+		Values:       map[string]any{"github": map[string]any{"workspace": workspace}},
+	}
+	tests := []struct {
+		expression string
+		want       string
+	}{
+		{expression: "hashFiles('**/*.txt')", want: combinedFileHash("alpha", "beta", "vendor")},
+		{expression: "hashFiles('**/*.txt', '!vendor/**')", want: combinedFileHash("alpha", "beta")},
+		{expression: "hashFiles('sub')", want: combinedFileHash("beta")},
+		{expression: "hashFiles('.')", want: combinedFileHash("alpha", "ignored", "beta", "vendor")},
+		{expression: fmt.Sprintf("hashFiles('%s')", filepath.ToSlash(filepath.Join(workspace, "sub", "b.txt"))), want: combinedFileHash("beta")},
+		{expression: "hashFiles('missing/**')", want: ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.expression, func(t *testing.T) {
+			result := evaluateForTest(t, "${{ "+tt.expression+" }}", context)
+			if result.Value != tt.want {
+				t.Fatalf("value = %#v, want %#v", result.Value, tt.want)
+			}
+		})
+	}
+
+	program, err := Parse("${{ hashFiles('**') }}")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = program.Evaluate(Context{
+		Availability: NewAvailability("github"),
+		Values:       map[string]any{"github": map[string]any{"workspace": workspace}},
+	})
+	if err == nil || !strings.Contains(err.Error(), `function "hashFiles" is unavailable`) {
+		t.Fatalf("error = %v, want unavailable hashFiles function", err)
+	}
+
+	program, err = Parse("${{ hashFiles('../secrets/**') }}")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = program.Evaluate(context)
+	if err == nil || !strings.Contains(err.Error(), "must remain within github.workspace") {
+		t.Fatalf("error = %v, want workspace escape rejection", err)
+	}
+}
+
+func TestHashFilesMatchesAbsolutePatternThroughWorkspaceSymlink(t *testing.T) {
+	parent := t.TempDir()
+	workspace := filepath.Join(parent, "workspace")
+	if err := os.Mkdir(workspace, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeExpressionTestFile(t, filepath.Join(workspace, "dependency.lock"), "locked dependency")
+	workspaceLink := filepath.Join(parent, "workspace-link")
+	if err := os.Symlink(workspace, workspaceLink); err != nil {
+		t.Skipf("create workspace symlink: %v", err)
+	}
+	context := Context{
+		Availability: NewAvailability("github").WithHashFiles(),
+		Values:       map[string]any{"github": map[string]any{"workspace": workspaceLink}},
+	}
+	pattern := filepath.ToSlash(filepath.Join(workspaceLink, "dependency.lock"))
+	result := evaluateForTest(t, "${{ hashFiles('"+pattern+"') }}", context)
+	if result.Value != combinedFileHash("locked dependency") {
+		t.Fatalf("value = %#v, want hash through workspace symlink", result.Value)
 	}
 }
 
@@ -238,6 +391,32 @@ func TestSecretDerivedValuesAreMarkedAndDiagnosticsAreRedacted(t *testing.T) {
 			t.Fatalf("result for %q = %#v, want redacted secret", input, result)
 		}
 	}
+
+	for _, input := range []string{
+		"${{ join(fromJSON(secrets.TOKEN), ',') }}",
+		"${{ toJSON(secrets) }}",
+		"${{ fromJSON(secrets.TOKEN) }}",
+	} {
+		result := evaluateForTest(t, input, Context{
+			Availability: NewAvailability("secrets"),
+			Values:       map[string]any{"secrets": map[string]any{"TOKEN": `["first","second"]`}},
+		})
+		if !result.Secret || result.Redacted() != "***" {
+			t.Fatalf("result for %q = %#v, want redacted secret", input, result)
+		}
+	}
+}
+
+func TestFromJSONRejectsInvalidInput(t *testing.T) {
+	for _, input := range []string{"not-json", "true false"} {
+		program, err := ParseCondition("fromJSON('" + input + "')")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := program.Evaluate(Context{Availability: NewAvailability()}); err == nil {
+			t.Fatalf("fromJSON(%q) succeeded", input)
+		}
+	}
 }
 
 func TestRejectsExcessiveExpressionComplexity(t *testing.T) {
@@ -303,6 +482,7 @@ func TestRejectsUnsupportedOrMalformedSyntax(t *testing.T) {
 		"${{ github.sha + 'suffix' }}",
 		"${{ \"double quoted\" }}",
 		"${{ unknown(github.sha) }}",
+		"${{ * }}",
 		"${{ }}",
 	}
 	availability := NewAvailability("github")
@@ -434,4 +614,23 @@ func evaluateForTest(t *testing.T, input string, context Context) Result {
 		t.Fatal(err)
 	}
 	return result
+}
+
+func writeExpressionTestFile(t *testing.T, path, contents string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func combinedFileHash(contents ...string) string {
+	result := sha256.New()
+	for _, content := range contents {
+		digest := sha256.Sum256([]byte(content))
+		_, _ = result.Write(digest[:])
+	}
+	return fmt.Sprintf("%x", result.Sum(nil))
 }
