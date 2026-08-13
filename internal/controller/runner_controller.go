@@ -19,6 +19,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -68,6 +69,7 @@ type RunnerReconciler struct {
 	client.Client
 	APIReader client.Reader
 	GitHub    *githubclient.Client
+	Recorder  events.EventRecorder
 }
 
 func (r *RunnerReconciler) Reconcile(ctx context.Context, request ctrl.Request) (ctrl.Result, error) {
@@ -937,7 +939,13 @@ func (r *RunnerReconciler) updateWorkflowJobStatus(ctx context.Context, workflow
 	if apiEquality.Semantic.DeepEqual(before, &workflowJob.Status) {
 		return nil
 	}
-	return r.Status().Update(ctx, workflowJob)
+	if err := r.Status().Update(ctx, workflowJob); err != nil {
+		return err
+	}
+	if condition := meta.FindStatusCondition(workflowJob.Status.Conditions, actionsv1alpha1.WorkflowJobConditionSucceeded); condition != nil && condition.Status == metav1.ConditionFalse {
+		recordConditionWarning(r.Recorder, workflowJob, before.Conditions, workflowJob.Status.Conditions, actionsv1alpha1.WorkflowJobConditionSucceeded)
+	}
+	return nil
 }
 
 func copyStringMap(values map[string]string) map[string]string {
@@ -974,6 +982,9 @@ func (r *RunnerReconciler) completeAssignedWorkflowJob(ctx context.Context, work
 		if err := r.Status().Update(ctx, workflowJob); err != nil {
 			return err
 		}
+		if result == actionsv1alpha1.WorkflowJobResultFailure {
+			recordConditionWarning(r.Recorder, workflowJob, before.Conditions, workflowJob.Status.Conditions, actionsv1alpha1.WorkflowJobConditionSucceeded)
+		}
 	}
 	return r.cleanupAuthSecret(ctx, workflowJob)
 }
@@ -1001,7 +1012,11 @@ func (r *RunnerReconciler) failQueuedWorkflowJob(ctx context.Context, workflowJo
 	if apiEquality.Semantic.DeepEqual(before, &workflowJob.Status) {
 		return nil
 	}
-	return r.Status().Update(ctx, workflowJob)
+	if err := r.Status().Update(ctx, workflowJob); err != nil {
+		return err
+	}
+	recordConditionWarning(r.Recorder, workflowJob, before.Conditions, workflowJob.Status.Conditions, actionsv1alpha1.WorkflowJobConditionSucceeded)
+	return nil
 }
 
 func (r *RunnerReconciler) failExpiredPreStart(ctx context.Context, workflowJob *actionsv1alpha1.WorkflowJob, message string) (bool, error) {
@@ -1079,7 +1094,13 @@ func (r *RunnerReconciler) updateRunnerStatus(ctx context.Context, runnerObject 
 	if apiEquality.Semantic.DeepEqual(before, &runnerObject.Status) {
 		return nil
 	}
-	return r.Status().Update(ctx, runnerObject)
+	if err := r.Status().Update(ctx, runnerObject); err != nil {
+		return err
+	}
+	if ready == metav1.ConditionFalse {
+		recordConditionWarning(r.Recorder, runnerObject, before.Conditions, runnerObject.Status.Conditions, actionsv1alpha1.RunnerConditionReady)
+	}
+	return nil
 }
 
 func (r *RunnerReconciler) SetupWithManager(manager ctrl.Manager) error {
