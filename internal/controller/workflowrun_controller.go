@@ -24,6 +24,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/validation"
+	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -71,6 +72,7 @@ type WorkflowRunReconciler struct {
 	ActionCloneBaseURL string
 	ConsoleURL         string
 	Now                func() time.Time
+	Recorder           events.EventRecorder
 }
 
 func (r *WorkflowRunReconciler) Reconcile(ctx context.Context, request ctrl.Request) (ctrl.Result, error) {
@@ -1319,6 +1321,7 @@ func (r *WorkflowRunReconciler) observeWorkflowJobs(ctx context.Context, run *ac
 			if err := r.Status().Update(ctx, run); err != nil {
 				return ctrl.Result{}, err
 			}
+			recordConditionWarning(r.Recorder, run, before.Conditions, run.Status.Conditions, actionsv1alpha1.WorkflowRunConditionSucceeded)
 		}
 		return ctrl.Result{}, nil
 	}
@@ -1371,6 +1374,9 @@ func (r *WorkflowRunReconciler) observeWorkflowJobs(ctx context.Context, run *ac
 	if !apiEquality.Semantic.DeepEqual(before, &run.Status) {
 		if err := r.Status().Update(ctx, run); err != nil {
 			return ctrl.Result{}, err
+		}
+		if condition := meta.FindStatusCondition(run.Status.Conditions, actionsv1alpha1.WorkflowRunConditionSucceeded); condition != nil && condition.Status == metav1.ConditionFalse {
+			recordConditionWarning(r.Recorder, run, before.Conditions, run.Status.Conditions, actionsv1alpha1.WorkflowRunConditionSucceeded)
 		}
 	}
 	if waitingForRuntimeState || failFastPending {
@@ -1651,7 +1657,13 @@ func (r *WorkflowRunReconciler) completeUnscheduledWorkflowJob(ctx context.Conte
 	if apiEquality.Semantic.DeepEqual(before, &job.Status) {
 		return nil
 	}
-	return r.Status().Update(ctx, job)
+	if err := r.Status().Update(ctx, job); err != nil {
+		return err
+	}
+	if result == actionsv1alpha1.WorkflowJobResultFailure {
+		recordConditionWarning(r.Recorder, job, before.Conditions, job.Status.Conditions, actionsv1alpha1.WorkflowJobConditionSucceeded)
+	}
+	return nil
 }
 
 func workflowJobReady(job *actionsv1alpha1.WorkflowJob) bool {
@@ -2026,6 +2038,7 @@ func (r *WorkflowRunReconciler) planningFailed(ctx context.Context, run *actions
 		if err := r.Status().Update(ctx, run); err != nil {
 			return ctrl.Result{}, err
 		}
+		recordConditionWarning(r.Recorder, run, before.Conditions, run.Status.Conditions, actionsv1alpha1.WorkflowRunConditionPlanned)
 	}
 	if disposition == planningFailureTerminal {
 		return ctrl.Result{}, nil

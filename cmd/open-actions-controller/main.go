@@ -144,7 +144,10 @@ func runManager(arguments []string) error {
 	if err != nil {
 		return fmt.Errorf("create controller manager: %w", err)
 	}
-	if err := (&controller.ProjectReconciler{Client: controllerManager.GetClient(), APIReader: controllerManager.GetAPIReader()}).SetupWithManager(controllerManager); err != nil {
+	if err := (&controller.ProjectReconciler{
+		Client: controllerManager.GetClient(), APIReader: controllerManager.GetAPIReader(),
+		Recorder: controllerManager.GetEventRecorder("project-controller"),
+	}).SetupWithManager(controllerManager); err != nil {
 		return fmt.Errorf("configure Project controller: %w", err)
 	}
 	if err := (&controller.ScheduleReconciler{
@@ -161,6 +164,7 @@ func runManager(arguments []string) error {
 		GitHubServerURL:    normalizedGitHubServerURL,
 		ActionCloneBaseURL: normalizedActionCloneBaseURL,
 		ConsoleURL:         normalizedConsoleURL,
+		Recorder:           controllerManager.GetEventRecorder("workflowrun-controller"),
 	}).SetupWithManager(controllerManager); err != nil {
 		return fmt.Errorf("configure WorkflowRun controller: %w", err)
 	}
@@ -168,6 +172,7 @@ func runManager(arguments []string) error {
 		Client:    controllerManager.GetClient(),
 		APIReader: controllerManager.GetAPIReader(),
 		GitHub:    github,
+		Recorder:  controllerManager.GetEventRecorder("runner-controller"),
 	}).SetupWithManager(controllerManager); err != nil {
 		return fmt.Errorf("configure Runner controller: %w", err)
 	}

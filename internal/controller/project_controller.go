@@ -11,6 +11,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
@@ -20,6 +21,7 @@ import (
 type ProjectReconciler struct {
 	client.Client
 	APIReader client.Reader
+	Recorder  events.EventRecorder
 }
 
 func (r *ProjectReconciler) Reconcile(ctx context.Context, request ctrl.Request) (ctrl.Result, error) {
@@ -55,6 +57,9 @@ func (r *ProjectReconciler) Reconcile(ctx context.Context, request ctrl.Request)
 	if !apiEquality.Semantic.DeepEqual(before, &project.Status) {
 		if err := r.Status().Update(ctx, project); err != nil {
 			return ctrl.Result{}, err
+		}
+		if status == metav1.ConditionFalse {
+			recordConditionWarning(r.Recorder, project, before.Conditions, project.Status.Conditions, actionsv1alpha1.ProjectConditionConfigured)
 		}
 	}
 	return ctrl.Result{RequeueAfter: 5 * time.Minute}, nil

@@ -217,6 +217,10 @@ availability. `Runner/Ready` reports operational health independently of
 capacity; clients use `Runner/Busy` to determine whether a Runner already has
 an assignment.
 
+When the controller reports a Project, Runner, WorkflowRun, or WorkflowJob
+failure, it emits a Kubernetes Warning Event with the condition's reason and
+message. Reconciliation of an unchanged condition does not emit another Event.
+
 ### Resource metadata
 
 Child resources carry `actions.kelos.dev/project-uid`, `runner-uid`,
