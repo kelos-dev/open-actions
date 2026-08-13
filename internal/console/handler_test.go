@@ -30,6 +30,27 @@ type testLogSource struct {
 	logs string
 }
 
+func TestConsoleTopbarsUseConsistentSpacing(t *testing.T) {
+	pages := map[string]string{
+		"workflow runs": mainPageTemplate,
+		"projects":      projectsPageTemplate,
+		"project":       projectPageTemplate,
+		"workflow run":  runPageTemplate,
+		"runner logs":   logPageTemplate,
+	}
+
+	for name, page := range pages {
+		t.Run(name, func(t *testing.T) {
+			if !strings.Contains(page, ".topbar{height:64px;display:flex;align-items:center;gap:24px;") {
+				t.Fatal("topbar does not separate navigation links")
+			}
+			if !strings.Contains(page, "@media(max-width:800px){.topbar{padding:0 16px}") {
+				t.Fatal("topbar does not use mobile padding")
+			}
+		})
+	}
+}
+
 func (s *testLogSource) ListPods(context.Context, string, string) (*corev1.PodList, error) {
 	return &corev1.PodList{Items: []corev1.Pod{*s.pod.DeepCopy()}}, nil
 }
