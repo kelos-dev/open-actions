@@ -1050,6 +1050,8 @@ func githubEventExpressionValue(source *actionsv1alpha1.GitHubWorkflowRunSource,
 		pullRequest := githubPullRequestExpressionValue(event.PullRequest)
 		if event.Name == actionsv1alpha1.GitHubEventNamePullRequest {
 			pullRequest["merge_commit_sha"] = source.Revision.SHA
+		} else if event.Name == actionsv1alpha1.GitHubEventNamePullRequestTarget {
+			pullRequest["base"].(map[string]any)["sha"] = source.Revision.SHA
 		}
 		eventValues["pull_request"] = pullRequest
 	} else if event.Name == actionsv1alpha1.GitHubEventNamePullRequest {

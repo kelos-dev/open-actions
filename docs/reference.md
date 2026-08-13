@@ -446,10 +446,63 @@ mutable branch during asynchronous delivery processing. Bounded untrusted
 metadata is recorded separately under `event.pullRequest`: the pull request
 number and body, HTML URL, head repository, head branch and SHA, and base branch.
 The normalized `github.event.pull_request` object exposes the same values and
-derives `merge_ref` from the pull request number. Open Actions does not
+derives `merge_ref` from the pull request number. For this event,
+`github.sha` and `github.event.pull_request.base.sha` are both the pinned trusted
+base SHA; `github.event.pull_request.head.sha` remains the untrusted fork head.
+Open Actions does not
 automatically check out the head or merge ref, expand the runner token beyond
 repository-scoped Contents read, or grant approval-gated secrets based on this
 metadata.
+
+#### Trusted fork checkout
+
+Treat every value under `github.event.pull_request.head` and all content fetched
+from `github.event.pull_request.merge_ref` as untrusted. Each `synchronize`
+delivery records its own immutable head SHA and creates a distinct WorkflowRun,
+so an approval system must bind approval to that SHA or to the exact
+WorkflowJob. An approval attached to an earlier delivery must not authorize a
+later fork update. Open Actions does not infer approval from labels, comments,
+or the existence of a pull request.
+
+Current releases of `actions/checkout` refuse an explicit fork head or merge-ref
+checkout from `pull_request_target` unless the trusted workflow sets
+`allow-unsafe-pr-checkout: true`. Older commit-pinned releases may not contain
+this guard. The opt-in only makes the checkout explicit; it does not make the
+checked-out code trusted. Follow the
+[GitHub `pull_request_target` security guidance](https://docs.github.com/en/actions/reference/security/securely-using-pull_request_target),
+use an isolated runner, and do not expose secrets until an approval tied to the
+current head SHA has passed.
+
+When an approved workflow must test the base repository's merge ref, disable
+persisted credentials and verify the checked-out merge commit before executing
+any pull-request-controlled command:
+
+```yaml
+- uses: actions/checkout@v4
+  with:
+    ref: ${{ github.event.pull_request.merge_ref }}
+    fetch-depth: 2
+    persist-credentials: false
+    allow-unsafe-pr-checkout: true
+- name: Verify approved pull request head
+  env:
+    EXPECTED_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+    EXPECTED_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+  run: |
+    set -euo pipefail
+    read -r base_parent head_parent extra < <(git show --no-patch --format=%P HEAD)
+    if [ "$base_parent" != "$EXPECTED_BASE_SHA" ] || [ "$head_parent" != "$EXPECTED_HEAD_SHA" ] || [ -n "${extra:-}" ]; then
+      echo "::error::merge ref does not match the approved base and pull request head"
+      exit 1
+    fi
+```
+
+The verification step must precede builds, dependency installation, local
+actions, or any other operation that can execute repository content. A missing
+or superseded merge ref therefore fails before untrusted code runs. Prefer the
+base repository's `refs/pull/<number>/merge` ref over cloning the fork directly.
+The job token is scoped to the base repository and is not used to authenticate
+downloads of actions from the fork repository.
 
 `workflow_run` accepts `workflows`, `types`, and `branches` filters and consumes
 GitHub App `workflow_run` webhooks. It does not synthesize a GitHub

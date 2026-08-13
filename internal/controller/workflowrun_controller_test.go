@@ -731,6 +731,36 @@ func TestWorkflowEventIncludesRevisionValues(t *testing.T) {
 	}
 }
 
+func TestPullRequestTargetExpressionSeparatesTrustedBaseFromForkHead(t *testing.T) {
+	baseSHA := strings.Repeat("a", 40)
+	headSHA := strings.Repeat("b", 40)
+	source := &actionsv1alpha1.GitHubWorkflowRunSource{
+		Repository: actionsv1alpha1.GitHubRepository{ID: 1, Owner: "acme", Name: "example"},
+		Event: actionsv1alpha1.GitHubEvent{
+			Name: actionsv1alpha1.GitHubEventNamePullRequestTarget,
+			PullRequest: &actionsv1alpha1.GitHubPullRequest{
+				Number: 42, HeadRef: "feature", HeadSHA: headSHA, BaseRef: "main",
+				HeadRepository: actionsv1alpha1.GitHubRepository{ID: 2, Owner: "contributor", Name: "example"},
+			},
+		},
+		Revision: actionsv1alpha1.GitRevision{SHA: baseSHA, Ref: "refs/heads/main"},
+	}
+	context := (&WorkflowRunReconciler{}).jobExpressionContext(&actionsv1alpha1.WorkflowRun{
+		Spec: actionsv1alpha1.WorkflowRunSpec{Source: actionsv1alpha1.WorkflowRunSource{GitHub: source}},
+	}, "Fork checks", nil, nil)
+	github := context.Values["github"].(map[string]any)
+	pullRequest := github["event"].(map[string]any)["pull_request"].(map[string]any)
+	base := pullRequest["base"].(map[string]any)
+	head := pullRequest["head"].(map[string]any)
+
+	if github["sha"] != baseSHA || github["ref"] != "refs/heads/main" || base["sha"] != baseSHA || base["ref"] != "main" {
+		t.Fatalf("trusted base context = %#v", github)
+	}
+	if head["sha"] != headSHA || head["ref"] != "feature" || pullRequest["merge_ref"] != "refs/pull/42/merge" {
+		t.Fatalf("untrusted pull request context = %#v", pullRequest)
+	}
+}
+
 func TestResolvePlanningEventInputs(t *testing.T) {
 	definition, err := workflow.Parse([]byte("name: Manual\non:\n  workflow_dispatch:\n    inputs:\n      namespace:\n        required: true\n        type: string\n      dry-run:\n        type: boolean\n        default: false\n      retries:\n        type: number\njobs:\n  run:\n    runs-on: ubuntu-latest\n    steps:\n      - run: make deploy\n"))
 	if err != nil {

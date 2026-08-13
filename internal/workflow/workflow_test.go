@@ -537,10 +537,11 @@ func TestEvaluateConcurrencyUsesRepositoryVariables(t *testing.T) {
 func TestEvaluateConcurrencyUsesPullRequestMetadata(t *testing.T) {
 	definition := &Definition{
 		Name:        "Fork E2E",
-		Concurrency: Concurrency{Group: "fork-e2e-${{ github.event.pull_request.number }}-${{ github.event.pull_request.head.repo.full_name }}-${{ github.event.pull_request.head.sha }}-${{ github.event.pull_request.merge_ref }}"},
+		Concurrency: Concurrency{Group: "fork-e2e-${{ github.event.pull_request.number }}-${{ github.event.pull_request.head.repo.full_name }}-${{ github.event.pull_request.head.sha }}-${{ github.event.pull_request.base.sha }}-${{ github.event.pull_request.merge_ref }}"},
 	}
+	baseSHA := strings.Repeat("b", 40)
 	event := Event{
-		Name: "pull_request_target", HeadRef: "feature", BaseRef: "main",
+		Name: "pull_request_target", SHA: baseSHA, HeadRef: "feature", BaseRef: "main",
 		PullRequest: &PullRequest{
 			Number: 42, HeadRef: "feature", HeadSHA: strings.Repeat("a", 40), BaseRef: "main",
 			HeadRepository: Repository{ID: 2, Owner: "contributor", Name: "example"},
@@ -550,7 +551,7 @@ func TestEvaluateConcurrencyUsesPullRequestMetadata(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := "fork-e2e-42-contributor/example-" + strings.Repeat("a", 40) + "-refs/pull/42/merge"
+	want := "fork-e2e-42-contributor/example-" + strings.Repeat("a", 40) + "-" + baseSHA + "-refs/pull/42/merge"
 	if group != want {
 		t.Errorf("group = %q, want %q", group, want)
 	}

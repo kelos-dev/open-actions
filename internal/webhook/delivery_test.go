@@ -639,6 +639,87 @@ func TestDeliveryTimesOutWhenPullRequestMergeRefIsUnavailable(t *testing.T) {
 	}
 }
 
+func TestForkUpdatesCreateIndependentTrustedTargetRuns(t *testing.T) {
+	baseSHA := strings.Repeat("a", 40)
+	firstHeadSHA := strings.Repeat("b", 40)
+	secondHeadSHA := strings.Repeat("c", 40)
+	workflowData := []byte("name: Trusted\non: pull_request_target\njobs:\n  check:\n    runs-on: ubuntu-latest\n    steps:\n      - run: make check\n")
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/app/installations/2/access_tokens":
+			fmt.Fprint(writer, `{"token":"installation-token"}`)
+		case "/repos/acme/example/contents/.open-actions/workflows":
+			if request.URL.Query().Get("ref") != baseSHA {
+				http.Error(writer, "workflow discovery did not use the trusted base SHA", http.StatusBadRequest)
+				return
+			}
+			fmt.Fprint(writer, `[{"name":"trusted.yaml","path":".open-actions/workflows/trusted.yaml","type":"file"}]`)
+		case "/repos/acme/example/contents/.open-actions/workflows/trusted.yaml":
+			if request.URL.Query().Get("ref") != baseSHA {
+				http.Error(writer, "workflow fetch did not use the trusted base SHA", http.StatusBadRequest)
+				return
+			}
+			fmt.Fprintf(writer, `{"encoding":"base64","content":%q}`, base64.StdEncoding.EncodeToString(workflowData))
+		default:
+			http.NotFound(writer, request)
+		}
+	}))
+	defer server.Close()
+	now := time.Date(2026, 8, 12, 22, 0, 0, 0, time.UTC)
+	clusterClient, reconciler, handler, project := newPullRequestDeliveryTest(t, server, now)
+
+	enqueue := func(headSHA string, body []byte) client.ObjectKey {
+		event := &payload{}
+		event.Repository.ID = 1
+		event.Repository.Name = "example"
+		event.Repository.Owner.Login = "acme"
+		normalized := normalizedEvent{
+			Name: "pull_request", Action: "synchronize", Ref: "refs/pull/42/merge", Fork: true,
+			PullRequest: &normalizedPullRequest{
+				Number: 42, HTMLURL: "https://github.com/acme/example/pull/42",
+				HeadRepository: normalizedRepository{ID: 2, Owner: "contributor", Name: "example"},
+				HeadRef:        "feature", HeadSHA: headSHA, BaseRef: "main", BaseSHA: baseSHA,
+			},
+		}
+		if err := handler.enqueueDelivery(context.Background(), project, event, normalized, "delivery-"+headSHA[:8], body); err != nil {
+			t.Fatal(err)
+		}
+		return client.ObjectKey{Namespace: project.Namespace, Name: webhookDeliveryName(body)}
+	}
+
+	for _, update := range []struct {
+		headSHA string
+		body    []byte
+	}{
+		{headSHA: firstHeadSHA, body: []byte(`{"head":"first"}`)},
+		{headSHA: secondHeadSHA, body: []byte(`{"head":"second"}`)},
+	} {
+		key := enqueue(update.headSHA, update.body)
+		if _, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: key}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	runs := &actionsv1alpha1.WorkflowRunList{}
+	if err := clusterClient.List(context.Background(), runs); err != nil {
+		t.Fatal(err)
+	}
+	if len(runs.Items) != 2 {
+		t.Fatalf("WorkflowRuns = %d, want 2", len(runs.Items))
+	}
+	wantHeads := map[string]bool{firstHeadSHA: true, secondHeadSHA: true}
+	for index := range runs.Items {
+		source := runs.Items[index].Spec.Source.GitHub
+		if source.Event.Name != actionsv1alpha1.GitHubEventNamePullRequestTarget || source.Revision.SHA != baseSHA || source.Revision.Ref != "refs/heads/main" || source.Event.PullRequest == nil || !wantHeads[source.Event.PullRequest.HeadSHA] {
+			t.Fatalf("trusted target source = %#v", source)
+		}
+		delete(wantHeads, source.Event.PullRequest.HeadSHA)
+	}
+	if len(wantHeads) != 0 {
+		t.Fatalf("missing fork head snapshots = %#v", wantHeads)
+	}
+}
+
 func TestDeliveryFinishesWhenEventRevisionIsUnavailable(t *testing.T) {
 	now := time.Date(2026, 8, 10, 0, 0, 0, 0, time.UTC)
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
