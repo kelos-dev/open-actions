@@ -858,6 +858,7 @@ func TestParseAcceptsWorkflowExpressions(t *testing.T) {
 		{name: "run script", job: "    steps:\n      - run: 'echo ${{ github.sha }}'\n"},
 		{name: "working directory", job: "    steps:\n      - run: echo test\n        working-directory: '${{ github.workspace }}'\n"},
 		{name: "step condition", job: "    steps:\n      - run: echo test\n        if: github.ref_name == 'main'\n"},
+		{name: "hash files", job: "    steps:\n      - run: \"echo ${{ hashFiles('**/*.go') }}\"\n"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -885,6 +886,14 @@ func TestParseRejectsInvalidOrUnavailableWorkflowExpressions(t *testing.T) {
 		{
 			name: "secret in concurrency",
 			data: "name: CI\non: push\nconcurrency: '${{ secrets.TOKEN }}'\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo test\n",
+		},
+		{
+			name: "hash files in job environment",
+			data: "name: CI\non: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    env:\n      HASH: \"${{ hashFiles('**') }}\"\n    steps:\n      - run: echo test\n",
+		},
+		{
+			name: "hash files in job output",
+			data: "name: CI\non: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    outputs:\n      digest: \"${{ hashFiles('**') }}\"\n    steps:\n      - run: echo test\n",
 		},
 	}
 	for _, tt := range tests {

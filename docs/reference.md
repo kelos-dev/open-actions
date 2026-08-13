@@ -320,15 +320,22 @@ an empty string. Malformed delimiters, unknown functions, unavailable contexts,
 and unsupported syntax fail explicitly.
 
 The supported grammar includes null, boolean, number, and single-quoted string
-literals; property and index access; parentheses; `!`, comparisons, `&&`, and
-`||`; and the `contains`, `format`, and `startsWith` functions. Comparisons and
-string conversions follow GitHub Actions coercion rules. `&&` and `||` return a
-selected operand and short-circuit, which supports fallback expressions and
-the conventional `condition && value || fallback` form. Conditions also
-support `success`, `always`, `failure`, and `cancelled` where status is
-available. Each expression is limited to 256 syntax nodes and 64 nesting
-levels. Format expansion and interpolated template output are limited to 100,000
-bytes during evaluation.
+literals; property and index access; object-filter wildcards; parentheses; `!`,
+comparisons, `&&`, and `||`; and the `contains`, `startsWith`, `endsWith`,
+`format`, `join`, `toJSON`, and `fromJSON` functions. Comparisons and string
+conversions follow GitHub Actions coercion rules. `&&` and `||` return a selected
+operand and short-circuit, which supports fallback expressions and the
+conventional `condition && value || fallback` form. Conditions also support
+`success`, `always`, `failure`, and `cancelled` where status is available. Each
+expression is limited to 256 syntax nodes and 64 nesting levels. Function and
+interpolated template output are limited to 100,000 bytes during evaluation.
+
+Step expressions also support `hashFiles` with one or more glob patterns.
+Patterns are evaluated against files in `github.workspace`; `*`, `**`, `?`,
+character classes, multiline patterns, and ordered `!` exclusions are
+supported. Directories and symlink targets outside the workspace are not
+hashed. The function returns the SHA-256 digest of the matched file digests in
+path order, or an empty string when no files match.
 
 Contexts are restricted by evaluation phase. An allowed context still fails at
 evaluation when the corresponding execution feature has not supplied it.
@@ -339,11 +346,11 @@ evaluation when the corresponding execution feature has not supplied it.
 | Workflow job condition | `github`, `needs`, `vars`, `inputs`, and status functions | `github`, direct dependency results and outputs, `vars`, `inputs`, and status functions |
 | Job name and runner labels | `github`, `needs`, `strategy`, `matrix`, `vars`, `inputs` | `github`, `inputs`, `vars`, and `matrix` for matrix jobs |
 | Job environment | `github`, `needs`, `strategy`, `matrix`, `vars`, `secrets`, `inputs` | `github`, `inputs`, `vars`, `secrets`, and `matrix` for matrix jobs |
-| Workflow step name, run script, working directory, environment, and inputs | `github`, `needs`, `strategy`, `matrix`, `job`, `runner`, `env`, `vars`, `secrets`, `steps`, `inputs` | `github`, `matrix`, `runner`, `env`, `vars`, `secrets`, `inputs`, `steps` |
-| Workflow step condition | Step contexts except `secrets`, plus status functions | `github`, `matrix`, `runner`, `env`, `vars`, `inputs`, `steps`, and status functions |
-| Job outputs | Workflow step contexts | `github`, `matrix`, `runner`, `env`, `vars`, `secrets`, `inputs`, `steps` |
-| Composite step fields and outputs | `github`, `runner`, `env`, `inputs`, `steps` | All listed contexts |
-| Composite step condition | Composite contexts and status functions | All listed contexts and functions |
+| Workflow step name, run script, working directory, environment, and inputs | `github`, `needs`, `strategy`, `matrix`, `job`, `runner`, `env`, `vars`, `secrets`, `steps`, `inputs`, and `hashFiles` | `github`, `matrix`, `runner`, `env`, `vars`, `secrets`, `inputs`, `steps`, and `hashFiles` |
+| Workflow step condition | Step contexts except `secrets`, plus status functions and `hashFiles` | `github`, `matrix`, `runner`, `env`, `vars`, `inputs`, `steps`, status functions, and `hashFiles` |
+| Job outputs | Workflow step contexts without `hashFiles` | `github`, `matrix`, `runner`, `env`, `vars`, `secrets`, `inputs`, `steps` |
+| Composite step fields and outputs | `github`, `runner`, `env`, `inputs`, `steps`, and `hashFiles` | All listed contexts and functions |
+| Composite step condition | Composite contexts, status functions, and `hashFiles` | All listed contexts and functions |
 | Action input default | `github` | `github` |
 
 Values derived from `github.token` or the `secrets` context are marked sensitive

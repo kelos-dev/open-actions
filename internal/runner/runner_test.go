@@ -3,6 +3,7 @@ package runner
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -52,6 +53,28 @@ func TestExecuteRunSteps(t *testing.T) {
 	}
 	if string(result) != "job/step/main/value/"+binDirectory {
 		t.Errorf("result = %q", result)
+	}
+}
+
+func TestExecuteResolvesHashFiles(t *testing.T) {
+	workspace := t.TempDir()
+	contents := []byte("locked dependency")
+	if err := os.WriteFile(filepath.Join(workspace, "dependency.lock"), contents, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	plan := testPlan()
+	plan.Steps = []Step{{Run: `printf '%s' "${{ hashFiles('**/*.lock') }}" > result`}}
+	if err := testExecutor(t, io.Discard, io.Discard).Execute(context.Background(), plan, workspace); err != nil {
+		t.Fatal(err)
+	}
+	result, err := os.ReadFile(filepath.Join(workspace, "result"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	fileDigest := sha256.Sum256(contents)
+	want := sha256.Sum256(fileDigest[:])
+	if string(result) != fmt.Sprintf("%x", want) {
+		t.Fatalf("result = %q, want %x", result, want)
 	}
 }
 

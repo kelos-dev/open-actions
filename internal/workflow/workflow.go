@@ -211,8 +211,9 @@ var (
 	jobNameAvailability             = expression.NewAvailability("github", "needs", "strategy", "matrix", "vars", "inputs")
 	jobEnvironmentAvailability      = expression.NewAvailability("github", "needs", "strategy", "matrix", "vars", "secrets", "inputs")
 	jobConditionAvailability        = expression.NewAvailability("github", "needs", "vars", "inputs").WithStatusFunctions()
-	stepAvailability                = expression.NewAvailability("github", "needs", "strategy", "matrix", "job", "runner", "env", "vars", "secrets", "steps", "inputs")
-	stepConditionAvailability       = expression.NewAvailability("github", "needs", "strategy", "matrix", "job", "runner", "env", "vars", "steps", "inputs").WithStatusFunctions()
+	stepAvailability                = expression.NewAvailability("github", "needs", "strategy", "matrix", "job", "runner", "env", "vars", "secrets", "steps", "inputs").WithHashFiles()
+	stepConditionAvailability       = expression.NewAvailability("github", "needs", "strategy", "matrix", "job", "runner", "env", "vars", "steps", "inputs").WithStatusFunctions().WithHashFiles()
+	jobOutputAvailability           = expression.NewAvailability("github", "needs", "strategy", "matrix", "job", "runner", "env", "vars", "secrets", "steps", "inputs")
 )
 
 func Parse(data []byte) (*Definition, error) {
@@ -569,7 +570,7 @@ func MatrixCombinations(strategy Strategy) []map[string]any {
 
 func validateJobOutputs(jobID string, outputs map[string]any) (int, error) {
 	field := fmt.Sprintf("job %q outputs", jobID)
-	bytes, err := validateScalarMap(field, outputs, stepAvailability)
+	bytes, err := validateScalarMap(field, outputs, jobOutputAvailability)
 	if err != nil {
 		return 0, err
 	}

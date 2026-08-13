@@ -289,7 +289,7 @@ func compositeCondition(value string, environment map[string]any, failed, cancel
 	status := workflowStepStatus(failed, cancelled)
 	context := compositeExpressionContext(compositeContext, compositeConditionAvailability, &status)
 	baseEnvironment := context.Values["env"].(map[string]any)
-	context.Values["env"] = workflowexpression.DeferredObject(func(name string) (any, bool, error) {
+	resolveEnvironment := func(name string) (any, bool, error) {
 		if rawValue, found := anyMapValue(environment, name); found {
 			input, err := inputString(rawValue)
 			if err != nil {
@@ -300,7 +300,26 @@ func compositeCondition(value string, environment map[string]any, failed, cancel
 		}
 		resolved, found := anyMapValue(baseEnvironment, name)
 		return resolved, found, nil
-	})
+	}
+	allEnvironment := func() (map[string]any, error) {
+		result := make(map[string]any, len(baseEnvironment)+len(environment))
+		for name, value := range baseEnvironment {
+			result[name] = value
+		}
+		for name, rawValue := range environment {
+			input, err := inputString(rawValue)
+			if err != nil {
+				return nil, err
+			}
+			resolved, err := resolveCompositeExpressions(input, compositeContext)
+			if err != nil {
+				return nil, err
+			}
+			result[name] = resolved
+		}
+		return result, nil
+	}
+	context.Values["env"] = workflowexpression.DeferredObjectMap{Resolve: resolveEnvironment, Values: allEnvironment}
 	return evaluateCondition(value, context, status.Success)
 }
 
