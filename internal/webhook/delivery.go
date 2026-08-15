@@ -17,6 +17,7 @@ import (
 
 	actionsv1alpha1 "github.com/kelos-dev/open-actions/api/v1alpha1"
 	githubclient "github.com/kelos-dev/open-actions/internal/github"
+	"github.com/kelos-dev/open-actions/internal/gitrepository"
 	"github.com/kelos-dev/open-actions/internal/workflow"
 	corev1 "k8s.io/api/core/v1"
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
@@ -36,8 +37,8 @@ const (
 	deliveryLabel             = "actions.kelos.dev/webhook-delivery"
 	deliveryDataKey           = "delivery.json"
 	deliveryRevisionKey       = "resolvedRevision"
+	deliveryMergeBaseKey      = "resolvedMergeBase"
 	deliveryTargetRevisionKey = "resolvedTargetRevision"
-	deliveryTargetRunCountKey = "targetWorkflowRuns"
 	deliveryStateKey          = "state"
 	deliveryMessageKey        = "message"
 	deliveryRunCountKey       = "workflowRuns"
@@ -47,7 +48,6 @@ const (
 	maxDeliveryBytes          = 900_000
 	maxWorkflowFiles          = 100
 	maxWorkflowJobs           = 1000
-	mergeRefWaitTimeout       = 2 * time.Minute
 	rerunRootWaitTimeout      = 2 * time.Minute
 	resourceNameMaxLength     = 63
 	workflowRunDigestLength   = 20
@@ -108,6 +108,7 @@ type DeliveryReconciler struct {
 	client.Client
 	APIReader                          client.Reader
 	GitHub                             *githubclient.Client
+	GitRepository                      *gitrepository.Client
 	Logger                             *slog.Logger
 	WorkflowRunTTLSecondsAfterFinished *int32
 	Now                                func() time.Time
@@ -255,11 +256,6 @@ func missingWorkflowDirectory(err error) bool {
 	return errors.As(err, &apiError) && apiError.StatusCode == http.StatusNotFound && apiError.Message == "Not Found"
 }
 
-func missingPullRequestMergeRef(err error) bool {
-	apiError := &githubclient.APIError{}
-	return errors.As(err, &apiError) && apiError.StatusCode == http.StatusNotFound
-}
-
 func unavailableDeliveryRevision(err error) bool {
 	apiError := &githubclient.APIError{}
 	if errors.As(err, &apiError) {
@@ -267,29 +263,6 @@ func unavailableDeliveryRevision(err error) bool {
 			apiError.StatusCode == http.StatusConflict && strings.EqualFold(strings.TrimSpace(apiError.Message), "Git Repository is empty.")
 	}
 	return strings.Contains(err.Error(), "GitHub returned no commits")
-}
-
-func mergeRefRetryInterval(age time.Duration) time.Duration {
-	switch {
-	case age >= 30*time.Second:
-		return 15 * time.Second
-	case age >= 10*time.Second:
-		return 5 * time.Second
-	default:
-		return 2 * time.Second
-	}
-}
-
-func resolveDeliveryRevision(ctx context.Context, installation *githubclient.InstallationClient, owner, repository string, event normalizedEvent) (string, bool, error) {
-	if event.HeadSHA == "" {
-		revision, err := installation.ResolveRevision(ctx, owner, repository, event.ResolveRef)
-		return revision, err == nil, err
-	}
-	revision, ready, err := installation.ResolvePullRequestRevision(ctx, owner, repository, event.ResolveRef, event.HeadSHA)
-	if err != nil && missingPullRequestMergeRef(err) {
-		return "", false, nil
-	}
-	return revision, ready, err
 }
 
 func (r *DeliveryReconciler) Reconcile(ctx context.Context, request ctrl.Request) (ctrl.Result, error) {
@@ -313,17 +286,15 @@ func (r *DeliveryReconciler) Reconcile(ctx context.Context, request ctrl.Request
 		}
 		delivery.Event.SHA = revision
 	}
+	if mergeBase := object.Data[deliveryMergeBaseKey]; mergeBase != "" {
+		if !validGitSHA(mergeBase) {
+			return ctrl.Result{}, r.finish(ctx, object, deliveryStateFailed, 0, "delivery contains an invalid resolved merge base")
+		}
+		delivery.Event.MergeBaseSHA = mergeBase
+	}
 	targetRevision := object.Data[deliveryTargetRevisionKey]
 	if targetRevision != "" && !validGitSHA(targetRevision) {
 		return ctrl.Result{}, r.finish(ctx, object, deliveryStateFailed, 0, "delivery contains an invalid resolved target revision")
-	}
-	targetDiscoveryCompleted := false
-	if value, found := object.Data[deliveryTargetRunCountKey]; found {
-		count, err := strconv.Atoi(value)
-		if err != nil || count < 0 {
-			return ctrl.Result{}, r.finish(ctx, object, deliveryStateFailed, 0, "delivery contains an invalid target workflow run count")
-		}
-		targetDiscoveryCompleted = true
 	}
 	reader := r.APIReader
 	project := &actionsv1alpha1.Project{}
@@ -357,43 +328,58 @@ func (r *DeliveryReconciler) Reconcile(ctx context.Context, request ctrl.Request
 	selections := make([]workflowSelection, 0)
 	seenFiles := map[string]struct{}{}
 	workflowJobs := 0
-	pendingMergeRef := false
-	mergeRefFailure := ""
-	retryAfter := time.Duration(0)
-	targetDiscovered := false
-	targetSelections := 0
 	for _, candidate := range events {
-		if candidate.Name == "pull_request_target" && targetDiscoveryCompleted && pendingMergeRef {
-			continue
+		var mergedRepository *gitrepository.Repository
+		if candidate.Name == "pull_request" && candidate.HeadSHA != "" {
+			if candidate.PullRequest == nil {
+				return ctrl.Result{}, r.finish(ctx, object, deliveryStateFailed, 0, "pull request delivery does not contain revision metadata")
+			}
+			if candidate.MergeBaseSHA == "" {
+				candidate.MergeBaseSHA, err = installation.ResolveMergeBase(ctx, delivery.Repository.Owner, delivery.Repository.Name, candidate.PullRequest.BaseSHA, candidate.PullRequest.HeadSHA)
+				if err != nil {
+					return ctrl.Result{}, err
+				}
+			}
+			mergedRepository, err = r.GitRepository.Merge(ctx, delivery.Repository.Owner, delivery.Repository.Name, installation.Token(), gitrepository.Revision{
+				BaseSHA: candidate.PullRequest.BaseSHA, HeadSHA: candidate.PullRequest.HeadSHA, MergeBaseSHA: candidate.MergeBaseSHA,
+			})
+			if err != nil {
+				conflict := &gitrepository.ConflictError{}
+				if errors.As(err, &conflict) {
+					r.Logger.Info("skipped conflicting pull request revision", "delivery_id", delivery.DeliveryID, "head_sha", candidate.PullRequest.HeadSHA, "base_sha", candidate.PullRequest.BaseSHA)
+					continue
+				}
+				return ctrl.Result{}, err
+			}
+			repositoryToClose := mergedRepository
+			defer func() {
+				if err := repositoryToClose.Close(); err != nil {
+					r.Logger.Warn("failed to clean Git merge", "delivery_id", delivery.DeliveryID, "error", err)
+				}
+			}()
+			if candidate.SHA != "" && candidate.SHA != mergedRepository.SHA {
+				return ctrl.Result{}, r.finish(ctx, object, deliveryStateFailed, 0, "delivery contains an inconsistent resolved revision")
+			}
+			candidate.SHA = mergedRepository.SHA
+			if err := r.persistResolvedRevision(ctx, object, candidate.Name, candidate.SHA, candidate.MergeBaseSHA); err != nil {
+				return ctrl.Result{}, err
+			}
 		}
 		if candidate.ResolveRef != "" && candidate.SHA == "" {
-			revision, ready, err := resolveDeliveryRevision(ctx, installation, delivery.Repository.Owner, delivery.Repository.Name, candidate)
+			revision, err := installation.ResolveRevision(ctx, delivery.Repository.Owner, delivery.Repository.Name, candidate.ResolveRef)
 			if err != nil {
-				if candidate.Name != "pull_request" && unavailableDeliveryRevision(err) {
+				if unavailableDeliveryRevision(err) {
 					message := fmt.Sprintf("GitHub event revision %q is unavailable: %v", candidate.ResolveRef, err)
 					return ctrl.Result{}, r.finish(ctx, object, deliveryStateFailed, 0, message)
 				}
 				return ctrl.Result{}, err
 			}
-			if !ready {
-				if candidate.Name != "pull_request" {
-					return ctrl.Result{}, fmt.Errorf("GitHub event revision %q is not ready", candidate.ResolveRef)
-				}
-				age := r.deliveryAge(object)
-				if age >= mergeRefWaitTimeout {
-					mergeRefFailure = fmt.Sprintf("GitHub pull request merge revision did not become ready for head %s within %s", candidate.HeadSHA, mergeRefWaitTimeout)
-				} else {
-					pendingMergeRef = true
-					retryAfter = mergeRefRetryInterval(age)
-				}
-				continue
-			}
 			candidate.SHA = revision
-			if err := r.persistResolvedRevision(ctx, object, candidate.Name, revision); err != nil {
+			if err := r.persistResolvedRevision(ctx, object, candidate.Name, revision, ""); err != nil {
 				return ctrl.Result{}, err
 			}
 		}
-		workflowFiles, err := workflowFilesAtRevision(ctx, installation, &delivery, project.Spec.WorkflowDirectory, candidate.SHA)
+		workflowFiles, err := workflowFilesAtRevision(ctx, installation, mergedRepository, &delivery, project.Spec.WorkflowDirectory, candidate.SHA)
 		if err != nil {
 			return ctrl.Result{}, err
 		}
@@ -402,7 +388,12 @@ func (r *DeliveryReconciler) Reconcile(ctx context.Context, request ctrl.Request
 			return ctrl.Result{}, r.finish(ctx, object, deliveryStateFailed, 0, err.Error())
 		}
 		for _, workflowPath := range workflowFiles {
-			data, err := installation.GetFile(ctx, delivery.Repository.Owner, delivery.Repository.Name, workflowPath, candidate.SHA)
+			var data []byte
+			if mergedRepository != nil {
+				data, err = mergedRepository.ReadFile(ctx, workflowPath)
+			} else {
+				data, err = installation.GetFile(ctx, delivery.Repository.Owner, delivery.Repository.Name, workflowPath, candidate.SHA)
+			}
 			if err != nil {
 				return ctrl.Result{}, err
 			}
@@ -425,13 +416,7 @@ func (r *DeliveryReconciler) Reconcile(ctx context.Context, request ctrl.Request
 					return ctrl.Result{}, r.finish(ctx, object, deliveryStateFailed, 0, err.Error())
 				}
 				selections = append(selections, workflowSelection{Path: workflowPath, Event: candidate})
-				if candidate.Name == "pull_request_target" {
-					targetSelections++
-				}
 			}
-		}
-		if candidate.Name == "pull_request_target" {
-			targetDiscovered = true
 		}
 	}
 	for _, selection := range selections {
@@ -442,19 +427,7 @@ func (r *DeliveryReconciler) Reconcile(ctx context.Context, request ctrl.Request
 			return ctrl.Result{}, err
 		}
 	}
-	if pendingMergeRef && targetDiscovered {
-		if err := r.persistTargetRunCount(ctx, object, targetSelections); err != nil {
-			return ctrl.Result{}, err
-		}
-	}
 	workflowRuns := len(selections)
-	if mergeRefFailure != "" {
-		return ctrl.Result{}, r.finish(ctx, object, deliveryStateFailed, workflowRuns, mergeRefFailure)
-	}
-	if pendingMergeRef {
-		r.Logger.Debug("waiting for GitHub pull request merge revision", "delivery_id", delivery.DeliveryID, "head_sha", delivery.Event.HeadSHA, "retry_after", retryAfter)
-		return ctrl.Result{RequeueAfter: retryAfter}, nil
-	}
 	r.Logger.Info("completed GitHub webhook discovery", "delivery_id", delivery.DeliveryID, "workflow_runs", workflowRuns)
 	return ctrl.Result{}, r.finish(ctx, object, deliveryStateCompleted, workflowRuns, "")
 }
@@ -486,11 +459,25 @@ func deliveryEvents(event normalizedEvent) []normalizedEvent {
 		target.ResolveRef = event.PullRequest.BaseRef
 	}
 	target.HeadSHA = ""
+	target.MergeBaseSHA = ""
 	events = append(events, target)
 	return events
 }
 
-func workflowFilesAtRevision(ctx context.Context, installation *githubclient.InstallationClient, delivery *queuedDelivery, directory, revision string) ([]string, error) {
+func workflowFilesAtRevision(ctx context.Context, installation *githubclient.InstallationClient, mergedRepository *gitrepository.Repository, delivery *queuedDelivery, directory, revision string) ([]string, error) {
+	if mergedRepository != nil {
+		paths, err := mergedRepository.ListFiles(ctx, directory)
+		if err != nil {
+			return nil, err
+		}
+		workflowFiles := make([]string, 0, len(paths))
+		for _, path := range paths {
+			if workflowFile(path) {
+				workflowFiles = append(workflowFiles, path)
+			}
+		}
+		return workflowFiles, nil
+	}
 	contents, err := installation.ListDirectory(ctx, delivery.Repository.Owner, delivery.Repository.Name, directory, revision)
 	if err != nil {
 		if missingWorkflowDirectory(err) {
@@ -836,11 +823,15 @@ func workflowRunPullRequest(pullRequest *normalizedPullRequest) *actionsv1alpha1
 }
 
 func workflowRunRevision(event normalizedEvent) actionsv1alpha1.GitRevision {
-	revision := actionsv1alpha1.GitRevision{SHA: event.SHA, HeadSHA: event.HeadSHA, Ref: event.Ref}
+	integrationRevision := event.HeadSHA != ""
+	revision := actionsv1alpha1.GitRevision{SHA: event.SHA, HeadSHA: event.HeadSHA, MergeBaseSHA: event.MergeBaseSHA, Ref: event.Ref}
 	if event.Name == "pull_request" {
 		revision.HeadRef = event.HeadRef
 		if event.PullRequest != nil {
 			revision.HeadSHA = event.PullRequest.HeadSHA
+			if integrationRevision {
+				revision.BaseSHA = event.PullRequest.BaseSHA
+			}
 		}
 	}
 	if event.Name == "pull_request" || event.Name == "merge_group" {
@@ -892,7 +883,7 @@ func (r *DeliveryReconciler) finish(ctx context.Context, object *corev1.ConfigMa
 	return r.Patch(ctx, object, client.MergeFrom(before))
 }
 
-func (r *DeliveryReconciler) persistResolvedRevision(ctx context.Context, object *corev1.ConfigMap, eventName, revision string) error {
+func (r *DeliveryReconciler) persistResolvedRevision(ctx context.Context, object *corev1.ConfigMap, eventName, revision, mergeBase string) error {
 	before := object.DeepCopy()
 	if object.Data == nil {
 		object.Data = map[string]string{}
@@ -902,15 +893,9 @@ func (r *DeliveryReconciler) persistResolvedRevision(ctx context.Context, object
 		key = deliveryTargetRevisionKey
 	}
 	object.Data[key] = revision
-	return r.Patch(ctx, object, client.MergeFrom(before))
-}
-
-func (r *DeliveryReconciler) persistTargetRunCount(ctx context.Context, object *corev1.ConfigMap, count int) error {
-	before := object.DeepCopy()
-	if object.Data == nil {
-		object.Data = map[string]string{}
+	if mergeBase != "" {
+		object.Data[deliveryMergeBaseKey] = mergeBase
 	}
-	object.Data[deliveryTargetRunCountKey] = strconv.Itoa(count)
 	return r.Patch(ctx, object, client.MergeFrom(before))
 }
 
@@ -948,6 +933,9 @@ func (r *DeliveryReconciler) deliveryAge(object *corev1.ConfigMap) time.Duration
 }
 
 func (r *DeliveryReconciler) SetupWithManager(manager ctrl.Manager) error {
+	if r.GitRepository == nil {
+		return errors.New("Git repository client must be specified")
+	}
 	return ctrl.NewControllerManagedBy(manager).
 		For(&corev1.ConfigMap{}, builder.WithPredicates(predicate.NewPredicateFuncs(isWebhookDelivery))).
 		Complete(r)

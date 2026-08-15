@@ -83,6 +83,9 @@ Each URL requires an absolute `http` or `https` URL with a host and an optional
 clean path prefix. User information, queries, fragments, escaped paths, and `.`
 or `..` path segments are rejected. The API URL is normalized with a trailing
 slash, while the server and clone base URLs are normalized without one.
+The controller image must provide Git with support for
+`merge-tree --write-tree` so it can construct pull request integration
+revisions.
 
 ```console
 open-actions-controller \
@@ -112,10 +115,13 @@ in the cluster may claim an installation; the earliest-created project retains
 the claim, and later duplicates remain unconfigured until the owner is deleted.
 A `WorkflowRun` records provider-specific event data under its own immutable
 `spec.source` union. `status.source.github.checkRun` records the GitHub Check Run
-ID and the last report accepted by GitHub. For open pull requests,
-`spec.source.github.revision.sha` identifies the test merge commit used for
-execution, while `headSHA` identifies the pull request commit used for check
-reporting. Set `spec.cancelRequested` to gracefully cancel ordinary jobs while
+ID and the last report accepted by GitHub. For locally integrated pull requests,
+`spec.source.github.revision.sha` identifies the deterministic integration
+commit used for execution. `baseSHA`, `headSHA`, and `mergeBaseSHA` pin its two
+parents and merge base; `headSHA` is also used for check reporting. Pull request
+runs without these integration inputs use the remote revision identified by
+`sha`. Set
+`spec.cancelRequested` to gracefully cancel ordinary jobs while
 allowing cancellation-aware reporting and cleanup jobs to finish. Deleting a
 WorkflowRun force-cancels and removes its child resources. A Runner's
 `spec.projectRef` is
@@ -442,7 +448,7 @@ The supported trigger declarations are `push`, `pull_request`, `merge_group`,
 each webhook-backed event. Webhook deliveries with unrecognized activity types
 are accepted without being queued. `pull_request_target` uses the pull request's
 trusted base-branch workflow and revision, including for fork pull requests;
-ordinary `pull_request` workflows continue to use the test merge revision. This
+ordinary `pull_request` workflows use a deterministic integration revision. This
 differs from GitHub Actions, which loads native `pull_request_target` workflows
 from the repository's default branch. Review and review-comment events discover
 and execute workflows only from the trusted default branch, so a maintainer
@@ -451,6 +457,21 @@ events are reported on the trusted default-branch revision,
 `pull_request_target` checks are reported on the trusted base-branch revision,
 and ordinary `pull_request` checks are reported on the pull request head
 revision.
+
+For an ordinary open `pull_request`, `github.sha` and
+`github.event.pull_request.merge_commit_sha` identify the locally constructed
+integration commit, and `github.event.pull_request.base.sha` and
+`github.event.pull_request.head.sha` identify its pinned parents. The default
+checkout of the current repository with `actions/checkout` fetches the pinned
+commits and reconstructs that integration commit in the workspace. Setting an
+explicit `ref` other than the integration SHA, or checking out another
+repository, leaves checkout behavior unchanged. The integration SHA is local to
+Open Actions and cannot be fetched from the GitHub remote by SHA; workflows
+that need it should use `actions/checkout` rather than fetching `github.sha`
+directly. Steps that send `github.sha` to a GitHub API or another service that
+requires a GitHub-hosted commit must use the appropriate
+`github.event.pull_request.head.sha` or `github.event.pull_request.base.sha`
+instead.
 
 For `pull_request_target`, `spec.source.github.revision` always identifies the
 trusted base-branch workflow and execution commit, and `revision.ref` must equal
@@ -628,9 +649,14 @@ available from the configured GitHub server. The default runner image pins Node
 20.20.2 for `node20` actions and Node 24.19.0 for `node24` actions. Custom runner
 images must provide the Node 20 executable as `node` and the Node 24 executable
 as `node24` on `PATH`; execution fails before the first lifecycle hook when the
-declared runtime is unavailable. Composite actions support Bash run steps and
-external action references. Composite expressions cover inputs, step outputs,
-selected GitHub and runner values, and environment variables.
+declared runtime is unavailable. They must also provide Git with support for
+`merge-tree --write-tree` to run the default current-repository checkout for
+ordinary pull requests. The controller and every runner that can execute its
+plans must use Git versions that produce identical merge results; a mismatch
+causes the runner's integration revision verification to fail. Composite
+actions support Bash run steps and external action references. Composite
+expressions cover inputs, step
+outputs, selected GitHub and runner values, and environment variables.
 
 Node, composite, and Bash steps can use Docker when assigned to a Runner with
 `spec.execution.docker`. This capability supports tools such as kind but does
@@ -642,13 +668,15 @@ reusable inputs, the selected cron expression, and revision fields used by the
 supported event. Actions that require other fields from GitHub's raw webhook
 payload are not supported.
 
-The controller emits job-plan version 4, and the runner accepts versions 1
-through 4. When a release changes the job-plan version, update every Runner
+The controller emits job-plan version 5, and the runner accepts versions 1
+through 5. When a release changes the job-plan version, update every Runner
 `spec.execution.image` to an image that accepts both the installed and target
 controller versions before upgrading the controller. The received job-plan
 version also determines the runner result version. A runner that accepts more
 than one plan version must emit the result version assigned to that plan, not
-always the latest result version supported by the runner binary.
+always the latest result version supported by the runner binary. Integration
+commit construction is part of this versioned contract; changing its merge
+behavior or commit metadata requires a job-plan version transition.
 
 Docker and local actions, private cross-repository action authentication,
 matrix `include` and `exclude`, service containers, caches, and artifacts are
@@ -668,14 +696,14 @@ available. Open Actions does not archive logs.
 The webhook endpoint accepts only signed GitHub `POST` deliveries up to 10 MiB
 and requires exactly one configured project for the installation. Supported
 deliveries return HTTP 202 with `{"accepted":true,"queued":true}`. Unsupported
-event names return HTTP 202 with `{"accepted":true,"queued":false}`. Ordinary
-open pull request workflows use GitHub's test merge revision and are skipped
-for fork or conflicted pull requests. `pull_request_target` workflows remain
-eligible and load only from the pull request's base branch in the base
-repository. Deliveries wait up to two minutes for a test merge revision while
-eligible `pull_request_target` workflows are discovered independently.
-Unavailable or superseded test merge revisions produce a `Failed` delivery
-after that wait.
+event names return HTTP 202 with `{"accepted":true,"queued":false}`. For an
+ordinary open pull request, the controller resolves the merge base and
+constructs a deterministic integration commit from the base and head SHAs in
+the signed webhook. It uses that commit to discover and plan workflows without
+waiting for GitHub's mutable pull request merge ref. Fork and conflicting pull
+requests are skipped. Eligible `pull_request_target` workflows are discovered
+independently and load only from the pull request's base branch in the base
+repository.
 
 For a Check Run created by Open Actions, GitHub's **Re-run** action sends a
 `check_run.rerequested` delivery. Open Actions authenticates the delivery,

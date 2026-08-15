@@ -20,7 +20,9 @@ spec:
         deliveryID: 72d3162e-cc78-11e3-81ab-c9367dc0958
       revision:
         sha: 0123456789abcdef0123456789abcdef01234567
+        baseSHA: abcdef0123456789abcdef0123456789abcdef01
         headSHA: fedcba9876543210fedcba9876543210fedcba98
+        mergeBaseSHA: 89abcdef0123456789abcdef0123456789abcdef
         ref: refs/pull/42/merge
         headRef: feature-branch
         baseRef: main

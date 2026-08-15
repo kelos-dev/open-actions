@@ -16,6 +16,7 @@ import (
 	"github.com/kelos-dev/open-actions/internal/controller"
 	"github.com/kelos-dev/open-actions/internal/endpointurl"
 	githubclient "github.com/kelos-dev/open-actions/internal/github"
+	"github.com/kelos-dev/open-actions/internal/gitrepository"
 	githubwebhook "github.com/kelos-dev/open-actions/internal/webhook"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -127,6 +128,10 @@ func runManager(arguments []string) error {
 	if err != nil {
 		return err
 	}
+	gitRepository, err := gitrepository.NewClient(normalizedGitHubServerURL)
+	if err != nil {
+		return err
+	}
 	configuration, err := ctrl.GetConfig()
 	if err != nil {
 		return fmt.Errorf("load Kubernetes configuration: %w", err)
@@ -160,6 +165,7 @@ func runManager(arguments []string) error {
 		Client:             controllerManager.GetClient(),
 		APIReader:          controllerManager.GetAPIReader(),
 		GitHub:             github,
+		GitRepository:      gitRepository,
 		GitHubAPIBase:      normalizedGitHubAPIURL,
 		GitHubServerURL:    normalizedGitHubServerURL,
 		ActionCloneBaseURL: normalizedActionCloneBaseURL,
@@ -180,6 +186,7 @@ func runManager(arguments []string) error {
 		Client:                             controllerManager.GetClient(),
 		APIReader:                          controllerManager.GetAPIReader(),
 		GitHub:                             github,
+		GitRepository:                      gitRepository,
 		Logger:                             logger,
 		WorkflowRunTTLSecondsAfterFinished: workflowRunTTLSecondsAfterFinished,
 	}).SetupWithManager(controllerManager); err != nil {

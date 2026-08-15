@@ -159,13 +159,19 @@ func TestWorkflowRunAcceptsGitHubEventContracts(t *testing.T) {
 			name: "closed merged pull request",
 			mutate: func(github map[string]any) {
 				github["event"].(map[string]any)["action"] = "closed"
-				github["revision"].(map[string]any)["ref"] = "refs/heads/main"
+				revision := github["revision"].(map[string]any)
+				revision["ref"] = "refs/heads/main"
+				delete(revision, "baseSHA")
+				delete(revision, "mergeBaseSHA")
 			},
 		},
 		{
 			name: "closed unmerged pull request",
 			mutate: func(github map[string]any) {
 				github["event"].(map[string]any)["action"] = "closed"
+				revision := github["revision"].(map[string]any)
+				delete(revision, "baseSHA")
+				delete(revision, "mergeBaseSHA")
 			},
 		},
 		{
@@ -178,6 +184,8 @@ func TestWorkflowRunAcceptsGitHubEventContracts(t *testing.T) {
 				revision["ref"] = "refs/heads/gh-readonly-queue/main/pr-42"
 				delete(revision, "headSHA")
 				delete(revision, "headRef")
+				delete(revision, "baseSHA")
+				delete(revision, "mergeBaseSHA")
 			},
 		},
 		{
@@ -212,6 +220,8 @@ func TestWorkflowRunAcceptsGitHubEventContracts(t *testing.T) {
 				delete(revision, "headSHA")
 				delete(revision, "headRef")
 				delete(revision, "baseRef")
+				delete(revision, "baseSHA")
+				delete(revision, "mergeBaseSHA")
 			},
 		},
 		{
@@ -259,6 +269,8 @@ func TestWorkflowRunAcceptsGitHubEventContracts(t *testing.T) {
 				delete(revision, "headSHA")
 				delete(revision, "headRef")
 				delete(revision, "baseRef")
+				delete(revision, "baseSHA")
+				delete(revision, "mergeBaseSHA")
 			},
 		},
 		{
@@ -290,6 +302,8 @@ func TestWorkflowRunValidatesPullRequestTargetMetadata(t *testing.T) {
 	delete(revision, "headSHA")
 	delete(revision, "headRef")
 	delete(revision, "baseRef")
+	delete(revision, "baseSHA")
+	delete(revision, "mergeBaseSHA")
 	if errs := validateObject(t, crd, object, nil); len(errs) == 0 {
 		t.Fatal("pull_request_target without metadata passed validation")
 	}
@@ -405,6 +419,23 @@ func TestWorkflowRunValidatesPullRequestMetadataConsistency(t *testing.T) {
 	if errs := validateObject(t, crd, object, nil); len(errs) == 0 {
 		t.Fatal("pull request metadata without revision.headSHA passed validation")
 	}
+	for _, fieldName := range []string{"baseSHA", "mergeBaseSHA"} {
+		object := loadSample(t, "actions_v1alpha1_workflowrun.yaml")
+		delete(workflowRunGitHub(object)["revision"].(map[string]any), fieldName)
+		if errs := validateObject(t, crd, object, nil); len(errs) == 0 {
+			t.Fatalf("pull request with an unpaired revision.%s passed validation", fieldName)
+		}
+	}
+	object = loadSample(t, "actions_v1alpha1_workflowrun.yaml")
+	delete(workflowRunGitHub(object)["revision"].(map[string]any), "headSHA")
+	if errs := validateObject(t, crd, object, nil); len(errs) == 0 {
+		t.Fatal("pull request integration revision without revision.headSHA passed validation")
+	}
+	object = loadSample(t, "actions_v1alpha1_workflowrun.yaml")
+	workflowRunGitHub(object)["event"].(map[string]any)["action"] = "closed"
+	if errs := validateObject(t, crd, object, nil); len(errs) == 0 {
+		t.Fatal("closed pull request with integration inputs passed validation")
+	}
 }
 
 func TestWorkflowRunBoundsGitHubEventMetadata(t *testing.T) {
@@ -463,6 +494,8 @@ func setBranchEvent(github map[string]any, name, action string) {
 	delete(revision, "headSHA")
 	delete(revision, "headRef")
 	delete(revision, "baseRef")
+	delete(revision, "baseSHA")
+	delete(revision, "mergeBaseSHA")
 }
 
 func TestWorkflowRunAcceptsAtBranchName(t *testing.T) {
@@ -474,12 +507,27 @@ func TestWorkflowRunAcceptsAtBranchName(t *testing.T) {
 	}
 }
 
-func TestWorkflowRunAcceptsPullRequestWithoutHeadSHA(t *testing.T) {
+func TestWorkflowRunAcceptsPullRequestWithoutIntegrationInputs(t *testing.T) {
 	crd, _ := loadCRD(t, "actions.kelos.dev_workflowruns.yaml")
-	object := loadSample(t, "actions_v1alpha1_workflowrun.yaml")
-	delete(workflowRunGitHub(object)["revision"].(map[string]any), "headSHA")
-	if errs := validateObject(t, crd, object, nil); len(errs) > 0 {
-		t.Fatalf("pull request without optional head SHA was rejected: %v", errs.ToAggregate())
+	for _, tt := range []struct {
+		name       string
+		removeHead bool
+	}{
+		{name: "with head SHA"},
+		{name: "without head SHA", removeHead: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			object := loadSample(t, "actions_v1alpha1_workflowrun.yaml")
+			revision := workflowRunGitHub(object)["revision"].(map[string]any)
+			if tt.removeHead {
+				delete(revision, "headSHA")
+			}
+			delete(revision, "baseSHA")
+			delete(revision, "mergeBaseSHA")
+			if errs := validateObject(t, crd, object, nil); len(errs) > 0 {
+				t.Fatalf("pull request without integration inputs was rejected: %v", errs.ToAggregate())
+			}
+		})
 	}
 }
 

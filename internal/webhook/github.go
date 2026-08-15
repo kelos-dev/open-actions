@@ -155,6 +155,7 @@ type normalizedEvent struct {
 	BaseRef       string                 `json:"baseRef,omitempty"`
 	ResolveRef    string                 `json:"resolveRef,omitempty"`
 	HeadSHA       string                 `json:"headSHA,omitempty"`
+	MergeBaseSHA  string                 `json:"mergeBaseSHA,omitempty"`
 	Fork          bool                   `json:"fork,omitempty"`
 	MergeRevision bool                   `json:"mergeRevision,omitempty"`
 	WorkflowName  string                 `json:"workflowName,omitempty"`
@@ -333,7 +334,6 @@ func normalize(eventName string, event *payload) (normalizedEvent, bool, error) 
 		} else {
 			result.Ref = mergeRef
 			if pullRequest.State == "open" && !result.Fork && (pullRequest.Mergeable == nil || *pullRequest.Mergeable) {
-				result.ResolveRef = result.Ref
 				result.HeadSHA = pullRequest.Head.SHA
 				result.MergeRevision = true
 			} else if pullRequest.State == "closed" && pullRequest.MergeCommitSHA != "" {
@@ -401,8 +401,8 @@ func normalize(eventName string, event *payload) (normalizedEvent, bool, error) 
 		return result, false, nil
 	}
 	missingRevision := result.SHA == "" && result.ResolveRef == ""
-	targetOnlyPullRequest := eventName == "pull_request" && !result.MergeRevision
-	if (missingRevision && !targetOnlyPullRequest) || result.Ref == "" || githubclient.RefName(result.Ref) == "" {
+	pullRequestRevision := eventName == "pull_request" && result.PullRequest != nil
+	if (missingRevision && !pullRequestRevision) || result.Ref == "" || githubclient.RefName(result.Ref) == "" {
 		return normalizedEvent{}, false, errors.New("GitHub event does not identify a revision")
 	}
 	if result.SHA != "" && !validGitSHA(result.SHA) {

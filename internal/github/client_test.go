@@ -248,40 +248,29 @@ func TestResolveRevisionErrorIncludesRepositoryIdentity(t *testing.T) {
 	}
 }
 
-func TestResolvePullRequestRevisionRequiresExpectedHeadParent(t *testing.T) {
-	mergeSHA := strings.Repeat("c", 40)
-	expectedHeadSHA := strings.Repeat("b", 40)
-	for _, tt := range []struct {
-		name      string
-		parentSHA string
-		wantReady bool
-	}{
-		{name: "current", parentSHA: expectedHeadSHA, wantReady: true},
-		{name: "stale", parentSHA: strings.Repeat("a", 40)},
-	} {
-		t.Run(tt.name, func(t *testing.T) {
-			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-				if request.URL.Path != "/repos/acme/example/commits" || request.URL.Query().Get("sha") != "refs/pull/9/merge" {
-					http.NotFound(writer, request)
-					return
-				}
-				fmt.Fprintf(writer, `[{"sha":%q,"parents":[{"sha":%q}]}]`, mergeSHA, tt.parentSHA)
-			}))
-			defer server.Close()
-			client, err := NewClient(server.URL, server.Client())
-			if err != nil {
-				t.Fatal(err)
-			}
-			installation := &InstallationClient{client: client, token: "token"}
-
-			resolved, ready, err := installation.ResolvePullRequestRevision(context.Background(), "acme", "example", "refs/pull/9/merge", expectedHeadSHA)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if resolved != mergeSHA || ready != tt.wantReady {
-				t.Errorf("resolved = %q, ready = %v", resolved, ready)
-			}
-		})
+func TestResolveMergeBase(t *testing.T) {
+	baseSHA := strings.Repeat("a", 40)
+	headSHA := strings.Repeat("b", 40)
+	mergeBaseSHA := strings.Repeat("c", 40)
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/repos/acme/example/compare/"+baseSHA+"..."+headSHA || request.URL.Query().Get("per_page") != "1" {
+			http.NotFound(writer, request)
+			return
+		}
+		fmt.Fprintf(writer, `{"merge_base_commit":{"sha":%q}}`, mergeBaseSHA)
+	}))
+	defer server.Close()
+	client, err := NewClient(server.URL, server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	installation := &InstallationClient{client: client, token: "token"}
+	got, err := installation.ResolveMergeBase(context.Background(), "acme", "example", baseSHA, headSHA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != mergeBaseSHA {
+		t.Fatalf("merge base = %q, want %q", got, mergeBaseSHA)
 	}
 }
 

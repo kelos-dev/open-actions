@@ -58,10 +58,7 @@ type Repository struct {
 }
 
 type repositoryCommit struct {
-	SHA     string `json:"sha"`
-	Parents []struct {
-		SHA string `json:"sha"`
-	} `json:"parents"`
+	SHA string `json:"sha"`
 }
 
 // InstallationPermissions selects the repository permissions for a scoped
@@ -305,19 +302,23 @@ func (c *InstallationClient) resolveRevision(ctx context.Context, owner, reposit
 	return commit, nil
 }
 
-// ResolvePullRequestRevision resolves a pull request merge ref and reports
-// whether its merge commit includes the expected head commit.
-func (c *InstallationClient) ResolvePullRequestRevision(ctx context.Context, owner, repository, revision, headSHA string) (string, bool, error) {
-	commit, err := c.resolveRevision(ctx, owner, repository, revision)
-	if err != nil {
-		return "", false, err
+// ResolveMergeBase returns the common ancestor selected by GitHub for two
+// commits in one repository.
+func (c *InstallationClient) ResolveMergeBase(ctx context.Context, owner, repository, baseSHA, headSHA string) (string, error) {
+	identity := fmt.Sprintf("resolve merge base for %s and %s from %s/%s", baseSHA, headSHA, owner, repository)
+	requestPath := "repos/" + owner + "/" + repository + "/compare/" + baseSHA + "..." + headSHA
+	response := struct {
+		MergeBaseCommit repositoryCommit `json:"merge_base_commit"`
+	}{}
+	if err := c.client.doJSONWithQuery(ctx, http.MethodGet, requestPath, url.Values{"per_page": []string{"1"}}, c.token, &response); err != nil {
+		return "", fmt.Errorf("%s: %w", identity, err)
 	}
-	for _, parent := range commit.Parents {
-		if parent.SHA == headSHA {
-			return commit.SHA, true, nil
-		}
+	sha := response.MergeBaseCommit.SHA
+	decoded, err := hex.DecodeString(sha)
+	if err != nil || len(decoded) != gitSHA1Bytes || sha != strings.ToLower(sha) {
+		return "", fmt.Errorf("%s: GitHub returned invalid commit SHA %q", identity, sha)
 	}
-	return commit.SHA, false, nil
+	return sha, nil
 }
 
 // CreateCheckRun creates a check run for a repository commit.

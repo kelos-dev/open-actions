@@ -45,6 +45,9 @@ spec:
               containerPort: 8081
             - name: metrics
               containerPort: 8082
+          volumeMounts:
+            - name: temporary
+              mountPath: /tmp
           readinessProbe:
             httpGet:
               path: /readyz
@@ -69,4 +72,7 @@ spec:
             capabilities:
               drop: [ALL]
             readOnlyRootFilesystem: true
+      volumes:
+        - name: temporary
+          emptyDir: {}
       terminationGracePeriodSeconds: 10

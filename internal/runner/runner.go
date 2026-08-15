@@ -23,7 +23,7 @@ import (
 
 const (
 	minimumPlanVersion = 1
-	PlanVersion        = 4
+	PlanVersion        = 5
 	ContainerName      = "runner"
 )
 
@@ -99,11 +99,14 @@ type EventRepository struct {
 }
 
 type Revision struct {
-	SHA     string `json:"sha"`
-	Ref     string `json:"ref"`
-	RefName string `json:"refName"`
-	HeadRef string `json:"headRef,omitempty"`
-	BaseRef string `json:"baseRef,omitempty"`
+	SHA          string `json:"sha"`
+	HeadSHA      string `json:"headSHA,omitempty"`
+	BaseSHA      string `json:"baseSHA,omitempty"`
+	MergeBaseSHA string `json:"mergeBaseSHA,omitempty"`
+	Ref          string `json:"ref"`
+	RefName      string `json:"refName"`
+	HeadRef      string `json:"headRef,omitempty"`
+	BaseRef      string `json:"baseRef,omitempty"`
 }
 
 type Step struct {
@@ -209,7 +212,27 @@ func LoadPlan(path string) (*Plan, error) {
 	if plan.Repository.ID < 1 || plan.Repository.Owner == "" || plan.Repository.Name == "" || plan.Repository.ServerURL == "" || plan.Repository.APIURL == "" || plan.Repository.ActionCloneBaseURL == "" || plan.Event.Name == "" || !validEventDeliveryID(plan.Event) || !validInputValues(plan.Inputs) || plan.Revision.SHA == "" || plan.Revision.Ref == "" || plan.Revision.RefName == "" || plan.WorkflowName == "" || plan.JobID == "" || len(plan.Steps) == 0 {
 		return nil, errors.New("job plan is incomplete")
 	}
+	if plan.Version >= 5 && plan.Event.Name == "pull_request" {
+		hasIntegrationRevision := plan.Revision.BaseSHA != "" || plan.Revision.MergeBaseSHA != ""
+		invalidHeadSHA := plan.Revision.HeadSHA != "" && !validGitSHA(plan.Revision.HeadSHA)
+		incompleteIntegrationRevision := hasIntegrationRevision && (!validGitSHA(plan.Revision.HeadSHA) || !validGitSHA(plan.Revision.BaseSHA) || !validGitSHA(plan.Revision.MergeBaseSHA))
+		if !validGitSHA(plan.Revision.SHA) || invalidHeadSHA || incompleteIntegrationRevision {
+			return nil, errors.New("job plan pull request revision is incomplete")
+		}
+	}
 	return plan, nil
+}
+
+func validGitSHA(value string) bool {
+	if len(value) != 40 {
+		return false
+	}
+	for _, character := range value {
+		if character < '0' || character > '9' && character < 'a' || character > 'f' {
+			return false
+		}
+	}
+	return true
 }
 
 func validInputValues(inputs map[string]any) bool {
@@ -493,6 +516,8 @@ func githubPullRequestEvent(plan *Plan) map[string]any {
 	base := map[string]any{"ref": plan.Event.PullRequest.BaseRef}
 	if plan.Event.Name == "pull_request_target" {
 		base["sha"] = plan.Revision.SHA
+	} else if plan.Event.Name == "pull_request" && plan.Revision.BaseSHA != "" {
+		base["sha"] = plan.Revision.BaseSHA
 	}
 	pullRequest := map[string]any{
 		"number": plan.Event.PullRequest.Number, "body": plan.Event.PullRequest.Body, "html_url": plan.Event.PullRequest.HTMLURL,

@@ -557,15 +557,16 @@ func TestEvaluateConcurrencyUsesPullRequestMetadata(t *testing.T) {
 	}
 }
 
-func TestEvaluateConcurrencyUsesPullRequestMergeRevision(t *testing.T) {
-	definition := &Definition{Name: "CI", Concurrency: Concurrency{Group: "pr-${{ github.event.pull_request.merge_commit_sha }}"}}
+func TestEvaluateConcurrencyUsesPullRequestIntegrationRevision(t *testing.T) {
+	definition := &Definition{Name: "CI", Concurrency: Concurrency{Group: "pr-${{ github.event.pull_request.merge_commit_sha }}-${{ github.event.pull_request.base.sha }}"}}
 	sha := strings.Repeat("a", 40)
-	group, _, err := EvaluateConcurrency(definition, Event{Name: "pull_request", SHA: sha, PullRequest: &PullRequest{Number: 42}}, nil)
+	baseSHA := strings.Repeat("b", 40)
+	group, _, err := EvaluateConcurrency(definition, Event{Name: "pull_request", SHA: sha, BaseSHA: baseSHA, PullRequest: &PullRequest{Number: 42}}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if group != "pr-"+sha {
-		t.Fatalf("group = %q, want %q", group, "pr-"+sha)
+	if group != "pr-"+sha+"-"+baseSHA {
+		t.Fatalf("group = %q, want %q", group, "pr-"+sha+"-"+baseSHA)
 	}
 }
 

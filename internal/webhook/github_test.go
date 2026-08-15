@@ -97,10 +97,11 @@ func TestNormalizePullRequestRevisions(t *testing.T) {
 		wantHeadSHA string
 		wantError   bool
 	}{
-		{name: "open mergeable resolves test merge revision", action: "synchronize", state: "open", mergeable: &mergeable, mergeSHA: strings.Repeat("a", 40), wantSupport: true, wantRef: "refs/pull/42/merge", wantRefName: "42/merge", wantResolve: "refs/pull/42/merge", wantHeadSHA: headSHA},
+		{name: "open mergeable pins integration inputs", action: "synchronize", state: "open", mergeable: &mergeable, mergeSHA: strings.Repeat("a", 40), wantSupport: true, wantRef: "refs/pull/42/merge", wantRefName: "42/merge", wantHeadSHA: headSHA},
 		{name: "open conflicted runs trusted workflow", action: "synchronize", state: "open", mergeable: &conflicted, mergeSHA: strings.Repeat("b", 40), wantSupport: true, wantRef: "refs/pull/42/merge", wantRefName: "42/merge"},
-		{name: "open merge result unavailable", action: "opened", state: "open", mergeable: &mergeable, wantSupport: true, wantRef: "refs/pull/42/merge", wantRefName: "42/merge", wantResolve: "refs/pull/42/merge", wantHeadSHA: headSHA},
+		{name: "open merge result unavailable", action: "opened", state: "open", mergeable: &mergeable, wantSupport: true, wantRef: "refs/pull/42/merge", wantRefName: "42/merge", wantHeadSHA: headSHA},
 		{name: "closed unmerged", action: "closed", state: "closed", mergeable: &mergeable, mergeSHA: strings.Repeat("c", 40), wantSupport: true, wantRef: "refs/pull/42/merge", wantRefName: "42/merge", wantSHA: strings.Repeat("c", 40)},
+		{name: "closed unmerged non-closed activity", action: "labeled", state: "closed", mergeable: &mergeable, mergeSHA: strings.Repeat("c", 40), wantSupport: true, wantRef: "refs/pull/42/merge", wantRefName: "42/merge", wantSHA: strings.Repeat("c", 40)},
 		{name: "closed unmerged without revision runs trusted workflow", action: "closed", state: "closed", mergeable: &mergeable, wantSupport: true, wantRef: "refs/pull/42/merge", wantRefName: "42/merge"},
 		{name: "closed merged", action: "closed", state: "closed", merged: true, mergeable: &conflicted, mergeSHA: strings.Repeat("d", 40), wantSupport: true, wantRef: "refs/heads/main", wantRefName: "main", wantSHA: strings.Repeat("d", 40)},
 		{name: "merged payload with non-closed activity", action: "synchronize", state: "closed", merged: true, mergeable: &conflicted, mergeSHA: strings.Repeat("e", 40), wantError: true},
