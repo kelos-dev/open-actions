@@ -13,7 +13,7 @@ const loginPageTemplate = `<!doctype html>
 <body>
   <main class="shell">
     <div class="mark" aria-hidden="true">OA</div>
-    <h1>Sign in to Open Actions</h1>
+    <h1>Administrator sign in</h1>
     <form class="card" id="login">
       <p class="hint">Use the administrator token configured for this Console.</p>
       <label for="token">Administrator token</label>
@@ -21,14 +21,14 @@ const loginPageTemplate = `<!doctype html>
       <button type="submit">Sign in</button>
       <p id="error" role="alert"></p>
     </form>
-    <p class="footer">Workflow runs and live runner logs</p>
+    <p class="footer">Project Secret management</p>
   </main>
   <script>
     const form=document.getElementById('login');const error=document.getElementById('error');const button=form.querySelector('button');
     form.addEventListener('submit',async event=>{event.preventDefault();error.textContent='';button.disabled=true;
       try{const response=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({token:form.token.value})});
         if(!response.ok){error.textContent='The token is invalid.';return}
-        const next=new URLSearchParams(location.search).get('next');location.assign(next&&(next.startsWith('/runs/')||next==='/projects'||next.startsWith('/projects/'))?next:'/');
+        const next=new URLSearchParams(location.search).get('next');location.assign(next&&(next==='/projects'||next.startsWith('/projects/'))?next:'/projects');
       }catch(_){error.textContent='The Console is unavailable.'}finally{button.disabled=false}
     });
   </script>
@@ -110,18 +110,20 @@ const projectPageTemplate = `<!doctype html>
     </dl>
     <section class="panel" aria-label="Workflow secrets">
       <h2>Workflow secrets</h2>
-      <p class="hint">Secret values are write-only. Existing values are never returned to the browser; submitting an existing name replaces its value.</p>
-      {{if .CanManageSecrets}}
+      <p class="hint">Secret values are write-only. Existing values are never returned to the browser.</p>
+      {{if .CanReadSecrets}}
         {{if .SecretMissing}}<p class="notice">The referenced Secret does not exist. Adding the first value will create it.</p>{{end}}
         <ul class="secret-list">
-          {{range .SecretNames}}<li class="secret-row"><code>{{.}}</code><form method="post" action="{{$.SecretsURL}}" onsubmit="return confirm('Delete this workflow secret?')"><input type="hidden" name="csrf" value="{{$.CSRFToken}}"><input type="hidden" name="action" value="delete"><input type="hidden" name="name" value="{{.}}"><button class="delete" type="submit">Delete</button></form></li>{{else}}<li class="empty">No workflow secrets are configured.</li>{{end}}
+          {{range .SecretNames}}<li class="secret-row"><code>{{.}}</code>{{if $.CanManageSecrets}}<form method="post" action="{{$.SecretsURL}}" onsubmit="return confirm('Delete this workflow secret?')"><input type="hidden" name="csrf" value="{{$.CSRFToken}}"><input type="hidden" name="action" value="delete"><input type="hidden" name="name" value="{{.}}"><button class="delete" type="submit">Delete</button></form>{{end}}</li>{{else}}<li class="empty">No workflow secrets are configured.</li>{{end}}
         </ul>
-        <form class="form" method="post" action="{{.SecretsURL}}">
-          <input type="hidden" name="csrf" value="{{.CSRFToken}}"><input type="hidden" name="action" value="set">
-          <div class="field"><label for="secret-name">Name</label><input id="secret-name" name="name" pattern="[A-Za-z_][A-Za-z0-9_]*" maxlength="255" autocomplete="off" required></div>
-          <div class="field"><label for="secret-value">New value</label><input id="secret-value" name="value" type="password" autocomplete="new-password" required></div>
-          <button type="submit">Add or replace</button>
-        </form>
+        {{if .CanManageSecrets}}
+          <form class="form" method="post" action="{{.SecretsURL}}">
+            <input type="hidden" name="csrf" value="{{.CSRFToken}}"><input type="hidden" name="action" value="set">
+            <div class="field"><label for="secret-name">Name</label><input id="secret-name" name="name" pattern="[A-Za-z_][A-Za-z0-9_]*" maxlength="255" autocomplete="off" required></div>
+            <div class="field"><label for="secret-value">New value</label><input id="secret-value" name="value" type="password" autocomplete="new-password" required></div>
+            <button type="submit">Add or replace</button>
+          </form>
+        {{else}}<p class="notice"><a href="{{.LoginURL}}">Sign in as an administrator</a> to add, replace, or delete workflow secrets.</p>{{end}}
       {{else}}<p class="notice">{{.ManagementNotice}}</p>{{end}}
     </section>
   </main>

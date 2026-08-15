@@ -37,9 +37,12 @@ GitHub Enterprise API path such as `/api/v3`. `--github-server-url` defaults to
 defaults to `https://github.com` and is used only to fetch external action
 repositories. The controller's optional `--console-url` adds Console links to
 GitHub Check Runs. The Console serves HTTP on `--bind-address` (default
-`:8080`) and requires `--token-file`. Set `--secure-cookie` when it is served
-through HTTPS. The Helm chart configures both authentication flags from its
-configured Secret and `console.publicURL`.
+`:8080`) and serves its read-only pages without authentication. Anyone who can
+reach the Console can read Project and workflow metadata and runner logs. The
+required `--token-file` authenticates Project Secret management. Set
+`--secure-cookie` when the Console is served through HTTPS. The Helm chart
+configures the administrator token and cookie security from its configured
+Secret and `console.publicURL`.
 
 The Console landing page lists up to 100 WorkflowRuns across all namespaces,
 newest first, and links to each run's details and jobs. The Console presents
@@ -55,10 +58,10 @@ bold, dim, italic, underline, and strike-through text. Other CSI control
 sequences are discarded. Log lines larger than 256 KiB are truncated so a
 workflow cannot retain unbounded Console memory.
 
-The authenticated Projects page lists Project configuration across all
-namespaces. A Project detail page lists the names, but never the values, of keys
-in its referenced workflow Secret. The administrator token can add, replace,
-and delete those keys only when the Project is in the Console's
+The Projects page lists Project configuration across all namespaces. A Project
+detail page lists the names, but never the values, of keys in its referenced
+workflow Secret. An administrator can sign in with the Console token to add,
+replace, and delete those keys only when the Project is in the Console's
 `--secret-management-namespace`. The Helm chart sets that namespace to its
 release namespace and grants the Console `get`, `create`, and `update` access to
 Secrets only there. Direct Kubernetes clients and external secret controllers

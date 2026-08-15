@@ -59,18 +59,33 @@ func (s *testLogSource) Stream(context.Context, string, string) (io.ReadCloser, 
 	return io.NopCloser(strings.NewReader(s.logs)), nil
 }
 
-func TestConsoleAuthenticatesWithStaticTokenAndStreamsLogs(t *testing.T) {
+func TestConsoleServesWorkflowRunsAndLogsWithoutAuthentication(t *testing.T) {
 	handler := newTestHandler(t, true)
 	runURL := "/runs/default/ci"
 
-	unauthenticated := httptest.NewRecorder()
-	handler.ServeHTTP(unauthenticated, httptest.NewRequest(http.MethodGet, runURL, nil))
-	if unauthenticated.Code != http.StatusFound || unauthenticated.Header().Get("Location") != "/login?next=%2Fruns%2Fdefault%2Fci" {
-		t.Fatalf("unauthenticated response = %d, %q", unauthenticated.Code, unauthenticated.Header().Get("Location"))
+	runResponse := httptest.NewRecorder()
+	handler.ServeHTTP(runResponse, httptest.NewRequest(http.MethodGet, runURL, nil))
+	if runResponse.Code != http.StatusOK || !strings.Contains(runResponse.Body.String(), "CI") || !strings.Contains(runResponse.Body.String(), "build") || !strings.Contains(runResponse.Body.String(), "Workflow run Queued") {
+		t.Fatalf("run page = %d, %q", runResponse.Code, runResponse.Body.String())
 	}
 
+	logResponse := httptest.NewRecorder()
+	handler.ServeHTTP(logResponse, httptest.NewRequest(http.MethodGet, runURL+"/jobs/build", nil))
+	if logResponse.Code != http.StatusOK || !strings.Contains(logResponse.Body.String(), "Show debug") || !strings.Contains(logResponse.Body.String(), "Show timestamps") {
+		t.Fatalf("log page = %d, %q", logResponse.Code, logResponse.Body.String())
+	}
+
+	streamResponse := httptest.NewRecorder()
+	handler.ServeHTTP(streamResponse, httptest.NewRequest(http.MethodGet, runURL+"/jobs/build/stream", nil))
+	if streamResponse.Code != http.StatusOK || !strings.Contains(streamResponse.Body.String(), "id: 1\nevent: log") || !strings.Contains(streamResponse.Body.String(), "build output") {
+		t.Fatalf("log stream = %d, %q", streamResponse.Code, streamResponse.Body.String())
+	}
+}
+
+func TestConsoleCreatesAdministratorSession(t *testing.T) {
+	handler := newTestHandler(t, true)
 	loginPage := httptest.NewRecorder()
-	handler.ServeHTTP(loginPage, httptest.NewRequest(http.MethodGet, unauthenticated.Header().Get("Location"), nil))
+	handler.ServeHTTP(loginPage, httptest.NewRequest(http.MethodGet, "/login", nil))
 	if loginPage.Code != http.StatusOK || !strings.Contains(loginPage.Body.String(), "administrator token") {
 		t.Fatalf("login page = %d, %q", loginPage.Code, loginPage.Body.String())
 	}
@@ -91,28 +106,12 @@ func TestConsoleAuthenticatesWithStaticTokenAndStreamsLogs(t *testing.T) {
 		t.Fatalf("session cookie = %#v", sessionCookie)
 	}
 
-	runRequest := httptest.NewRequest(http.MethodGet, runURL, nil)
-	runRequest.AddCookie(sessionCookie)
-	runResponse := httptest.NewRecorder()
-	handler.ServeHTTP(runResponse, runRequest)
-	if runResponse.Code != http.StatusOK || !strings.Contains(runResponse.Body.String(), "CI") || !strings.Contains(runResponse.Body.String(), "build") || !strings.Contains(runResponse.Body.String(), "Workflow run Queued") {
-		t.Fatalf("run page = %d, %q", runResponse.Code, runResponse.Body.String())
-	}
-
-	logRequest := httptest.NewRequest(http.MethodGet, runURL+"/jobs/build", nil)
-	logRequest.AddCookie(sessionCookie)
-	logResponse := httptest.NewRecorder()
-	handler.ServeHTTP(logResponse, logRequest)
-	if logResponse.Code != http.StatusOK || !strings.Contains(logResponse.Body.String(), "Show debug") || !strings.Contains(logResponse.Body.String(), "Show timestamps") {
-		t.Fatalf("log page = %d, %q", logResponse.Code, logResponse.Body.String())
-	}
-
-	streamRequest := httptest.NewRequest(http.MethodGet, runURL+"/jobs/build/stream", nil)
-	streamRequest.AddCookie(sessionCookie)
-	streamResponse := httptest.NewRecorder()
-	handler.ServeHTTP(streamResponse, streamRequest)
-	if streamResponse.Code != http.StatusOK || !strings.Contains(streamResponse.Body.String(), "id: 1\nevent: log") || !strings.Contains(streamResponse.Body.String(), "build output") {
-		t.Fatalf("log stream = %d, %q", streamResponse.Code, streamResponse.Body.String())
+	projectRequest := httptest.NewRequest(http.MethodGet, "/projects/default/project", nil)
+	projectRequest.AddCookie(sessionCookie)
+	projectResponse := httptest.NewRecorder()
+	handler.ServeHTTP(projectResponse, projectRequest)
+	if projectResponse.Code != http.StatusOK || !strings.Contains(projectResponse.Body.String(), "Add or replace") || !strings.Contains(projectResponse.Body.String(), ">Delete</button>") {
+		t.Fatalf("authenticated Project page = %d, %q", projectResponse.Code, projectResponse.Body.String())
 	}
 }
 
@@ -150,16 +149,8 @@ func TestConsoleResumesReconnectedLogStream(t *testing.T) {
 func TestConsoleMainPageListsWorkflowRunsNewestFirst(t *testing.T) {
 	handler := newTestHandler(t, false)
 
-	unauthenticated := httptest.NewRecorder()
-	handler.ServeHTTP(unauthenticated, httptest.NewRequest(http.MethodGet, "/", nil))
-	if unauthenticated.Code != http.StatusFound || unauthenticated.Header().Get("Location") != "/login?next=%2F" {
-		t.Fatalf("unauthenticated response = %d, %q", unauthenticated.Code, unauthenticated.Header().Get("Location"))
-	}
-
-	request := httptest.NewRequest(http.MethodGet, "/", nil)
-	request.Header.Set("Authorization", "Bearer "+testConsoleToken)
 	response := httptest.NewRecorder()
-	handler.ServeHTTP(response, request)
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/", nil))
 	body := response.Body.String()
 	if response.Code != http.StatusOK || !strings.Contains(body, "Workflow runs") || !strings.Contains(body, `href="/runs/default/ci"`) || !strings.Contains(body, "acme/example") || !strings.Contains(body, "default/project") {
 		t.Fatalf("main page = %d, %q", response.Code, body)
@@ -212,11 +203,23 @@ func TestConsoleManagesReferencedProjectSecretWithoutDisplayingValues(t *testing
 	handler := newTestHandler(t, false)
 
 	projectsRequest := httptest.NewRequest(http.MethodGet, "/projects", nil)
-	projectsRequest.Header.Set("Authorization", "Bearer "+testConsoleToken)
 	projectsResponse := httptest.NewRecorder()
 	handler.ServeHTTP(projectsResponse, projectsRequest)
 	if projectsResponse.Code != http.StatusOK || !strings.Contains(projectsResponse.Body.String(), `href="/projects/default/project"`) {
 		t.Fatalf("projects page = %d, %q", projectsResponse.Code, projectsResponse.Body.String())
+	}
+
+	readRequest := httptest.NewRequest(http.MethodGet, "/projects/default/project", nil)
+	readResponse := httptest.NewRecorder()
+	handler.ServeHTTP(readResponse, readRequest)
+	readBody := readResponse.Body.String()
+	if readResponse.Code != http.StatusOK || !strings.Contains(readBody, "DEPLOY_TOKEN") || !strings.Contains(readBody, "Sign in as an administrator") {
+		t.Fatalf("read-only Project page = %d, %q", readResponse.Code, readBody)
+	}
+	for _, privateContent := range []string{"existing-secret-value", "Add or replace", ">Delete</button>", handler.csrfToken} {
+		if strings.Contains(readBody, privateContent) {
+			t.Fatalf("read-only Project page exposed %q: %s", privateContent, readBody)
+		}
 	}
 
 	detailsRequest := httptest.NewRequest(http.MethodGet, "/projects/default/project", nil)
@@ -359,13 +362,13 @@ func TestConsoleReportsProjectSecretCountLimit(t *testing.T) {
 	}
 }
 
-func TestConsoleRedirectsAuthenticatedLoginToMainPage(t *testing.T) {
+func TestConsoleRedirectsAuthenticatedLoginToProjectsPage(t *testing.T) {
 	handler := newTestHandler(t, false)
 	request := httptest.NewRequest(http.MethodGet, "/login", nil)
 	request.Header.Set("Authorization", "Bearer "+testConsoleToken)
 	response := httptest.NewRecorder()
 	handler.ServeHTTP(response, request)
-	if response.Code != http.StatusFound || response.Header().Get("Location") != "/" {
+	if response.Code != http.StatusFound || response.Header().Get("Location") != "/projects" {
 		t.Fatalf("response = %d, %q", response.Code, response.Header().Get("Location"))
 	}
 }
@@ -419,25 +422,22 @@ func TestConsoleStructuresGitHubActionsLogs(t *testing.T) {
 	}
 }
 
-func TestConsoleAcceptsBearerToken(t *testing.T) {
+func TestConsoleRequiresAuthenticationForProjectSecretUpdates(t *testing.T) {
 	handler := newTestHandler(t, false)
-	request := httptest.NewRequest(http.MethodGet, "/runs/default/ci", nil)
-	request.Header.Set("Authorization", "Bearer "+testConsoleToken)
+	form := url.Values{"csrf": {handler.csrfToken}, "action": {"set"}, "name": {"DEPLOY_TOKEN"}, "value": {"replacement-value"}}
+	request := httptest.NewRequest(http.MethodPost, "/projects/default/project/secrets", strings.NewReader(form.Encode()))
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	response := httptest.NewRecorder()
 	handler.ServeHTTP(response, request)
-	if response.Code != http.StatusOK {
-		t.Fatalf("bearer response = %d, %q", response.Code, response.Body.String())
-	}
-}
-
-func TestConsoleRejectsInvalidSessionCookie(t *testing.T) {
-	handler := newTestHandler(t, false)
-	request := httptest.NewRequest(http.MethodGet, "/runs/default/ci", nil)
-	request.AddCookie(&http.Cookie{Name: sessionCookieName, Value: "invalid"})
-	response := httptest.NewRecorder()
-	handler.ServeHTTP(response, request)
-	if response.Code != http.StatusFound || !strings.HasPrefix(response.Header().Get("Location"), "/login?next=") {
+	if response.Code != http.StatusFound || response.Header().Get("Location") != "/login?next=%2Fprojects%2Fdefault%2Fproject" {
 		t.Fatalf("response = %d, %q", response.Code, response.Header().Get("Location"))
+	}
+	secret := &corev1.Secret{}
+	if err := handler.client.Get(context.Background(), client.ObjectKey{Namespace: "default", Name: "project-secrets"}, secret); err != nil {
+		t.Fatal(err)
+	}
+	if string(secret.Data["DEPLOY_TOKEN"]) != "existing-secret-value" {
+		t.Fatalf("unauthenticated request updated Secret: %#v", secret.Data)
 	}
 }
 
@@ -454,15 +454,12 @@ func TestNewRequiresToken(t *testing.T) {
 }
 
 func TestSafeNextRejectsExternalURLs(t *testing.T) {
-	for _, value := range []string{"https://example.com/runs/default/ci", "//example.com/runs/default/ci", "/login"} {
+	for _, value := range []string{"https://example.com/projects/default/project", "//example.com/projects/default/project", "/", "/login", "/runs/default/ci"} {
 		if next := safeNext(value); next != "" {
 			t.Fatalf("safeNext(%q) = %q", value, next)
 		}
 	}
-	if next := safeNext("/runs/default/ci?tab=logs"); next != "/runs/default/ci?tab=logs" {
-		t.Fatalf("safeNext() = %q", next)
-	}
-	if next := safeNext("/"); next != "/" {
+	if next := safeNext("/projects/default/project?tab=secrets"); next != "/projects/default/project?tab=secrets" {
 		t.Fatalf("safeNext() = %q", next)
 	}
 }

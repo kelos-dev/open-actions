@@ -64,7 +64,7 @@ type Config struct {
 	Logger                    *slog.Logger
 }
 
-// Handler serves an authenticated workflow run overview, details, and logs.
+// Handler serves workflow run information and authenticated Project Secret management.
 type Handler struct {
 	client                    client.Client
 	logs                      LogSource
@@ -134,8 +134,10 @@ type projectPageData struct {
 	SecretName        string
 	SecretNames       []string
 	SecretMissing     bool
+	CanReadSecrets    bool
 	CanManageSecrets  bool
 	ManagementNotice  string
+	LoginURL          string
 	CSRFToken         string
 }
 
@@ -228,7 +230,7 @@ func New(config Config) (*Handler, error) {
 	}, nil
 }
 
-// ServeHTTP routes authenticated Console requests and token login requests.
+// ServeHTTP routes public read requests and authenticated administration requests.
 func (h *Handler) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	writer.Header().Set("Cache-Control", "no-store")
 	writer.Header().Set("Referrer-Policy", "no-referrer")
@@ -241,12 +243,13 @@ func (h *Handler) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 		h.login(writer, request)
 		return
 	}
-	if !h.authenticated(request) {
-		http.Redirect(writer, request, "/login?next="+url.QueryEscape(request.URL.RequestURI()), http.StatusFound)
-		return
-	}
 	parts := splitPath(request.URL.Path)
 	if request.Method == http.MethodPost && len(parts) == 4 && parts[0] == "projects" && parts[3] == "secrets" {
+		if !h.authenticated(request) {
+			next := "/projects/" + url.PathEscape(parts[1]) + "/" + url.PathEscape(parts[2])
+			http.Redirect(writer, request, "/login?next="+url.QueryEscape(next), http.StatusFound)
+			return
+		}
 		h.updateProjectSecret(writer, request, parts[1], parts[2])
 		return
 	}
@@ -308,7 +311,7 @@ func (h *Handler) serveLoginPage(writer http.ResponseWriter, request *http.Reque
 	if h.authenticated(request) {
 		next := safeNext(request.URL.Query().Get("next"))
 		if next == "" {
-			next = "/"
+			next = "/projects"
 		}
 		http.Redirect(writer, request, next, http.StatusFound)
 		return
@@ -454,7 +457,7 @@ func (h *Handler) projectDetails(writer http.ResponseWriter, request *http.Reque
 	data := projectPageData{
 		Name: project.Name, Namespace: project.Namespace, Status: status, StatusClass: statusClass, StatusMessage: statusMessage,
 		SecretsURL:        "/projects/" + url.PathEscape(project.Namespace) + "/" + url.PathEscape(project.Name) + "/secrets",
-		WorkflowDirectory: project.Spec.WorkflowDirectory, CSRFToken: h.csrfToken,
+		WorkflowDirectory: project.Spec.WorkflowDirectory,
 	}
 	if project.Spec.Source.GitHub != nil {
 		data.Installation = project.Spec.Source.GitHub.InstallationID
@@ -473,7 +476,13 @@ func (h *Handler) projectDetails(writer http.ResponseWriter, request *http.Reque
 		h.writeHTML(writer, h.projectPage, data)
 		return
 	}
-	data.CanManageSecrets = true
+	data.CanReadSecrets = true
+	data.CanManageSecrets = h.authenticated(request)
+	if data.CanManageSecrets {
+		data.CSRFToken = h.csrfToken
+	} else {
+		data.LoginURL = "/login?next=" + url.QueryEscape(request.URL.RequestURI())
+	}
 	secret := &corev1.Secret{}
 	if err := h.client.Get(request.Context(), types.NamespacedName{Namespace: project.Namespace, Name: data.SecretName}, secret); err != nil {
 		if apierrors.IsNotFound(err) {
@@ -922,7 +931,7 @@ func splitPath(value string) []string {
 
 func safeNext(value string) string {
 	parsed, err := url.Parse(value)
-	if err != nil || parsed.IsAbs() || parsed.Host != "" || (parsed.Path != "/" && parsed.Path != "/projects" && !strings.HasPrefix(parsed.Path, "/projects/") && !strings.HasPrefix(parsed.Path, "/runs/")) {
+	if err != nil || parsed.IsAbs() || parsed.Host != "" || (parsed.Path != "/projects" && !strings.HasPrefix(parsed.Path, "/projects/")) {
 		return ""
 	}
 	return value
