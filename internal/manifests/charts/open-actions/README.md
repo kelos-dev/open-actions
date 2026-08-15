@@ -13,14 +13,15 @@ release does not delete Open Actions resources.
 The default Console URL supports access through `kubectl port-forward
 service/open-actions-console 8080:80 --namespace open-actions-system`. Set
 `console.publicURL` to the public HTTPS origin when exposing the Service. The
-chart creates and preserves an administrator token in the
-`open-actions-console-auth` Secret. Retrieve the `token` key and enter it on the
-Console login page. This token grants read access to every run, job, and runner
-Pod log visible to the Console, so protect it like any other administrator
-credential. The Console uses its own Deployment and ServiceAccount with
-read-only access to those resources. Set `console.enabled=false` to omit the
-Console. Set `console.secretName` to mount an externally managed Secret from the
-release namespace instead; `console.tokenKey` selects its token key.
+Console serves Project and workflow metadata and runner Pod logs without
+authentication, so expose it only to the intended audience. The chart creates
+and preserves an administrator token in the `open-actions-console-auth` Secret.
+Retrieve the `token` key and enter it on the Console login page to manage
+Project Secrets in the release namespace. The Console uses its own Deployment
+and ServiceAccount with read-only access to workflow resources. Set
+`console.enabled=false` to omit the Console. Set `console.secretName` to mount
+an externally managed Secret from the release namespace instead;
+`console.tokenKey` selects its token key.
 
 Generated WorkflowRuns omit `spec.ttlSecondsAfterFinished` by default and are
 retained indefinitely. Set `controller.workflowRunTTLSecondsAfterFinished` to
@@ -44,8 +45,8 @@ resources.
 | `console.enabled` | `true` | Deploy the Open Actions Console |
 | `console.replicas` | `1` | Console replica count |
 | `console.publicURL` | `http://localhost:8080` | Public Console URL used by GitHub Check Run links |
-| `console.secretName` | `""` | Existing Console authentication Secret; the chart creates `open-actions-console-auth` when empty |
-| `console.tokenKey` | `token` | Secret key containing the Console administrator token |
+| `console.secretName` | `""` | Existing Console administrator Secret; the chart creates `open-actions-console-auth` when empty |
+| `console.tokenKey` | `token` | Secret key containing the Project Secret management token |
 | `console.image.repository` | `ghcr.io/kelos-dev/open-actions-console` | Console image repository |
 | `console.image.tag` | `latest` | Console image tag |
 | `console.image.pullPolicy` | `IfNotPresent` | Console image pull policy |

@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
-	"net/http/cookiejar"
 	"net/url"
 	"strings"
 	"time"
@@ -26,7 +25,7 @@ var _ = Describe("Console", func() {
 		setupTestProject(true)
 	})
 
-	It("publishes a discoverable run, authenticates the user, and streams logs", func() {
+	It("accepts administrator login and serves run logs without authentication", func() {
 		ctx := context.Background()
 		run := &actionsv1alpha1.WorkflowRun{
 			ObjectMeta: metav1.ObjectMeta{Name: "console", Namespace: e2eNamespace},
@@ -112,7 +111,18 @@ var _ = Describe("Console", func() {
 			g.Expect(workflowJob.Name).NotTo(BeEmpty())
 		}, 30*time.Second, time.Second).Should(Succeed())
 
-		webClient := authenticateConsole(run)
+		webClient := &http.Client{Timeout: 30 * time.Second}
+		loginBody, err := json.Marshal(map[string]string{"token": consoleToken})
+		Expect(err).NotTo(HaveOccurred())
+		loginResponse, err := webClient.Post(consoleURL+"/api/login", "application/json", strings.NewReader(string(loginBody)))
+		Expect(err).NotTo(HaveOccurred())
+		Expect(loginResponse.StatusCode).To(Equal(http.StatusOK))
+		Expect(loginResponse.Cookies()).To(ContainElement(And(
+			WithTransform(func(cookie *http.Cookie) string { return cookie.Name }, Equal("open_actions_console_session")),
+			WithTransform(func(cookie *http.Cookie) bool { return cookie.HttpOnly }, BeTrue()),
+		)))
+		Expect(loginResponse.Body.Close()).To(Succeed())
+
 		runPath := "/runs/" + url.PathEscape(run.Namespace) + "/" + url.PathEscape(run.Name)
 		mainPage := getConsolePage(webClient, consoleURL+"/", http.StatusOK)
 		Expect(mainPage).To(ContainSubstring("Workflow runs"))
@@ -142,40 +152,6 @@ var _ = Describe("Console", func() {
 		Expect(stream).To(ContainSubstring("event: end"))
 	})
 })
-
-func authenticateConsole(run *actionsv1alpha1.WorkflowRun) *http.Client {
-	jar, err := cookiejar.New(nil)
-	Expect(err).NotTo(HaveOccurred())
-	webClient := &http.Client{
-		Jar:     jar,
-		Timeout: 30 * time.Second,
-		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
-			return http.ErrUseLastResponse
-		},
-	}
-	runPath := "/runs/" + url.PathEscape(run.Namespace) + "/" + url.PathEscape(run.Name)
-	response, err := webClient.Get(consoleURL + runPath)
-	Expect(err).NotTo(HaveOccurred())
-	Expect(response.StatusCode).To(Equal(http.StatusFound))
-	Expect(response.Body.Close()).To(Succeed())
-
-	loginURL, err := response.Location()
-	Expect(err).NotTo(HaveOccurred())
-	Expect(loginURL.Path).To(Equal("/login"))
-	Expect(loginURL.Query().Get("next")).To(Equal(runPath))
-	response, err = webClient.Get(loginURL.String())
-	Expect(err).NotTo(HaveOccurred())
-	Expect(response.StatusCode).To(Equal(http.StatusOK))
-	Expect(response.Body.Close()).To(Succeed())
-
-	body, err := json.Marshal(map[string]string{"token": consoleToken})
-	Expect(err).NotTo(HaveOccurred())
-	response, err = webClient.Post(consoleURL+"/api/login", "application/json", strings.NewReader(string(body)))
-	Expect(err).NotTo(HaveOccurred())
-	Expect(response.StatusCode).To(Equal(http.StatusOK))
-	Expect(response.Body.Close()).To(Succeed())
-	return webClient
-}
 
 func getConsolePage(webClient *http.Client, target string, status int) string {
 	response, err := webClient.Get(target)
