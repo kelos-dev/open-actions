@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"github.com/kelos-dev/open-actions/internal/actionref"
+	"github.com/kelos-dev/open-actions/internal/gitrepository"
 	"gopkg.in/yaml.v3"
 )
 
@@ -283,6 +284,10 @@ func (e *Executor) executeAction(ctx context.Context, state *executionState, ste
 	if err != nil {
 		return nil, err
 	}
+	integrationDirectory, integrate, err := configurePullRequestCheckout(invocation, state.plan, state.workspace)
+	if err != nil {
+		return nil, err
+	}
 	e.logger.Info("prepared external action", "action", step.Uses, "runtime", invocation.definition.Runs.Using)
 	e.logCommandNames("workflow step input", invocation.inputs)
 	var outputs map[string]string
@@ -302,6 +307,17 @@ func (e *Executor) executeAction(ctx context.Context, state *executionState, ste
 		if err := e.runJavaScriptHook(ctx, invocation, "main", invocation.definition.Runs.Main, state.temporaryDirectory, state.workspace, &state.environment); err != nil {
 			return invocation.outputs, err
 		}
+		if integrate {
+			gitRepository, err := gitrepository.NewClient(state.plan.Repository.ServerURL)
+			if err != nil {
+				return invocation.outputs, err
+			}
+			if err := gitRepository.IntegrateCheckout(ctx, integrationDirectory, state.plan.Repository.Owner, state.plan.Repository.Name, e.githubToken, state.plan.Revision.SHA, gitrepository.Revision{
+				BaseSHA: state.plan.Revision.BaseSHA, HeadSHA: state.plan.Revision.HeadSHA, MergeBaseSHA: state.plan.Revision.MergeBaseSHA,
+			}); err != nil {
+				return invocation.outputs, fmt.Errorf("construct pull request checkout: %w", err)
+			}
+		}
 		outputs = invocation.outputs
 	case "composite":
 		outputs, err = e.runComposite(ctx, state, invocation, depth+1, cancelled)
@@ -313,6 +329,29 @@ func (e *Executor) executeAction(ctx context.Context, state *executionState, ste
 	}
 	e.logCommandNames("workflow step output", outputs)
 	return outputs, nil
+}
+
+func configurePullRequestCheckout(invocation *actionInvocation, plan *Plan, workspace string) (string, bool, error) {
+	if plan.Event.Name != "pull_request" || plan.Revision.BaseSHA == "" || plan.Revision.MergeBaseSHA == "" || plan.Revision.HeadSHA == "" ||
+		!strings.EqualFold(invocation.reference.Owner, "actions") || !strings.EqualFold(invocation.reference.Repository, "checkout") {
+		return "", false, nil
+	}
+	repository := strings.TrimSpace(invocation.inputs["repository"])
+	currentRepository := plan.Repository.Owner + "/" + plan.Repository.Name
+	ref := strings.TrimSpace(invocation.inputs["ref"])
+	if (repository != "" && !strings.EqualFold(repository, currentRepository)) || (ref != "" && ref != plan.Revision.SHA) {
+		return "", false, nil
+	}
+	directory := workspace
+	if path := strings.TrimSpace(invocation.inputs["path"]); path != "" {
+		var err error
+		directory, err = withinDirectory(workspace, filepath.FromSlash(path))
+		if err != nil {
+			return "", false, fmt.Errorf("resolve pull request checkout path: %w", err)
+		}
+	}
+	invocation.inputs["ref"] = plan.Revision.HeadSHA
+	return directory, true, nil
 }
 
 func actionRuntimeExecutable(runtime string, environment []string) (string, error) {

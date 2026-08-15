@@ -546,6 +546,50 @@ func TestLoadPlanSupportsCompatibleVersions(t *testing.T) {
 	}
 }
 
+func TestLoadPlanValidatesVersionFivePullRequestRevision(t *testing.T) {
+	sha := strings.Repeat("a", 40)
+	for _, tt := range []struct {
+		name     string
+		action   string
+		revision Revision
+		wantErr  bool
+	}{
+		{name: "remote revision", revision: Revision{SHA: sha, Ref: "refs/pull/42/merge", RefName: "42/merge"}},
+		{name: "head revision", revision: Revision{SHA: sha, HeadSHA: strings.Repeat("b", 40), Ref: "refs/pull/42/merge", RefName: "42/merge"}},
+		{name: "integration revision", revision: Revision{SHA: sha, HeadSHA: strings.Repeat("b", 40), BaseSHA: strings.Repeat("c", 40), MergeBaseSHA: strings.Repeat("d", 40), Ref: "refs/pull/42/merge", RefName: "42/merge"}},
+		{name: "invalid execution SHA", revision: Revision{SHA: "invalid", Ref: "refs/pull/42/merge", RefName: "42/merge"}, wantErr: true},
+		{name: "invalid head SHA", revision: Revision{SHA: sha, HeadSHA: "invalid", Ref: "refs/pull/42/merge", RefName: "42/merge"}, wantErr: true},
+		{name: "invalid labeled revision", action: "labeled", revision: Revision{SHA: "invalid", HeadSHA: strings.Repeat("b", 40), Ref: "refs/pull/42/merge", RefName: "42/merge"}, wantErr: true},
+		{name: "base without merge base", revision: Revision{SHA: sha, HeadSHA: strings.Repeat("b", 40), BaseSHA: strings.Repeat("c", 40), Ref: "refs/pull/42/merge", RefName: "42/merge"}, wantErr: true},
+		{name: "integration without head", revision: Revision{SHA: sha, BaseSHA: strings.Repeat("c", 40), MergeBaseSHA: strings.Repeat("d", 40), Ref: "refs/pull/42/merge", RefName: "42/merge"}, wantErr: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			plan := testPlan()
+			action := tt.action
+			if action == "" {
+				action = "synchronize"
+			}
+			plan.Event = Event{Name: "pull_request", Action: action, DeliveryID: "delivery"}
+			plan.Revision = tt.revision
+			path := filepath.Join(t.TempDir(), "job.json")
+			data, err := json.Marshal(plan)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(path, data, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			_, err = LoadPlan(path)
+			if tt.wantErr && (err == nil || !strings.Contains(err.Error(), "pull request revision is incomplete")) {
+				t.Fatalf("LoadPlan() error = %v, want incomplete pull request revision", err)
+			}
+			if !tt.wantErr && err != nil {
+				t.Fatalf("LoadPlan() error = %v", err)
+			}
+		})
+	}
+}
+
 func TestExpressionContextsPreserveTriggerInputTypes(t *testing.T) {
 	plan := testPlan()
 	plan.Inputs = map[string]any{"enabled": false, "retries": float64(2)}
@@ -703,6 +747,37 @@ func TestActionCloneTokenIsLimitedToWorkflowRepository(t *testing.T) {
 	}
 }
 
+func TestConfigurePullRequestCheckoutUsesPinnedHead(t *testing.T) {
+	workspace := t.TempDir()
+	plan := testPlan()
+	plan.Event = Event{Name: "pull_request", Action: "synchronize"}
+	plan.Revision = Revision{
+		SHA: strings.Repeat("a", 40), HeadSHA: strings.Repeat("b", 40), BaseSHA: strings.Repeat("c", 40), MergeBaseSHA: strings.Repeat("d", 40),
+		Ref: "refs/pull/42/merge", RefName: "42/merge", HeadRef: "feature", BaseRef: "main",
+	}
+	invocation := &actionInvocation{
+		reference: actionref.Reference{Owner: "actions", Repository: "checkout", Ref: "v4"},
+		inputs:    map[string]string{"repository": "acme/example", "path": "source", "ref": ""},
+	}
+	directory, integrate, err := configurePullRequestCheckout(invocation, plan, workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !integrate || directory != filepath.Join(workspace, "source") || invocation.inputs["ref"] != plan.Revision.HeadSHA {
+		t.Fatalf("checkout integration = directory %q, integrate %v, inputs %#v", directory, integrate, invocation.inputs)
+	}
+
+	invocation.inputs["ref"] = plan.Revision.SHA
+	if _, integrate, err := configurePullRequestCheckout(invocation, plan, workspace); err != nil || !integrate || invocation.inputs["ref"] != plan.Revision.HeadSHA {
+		t.Fatalf("integration SHA checkout = integrate %v, inputs %#v, error %v", integrate, invocation.inputs, err)
+	}
+
+	invocation.inputs["ref"] = "release"
+	if _, integrate, err := configurePullRequestCheckout(invocation, plan, workspace); err != nil || integrate {
+		t.Fatalf("explicit checkout ref integration = %v, error = %v", integrate, err)
+	}
+}
+
 func TestGitHubEventDocumentContainsNormalizedContext(t *testing.T) {
 	pullRequest := &PullRequest{
 		Number: 42, Body: "Pull request body", HTMLURL: "https://github.com/contributor/example/pull/42",
@@ -735,6 +810,9 @@ func TestGitHubEventDocumentContainsNormalizedContext(t *testing.T) {
 		if event.PullRequest != nil {
 			plan.Revision.HeadRef = "feature"
 			plan.Revision.BaseRef = "main"
+		}
+		if event.Name == "pull_request" {
+			plan.Revision.BaseSHA = strings.Repeat("c", 40)
 		}
 		data, err := githubEventDocument(plan)
 		if err != nil {
@@ -770,8 +848,11 @@ func TestGitHubEventDocumentContainsNormalizedContext(t *testing.T) {
 			if event.Name == "pull_request_target" && base["sha"] != plan.Revision.SHA {
 				t.Fatalf("trusted target base SHA = %#v, want %q", base["sha"], plan.Revision.SHA)
 			}
-			if event.Name != "pull_request_target" && base["sha"] != nil {
-				t.Fatalf("non-target event exposes execution SHA as base SHA: %#v", pullRequestDocument)
+			if event.Name == "pull_request" && base["sha"] != plan.Revision.BaseSHA {
+				t.Fatalf("pull request base SHA = %#v, want %q", base["sha"], plan.Revision.BaseSHA)
+			}
+			if event.Name != "pull_request" && event.Name != "pull_request_target" && base["sha"] != nil {
+				t.Fatalf("review event exposes a base SHA: %#v", pullRequestDocument)
 			}
 			if event.Name == "pull_request" && pullRequestDocument["merge_commit_sha"] != plan.Revision.SHA {
 				t.Fatalf("pull request merge_commit_sha = %#v, want %q", pullRequestDocument["merge_commit_sha"], plan.Revision.SHA)

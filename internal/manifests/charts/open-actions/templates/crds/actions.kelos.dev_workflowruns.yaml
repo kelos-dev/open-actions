@@ -552,6 +552,13 @@ spec:
                                 && !self.contains(''/.'') && !self.endsWith(''.'')
                                 && !self.contains(''.lock/'') && !self.endsWith(''.lock'')
                                 && !self.contains(''@{'') && !self.matches(''^[0-9A-Fa-f]{40}$'')'
+                          baseSHA:
+                            description: |-
+                              BaseSHA is the pull request base commit used to construct the integration
+                              revision identified by SHA. When present, it is paired with MergeBaseSHA
+                              and HeadSHA for an open pull request.
+                            pattern: ^[0-9a-f]{40}$
+                            type: string
                           headRef:
                             description: |-
                               HeadRef is the pull request source branch name, when applicable to the
@@ -571,8 +578,14 @@ spec:
                           headSHA:
                             description: |-
                               HeadSHA is the pull request head commit used for GitHub check reporting.
-                              It may differ from SHA when the workflow executes a test merge commit.
+                              It may differ from SHA when the workflow executes an integration commit.
                               When absent, GitHub checks are reported on SHA.
+                            pattern: ^[0-9a-f]{40}$
+                            type: string
+                          mergeBaseSHA:
+                            description: |-
+                              MergeBaseSHA is the common ancestor used to construct the integration
+                              revision from BaseSHA and HeadSHA.
                             pattern: ^[0-9a-f]{40}$
                             type: string
                           ref:
@@ -618,6 +631,16 @@ spec:
                     - message: revision.headSHA may be specified only for pull_request
                         events
                       rule: '!has(self.revision.headSHA) || self.event.name == ''pull_request'''
+                    - message: revision.baseSHA and revision.mergeBaseSHA must be
+                        specified together
+                      rule: has(self.revision.baseSHA) == has(self.revision.mergeBaseSHA)
+                    - message: revision.headSHA must be specified when revision.baseSHA
+                        and revision.mergeBaseSHA are specified
+                      rule: '!has(self.revision.baseSHA) || has(self.revision.headSHA)'
+                    - message: revision.baseSHA and revision.mergeBaseSHA may be specified
+                        only for open pull_request events
+                      rule: '!has(self.revision.baseSHA) || (self.event.name == ''pull_request''
+                        && self.event.action != ''closed'')'
                     - message: push revision.ref must identify a branch or tag
                       rule: self.event.name != 'push' || self.revision.ref.startsWith('refs/heads/')
                         || self.revision.ref.startsWith('refs/tags/')

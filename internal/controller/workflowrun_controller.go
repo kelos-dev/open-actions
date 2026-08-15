@@ -15,6 +15,7 @@ import (
 	actionsv1alpha1 "github.com/kelos-dev/open-actions/api/v1alpha1"
 	workflowexpression "github.com/kelos-dev/open-actions/internal/expression"
 	githubclient "github.com/kelos-dev/open-actions/internal/github"
+	"github.com/kelos-dev/open-actions/internal/gitrepository"
 	"github.com/kelos-dev/open-actions/internal/projectvalue"
 	"github.com/kelos-dev/open-actions/internal/runner"
 	"github.com/kelos-dev/open-actions/internal/workflow"
@@ -80,6 +81,7 @@ type WorkflowRunReconciler struct {
 	client.Client
 	APIReader          client.Reader
 	GitHub             *githubclient.Client
+	GitRepository      *gitrepository.Client
 	GitHubAPIBase      string
 	GitHubServerURL    string
 	ActionCloneBaseURL string
@@ -235,13 +237,40 @@ func (r *WorkflowRunReconciler) reconcileWorkflowRun(ctx context.Context, run *a
 	if err != nil {
 		return r.planningFailed(ctx, run, "GitHubAuthenticationFailed", err, planningFailureRetry)
 	}
-	workflowData, err := installation.GetFile(ctx, githubSource.Repository.Owner, githubSource.Repository.Name, run.Spec.WorkflowPath, githubSource.Revision.SHA)
-	if err != nil {
-		disposition := planningFailureRetry
-		if githubAPIStatus(err, 404) {
-			disposition = planningFailureTerminal
+	var workflowData []byte
+	if githubSource.Revision.BaseSHA != "" {
+		mergedRepository, mergeErr := r.GitRepository.Merge(ctx, githubSource.Repository.Owner, githubSource.Repository.Name, installation.Token(), gitrepository.Revision{
+			BaseSHA: githubSource.Revision.BaseSHA, HeadSHA: githubSource.Revision.HeadSHA, MergeBaseSHA: githubSource.Revision.MergeBaseSHA,
+		})
+		if mergeErr != nil {
+			disposition := planningFailureRetry
+			conflict := &gitrepository.ConflictError{}
+			if errors.As(mergeErr, &conflict) {
+				disposition = planningFailureTerminal
+			}
+			return r.planningFailed(ctx, run, "IntegrationRevisionFailed", fmt.Errorf("construct integration revision for WorkflowRun %q: %w", run.Name, mergeErr), disposition)
 		}
-		return r.planningFailed(ctx, run, "WorkflowFetchFailed", err, disposition)
+		defer mergedRepository.Close()
+		if mergedRepository.SHA != githubSource.Revision.SHA {
+			return r.planningFailed(ctx, run, "IntegrationRevisionFailed", fmt.Errorf("constructed integration revision for WorkflowRun %q is %s, want %s", run.Name, mergedRepository.SHA, githubSource.Revision.SHA), planningFailureTerminal)
+		}
+		workflowData, err = mergedRepository.ReadFile(ctx, run.Spec.WorkflowPath)
+		if err != nil {
+			disposition := planningFailureRetry
+			if errors.Is(err, gitrepository.ErrPathNotFound) {
+				disposition = planningFailureTerminal
+			}
+			return r.planningFailed(ctx, run, "WorkflowFetchFailed", fmt.Errorf("read workflow for WorkflowRun %q: %w", run.Name, err), disposition)
+		}
+	} else {
+		workflowData, err = installation.GetFile(ctx, githubSource.Repository.Owner, githubSource.Repository.Name, run.Spec.WorkflowPath, githubSource.Revision.SHA)
+		if err != nil {
+			disposition := planningFailureRetry
+			if githubAPIStatus(err, 404) {
+				disposition = planningFailureTerminal
+			}
+			return r.planningFailed(ctx, run, "WorkflowFetchFailed", err, disposition)
+		}
 	}
 	definition, err := workflow.Parse(workflowData)
 	if err != nil {
@@ -898,6 +927,7 @@ func workflowEvent(source *actionsv1alpha1.GitHubWorkflowRunSource) workflow.Eve
 		Name:        string(source.Event.Name),
 		Action:      source.Event.Action,
 		SHA:         source.Revision.SHA,
+		BaseSHA:     source.Revision.BaseSHA,
 		Ref:         source.Revision.Ref,
 		RefName:     githubclient.RefName(source.Revision.Ref),
 		HeadRef:     headRef,
@@ -1087,6 +1117,9 @@ func githubEventExpressionValue(source *actionsv1alpha1.GitHubWorkflowRunSource,
 		pullRequest := githubPullRequestExpressionValue(event.PullRequest)
 		if event.Name == actionsv1alpha1.GitHubEventNamePullRequest {
 			pullRequest["merge_commit_sha"] = source.Revision.SHA
+			if source.Revision.BaseSHA != "" {
+				pullRequest["base"].(map[string]any)["sha"] = source.Revision.BaseSHA
+			}
 		} else if event.Name == actionsv1alpha1.GitHubEventNamePullRequestTarget {
 			pullRequest["base"].(map[string]any)["sha"] = source.Revision.SHA
 		}
@@ -1256,11 +1289,14 @@ func (r *WorkflowRunReconciler) jobPlan(run *actionsv1alpha1.WorkflowRun, workfl
 		},
 		WorkflowName: workflowName,
 		Revision: runner.Revision{
-			SHA:     githubSource.Revision.SHA,
-			Ref:     githubSource.Revision.Ref,
-			RefName: githubclient.RefName(githubSource.Revision.Ref),
-			HeadRef: headRef,
-			BaseRef: baseRef,
+			SHA:          githubSource.Revision.SHA,
+			HeadSHA:      githubSource.Revision.HeadSHA,
+			BaseSHA:      githubSource.Revision.BaseSHA,
+			MergeBaseSHA: githubSource.Revision.MergeBaseSHA,
+			Ref:          githubSource.Revision.Ref,
+			RefName:      githubclient.RefName(githubSource.Revision.Ref),
+			HeadRef:      headRef,
+			BaseRef:      baseRef,
 		},
 		JobID:   id,
 		Matrix:  matrix,
@@ -2184,6 +2220,9 @@ func githubAPIStatus(err error, status int) bool {
 }
 
 func (r *WorkflowRunReconciler) SetupWithManager(manager ctrl.Manager) error {
+	if r.GitRepository == nil {
+		return errors.New("Git repository client must be specified")
+	}
 	return ctrl.NewControllerManagedBy(manager).
 		For(&actionsv1alpha1.WorkflowRun{}).
 		Owns(&actionsv1alpha1.WorkflowJob{}).

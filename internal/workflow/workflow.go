@@ -157,6 +157,7 @@ type Event struct {
 	Name         string
 	Action       string
 	SHA          string
+	BaseSHA      string
 	Ref          string
 	RefName      string
 	HeadRef      string
@@ -771,6 +772,9 @@ func eventExpressionValue(event Event) map[string]any {
 		pullRequest := pullRequestExpressionValue(event.PullRequest)
 		if event.Name == "pull_request" {
 			pullRequest["merge_commit_sha"] = event.SHA
+			if event.BaseSHA != "" {
+				pullRequest["base"].(map[string]any)["sha"] = event.BaseSHA
+			}
 		} else if event.Name == "pull_request_target" {
 			pullRequest["base"].(map[string]any)["sha"] = event.SHA
 		}

@@ -12,6 +12,9 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -20,6 +23,7 @@ import (
 	actionsv1alpha1 "github.com/kelos-dev/open-actions/api/v1alpha1"
 	workflowexpression "github.com/kelos-dev/open-actions/internal/expression"
 	githubclient "github.com/kelos-dev/open-actions/internal/github"
+	"github.com/kelos-dev/open-actions/internal/gitrepository"
 	"github.com/kelos-dev/open-actions/internal/runner"
 	"github.com/kelos-dev/open-actions/internal/workflow"
 	batchv1 "k8s.io/api/batch/v1"
@@ -81,6 +85,113 @@ func TestJobPlanCoversSupportedSteps(t *testing.T) {
 	}
 	if plan.Steps[2].ID != "build" || plan.Outputs["artifact"] == "" {
 		t.Errorf("output plan = %#v", plan)
+	}
+}
+
+func TestWorkflowRunPlansFromLocalPullRequestIntegration(t *testing.T) {
+	serverRoot, baseSHA, headSHA, mergeBaseSHA := createControllerTestRepository(t)
+	gitRepository, err := gitrepository.NewClient(serverRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mergedRepository, err := gitRepository.Merge(context.Background(), "acme", "example", "token", gitrepository.Revision{
+		BaseSHA: baseSHA, HeadSHA: headSHA, MergeBaseSHA: mergeBaseSHA,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	integrationSHA := mergedRepository.SHA
+	if err := mergedRepository.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	privateKeyData := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(privateKey)})
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.Method == http.MethodPost && request.URL.Path == "/app/installations/2/access_tokens" {
+			fmt.Fprint(writer, `{"token":"contents-token"}`)
+			return
+		}
+		http.NotFound(writer, request)
+	}))
+	defer server.Close()
+	github, err := githubclient.NewClient(server.URL, server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	scheme := runtime.NewScheme()
+	if err := actionsv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	project := &actionsv1alpha1.Project{
+		ObjectMeta: metav1.ObjectMeta{Name: "project", Namespace: "default", UID: "project-uid"},
+		Spec: actionsv1alpha1.ProjectSpec{Source: actionsv1alpha1.ProjectSource{Type: actionsv1alpha1.SourceTypeGitHub, GitHub: &actionsv1alpha1.GitHubAppConfiguration{
+			AppID: 1, InstallationID: 2,
+			PrivateKeySecretRef: corev1.SecretKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: "github"}, Key: "private-key"},
+			WebhookSecretRef:    corev1.SecretKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: "github"}, Key: "webhook-secret"},
+		}}},
+	}
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "github", Namespace: "default"},
+		Data:       map[string][]byte{"private-key": privateKeyData},
+	}
+	run := &actionsv1alpha1.WorkflowRun{
+		ObjectMeta: metav1.ObjectMeta{Name: "ci", Namespace: "default", UID: "run-uid"},
+		Spec: actionsv1alpha1.WorkflowRunSpec{
+			ProjectRef:   corev1.LocalObjectReference{Name: project.Name},
+			WorkflowPath: ".open-actions/workflows/ci.yaml",
+			Source: actionsv1alpha1.WorkflowRunSource{Type: actionsv1alpha1.SourceTypeGitHub, GitHub: &actionsv1alpha1.GitHubWorkflowRunSource{
+				Repository: actionsv1alpha1.GitHubRepository{ID: 3, Owner: "acme", Name: "example"},
+				Event: actionsv1alpha1.GitHubEvent{
+					Name: "pull_request", Action: "synchronize", DeliveryID: "delivery",
+					PullRequest: &actionsv1alpha1.GitHubPullRequest{Number: 42, HeadRef: "feature", HeadSHA: headSHA, BaseRef: "main"},
+				},
+				Revision: actionsv1alpha1.GitRevision{
+					SHA: integrationSHA, BaseSHA: baseSHA, HeadSHA: headSHA, MergeBaseSHA: mergeBaseSHA,
+					Ref: "refs/pull/42/merge", HeadRef: "feature", BaseRef: "main",
+				},
+			}},
+		},
+	}
+	clusterClient := fake.NewClientBuilder().WithScheme(scheme).
+		WithStatusSubresource(&actionsv1alpha1.WorkflowRun{}, &actionsv1alpha1.WorkflowJob{}).
+		WithObjects(project, secret, run).
+		Build()
+	reconciler := &WorkflowRunReconciler{
+		Client: clusterClient, APIReader: clusterClient, GitHub: github, GitRepository: gitRepository,
+		GitHubAPIBase: server.URL, GitHubServerURL: "https://github.example", ActionCloneBaseURL: "https://github.example",
+	}
+	if _, err := reconciler.reconcileWorkflowRun(context.Background(), run); err != nil {
+		t.Fatal(err)
+	}
+
+	jobs := &actionsv1alpha1.WorkflowJobList{}
+	if err := clusterClient.List(context.Background(), jobs); err != nil {
+		t.Fatal(err)
+	}
+	if len(jobs.Items) != 1 || jobs.Items[0].Spec.JobID != "build" {
+		t.Fatalf("WorkflowJobs = %#v", jobs.Items)
+	}
+	plans := &corev1.ConfigMapList{}
+	if err := clusterClient.List(context.Background(), plans, client.MatchingLabels{actionsv1alpha1.LabelWorkflowRunUID: string(run.UID)}); err != nil {
+		t.Fatal(err)
+	}
+	if len(plans.Items) != 1 {
+		t.Fatalf("plan ConfigMaps = %d", len(plans.Items))
+	}
+	plan := &runner.Plan{}
+	if err := json.Unmarshal([]byte(plans.Items[0].Data[jobPlanKey]), plan); err != nil {
+		t.Fatal(err)
+	}
+	if plan.Revision.SHA != integrationSHA || plan.Revision.BaseSHA != baseSHA || plan.Revision.HeadSHA != headSHA || plan.Revision.MergeBaseSHA != mergeBaseSHA {
+		t.Fatalf("plan revision = %#v", plan.Revision)
 	}
 }
 
@@ -2483,6 +2594,63 @@ func TestCancelledWorkflowRunWaitsForTerminatingWorkloads(t *testing.T) {
 	if condition == nil || condition.Status != metav1.ConditionFalse || condition.Reason != "JobCancelled" {
 		t.Fatalf("succeeded condition after Pod termination = %#v", condition)
 	}
+}
+
+func createControllerTestRepository(t *testing.T) (string, string, string, string) {
+	t.Helper()
+	root := t.TempDir()
+	work := filepath.Join(root, "work")
+	if err := os.Mkdir(work, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	runControllerTestGit(t, work, "init", "--quiet")
+	runControllerTestGit(t, work, "config", "user.name", "Open Actions Test")
+	runControllerTestGit(t, work, "config", "user.email", "test@example.com")
+	if err := os.WriteFile(filepath.Join(work, "README.md"), []byte("test\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runControllerTestGit(t, work, "add", "README.md")
+	runControllerTestGit(t, work, "commit", "--quiet", "-m", "common")
+	mergeBaseSHA := runControllerTestGit(t, work, "rev-parse", "HEAD")
+
+	runControllerTestGit(t, work, "checkout", "--quiet", "-b", "base")
+	workflowDirectory := filepath.Join(work, ".open-actions", "workflows")
+	if err := os.MkdirAll(workflowDirectory, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	workflowData := "name: CI\non:\n  pull_request:\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo ok\n"
+	if err := os.WriteFile(filepath.Join(workflowDirectory, "ci.yaml"), []byte(workflowData), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runControllerTestGit(t, work, "add", ".open-actions/workflows/ci.yaml")
+	runControllerTestGit(t, work, "commit", "--quiet", "-m", "base")
+	baseSHA := runControllerTestGit(t, work, "rev-parse", "HEAD")
+
+	runControllerTestGit(t, work, "checkout", "--quiet", "-b", "head", mergeBaseSHA)
+	if err := os.WriteFile(filepath.Join(work, "feature.txt"), []byte("feature\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runControllerTestGit(t, work, "add", "feature.txt")
+	runControllerTestGit(t, work, "commit", "--quiet", "-m", "head")
+	headSHA := runControllerTestGit(t, work, "rev-parse", "HEAD")
+
+	remote := filepath.Join(root, "acme", "example")
+	if err := os.MkdirAll(filepath.Dir(remote), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	runControllerTestGit(t, "", "clone", "--quiet", "--bare", work, remote)
+	return root, baseSHA, headSHA, mergeBaseSHA
+}
+
+func runControllerTestGit(t *testing.T, directory string, arguments ...string) string {
+	t.Helper()
+	command := exec.Command("git", arguments...)
+	command.Dir = directory
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %s: %v: %s", strings.Join(arguments, " "), err, output)
+	}
+	return strings.TrimSpace(string(output))
 }
 
 func TestMatrixFailFastCancelsOnlyUnfinishedSiblings(t *testing.T) {
