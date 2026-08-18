@@ -7,9 +7,9 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
+	"encoding/json"
 	"encoding/pem"
 	"fmt"
-	"io"
 	"net/http"
 	"os"
 	"os/exec"
@@ -33,24 +33,34 @@ import (
 )
 
 const (
-	webhookSecret = "open-actions-e2e-secret"
-	fixtureURL    = "http://127.0.0.1:18081"
-	webhookURL    = "http://127.0.0.1:18080"
-	consoleURL    = "http://127.0.0.1:18082"
-	workflowPath  = ".open-actions/workflows/ci.yaml"
-	dockerImage   = "docker:29.7.2-dind@sha256:12e683a161823b2a839aeea999b9d960e6e1f9a97b1679ad6b441982e2d9cf07"
+	webhookSecret           = "open-actions-e2e-secret"
+	fixtureURL              = "http://127.0.0.1:18081"
+	webhookURL              = "http://127.0.0.1:18080"
+	consoleURL              = "http://127.0.0.1:18082"
+	workflowPath            = ".open-actions/workflows/ci.yaml"
+	pullRequestWorkflowPath = ".open-actions/workflows/pull-request.yaml"
+	dockerImage             = "docker:29.7.2-dind@sha256:12e683a161823b2a839aeea999b9d960e6e1f9a97b1679ad6b441982e2d9cf07"
 )
 
 var (
-	repositoryRoot  string
-	fixtureRevision string
-	portForwards    []*exec.Cmd
-	clusterClient   client.Client
-	clientset       kubernetes.Interface
-	consoleToken    string
-	e2eNamespace    string
-	installationID  int64
+	repositoryRoot            string
+	fixtureRevision           string
+	fixtureRepositoryRevision fixtureRevisions
+	portForwards              []*exec.Cmd
+	clusterClient             client.Client
+	clientset                 kubernetes.Interface
+	consoleToken              string
+	e2eNamespace              string
+	installationID            int64
 )
+
+type fixtureRevisions struct {
+	PushSHA        string `json:"pushSHA"`
+	IntegrationSHA string `json:"integrationSHA"`
+	BaseSHA        string `json:"baseSHA"`
+	HeadSHA        string `json:"headSHA"`
+	MergeBaseSHA   string `json:"mergeBaseSHA"`
+}
 
 var _ = SynchronizedBeforeSuite(func() []byte {
 	var err error
@@ -59,18 +69,17 @@ var _ = SynchronizedBeforeSuite(func() []byte {
 
 	startPortForward("open-actions-system", "service/github-fixture", "18081:8080")
 	Eventually(func() error {
-		response, err := http.Get(fixtureURL + "/fixture/sha")
+		response, err := http.Get(fixtureURL + "/fixture/revisions")
 		if err != nil {
 			return err
 		}
 		defer response.Body.Close()
-		data, err := io.ReadAll(response.Body)
-		if err != nil {
+		if err := json.NewDecoder(response.Body).Decode(&fixtureRepositoryRevision); err != nil {
 			return err
 		}
-		fixtureRevision = strings.TrimSpace(string(data))
-		if response.StatusCode != http.StatusOK || len(fixtureRevision) != 40 {
-			return fmt.Errorf("fixture returned status %d and revision %q", response.StatusCode, fixtureRevision)
+		fixtureRevision = fixtureRepositoryRevision.PushSHA
+		if response.StatusCode != http.StatusOK || !fixtureRepositoryRevision.valid() {
+			return fmt.Errorf("fixture returned status %d and revisions %#v", response.StatusCode, fixtureRepositoryRevision)
 		}
 		return nil
 	}, 30*time.Second, 500*time.Millisecond).Should(Succeed())
@@ -96,12 +105,15 @@ var _ = SynchronizedBeforeSuite(func() []byte {
 		}
 		return nil
 	}, 30*time.Second, 500*time.Millisecond).Should(Succeed())
-	return []byte(fixtureRevision)
+	data, err := json.Marshal(fixtureRepositoryRevision)
+	Expect(err).NotTo(HaveOccurred())
+	return data
 }, func(data []byte) {
 	var err error
 	repositoryRoot, err = filepath.Abs(filepath.Join("..", ".."))
 	Expect(err).NotTo(HaveOccurred())
-	fixtureRevision = string(data)
+	Expect(json.Unmarshal(data, &fixtureRepositoryRevision)).To(Succeed())
+	fixtureRevision = fixtureRepositoryRevision.PushSHA
 
 	scheme := runtime.NewScheme()
 	Expect(clientgoscheme.AddToScheme(scheme)).To(Succeed())
@@ -117,6 +129,10 @@ var _ = SynchronizedBeforeSuite(func() []byte {
 	consoleToken = string(consoleSecret.Data["token"])
 	Expect(consoleToken).NotTo(BeEmpty())
 })
+
+func (r fixtureRevisions) valid() bool {
+	return len(r.PushSHA) == 40 && len(r.IntegrationSHA) == 40 && len(r.BaseSHA) == 40 && len(r.HeadSHA) == 40 && len(r.MergeBaseSHA) == 40
+}
 
 var _ = SynchronizedAfterSuite(func() {}, func() {
 	for _, command := range portForwards {

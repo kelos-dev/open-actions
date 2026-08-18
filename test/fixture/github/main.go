@@ -63,6 +63,27 @@ jobs:
       - run: printf 'dependency graph e2e works\n'
 `
 
+const pullRequestWorkflowPath = ".open-actions/workflows/pull-request.yaml"
+
+const pullRequestWorkflowData = `name: Pull request checkout
+on: pull_request
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify pull request checkout
+        run: |
+          test "$GITHUB_REPOSITORY" = "acme/example"
+          test "$GITHUB_REF_NAME" = "42/merge"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test -f base.txt
+          test -f head.txt
+          credential_key="http.${GITHUB_SERVER_URL}/.extraheader"
+          test "$(git config --local --get-all "$credential_key" | wc -l)" -eq 1
+          printf 'pull request checkout integration works\n'
+`
+
 const unsupportedTriggerWorkflowData = `name: Unsupported trigger
 on: repository_dispatch
 jobs:
@@ -86,8 +107,12 @@ const checkoutMetadata = `name: Checkout fixture
 inputs:
   repository:
     default: ${{ github.repository }}
+  ref:
+    description: The branch, tag or SHA to checkout
   token:
     default: ${{ github.token }}
+  persist-credentials:
+    default: true
 runs:
   using: node20
   main: dist/index.js
@@ -97,14 +122,10 @@ runs:
 const checkoutScript = `const childProcess = require('child_process');
 const fs = require('fs');
 
-if (process.env.STATE_checked_out === 'true') {
-  console.log('external checkout post ran');
-  process.exit(0);
-}
-
 const workspace = process.env.GITHUB_WORKSPACE;
 const repository = process.env['INPUT_REPOSITORY'];
 const remote = process.env.GITHUB_SERVER_URL + '/' + repository;
+const credentialKey = 'http.' + process.env.GITHUB_SERVER_URL + '/.extraheader';
 const gitEnvironment = {
   ...process.env,
   GIT_CONFIG_COUNT: '1',
@@ -115,14 +136,42 @@ const run = (args) => childProcess.execFileSync('git', args, {
   env: gitEnvironment,
   stdio: 'inherit',
 });
+const removeCredential = () => {
+  try {
+    run(['-C', workspace, 'config', '--local', '--unset-all', credentialKey]);
+  } catch (error) {
+    if (error.status !== 5) throw error;
+  }
+};
+
+if (process.env.STATE_checked_out === 'true') {
+  removeCredential();
+  console.log('external checkout post ran');
+  process.exit(0);
+}
+
 fs.mkdirSync(workspace, {recursive: true});
 run(['init', '--quiet', workspace]);
 run(['-C', workspace, 'remote', 'add', 'origin', remote]);
-run(['-C', workspace, 'fetch', '--quiet', '--depth=1', 'origin', process.env.GITHUB_SHA]);
+const credential = Buffer.from('x-access-token:' + process.env['INPUT_TOKEN']).toString('base64');
+run(['-C', workspace, 'config', '--local', credentialKey, 'AUTHORIZATION: basic ' + credential]);
+const revision = process.env['INPUT_REF'] || process.env.GITHUB_SHA;
+run(['-C', workspace, 'fetch', '--quiet', '--depth=1', 'origin', revision]);
 run(['-C', workspace, 'checkout', '--quiet', '--detach', 'FETCH_HEAD']);
+if (process.env['INPUT_PERSIST-CREDENTIALS'] === 'false') {
+  removeCredential();
+}
 fs.appendFileSync(process.env.GITHUB_STATE, 'checked_out=true\n');
 console.log('external checkout main ran');
 `
+
+type fixtureRevisions struct {
+	PushSHA        string `json:"pushSHA"`
+	IntegrationSHA string `json:"integrationSHA"`
+	BaseSHA        string `json:"baseSHA"`
+	HeadSHA        string `json:"headSHA"`
+	MergeBaseSHA   string `json:"mergeBaseSHA"`
+}
 
 const setupGoMetadata = `name: Setup Go fixture
 inputs:
@@ -309,7 +358,7 @@ func main() {
 	dataDirectory := flag.String("data-dir", "/data", "Directory used for fixture Git repositories")
 	listenAddress := flag.String("listen-address", ":8080", "HTTP listen address")
 	flag.Parse()
-	sha, err := createRepositories(*dataDirectory)
+	revisions, err := createRepositories(*dataDirectory)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -326,7 +375,13 @@ func main() {
 			"GIT_PROJECT_ROOT=" + filepath.Join(*dataDirectory, "git"),
 		},
 	}
-	mux.Handle("/acme/", gitBackend)
+	mux.Handle("/acme/", http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if count := len(request.Header.Values("Authorization")); count != 1 {
+			http.Error(writer, fmt.Sprintf("expected one Authorization header, got %d", count), http.StatusBadRequest)
+			return
+		}
+		gitBackend.ServeHTTP(writer, request)
+	}))
 	mux.Handle("/actions/", gitBackend)
 	mux.Handle("/helm/", gitBackend)
 	mux.HandleFunc("/app/installations/", func(writer http.ResponseWriter, request *http.Request) {
@@ -409,8 +464,8 @@ func main() {
 			writeJSON(writer, map[string]string{"encoding": "base64", "content": base64.StdEncoding.EncodeToString([]byte(data))})
 		})
 	}
-	mux.HandleFunc("/fixture/sha", func(writer http.ResponseWriter, _ *http.Request) {
-		fmt.Fprint(writer, sha)
+	mux.HandleFunc("/fixture/revisions", func(writer http.ResponseWriter, _ *http.Request) {
+		writeJSON(writer, revisions)
 	})
 	mux.HandleFunc("/fixture/check-runs/", func(writer http.ResponseWriter, request *http.Request) {
 		if request.Method != http.MethodGet {
@@ -434,14 +489,15 @@ func main() {
 	log.Fatal(server.ListenAndServe())
 }
 
-func createRepositories(dataDirectory string) (string, error) {
+func createRepositories(dataDirectory string) (fixtureRevisions, error) {
 	if err := os.RemoveAll(filepath.Join(dataDirectory, "git")); err != nil {
-		return "", err
+		return fixtureRevisions{}, err
 	}
 	if err := os.RemoveAll(filepath.Join(dataDirectory, "work")); err != nil {
-		return "", err
+		return fixtureRevisions{}, err
 	}
-	repositorySHA, err := createRepository(dataDirectory, "acme", "example", "", map[string]string{
+	mergeBaseSHA, err := createRepository(dataDirectory, "acme", "example", "", map[string]string{
+		pullRequestWorkflowPath:  pullRequestWorkflowData,
 		"Dockerfile.docker-e2e":  "FROM scratch\nCOPY docker-e2e /docker-e2e\nENTRYPOINT [\"/docker-e2e\"]\n",
 		"cmd/docker-e2e/main.go": "package main\n\nimport \"fmt\"\n\nfunc main() { fmt.Println(\"open actions docker e2e works\") }\n",
 		"go.mod":                 fmt.Sprintf("module example.com/fixture\n\ngo %s\n", strings.TrimPrefix(runtime.Version(), "go")),
@@ -449,39 +505,128 @@ func createRepositories(dataDirectory string) (string, error) {
 		"fixture_test.go":        "package fixture\n\nimport \"testing\"\n\nfunc TestMessage(t *testing.T) {\n\tif Message() != \"open actions e2e works\" { t.Fatal(\"unexpected message\") }\n}\n",
 	})
 	if err != nil {
-		return "", err
+		return fixtureRevisions{}, err
+	}
+	revisions, err := createPullRequestRevisions(dataDirectory, mergeBaseSHA)
+	if err != nil {
+		return fixtureRevisions{}, err
 	}
 	if _, err := createRepository(dataDirectory, "actions", "checkout", "v4", map[string]string{
 		"action.yml":    checkoutMetadata,
 		"dist/index.js": checkoutScript,
 	}); err != nil {
-		return "", err
+		return fixtureRevisions{}, err
 	}
 	if _, err := createRepository(dataDirectory, "actions", "setup-go", "v5", map[string]string{
 		"action.yml":    setupGoMetadata,
 		"dist/index.js": setupGoScript,
 	}); err != nil {
-		return "", err
+		return fixtureRevisions{}, err
 	}
 	if _, err := createRepository(dataDirectory, "helm", "kind-action", "v1", map[string]string{
 		"action.yml": kindActionMetadata,
 		"main.js":    kindActionScript,
 		"cleanup.js": kindActionCleanupScript,
 	}); err != nil {
-		return "", err
+		return fixtureRevisions{}, err
 	}
 	if _, err := createRepository(dataDirectory, "actions", "marker", "v1", map[string]string{
 		"action.yml":    markerMetadata,
 		"dist/index.js": markerScript,
 	}); err != nil {
-		return "", err
+		return fixtureRevisions{}, err
 	}
 	if _, err := createRepository(dataDirectory, "actions", "composite", "v1", map[string]string{
 		"action.yml": compositeMetadata,
 	}); err != nil {
-		return "", err
+		return fixtureRevisions{}, err
 	}
-	return repositorySHA, nil
+	return revisions, nil
+}
+
+func createPullRequestRevisions(dataDirectory, mergeBaseSHA string) (fixtureRevisions, error) {
+	workDirectory := filepath.Join(dataDirectory, "work", "acme", "example")
+	bareDirectory := filepath.Join(dataDirectory, "git", "acme", "example")
+	run := func(description string, arguments ...string) error {
+		output, err := exec.Command("git", append([]string{"-C", workDirectory}, arguments...)...).CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("%s: %w: %s", description, err, output)
+		}
+		return nil
+	}
+	if err := run("create feature branch", "switch", "--quiet", "-c", "feature"); err != nil {
+		return fixtureRevisions{}, err
+	}
+	if err := os.WriteFile(filepath.Join(workDirectory, "head.txt"), []byte("head\n"), 0o644); err != nil {
+		return fixtureRevisions{}, err
+	}
+	if err := run("stage head revision", "add", "head.txt"); err != nil {
+		return fixtureRevisions{}, err
+	}
+	if err := run("commit head revision", "commit", "--quiet", "-m", "head"); err != nil {
+		return fixtureRevisions{}, err
+	}
+	headSHA, err := repositoryRevision(workDirectory)
+	if err != nil {
+		return fixtureRevisions{}, err
+	}
+	if err := run("switch to main branch", "switch", "--quiet", "main"); err != nil {
+		return fixtureRevisions{}, err
+	}
+	if err := os.WriteFile(filepath.Join(workDirectory, "base.txt"), []byte("base\n"), 0o644); err != nil {
+		return fixtureRevisions{}, err
+	}
+	if err := run("stage base revision", "add", "base.txt"); err != nil {
+		return fixtureRevisions{}, err
+	}
+	if err := run("commit base revision", "commit", "--quiet", "-m", "base"); err != nil {
+		return fixtureRevisions{}, err
+	}
+	baseSHA, err := repositoryRevision(workDirectory)
+	if err != nil {
+		return fixtureRevisions{}, err
+	}
+	if err := run("publish pull request revisions", "push", "--quiet", bareDirectory, "main", "feature"); err != nil {
+		return fixtureRevisions{}, err
+	}
+	integrationSHA, err := integrationRevision(workDirectory, baseSHA, headSHA)
+	if err != nil {
+		return fixtureRevisions{}, err
+	}
+	return fixtureRevisions{
+		PushSHA: baseSHA, IntegrationSHA: integrationSHA, BaseSHA: baseSHA, HeadSHA: headSHA, MergeBaseSHA: mergeBaseSHA,
+	}, nil
+}
+
+func repositoryRevision(directory string) (string, error) {
+	output, err := exec.Command("git", "-C", directory, "rev-parse", "HEAD").CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("resolve repository revision: %w: %s", err, output)
+	}
+	return strings.TrimSpace(string(output)), nil
+}
+
+func integrationRevision(directory, baseSHA, headSHA string) (string, error) {
+	output, err := exec.Command("git", "-C", directory, "merge-tree", "--write-tree", "--no-messages", baseSHA, headSHA).CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("construct integration tree: %w: %s", err, output)
+	}
+	treeSHA := strings.TrimSpace(string(output))
+	command := exec.Command("git", "-C", directory, "commit-tree", treeSHA, "-p", baseSHA, "-p", headSHA)
+	command.Env = append(os.Environ(),
+		"GIT_AUTHOR_NAME=Open Actions",
+		"GIT_AUTHOR_EMAIL=open-actions@localhost",
+		"GIT_AUTHOR_DATE=2000-01-01T00:00:00Z",
+		"GIT_COMMITTER_NAME=Open Actions",
+		"GIT_COMMITTER_EMAIL=open-actions@localhost",
+		"GIT_COMMITTER_DATE=2000-01-01T00:00:00Z",
+	)
+	command.Stdin = strings.NewReader(fmt.Sprintf("Merge %s into %s\n", headSHA, baseSHA))
+	output, err = command.CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("commit integration revision: %w: %s", err, output)
+	}
+	return strings.TrimSpace(string(output)), nil
 }
 
 func createRepository(dataDirectory, owner, name, tag string, files map[string]string) (string, error) {

@@ -340,10 +340,14 @@ func (b *limitedBuffer) Write(data []byte) (int, error) {
 
 func gitEnvironment(remoteURL, token string) []string {
 	credential := base64.StdEncoding.EncodeToString([]byte("x-access-token:" + token))
+	headerKey := "http." + strings.TrimSuffix(remoteURL, "/") + "/.extraHeader"
+	// Git accumulates matching extraHeader values, so reset them before adding the credential for this process.
 	return []string{
-		"GIT_CONFIG_COUNT=1",
-		"GIT_CONFIG_KEY_0=http." + remoteURL + ".extraHeader",
-		"GIT_CONFIG_VALUE_0=AUTHORIZATION: basic " + credential,
+		"GIT_CONFIG_COUNT=2",
+		"GIT_CONFIG_KEY_0=" + headerKey,
+		"GIT_CONFIG_VALUE_0=",
+		"GIT_CONFIG_KEY_1=" + headerKey,
+		"GIT_CONFIG_VALUE_1=AUTHORIZATION: basic " + credential,
 		"GIT_TERMINAL_PROMPT=0",
 	}
 }

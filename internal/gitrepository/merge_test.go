@@ -2,11 +2,16 @@ package gitrepository
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -91,6 +96,48 @@ func TestIntegrateCheckoutPreservesShallowHistory(t *testing.T) {
 	}
 	if got := strings.TrimSpace(runGit(t, checkout, "rev-list", "--count", revision.BaseSHA)); got != "1" {
 		t.Fatalf("base history count = %q, want 1", got)
+	}
+}
+
+func TestGitEnvironmentOverridesInheritedAuthorizationHeader(t *testing.T) {
+	var mutex sync.Mutex
+	var authorizationHeaders [][]string
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		mutex.Lock()
+		authorizationHeaders = append(authorizationHeaders, request.Header.Values("Authorization"))
+		mutex.Unlock()
+		response.WriteHeader(http.StatusNotFound)
+	}))
+	t.Cleanup(server.Close)
+
+	directory := t.TempDir()
+	runGit(t, "", "init", "--quiet", directory)
+	checkoutHeaderKey := "http." + server.URL + "/.extraHeader"
+	checkoutHeader := "AUTHORIZATION: basic " + base64.StdEncoding.EncodeToString([]byte("x-access-token:checkout-token"))
+	runGit(t, directory, "config", "--local", checkoutHeaderKey, checkoutHeader)
+
+	remoteURL := server.URL + "/acme/example"
+	client, err := NewClient(server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.output(context.Background(), directory, gitEnvironment(remoteURL, "runner-token"), nil, "git", "ls-remote", remoteURL); err == nil {
+		t.Fatal("git ls-remote succeeded against a server without a repository")
+	}
+
+	wantHeader := "basic " + base64.StdEncoding.EncodeToString([]byte("x-access-token:runner-token"))
+	mutex.Lock()
+	defer mutex.Unlock()
+	if len(authorizationHeaders) == 0 {
+		t.Fatal("Git did not send a request")
+	}
+	for _, headers := range authorizationHeaders {
+		if !slices.Equal(headers, []string{wantHeader}) {
+			t.Fatalf("Authorization headers = %#v, want %#v", headers, []string{wantHeader})
+		}
+	}
+	if got := strings.TrimSpace(runGit(t, directory, "config", "--local", "--get", checkoutHeaderKey)); got != checkoutHeader {
+		t.Fatalf("persisted checkout header = %q, want %q", got, checkoutHeader)
 	}
 }
 
