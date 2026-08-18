@@ -214,6 +214,71 @@ var _ = Describe("Runner", func() {
 			g.Expect(apierrors.IsNotFound(err)).To(BeTrue())
 		}, 60*time.Second, time.Second).Should(Succeed())
 	})
+
+	It("executes a pull request checkout with persisted credentials", func() {
+		ctx := context.Background()
+		run := &actionsv1alpha1.WorkflowRun{
+			ObjectMeta: metav1.ObjectMeta{Name: "runner-pull-request", Namespace: e2eNamespace},
+			Spec: actionsv1alpha1.WorkflowRunSpec{
+				ProjectRef: corev1.LocalObjectReference{Name: "default"},
+				Source: actionsv1alpha1.WorkflowRunSource{
+					Type: actionsv1alpha1.SourceTypeGitHub,
+					GitHub: &actionsv1alpha1.GitHubWorkflowRunSource{
+						Repository: actionsv1alpha1.GitHubRepository{ID: 123456789, Owner: "acme", Name: "example"},
+						Event: actionsv1alpha1.GitHubEvent{
+							Name:       actionsv1alpha1.GitHubEventNamePullRequest,
+							Action:     "synchronize",
+							DeliveryID: "61111111-2222-3333-4444-555555555555",
+							PullRequest: &actionsv1alpha1.GitHubPullRequest{
+								Number:         42,
+								HTMLURL:        "https://github.example/acme/example/pull/42",
+								HeadRepository: actionsv1alpha1.GitHubRepository{ID: 123456789, Owner: "acme", Name: "example"},
+								HeadRef:        "feature",
+								HeadSHA:        fixtureRepositoryRevision.HeadSHA,
+								BaseRef:        "main",
+							},
+						},
+						Revision: actionsv1alpha1.GitRevision{
+							SHA:          fixtureRepositoryRevision.IntegrationSHA,
+							HeadSHA:      fixtureRepositoryRevision.HeadSHA,
+							BaseSHA:      fixtureRepositoryRevision.BaseSHA,
+							MergeBaseSHA: fixtureRepositoryRevision.MergeBaseSHA,
+							Ref:          "refs/pull/42/merge",
+							HeadRef:      "feature",
+							BaseRef:      "main",
+						},
+					},
+				},
+				WorkflowPath: pullRequestWorkflowPath,
+			},
+		}
+		Expect(clusterClient.Create(ctx, run)).To(Succeed())
+
+		Eventually(func(g Gomega) {
+			stored := &actionsv1alpha1.WorkflowRun{}
+			g.Expect(clusterClient.Get(ctx, client.ObjectKeyFromObject(run), stored)).To(Succeed())
+			condition := meta.FindStatusCondition(stored.Status.Conditions, actionsv1alpha1.WorkflowRunConditionSucceeded)
+			g.Expect(condition).NotTo(BeNil())
+			if condition != nil {
+				g.Expect(condition.Status).To(Equal(metav1.ConditionTrue), condition.Message)
+			}
+		}, 180*time.Second, time.Second).Should(Succeed())
+
+		jobs := &batchv1.JobList{}
+		Expect(clusterClient.List(ctx, jobs, client.InNamespace(e2eNamespace), client.MatchingLabels{
+			actionsv1alpha1.LabelWorkflowRunUID: string(run.UID),
+		})).To(Succeed())
+		Expect(jobs.Items).To(HaveLen(1))
+		pods, err := clientset.CoreV1().Pods(e2eNamespace).List(ctx, metav1.ListOptions{
+			LabelSelector: labels.Set{batchv1.JobNameLabel: jobs.Items[0].Name}.String(),
+		})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(pods.Items).To(HaveLen(1))
+		logs, err := clientset.CoreV1().Pods(e2eNamespace).GetLogs(pods.Items[0].Name, &corev1.PodLogOptions{}).DoRaw(ctx)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(string(logs)).To(ContainSubstring("pull request checkout integration works"))
+		Expect(string(logs)).To(ContainSubstring("external checkout post ran"))
+	})
 })
 
 func findJobCondition(conditions []batchv1.JobCondition, conditionType batchv1.JobConditionType) *batchv1.JobCondition {
