@@ -46,13 +46,16 @@ func run(ctx context.Context, arguments []string) error {
 	if err != nil {
 		return fmt.Errorf("load Project variables: %w", err)
 	}
-	githubToken := os.Getenv("OPEN_ACTIONS_GITHUB_TOKEN")
+	githubToken := os.Getenv(runner.GitHubTokenEnvVar)
+	actionToken := os.Getenv(runner.ActionTokenEnvVar)
+	environment := withoutEnvironmentVariables(os.Environ(), runner.GitHubTokenEnvVar, runner.ActionTokenEnvVar)
 	executor, err := runner.NewExecutor(runner.ExecutorConfig{
 		Logger:      slog.New(slog.NewJSONHandler(os.Stdout, nil)),
 		GitHubToken: githubToken,
+		ActionToken: actionToken,
 		Secrets:     secrets,
 		Variables:   variables,
-		Environment: withoutEnvironmentVariable(os.Environ(), "OPEN_ACTIONS_GITHUB_TOKEN"),
+		Environment: environment,
 		Stdout:      os.Stdout,
 		Stderr:      os.Stderr,
 	})
@@ -94,11 +97,21 @@ func loadValues(directory string) (map[string]string, error) {
 	return values, nil
 }
 
-func withoutEnvironmentVariable(environment []string, name string) []string {
-	prefix := name + "="
+func withoutEnvironmentVariables(environment []string, names ...string) []string {
+	prefixes := make([]string, len(names))
+	for index, name := range names {
+		prefixes[index] = name + "="
+	}
 	result := make([]string, 0, len(environment))
 	for _, entry := range environment {
-		if !strings.HasPrefix(entry, prefix) {
+		include := true
+		for _, prefix := range prefixes {
+			if strings.HasPrefix(entry, prefix) {
+				include = false
+				break
+			}
+		}
+		if include {
 			result = append(result, entry)
 		}
 	}

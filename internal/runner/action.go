@@ -44,9 +44,17 @@ type actionResolver struct {
 	cloneBaseURL  string
 	directory     string
 	environment   []string
+	actionToken   string
 	execute       func(context.Context, string, []string, string, []string) error
-	cache         map[string]string
+	repositories  map[string]string
+	actions       map[string]preparedAction
 	nextDirectory int
+}
+
+type preparedAction struct {
+	reference  actionref.Reference
+	directory  string
+	definition actionDefinition
 }
 
 type actionInvocation struct {
@@ -60,83 +68,154 @@ type actionInvocation struct {
 	outputs    map[string]string
 }
 
-func newActionResolver(cloneBaseURL, directory string, environment []string, executeCommand func(context.Context, string, []string, string, []string) error) *actionResolver {
+func newActionResolver(cloneBaseURL, directory string, environment []string, actionToken string, executeCommand func(context.Context, string, []string, string, []string) error) *actionResolver {
 	return &actionResolver{
 		cloneBaseURL: strings.TrimSuffix(cloneBaseURL, "/"),
 		directory:    directory,
 		environment:  environment,
+		actionToken:  actionToken,
 		execute:      executeCommand,
-		cache:        map[string]string{},
+		repositories: map[string]string{},
+		actions:      map[string]preparedAction{},
 	}
 }
 
-func (r *actionResolver) prepare(ctx context.Context, step Step, plan *Plan, token string) (*actionInvocation, error) {
-	reference, err := actionref.Parse(step.Uses)
+func (r *actionResolver) prepareAll(ctx context.Context, steps []Step) error {
+	preparedDepths := map[string]int{}
+	stack := map[string]bool{}
+	for _, step := range steps {
+		if step.Uses == "" {
+			continue
+		}
+		if _, err := r.prepareAction(ctx, step.Uses, preparedDepths, stack); err != nil {
+			return fmt.Errorf("prepare action %s: %w", step.Uses, err)
+		}
+	}
+	return nil
+}
+
+func (r *actionResolver) prepareAction(ctx context.Context, uses string, preparedDepths map[string]int, stack map[string]bool) (int, error) {
+	action, err := r.resolve(ctx, uses)
 	if err != nil {
-		return nil, err
+		return 0, err
+	}
+	key := actionKey(action.reference)
+	if stack[key] {
+		return 0, fmt.Errorf("composite action cycle detected at %s", uses)
+	}
+	if depth, found := preparedDepths[key]; found {
+		return depth, nil
+	}
+	if action.definition.Runs.Using != "composite" {
+		preparedDepths[key] = 0
+		return 0, nil
+	}
+	stack[key] = true
+	defer delete(stack, key)
+	depth := 1
+	for _, step := range action.definition.Runs.Steps {
+		if step.Uses == "" {
+			continue
+		}
+		nestedDepth, err := r.prepareAction(ctx, step.Uses, preparedDepths, stack)
+		if err != nil {
+			return 0, err
+		}
+		depth = max(depth, nestedDepth+1)
+		if depth > maxCompositeDepth {
+			return 0, fmt.Errorf("composite action nesting exceeds %d levels", maxCompositeDepth)
+		}
+	}
+	preparedDepths[key] = depth
+	return depth, nil
+}
+
+func (r *actionResolver) resolve(ctx context.Context, uses string) (preparedAction, error) {
+	reference, err := actionref.Parse(uses)
+	if err != nil {
+		return preparedAction{}, err
+	}
+	key := actionKey(reference)
+	if action, found := r.actions[key]; found {
+		return action, nil
 	}
 	repositoryKey := reference.Owner + "/" + reference.Repository + "@" + reference.Ref
-	repositoryDirectory, found := r.cache[repositoryKey]
+	repositoryDirectory, found := r.repositories[repositoryKey]
 	if !found {
 		r.nextDirectory++
 		repositoryDirectory = filepath.Join(r.directory, strconv.Itoa(r.nextDirectory))
-		cloneToken := actionCloneToken(reference, plan, token)
-		if err := r.download(ctx, reference, repositoryDirectory, cloneToken); err != nil {
+		if err := r.download(ctx, reference, repositoryDirectory); err != nil {
 			if cleanupErr := os.RemoveAll(repositoryDirectory); cleanupErr != nil {
-				return nil, errors.Join(err, fmt.Errorf("clean failed action download: %w", cleanupErr))
+				return preparedAction{}, errors.Join(err, fmt.Errorf("clean failed action download: %w", cleanupErr))
 			}
-			return nil, err
+			return preparedAction{}, err
 		}
-		r.cache[repositoryKey] = repositoryDirectory
+		r.repositories[repositoryKey] = repositoryDirectory
 	}
 	actionDirectory, err := withinDirectory(repositoryDirectory, reference.Path)
 	if err != nil {
-		return nil, err
+		return preparedAction{}, err
 	}
 	definition, err := loadActionDefinition(actionDirectory)
 	if err != nil {
-		return nil, fmt.Errorf("load action %s: %w", step.Uses, err)
+		return preparedAction{}, fmt.Errorf("load action %s: %w", uses, err)
 	}
 	switch definition.Runs.Using {
 	case "node20", "node24":
 		if definition.Runs.Main == "" {
-			return nil, fmt.Errorf("action %s does not define runs.main", step.Uses)
+			return preparedAction{}, fmt.Errorf("action %s does not define runs.main", uses)
 		}
 		if !supportedActionCondition(definition.Runs.PreIf) || !supportedActionCondition(definition.Runs.PostIf) {
-			return nil, fmt.Errorf("action %s uses an unsupported lifecycle condition", step.Uses)
+			return preparedAction{}, fmt.Errorf("action %s uses an unsupported lifecycle condition", uses)
 		}
 	case "composite":
 		if err := validateComposite(definition); err != nil {
-			return nil, fmt.Errorf("action %s: %w", step.Uses, err)
+			return preparedAction{}, fmt.Errorf("action %s: %w", uses, err)
 		}
 	default:
-		return nil, fmt.Errorf("action %s uses unsupported runtime %q", step.Uses, definition.Runs.Using)
+		return preparedAction{}, fmt.Errorf("action %s uses unsupported runtime %q", uses, definition.Runs.Using)
 	}
-	inputs, err := actionInputs(definition.Inputs, step.With, plan, r.environment, token)
+	action := preparedAction{reference: reference, directory: actionDirectory, definition: definition}
+	r.actions[key] = action
+	return action, nil
+}
+
+func (r *actionResolver) invocation(step Step, plan *Plan, token string) (*actionInvocation, error) {
+	reference, err := actionref.Parse(step.Uses)
+	if err != nil {
+		return nil, err
+	}
+	action, found := r.actions[actionKey(reference)]
+	if !found {
+		return nil, fmt.Errorf("action %s was not prepared", step.Uses)
+	}
+	inputs, err := actionInputs(action.definition.Inputs, step.With, plan, r.environment, token)
 	if err != nil {
 		return nil, fmt.Errorf("configure action %s: %w", step.Uses, err)
 	}
 	return &actionInvocation{
 		step:       step,
-		reference:  reference,
-		directory:  actionDirectory,
-		definition: definition,
+		reference:  action.reference,
+		directory:  action.directory,
+		definition: action.definition,
 		inputs:     inputs,
 		state:      map[string]string{},
 		outputs:    map[string]string{},
 	}, nil
 }
 
-func actionCloneToken(reference actionref.Reference, plan *Plan, token string) string {
-	if strings.EqualFold(reference.Owner, plan.Repository.Owner) && strings.EqualFold(reference.Repository, plan.Repository.Name) {
-		return token
+func actionTokenForClone(plan *Plan, actionToken string) string {
+	serverURL, serverError := url.Parse(plan.Repository.ServerURL)
+	cloneURL, cloneError := url.Parse(plan.Repository.ActionCloneBaseURL)
+	if serverError != nil || cloneError != nil || !strings.EqualFold(serverURL.Scheme, cloneURL.Scheme) || !strings.EqualFold(serverURL.Host, cloneURL.Host) {
+		return ""
 	}
-	return ""
+	return actionToken
 }
 
-func (r *actionResolver) download(ctx context.Context, reference actionref.Reference, directory, token string) error {
+func (r *actionResolver) download(ctx context.Context, reference actionref.Reference, directory string) error {
 	remoteURL := r.cloneBaseURL + "/" + url.PathEscape(reference.Owner) + "/" + url.PathEscape(reference.Repository)
-	environment := actionDownloadEnvironment(r.environment, remoteURL, token)
+	environment := actionDownloadEnvironment(r.environment, remoteURL, r.actionToken)
 	commands := [][]string{
 		{"git", "init", "--quiet", directory},
 		{"git", "-C", directory, "remote", "add", "origin", remoteURL},
@@ -152,13 +231,28 @@ func (r *actionResolver) download(ctx context.Context, reference actionref.Refer
 }
 
 func actionDownloadEnvironment(environment []string, remoteURL, token string) []string {
+	environment = setEnvironment(environment, "GIT_TERMINAL_PROMPT", "0")
 	if token == "" {
 		return environment
 	}
 	credential := base64.StdEncoding.EncodeToString([]byte("x-access-token:" + token))
 	environment = setEnvironment(environment, "GIT_CONFIG_COUNT", "1")
-	environment = setEnvironment(environment, "GIT_CONFIG_KEY_0", "http."+remoteURL+".extraHeader")
+	environment = setEnvironment(environment, "GIT_CONFIG_KEY_0", "http."+remoteURL+"/.extraHeader")
 	return setEnvironment(environment, "GIT_CONFIG_VALUE_0", "AUTHORIZATION: basic "+credential)
+}
+
+func findExecutable(name string, environment []string) (string, error) {
+	for _, directory := range filepath.SplitList(environmentValue(environment, "PATH")) {
+		if directory == "" {
+			directory = "."
+		}
+		path := filepath.Join(directory, name)
+		info, err := os.Stat(path)
+		if err == nil && !info.IsDir() && info.Mode()&0o111 != 0 {
+			return filepath.Abs(path)
+		}
+	}
+	return "", fmt.Errorf("executable %q was not found in PATH", name)
 }
 
 func loadActionDefinition(directory string) (actionDefinition, error) {
@@ -279,8 +373,8 @@ func (e *Executor) runJavaScriptHook(ctx context.Context, invocation *actionInvo
 	return executionError
 }
 
-func (e *Executor) executeAction(ctx context.Context, state *executionState, step Step, depth int, cancelled bool) (map[string]string, error) {
-	invocation, err := state.resolver.prepare(ctx, step, state.plan, e.githubToken)
+func (e *Executor) executeAction(ctx context.Context, state *executionState, step Step, cancelled bool) (map[string]string, error) {
+	invocation, err := state.resolver.invocation(step, state.plan, e.githubToken)
 	if err != nil {
 		return nil, err
 	}
@@ -288,7 +382,6 @@ func (e *Executor) executeAction(ctx context.Context, state *executionState, ste
 	if err != nil {
 		return nil, err
 	}
-	e.logger.Info("prepared external action", "action", step.Uses, "runtime", invocation.definition.Runs.Using)
 	e.logCommandNames("workflow step input", invocation.inputs)
 	var outputs map[string]string
 	switch invocation.definition.Runs.Using {
@@ -320,7 +413,7 @@ func (e *Executor) executeAction(ctx context.Context, state *executionState, ste
 		}
 		outputs = invocation.outputs
 	case "composite":
-		outputs, err = e.runComposite(ctx, state, invocation, depth+1, cancelled)
+		outputs, err = e.runComposite(ctx, state, invocation, cancelled)
 	default:
 		return nil, fmt.Errorf("action %s uses unsupported runtime %q", step.Uses, invocation.definition.Runs.Using)
 	}
@@ -333,7 +426,7 @@ func (e *Executor) executeAction(ctx context.Context, state *executionState, ste
 
 func configurePullRequestCheckout(invocation *actionInvocation, plan *Plan, workspace string) (string, bool, error) {
 	if plan.Event.Name != "pull_request" || plan.Revision.BaseSHA == "" || plan.Revision.MergeBaseSHA == "" || plan.Revision.HeadSHA == "" ||
-		!strings.EqualFold(invocation.reference.Owner, "actions") || !strings.EqualFold(invocation.reference.Repository, "checkout") {
+		!isCheckoutAction(invocation.reference) {
 		return "", false, nil
 	}
 	repository := strings.TrimSpace(invocation.inputs["repository"])
@@ -354,24 +447,18 @@ func configurePullRequestCheckout(invocation *actionInvocation, plan *Plan, work
 	return directory, true, nil
 }
 
+func isCheckoutAction(reference actionref.Reference) bool {
+	return strings.EqualFold(reference.Repository, "checkout")
+}
+
 func actionRuntimeExecutable(runtime string, environment []string) (string, error) {
 	executable := "node"
 	if runtime == "node24" {
 		executable = "node24"
 	}
-	for _, directory := range filepath.SplitList(environmentValue(environment, "PATH")) {
-		if directory == "" {
-			directory = "."
-		}
-		path := filepath.Join(directory, executable)
-		info, err := os.Stat(path)
-		if err == nil && !info.IsDir() && info.Mode()&0o111 != 0 {
-			absolutePath, err := filepath.Abs(path)
-			if err != nil {
-				return "", fmt.Errorf("resolve %s action runtime executable %q: %w", runtime, executable, err)
-			}
-			return absolutePath, nil
-		}
+	path, err := findExecutable(executable, environment)
+	if err == nil {
+		return path, nil
 	}
 	return "", fmt.Errorf("%s action runtime is unavailable: executable %q was not found in PATH", runtime, executable)
 }

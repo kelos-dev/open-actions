@@ -31,7 +31,9 @@ spec:
             - --leader-elect=true
             - {{ printf "--github-api-url=%s" .Values.controller.githubAPIURL | quote }}
             - {{ printf "--github-server-url=%s" .Values.controller.githubServerURL | quote }}
+            {{- if .Values.controller.actionCloneBaseURL }}
             - {{ printf "--action-clone-base-url=%s" .Values.controller.actionCloneBaseURL | quote }}
+            {{- end }}
             {{- if ne .Values.controller.workflowRunTTLSecondsAfterFinished nil }}
             - {{ printf "--workflow-run-ttl-seconds-after-finished=%d" (int64 .Values.controller.workflowRunTTLSecondsAfterFinished) | quote }}
             {{- end }}

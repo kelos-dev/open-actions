@@ -81,17 +81,7 @@ func validateComposite(definition actionDefinition) error {
 	return nil
 }
 
-func (e *Executor) runComposite(ctx context.Context, state *executionState, invocation *actionInvocation, depth int, cancelled bool) (map[string]string, error) {
-	if depth > maxCompositeDepth {
-		return nil, fmt.Errorf("composite action nesting exceeds %d levels", maxCompositeDepth)
-	}
-	key := compositeKey(invocation)
-	if state.compositeStack[key] {
-		return nil, fmt.Errorf("composite action cycle detected at %s", invocation.step.Uses)
-	}
-	state.compositeStack[key] = true
-	defer delete(state.compositeStack, key)
-
+func (e *Executor) runComposite(ctx context.Context, state *executionState, invocation *actionInvocation, cancelled bool) (map[string]string, error) {
 	compositeContext := &compositeContext{
 		inputs:            invocation.inputs,
 		stepOutput:        map[string]map[string]string{},
@@ -140,7 +130,7 @@ func (e *Executor) runComposite(ctx context.Context, state *executionState, invo
 		cancelledBeforeCommand := ctx.Err() != nil
 		commandContext := executionContext(ctx)
 		if step.Uses != "" {
-			outputs, err = e.executeAction(commandContext, state, step, depth, cancelled)
+			outputs, err = e.executeAction(commandContext, state, step, cancelled)
 		} else {
 			outputs, err = e.runCompositeScript(commandContext, state, invocation, step)
 		}
@@ -211,7 +201,6 @@ func resolveCompositeStep(step compositeStep, environment map[string]string, com
 		target *string
 	}{
 		{name: "name", target: &resolved.Name},
-		{name: "uses", target: &resolved.Uses},
 		{name: "run", target: &resolved.Run},
 		{name: "working-directory", target: &resolved.WorkingDirectory},
 	} {
@@ -359,8 +348,8 @@ func mergeEnvironment(base, override map[string]string) map[string]string {
 	return result
 }
 
-func compositeKey(invocation *actionInvocation) string {
-	return invocation.reference.Owner + "/" + invocation.reference.Repository + "/" + invocation.reference.Path + "@" + invocation.reference.Ref
+func actionKey(reference actionref.Reference) string {
+	return reference.Owner + "/" + reference.Repository + "/" + reference.Path + "@" + reference.Ref
 }
 
 var (

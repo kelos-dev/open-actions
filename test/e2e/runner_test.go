@@ -4,6 +4,7 @@ package e2e_test
 
 import (
 	"context"
+	"net/http"
 	"time"
 
 	actionsv1alpha1 "github.com/kelos-dev/open-actions/api/v1alpha1"
@@ -25,6 +26,8 @@ var _ = Describe("Runner", func() {
 
 	It("executes a typed WorkflowRun and deletes its owned resources after its TTL expires", func() {
 		ctx := context.Background()
+		resetPreparationActionDownloads()
+		DeferCleanup(resetPreparationActionDownloads)
 		run := &actionsv1alpha1.WorkflowRun{
 			ObjectMeta: metav1.ObjectMeta{Name: "runner-execution", Namespace: e2eNamespace},
 			Spec: actionsv1alpha1.WorkflowRunSpec{
@@ -43,7 +46,7 @@ var _ = Describe("Runner", func() {
 						},
 					},
 				},
-				WorkflowPath: workflowPath,
+				WorkflowPath: preparationWorkflowPath,
 			},
 		}
 		Expect(clusterClient.Create(ctx, run)).To(Succeed())
@@ -177,6 +180,9 @@ var _ = Describe("Runner", func() {
 		logs, err := clientset.CoreV1().Pods(e2eNamespace).GetLogs(pods.Items[0].Name, &corev1.PodLogOptions{}).DoRaw(ctx)
 		Expect(err).NotTo(HaveOccurred())
 		output := string(logs)
+		Expect(output).To(ContainSubstring("action downloads blocked after preparation"))
+		Expect(output).To(ContainSubstring("external preparation composite run"))
+		Expect(output).To(ContainSubstring("prepared action graph e2e works"))
 		Expect(output).To(ContainSubstring("external checkout main ran"))
 		Expect(output).To(ContainSubstring("external setup-go main ran"))
 		Expect(output).To(ContainSubstring("external kind-action main ran"))
@@ -280,6 +286,15 @@ var _ = Describe("Runner", func() {
 		Expect(string(logs)).To(ContainSubstring("external checkout post ran"))
 	})
 })
+
+func resetPreparationActionDownloads() {
+	request, err := http.NewRequest(http.MethodDelete, fixtureURL+"/fixture/block-preparation-actions", nil)
+	Expect(err).NotTo(HaveOccurred())
+	response, err := http.DefaultClient.Do(request)
+	Expect(err).NotTo(HaveOccurred())
+	Expect(response.Body.Close()).To(Succeed())
+	Expect(response.StatusCode).To(Equal(http.StatusNoContent))
+}
 
 func findJobCondition(conditions []batchv1.JobCondition, conditionType batchv1.JobConditionType) *batchv1.JobCondition {
 	for index := range conditions {

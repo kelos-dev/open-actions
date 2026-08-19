@@ -58,6 +58,8 @@ const (
 	workflowJobProjectNameIndex = "actions.kelos.dev/workflow-job-project-name"
 	matrixFailFastReason        = "MatrixFailFast"
 	matrixFailFastMessage       = "Another matrix combination failed"
+	jobTokenSecretKey           = "job-token"
+	actionTokenSecretKey        = "action-token"
 )
 
 type workflowJobCancellation struct {
@@ -480,7 +482,11 @@ func (r *RunnerReconciler) executeWorkflowJob(ctx context.Context, runnerObject 
 	if err != nil {
 		return false, err
 	}
-	installation, err := r.GitHub.Installation(ctx, githubConfig.AppID, githubConfig.InstallationID, privateKey, githubSource.Repository.Name, githubclient.InstallationPermissions{ContentsRead: true})
+	jobInstallation, err := r.GitHub.Installation(ctx, githubConfig.AppID, githubConfig.InstallationID, privateKey, githubSource.Repository.Name, githubclient.InstallationPermissions{ContentsRead: true})
+	if err != nil {
+		return false, err
+	}
+	actionInstallation, err := r.GitHub.InstallationForAllRepositories(ctx, githubConfig.AppID, githubConfig.InstallationID, privateKey, githubclient.InstallationPermissions{ContentsRead: true})
 	if err != nil {
 		return false, err
 	}
@@ -489,7 +495,7 @@ func (r *RunnerReconciler) executeWorkflowJob(ctx context.Context, runnerObject 
 	} else if cancellation != nil {
 		return true, r.cancelWorkflowJob(ctx, workflowJob, cancellation)
 	}
-	if err := r.ensureAuthSecret(ctx, workflowJob, installation.Token()); err != nil {
+	if err := r.ensureAuthSecret(ctx, workflowJob, jobInstallation.Token(), actionInstallation.Token()); err != nil {
 		return false, err
 	}
 	nativeJob, err := r.buildJob(workflowJob, run, project, runnerObject)
@@ -714,7 +720,7 @@ func (r *RunnerReconciler) cleanupAuthSecret(ctx context.Context, workflowJob *a
 	return nil
 }
 
-func (r *RunnerReconciler) ensureAuthSecret(ctx context.Context, workflowJob *actionsv1alpha1.WorkflowJob, token string) error {
+func (r *RunnerReconciler) ensureAuthSecret(ctx context.Context, workflowJob *actionsv1alpha1.WorkflowJob, jobToken, actionToken string) error {
 	secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{
 		Name:      childName(workflowJob.Name, "auth"),
 		Namespace: workflowJob.Namespace,
@@ -722,7 +728,7 @@ func (r *RunnerReconciler) ensureAuthSecret(ctx context.Context, workflowJob *ac
 			actionsv1alpha1.LabelWorkflowRunUID: workflowJob.Labels[actionsv1alpha1.LabelWorkflowRunUID],
 			actionsv1alpha1.LabelWorkflowJobUID: string(workflowJob.UID),
 		},
-	}, Data: map[string][]byte{"token": []byte(token)}}
+	}, Data: map[string][]byte{jobTokenSecretKey: []byte(jobToken), actionTokenSecretKey: []byte(actionToken)}}
 	if err := controllerutil.SetControllerReference(workflowJob, secret, r.Scheme()); err != nil {
 		return err
 	}
@@ -749,7 +755,8 @@ func (r *RunnerReconciler) ensureAuthSecret(ctx context.Context, workflowJob *ac
 	if existing.Data == nil {
 		existing.Data = map[string][]byte{}
 	}
-	existing.Data["token"] = []byte(token)
+	existing.Data[jobTokenSecretKey] = []byte(jobToken)
+	existing.Data[actionTokenSecretKey] = []byte(actionToken)
 	if apiEquality.Semantic.DeepEqual(before, existing) {
 		return nil
 	}
@@ -793,13 +800,22 @@ func (r *RunnerReconciler) buildJob(workflowJob *actionsv1alpha1.WorkflowJob, ru
 				Args:                     []string{"--job-file=" + jobPlanMountPath + "/" + jobPlanKey, "--result-file=" + jobResultPath, "--workspace=" + workspacePath},
 				TerminationMessagePath:   jobResultPath,
 				TerminationMessagePolicy: corev1.TerminationMessageReadFile,
-				Env: []corev1.EnvVar{{
-					Name: "OPEN_ACTIONS_GITHUB_TOKEN",
-					ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
-						LocalObjectReference: corev1.LocalObjectReference{Name: childName(workflowJob.Name, "auth")},
-						Key:                  "token",
-					}},
-				}},
+				Env: []corev1.EnvVar{
+					{
+						Name: runner.GitHubTokenEnvVar,
+						ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
+							LocalObjectReference: corev1.LocalObjectReference{Name: childName(workflowJob.Name, "auth")},
+							Key:                  jobTokenSecretKey,
+						}},
+					},
+					{
+						Name: runner.ActionTokenEnvVar,
+						ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
+							LocalObjectReference: corev1.LocalObjectReference{Name: childName(workflowJob.Name, "auth")},
+							Key:                  actionTokenSecretKey,
+						}},
+					},
+				},
 				VolumeMounts: []corev1.VolumeMount{
 					{Name: jobPlanVolume, MountPath: jobPlanMountPath, ReadOnly: true},
 					{Name: workspaceVolume, MountPath: workspaceVolumeMountPath},

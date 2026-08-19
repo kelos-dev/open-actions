@@ -79,7 +79,7 @@ func runManager(arguments []string) error {
 	webhookAddress := flags.String("webhook-bind-address", ":8080", "Address used by the GitHub webhook endpoint")
 	githubAPIURL := flags.String("github-api-url", "https://api.github.com/", "Base URL for the GitHub API")
 	githubServerURL := flags.String("github-server-url", "https://github.com", "GitHub web-server URL exposed to workflows")
-	actionCloneBaseURL := flags.String("action-clone-base-url", "https://github.com", "Base URL used to clone external action repositories")
+	actionCloneBaseURL := flags.String("action-clone-base-url", "", "Base URL used to clone external action repositories; defaults to the GitHub server URL")
 	consoleURL := flags.String("console-url", "", "Public URL for the Open Actions Console")
 	var workflowRunTTLSecondsAfterFinished *int32
 	flags.Func("workflow-run-ttl-seconds-after-finished", "Default spec.ttlSecondsAfterFinished for generated WorkflowRuns; omit the flag to retain them indefinitely", func(value string) error {
@@ -103,7 +103,7 @@ func runManager(arguments []string) error {
 	if err != nil {
 		return err
 	}
-	normalizedActionCloneBaseURL, err := githubclient.NormalizeActionCloneBaseURL(*actionCloneBaseURL)
+	normalizedActionCloneBaseURL, err := normalizeActionCloneBaseURL(*actionCloneBaseURL, normalizedGitHubServerURL)
 	if err != nil {
 		return err
 	}
@@ -216,4 +216,11 @@ func runManager(arguments []string) error {
 	}
 	logger.Info("starting Open Actions controller")
 	return controllerManager.Start(ctrl.SetupSignalHandler())
+}
+
+func normalizeActionCloneBaseURL(value, githubServerURL string) (string, error) {
+	if value == "" {
+		return githubServerURL, nil
+	}
+	return githubclient.NormalizeActionCloneBaseURL(value)
 }

@@ -34,9 +34,10 @@ kubeconfig user. It does not use the Console administrator token.
 `--github-api-url` defaults to `https://api.github.com/` and may include a
 GitHub Enterprise API path such as `/api/v3`. `--github-server-url` defaults to
 `https://github.com` and supplies `github.server_url`. `--action-clone-base-url`
-defaults to `https://github.com` and is used only to fetch external action
-repositories. The controller's optional `--console-url` adds Console links to
-GitHub Check Runs. The Console serves HTTP on `--bind-address` (default
+defaults to the GitHub server URL and is used only to fetch external action
+repositories. Set it explicitly when actions are hosted on another server. The
+controller's optional `--console-url` adds Console links to GitHub Check Runs.
+The Console serves HTTP on `--bind-address` (default
 `:8080`) and serves its read-only pages without authentication. Anyone who can
 reach the Console can read Project and workflow metadata and runner logs. The
 required `--token-file` authenticates Project Secret management. Set
@@ -181,6 +182,32 @@ The job-scoped GitHub App installation token is available as both
 environment unless the workflow assigns one of those expressions to an
 environment variable or action input. Token permission selection is described
 separately from Project value sources.
+
+### External actions
+
+External action repositories on the configured GitHub server are downloaded
+with a short-lived token granting Contents read access to repositories
+granted to the Project's GitHub App installation. Install the App on each
+action repository used by a workflow. The token is used only for the exact
+action repository URL and is not placed in workflow expressions, action inputs,
+or workflow step environments. Runner and workflow processes share a container
+security boundary, so every workflow using an installation must be trusted to
+read every repository granted to it. Limit the installation to repositories
+within that trust boundary. No GitHub credential is sent when
+`--action-clone-base-url` has a different scheme or host from
+`--github-server-url`.
+
+Before the first workflow step runs, the runner recursively resolves and
+downloads every external action referenced by the job or by a nested composite
+action, including actions on steps whose `if` condition evaluates to false.
+An unavailable action therefore fails preparation even when its step would be
+skipped. This keeps action download authentication out of workflow inputs and
+the step environment.
+
+For pull request events, Open Actions applies its merge checkout integration to
+`actions/checkout` and compatible forks whose repository is named `checkout`.
+An action with that repository name must implement the `actions/checkout`
+contract; other actions named `checkout` are unsupported.
 
 `spec.rerun` identifies a repeated attempt. `originalRunRef` anchors the
 attempt lineage, `previousRunRef` names the immediately preceding completed
@@ -678,11 +705,10 @@ always the latest result version supported by the runner binary. Integration
 commit construction is part of this versioned contract; changing its merge
 behavior or commit metadata requires a job-plan version transition.
 
-Docker and local actions, private cross-repository action authentication,
-matrix `include` and `exclude`, service containers, caches, and artifacts are
-not supported. Expressions outside the documented fields and runtime contexts
-are rejected during planning or execution and are never interpreted as literal
-values.
+Docker and local actions, matrix `include` and `exclude`, service containers,
+caches, and artifacts are not supported. Expressions outside the documented
+fields and runtime contexts are rejected during planning or execution and are
+never interpreted as literal values.
 `WorkflowJob` resources are not retried or reassigned when a Runner is removed.
 Native Jobs and their Pod logs are deleted one hour after completion. Completed
 WorkflowRuns are retained indefinitely unless `spec.ttlSecondsAfterFinished` is

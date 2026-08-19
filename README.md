@@ -62,8 +62,13 @@ installed on a public fork for that path. Checks read and write reports run
 state; no GitHub App permission by itself makes fork code safe to execute.
 
 Generate a private key, [install the App](https://docs.github.com/en/apps/using-github-apps/installing-your-own-github-app)
-on the repositories to run, and record the App ID and installation ID. Then
-create the Kubernetes Secret, replacing `WEBHOOK_SECRET` with the secret from
+on every repository whose workflows or actions Open Actions runs, and record
+the App ID and installation ID. The job token is limited to its Project
+repository, while action downloads use a separate short-lived token for the
+repositories granted to the installation. See
+[External actions](docs/reference.md#external-actions).
+
+Create the Kubernetes Secret, replacing `WEBHOOK_SECRET` with the secret from
 GitHub:
 
 ```console

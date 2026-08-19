@@ -68,6 +68,10 @@ func TestRunnerBuildsOwnedJob(t *testing.T) {
 	if container.TerminationMessagePath != jobResultPath || container.TerminationMessagePolicy != corev1.TerminationMessageReadFile {
 		t.Errorf("termination message = %q, policy = %q", container.TerminationMessagePath, container.TerminationMessagePolicy)
 	}
+	if len(container.Env) != 2 || container.Env[0].Name != runner.GitHubTokenEnvVar || container.Env[0].ValueFrom.SecretKeyRef.Key != jobTokenSecretKey ||
+		container.Env[1].Name != runner.ActionTokenEnvVar || container.Env[1].ValueFrom.SecretKeyRef.Key != actionTokenSecretKey {
+		t.Fatalf("runner credential environment = %#v", container.Env)
+	}
 	workspaceMount := ""
 	for _, mount := range container.VolumeMounts {
 		if mount.Name == workspaceVolume {
@@ -1349,6 +1353,26 @@ func TestAssignedWorkflowJobRejectsRecreatedProject(t *testing.T) {
 	}
 }
 
+func TestEnsureAuthSecretStoresRunnerTokens(t *testing.T) {
+	scheme := runnerTestScheme(t)
+	workflowJob := &actionsv1alpha1.WorkflowJob{
+		TypeMeta:   metav1.TypeMeta{APIVersion: actionsv1alpha1.GroupVersion.String(), Kind: "WorkflowJob"},
+		ObjectMeta: metav1.ObjectMeta{Name: "build", Namespace: "default", UID: types.UID("job-uid")},
+	}
+	clusterClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(workflowJob).Build()
+	reconciler := &RunnerReconciler{Client: clusterClient, APIReader: clusterClient}
+	if err := reconciler.ensureAuthSecret(context.Background(), workflowJob, "job-token", "action-token"); err != nil {
+		t.Fatal(err)
+	}
+	secret := &corev1.Secret{}
+	if err := clusterClient.Get(context.Background(), client.ObjectKey{Namespace: workflowJob.Namespace, Name: childName(workflowJob.Name, "auth")}, secret); err != nil {
+		t.Fatal(err)
+	}
+	if string(secret.Data[jobTokenSecretKey]) != "job-token" || string(secret.Data[actionTokenSecretKey]) != "action-token" {
+		t.Fatalf("authentication Secret data = %#v", secret.Data)
+	}
+}
+
 func TestEnsureAuthSecretRejectsUnownedCollision(t *testing.T) {
 	scheme := runnerTestScheme(t)
 	workflowJob := &actionsv1alpha1.WorkflowJob{
@@ -1357,19 +1381,19 @@ func TestEnsureAuthSecretRejectsUnownedCollision(t *testing.T) {
 	}
 	secret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{Name: childName(workflowJob.Name, "auth"), Namespace: workflowJob.Namespace},
-		Data:       map[string][]byte{"token": []byte("existing")},
+		Data:       map[string][]byte{jobTokenSecretKey: []byte("existing")},
 	}
 	clusterClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(workflowJob, secret).Build()
 	reconciler := &RunnerReconciler{Client: clusterClient, APIReader: clusterClient}
-	if err := reconciler.ensureAuthSecret(context.Background(), workflowJob, "replacement"); err == nil {
+	if err := reconciler.ensureAuthSecret(context.Background(), workflowJob, "replacement", "action-replacement"); err == nil {
 		t.Fatal("unowned authentication Secret was accepted")
 	}
 	stored := &corev1.Secret{}
 	if err := clusterClient.Get(context.Background(), client.ObjectKeyFromObject(secret), stored); err != nil {
 		t.Fatal(err)
 	}
-	if string(stored.Data["token"]) != "existing" {
-		t.Fatalf("unowned Secret token = %q", stored.Data["token"])
+	if string(stored.Data[jobTokenSecretKey]) != "existing" {
+		t.Fatalf("unowned Secret token = %q", stored.Data[jobTokenSecretKey])
 	}
 }
 

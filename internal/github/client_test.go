@@ -114,6 +114,38 @@ func TestInstallationRequestsOnlySelectedPermissions(t *testing.T) {
 	}
 }
 
+func TestInstallationForAllRepositoriesOmitsRepositorySelection(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		body := map[string]any{}
+		if err := json.NewDecoder(request.Body).Decode(&body); err != nil {
+			http.Error(writer, "invalid request", http.StatusBadRequest)
+			return
+		}
+		if _, found := body["repositories"]; found {
+			http.Error(writer, "repository selection was included", http.StatusBadRequest)
+			return
+		}
+		permissions, ok := body["permissions"].(map[string]any)
+		if !ok || permissions["contents"] != "read" {
+			http.Error(writer, "unexpected permissions", http.StatusBadRequest)
+			return
+		}
+		fmt.Fprint(writer, `{"token":"action-installation-token"}`)
+	}))
+	defer server.Close()
+	client, err := NewClient(server.URL, server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	installation, err := client.InstallationForAllRepositories(context.Background(), 1, 2, testPrivateKey(t), InstallationPermissions{ContentsRead: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if installation.Token() != "action-installation-token" {
+		t.Fatalf("token = %q", installation.Token())
+	}
+}
+
 func TestListRepositoriesStopsAtLimit(t *testing.T) {
 	requests := 0
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
