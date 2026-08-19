@@ -30,6 +30,15 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
+      - name: Diagnose verify environment
+        run: |
+          git rev-parse HEAD
+          go version
+          go env GOTOOLCHAIN GOOS GOARCH CGO_ENABLED
+          wc -l go.sum
+          sha256sum go.sum
+          git show HEAD:go.sum | sha256sum
+          git status --short
       - name: Verify
         run: make verify
 
