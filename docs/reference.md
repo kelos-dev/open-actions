@@ -38,9 +38,10 @@ defaults to the GitHub server URL and is used only to fetch external action
 repositories. Set it explicitly when actions are hosted on another server. The
 controller's optional `--console-url` adds Console links to GitHub Check Runs.
 The Console serves HTTP on `--bind-address` (default
-`:8080`) and serves its read-only pages without authentication. Anyone who can
+`:8080`) and serves its read-only views without authentication. Anyone who can
 reach the Console can read Project and workflow metadata and runner logs. The
-required `--token-file` authenticates Project Secret management. Set
+required `--token-file` authenticates workflow reruns and Project Secret
+management. Set
 `--secure-cookie` when the Console is served through HTTPS. The Helm chart
 configures the administrator token and cookie security from its configured
 Secret and `console.publicURL`.
@@ -58,6 +59,17 @@ including standard, bright, 256-color, and RGB values, are rendered along with
 bold, dim, italic, underline, and strike-through text. Other CSI control
 sequences are discarded. Log lines larger than 256 KiB are truncated so a
 workflow cannot retain unbounded Console memory.
+
+After signing in with the Console administrator token, an administrator can
+rerun all jobs from the latest completed attempt in a workflow lineage. When
+the attempt failed because one or more jobs failed, the administrator can
+instead rerun the failed expanded job IDs and their transitive dependents; the
+controller also includes the prerequisite jobs needed by that selected graph.
+The Console creates a new immutable WorkflowRun attempt with the same project,
+source, workflow path, and retention setting, clears any prior cancellation
+request, and redirects to the new run. Rerun actions are unavailable while the
+latest attempt is still active. The Helm chart grants the Console `create`
+access to WorkflowRuns across the namespaces it displays.
 
 The Projects page lists Project configuration across all namespaces. A Project
 detail page lists the names, but never the values, of keys in its referenced

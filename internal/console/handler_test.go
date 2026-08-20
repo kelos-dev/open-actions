@@ -14,6 +14,7 @@ import (
 
 	actionsv1alpha1 "github.com/kelos-dev/open-actions/api/v1alpha1"
 	"github.com/kelos-dev/open-actions/internal/projectvalue"
+	"github.com/kelos-dev/open-actions/internal/workflowrun"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -196,6 +197,205 @@ func TestConsoleMainPageLimitsWorkflowRuns(t *testing.T) {
 	}
 	if strings.Contains(body, oldestName) {
 		t.Fatalf("main page contains truncated WorkflowRun %q", oldestName)
+	}
+}
+
+func TestConsoleRerunsCompletedWorkflow(t *testing.T) {
+	handler := newTestHandler(t, false)
+	run := &actionsv1alpha1.WorkflowRun{}
+	if err := handler.client.Get(context.Background(), client.ObjectKey{Namespace: "default", Name: "ci"}, run); err != nil {
+		t.Fatal(err)
+	}
+	run.Status.Conditions = []metav1.Condition{{
+		Type: actionsv1alpha1.WorkflowRunConditionSucceeded, Status: metav1.ConditionTrue, Reason: "JobsSucceeded",
+	}}
+	if err := handler.client.Update(context.Background(), run); err != nil {
+		t.Fatal(err)
+	}
+
+	page := httptest.NewRecorder()
+	handler.ServeHTTP(page, httptest.NewRequest(http.MethodGet, "/runs/default/ci", nil))
+	if page.Code != http.StatusOK || !strings.Contains(page.Body.String(), "Sign in to re-run") {
+		t.Fatalf("unauthenticated run page = %d, %q", page.Code, page.Body.String())
+	}
+
+	form := url.Values{"csrf": {handler.csrfToken}, "jobs": {"all"}}
+	unauthenticated := httptest.NewRequest(http.MethodPost, "/runs/default/ci/rerun", strings.NewReader(form.Encode()))
+	unauthenticated.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	unauthenticatedResponse := httptest.NewRecorder()
+	handler.ServeHTTP(unauthenticatedResponse, unauthenticated)
+	if unauthenticatedResponse.Code != http.StatusFound || unauthenticatedResponse.Header().Get("Location") != "/login?next=%2Fruns%2Fdefault%2Fci" {
+		t.Fatalf("unauthenticated rerun response = %d, %q", unauthenticatedResponse.Code, unauthenticatedResponse.Header().Get("Location"))
+	}
+
+	authenticatedPageRequest := httptest.NewRequest(http.MethodGet, "/runs/default/ci", nil)
+	authenticatedPageRequest.Header.Set("Authorization", "Bearer "+testConsoleToken)
+	authenticatedPage := httptest.NewRecorder()
+	handler.ServeHTTP(authenticatedPage, authenticatedPageRequest)
+	if authenticatedPage.Code != http.StatusOK || !strings.Contains(authenticatedPage.Body.String(), "Re-run all jobs") || strings.Contains(authenticatedPage.Body.String(), "Re-run failed jobs") || !strings.Contains(authenticatedPage.Body.String(), handler.csrfToken) {
+		t.Fatalf("authenticated run page = %d, %q", authenticatedPage.Code, authenticatedPage.Body.String())
+	}
+	failedForm := url.Values{"csrf": {handler.csrfToken}, "jobs": {"failed"}}
+	failedRequest := httptest.NewRequest(http.MethodPost, "/runs/default/ci/rerun", strings.NewReader(failedForm.Encode()))
+	failedRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	failedRequest.Header.Set("Authorization", "Bearer "+testConsoleToken)
+	failedResponse := httptest.NewRecorder()
+	handler.ServeHTTP(failedResponse, failedRequest)
+	if failedResponse.Code != http.StatusConflict || !strings.Contains(failedResponse.Body.String(), "did not fail because of a job") {
+		t.Fatalf("failed-job rerun response = %d, %q", failedResponse.Code, failedResponse.Body.String())
+	}
+
+	invalidRequest := httptest.NewRequest(http.MethodPost, "/runs/default/ci/rerun", strings.NewReader("csrf=invalid"))
+	invalidRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	invalidRequest.Header.Set("Authorization", "Bearer "+testConsoleToken)
+	invalidResponse := httptest.NewRecorder()
+	handler.ServeHTTP(invalidResponse, invalidRequest)
+	if invalidResponse.Code != http.StatusForbidden {
+		t.Fatalf("invalid CSRF response = %d, want %d", invalidResponse.Code, http.StatusForbidden)
+	}
+
+	request := httptest.NewRequest(http.MethodPost, "/runs/default/ci/rerun", strings.NewReader(form.Encode()))
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.Header.Set("Authorization", "Bearer "+testConsoleToken)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	rerunName := workflowrun.RerunName(run, 2)
+	if response.Code != http.StatusSeeOther || response.Header().Get("Location") != "/runs/default/"+rerunName {
+		t.Fatalf("rerun response = %d, %q", response.Code, response.Header().Get("Location"))
+	}
+	rerun := &actionsv1alpha1.WorkflowRun{}
+	if err := handler.client.Get(context.Background(), client.ObjectKey{Namespace: "default", Name: rerunName}, rerun); err != nil {
+		t.Fatal(err)
+	}
+	if rerun.Spec.Rerun == nil || rerun.Spec.Rerun.Attempt != 2 || rerun.Spec.Rerun.OriginalRunRef.Name != run.Name || rerun.Spec.Rerun.OriginalRunRef.UID != run.UID || rerun.Spec.Rerun.PreviousRunRef.Name != run.Name || rerun.Spec.Rerun.PreviousRunRef.UID != run.UID || len(rerun.Spec.Rerun.JobIDs) != 0 {
+		t.Fatalf("rerun spec = %#v", rerun.Spec.Rerun)
+	}
+	if rerun.Spec.CancelRequested || rerun.Labels[actionsv1alpha1.LabelWorkflowRunRootUID] != string(run.UID) {
+		t.Fatalf("rerun = %#v", rerun)
+	}
+
+	rerun.UID = "rerun-uid"
+	rerun.Status.Conditions = []metav1.Condition{{
+		Type: actionsv1alpha1.WorkflowRunConditionSucceeded, Status: metav1.ConditionFalse, Reason: "JobFailed",
+	}}
+	if err := handler.client.Update(context.Background(), rerun); err != nil {
+		t.Fatal(err)
+	}
+	request = httptest.NewRequest(http.MethodPost, "/runs/default/ci/rerun", strings.NewReader(form.Encode()))
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.Header.Set("Authorization", "Bearer "+testConsoleToken)
+	response = httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	thirdName := workflowrun.RerunName(run, 3)
+	if response.Code != http.StatusSeeOther || response.Header().Get("Location") != "/runs/default/"+thirdName {
+		t.Fatalf("third attempt response = %d, %q", response.Code, response.Header().Get("Location"))
+	}
+	third := &actionsv1alpha1.WorkflowRun{}
+	if err := handler.client.Get(context.Background(), client.ObjectKey{Namespace: "default", Name: thirdName}, third); err != nil {
+		t.Fatal(err)
+	}
+	if third.Spec.Rerun == nil || third.Spec.Rerun.Attempt != 3 || third.Spec.Rerun.PreviousRunRef.Name != rerun.Name || third.Spec.Rerun.PreviousRunRef.UID != rerun.UID {
+		t.Fatalf("third attempt spec = %#v", third.Spec.Rerun)
+	}
+}
+
+func TestConsoleRerunsFailedWorkflowJobs(t *testing.T) {
+	handler := newTestHandler(t, false)
+	run := &actionsv1alpha1.WorkflowRun{}
+	if err := handler.client.Get(context.Background(), client.ObjectKey{Namespace: "default", Name: "ci"}, run); err != nil {
+		t.Fatal(err)
+	}
+	run.Status.Jobs = &actionsv1alpha1.WorkflowRunJobStatus{Total: 3}
+	run.Status.Conditions = []metav1.Condition{{
+		Type: actionsv1alpha1.WorkflowRunConditionSucceeded, Status: metav1.ConditionFalse, Reason: "JobFailed",
+	}}
+	if err := handler.client.Update(context.Background(), run); err != nil {
+		t.Fatal(err)
+	}
+	failed := &actionsv1alpha1.WorkflowJob{}
+	if err := handler.client.Get(context.Background(), client.ObjectKey{Namespace: "default", Name: "build"}, failed); err != nil {
+		t.Fatal(err)
+	}
+	failed.Status.Result = actionsv1alpha1.WorkflowJobResultFailure
+	if err := handler.client.Update(context.Background(), failed); err != nil {
+		t.Fatal(err)
+	}
+	succeeded := &actionsv1alpha1.WorkflowJob{
+		ObjectMeta: metav1.ObjectMeta{Name: "lint", Namespace: run.Namespace, Labels: map[string]string{actionsv1alpha1.LabelWorkflowRunUID: string(run.UID)}},
+		Spec:       actionsv1alpha1.WorkflowJobSpec{JobID: "lint"},
+		Status:     actionsv1alpha1.WorkflowJobStatus{Result: actionsv1alpha1.WorkflowJobResultSuccess},
+	}
+	dependent := &actionsv1alpha1.WorkflowJob{
+		ObjectMeta: metav1.ObjectMeta{Name: "report", Namespace: run.Namespace, Labels: map[string]string{actionsv1alpha1.LabelWorkflowRunUID: string(run.UID)}},
+		Spec:       actionsv1alpha1.WorkflowJobSpec{JobID: "report", Needs: []string{"build"}},
+		Status:     actionsv1alpha1.WorkflowJobStatus{Result: actionsv1alpha1.WorkflowJobResultSkipped},
+	}
+	if err := handler.client.Create(context.Background(), succeeded); err != nil {
+		t.Fatal(err)
+	}
+	if err := handler.client.Create(context.Background(), dependent); err != nil {
+		t.Fatal(err)
+	}
+
+	pageRequest := httptest.NewRequest(http.MethodGet, "/runs/default/ci", nil)
+	pageRequest.Header.Set("Authorization", "Bearer "+testConsoleToken)
+	page := httptest.NewRecorder()
+	handler.ServeHTTP(page, pageRequest)
+	if page.Code != http.StatusOK || !strings.Contains(page.Body.String(), "Re-run failed jobs") || !strings.Contains(page.Body.String(), "Re-run all jobs") {
+		t.Fatalf("failed run page = %d, %q", page.Code, page.Body.String())
+	}
+
+	form := url.Values{"csrf": {handler.csrfToken}, "jobs": {"failed"}}
+	request := httptest.NewRequest(http.MethodPost, "/runs/default/ci/rerun", strings.NewReader(form.Encode()))
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.Header.Set("Authorization", "Bearer "+testConsoleToken)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusSeeOther {
+		t.Fatalf("failed-job rerun response = %d, %q", response.Code, response.Body.String())
+	}
+	rerun := &actionsv1alpha1.WorkflowRun{}
+	if err := handler.client.Get(context.Background(), client.ObjectKey{Namespace: run.Namespace, Name: workflowrun.RerunName(run, 2)}, rerun); err != nil {
+		t.Fatal(err)
+	}
+	if rerun.Spec.Rerun == nil || len(rerun.Spec.Rerun.JobIDs) != 2 || rerun.Spec.Rerun.JobIDs[0] != "build" || rerun.Spec.Rerun.JobIDs[1] != "report" {
+		t.Fatalf("failed-job rerun spec = %#v", rerun.Spec.Rerun)
+	}
+}
+
+func TestConsoleRejectsRerunBeforeWorkflowCompletes(t *testing.T) {
+	handler := newTestHandler(t, false)
+	form := url.Values{"csrf": {handler.csrfToken}, "jobs": {"all"}}
+	request := httptest.NewRequest(http.MethodPost, "/runs/default/ci/rerun", strings.NewReader(form.Encode()))
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.Header.Set("Authorization", "Bearer "+testConsoleToken)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusConflict || !strings.Contains(response.Body.String(), "not complete") {
+		t.Fatalf("rerun response = %d, %q", response.Code, response.Body.String())
+	}
+}
+
+func TestConsoleShowsRerunWhenOriginalWorkflowRunIsGone(t *testing.T) {
+	handler := newTestHandler(t, false)
+	root := &actionsv1alpha1.WorkflowRun{}
+	if err := handler.client.Get(context.Background(), client.ObjectKey{Namespace: "default", Name: "ci"}, root); err != nil {
+		t.Fatal(err)
+	}
+	rerun := workflowrun.NewRerun(root, root, 2, "", nil)
+	rerun.UID = "rerun-uid"
+	rerun.Status.WorkflowName = "CI rerun"
+	if err := handler.client.Create(context.Background(), rerun); err != nil {
+		t.Fatal(err)
+	}
+	if err := handler.client.Delete(context.Background(), root); err != nil {
+		t.Fatal(err)
+	}
+
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, runPath(rerun), nil))
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), "CI rerun") || strings.Contains(response.Body.String(), "Sign in to re-run") {
+		t.Fatalf("rerun page = %d, %q", response.Code, response.Body.String())
 	}
 }
 
@@ -454,12 +654,15 @@ func TestNewRequiresToken(t *testing.T) {
 }
 
 func TestSafeNextRejectsExternalURLs(t *testing.T) {
-	for _, value := range []string{"https://example.com/projects/default/project", "//example.com/projects/default/project", "/", "/login", "/runs/default/ci"} {
+	for _, value := range []string{"https://example.com/projects/default/project", "//example.com/projects/default/project", "/", "/login"} {
 		if next := safeNext(value); next != "" {
 			t.Fatalf("safeNext(%q) = %q", value, next)
 		}
 	}
 	if next := safeNext("/projects/default/project?tab=secrets"); next != "/projects/default/project?tab=secrets" {
+		t.Fatalf("safeNext() = %q", next)
+	}
+	if next := safeNext("/runs/default/ci"); next != "/runs/default/ci" {
 		t.Fatalf("safeNext() = %q", next)
 	}
 }

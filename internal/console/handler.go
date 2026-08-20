@@ -22,6 +22,7 @@ import (
 
 	actionsv1alpha1 "github.com/kelos-dev/open-actions/api/v1alpha1"
 	"github.com/kelos-dev/open-actions/internal/projectvalue"
+	"github.com/kelos-dev/open-actions/internal/workflowrun"
 	"github.com/kelos-dev/open-actions/internal/workflowstatus"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -42,6 +43,8 @@ const (
 	truncatedLogMarker = " … [log line truncated]"
 	mainPageRunLimit   = 100
 	secretRequestSize  = 3*projectvalue.MaxValueBytes + (8 << 10)
+	adminRequestSize   = 8 << 10
+	maxRerunAttempt    = int32(2147483647)
 )
 
 var errLogsUnavailable = errors.New("logs are no longer available")
@@ -142,18 +145,23 @@ type projectPageData struct {
 }
 
 type runPageData struct {
-	RunURL        string
-	Repository    string
-	WorkflowName  string
-	WorkflowPath  string
-	Revision      string
-	ShortRevision string
-	RefName       string
-	Status        string
-	StatusClass   string
-	Started       string
-	Duration      string
-	Jobs          []jobPageData
+	RunURL         string
+	RerunURL       string
+	LoginURL       string
+	CSRFToken      string
+	CanRerun       bool
+	CanRerunFailed bool
+	Repository     string
+	WorkflowName   string
+	WorkflowPath   string
+	Revision       string
+	ShortRevision  string
+	RefName        string
+	Status         string
+	StatusClass    string
+	Started        string
+	Duration       string
+	Jobs           []jobPageData
 }
 
 type jobPageData struct {
@@ -244,6 +252,15 @@ func (h *Handler) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 		return
 	}
 	parts := splitPath(request.URL.Path)
+	if request.Method == http.MethodPost && len(parts) == 4 && parts[0] == "runs" && parts[3] == "rerun" {
+		next := "/runs/" + url.PathEscape(parts[1]) + "/" + url.PathEscape(parts[2])
+		if !h.authenticated(request) {
+			http.Redirect(writer, request, "/login?next="+url.QueryEscape(next), http.StatusFound)
+			return
+		}
+		h.rerunWorkflow(writer, request, parts[1], parts[2])
+		return
+	}
 	if request.Method == http.MethodPost && len(parts) == 4 && parts[0] == "projects" && parts[3] == "secrets" {
 		if !h.authenticated(request) {
 			next := "/projects/" + url.PathEscape(parts[1]) + "/" + url.PathEscape(parts[2])
@@ -609,7 +626,122 @@ func (h *Handler) runDetails(writer http.ResponseWriter, request *http.Request, 
 		h.writeResolutionError(writer, request, err)
 		return
 	}
+	_, latest, err := h.workflowRunLineage(request.Context(), run)
+	if err != nil {
+		h.logger.Warn("Unable to load WorkflowRun lineage", "namespace", run.Namespace, "workflow_run", run.Name, "error", err)
+	} else if workflowrun.Terminal(latest) && (latest.Spec.Rerun == nil || latest.Spec.Rerun.Attempt < maxRerunAttempt) {
+		data.RerunURL = runPath(run) + "/rerun"
+		if h.authenticated(request) {
+			data.CanRerun = true
+			data.CanRerunFailed = workflowrun.Failed(latest)
+			data.CSRFToken = h.csrfToken
+		} else {
+			data.LoginURL = "/login?next=" + url.QueryEscape(runPath(run))
+		}
+	}
 	h.writeHTML(writer, h.runPage, data)
+}
+
+func (h *Handler) rerunWorkflow(writer http.ResponseWriter, request *http.Request, namespace, name string) {
+	request.Body = http.MaxBytesReader(writer, request.Body, adminRequestSize)
+	if err := request.ParseForm(); err != nil {
+		http.Error(writer, "invalid rerun request", http.StatusBadRequest)
+		return
+	}
+	if !h.validCSRF(request.PostForm.Get("csrf")) {
+		http.Error(writer, "invalid CSRF token", http.StatusForbidden)
+		return
+	}
+	selection := request.PostForm.Get("jobs")
+	if selection != "all" && selection != "failed" {
+		http.Error(writer, "invalid rerun job selection", http.StatusBadRequest)
+		return
+	}
+	run, err := h.resolveRun(request.Context(), namespace, name)
+	if err != nil {
+		h.writeResolutionError(writer, request, err)
+		return
+	}
+	root, latest, err := h.workflowRunLineage(request.Context(), run)
+	if err != nil {
+		h.writeResolutionError(writer, request, err)
+		return
+	}
+	if !workflowrun.Terminal(latest) {
+		http.Error(writer, "the latest workflow attempt is not complete", http.StatusConflict)
+		return
+	}
+	attempt := int32(2)
+	if latest.Spec.Rerun != nil {
+		if latest.Spec.Rerun.Attempt == maxRerunAttempt {
+			http.Error(writer, "workflow rerun attempt limit reached", http.StatusConflict)
+			return
+		}
+		attempt = latest.Spec.Rerun.Attempt + 1
+	}
+	var jobIDs []string
+	if selection == "failed" {
+		if !workflowrun.Failed(latest) {
+			http.Error(writer, "the latest workflow attempt did not fail because of a job", http.StatusConflict)
+			return
+		}
+		jobs := &actionsv1alpha1.WorkflowJobList{}
+		if err := h.client.List(request.Context(), jobs, client.InNamespace(latest.Namespace), client.MatchingLabels{actionsv1alpha1.LabelWorkflowRunUID: string(latest.UID)}); err != nil {
+			h.writeResolutionError(writer, request, fmt.Errorf("load WorkflowJobs for WorkflowRun %q: %w", latest.Name, err))
+			return
+		}
+		jobIDs, err = workflowrun.FailedJobIDs(latest, jobs.Items)
+		if err != nil {
+			http.Error(writer, err.Error(), http.StatusConflict)
+			return
+		}
+	}
+	desired := workflowrun.NewRerun(root, latest, attempt, "", jobIDs)
+	if err := h.client.Create(request.Context(), desired); err != nil {
+		if apierrors.IsAlreadyExists(err) {
+			http.Error(writer, "another workflow rerun was requested", http.StatusConflict)
+			return
+		}
+		h.writeResolutionError(writer, request, fmt.Errorf("create rerun WorkflowRun %q for WorkflowRun %q: %w", desired.Name, latest.Name, err))
+		return
+	}
+	h.logger.Info("Created WorkflowRun rerun", "namespace", desired.Namespace, "workflow_run", desired.Name, "previous_run", latest.Name, "attempt", attempt, "jobs", selection, "selected_jobs", len(jobIDs))
+	http.Redirect(writer, request, runPath(desired), http.StatusSeeOther)
+}
+
+func (h *Handler) workflowRunLineage(ctx context.Context, run *actionsv1alpha1.WorkflowRun) (*actionsv1alpha1.WorkflowRun, *actionsv1alpha1.WorkflowRun, error) {
+	root := run
+	if run.Spec.Rerun != nil {
+		root = &actionsv1alpha1.WorkflowRun{}
+		key := types.NamespacedName{Namespace: run.Namespace, Name: run.Spec.Rerun.OriginalRunRef.Name}
+		if err := h.client.Get(ctx, key, root); err != nil {
+			return nil, nil, fmt.Errorf("load original WorkflowRun %q for WorkflowRun %q: %w", key.Name, run.Name, err)
+		}
+		if root.UID != run.Spec.Rerun.OriginalRunRef.UID || root.Spec.Rerun != nil {
+			return nil, nil, fmt.Errorf("WorkflowRun %q does not have a valid original WorkflowRun", run.Name)
+		}
+	}
+	runs := &actionsv1alpha1.WorkflowRunList{}
+	if err := h.client.List(ctx, runs, client.InNamespace(root.Namespace), client.MatchingLabels{actionsv1alpha1.LabelWorkflowRunRootUID: string(root.UID)}); err != nil {
+		return nil, nil, fmt.Errorf("load rerun attempts for WorkflowRun %q: %w", root.Name, err)
+	}
+	if run.Spec.Rerun != nil {
+		found := false
+		for index := range runs.Items {
+			found = runs.Items[index].UID == run.UID
+			if found {
+				break
+			}
+		}
+		if !found {
+			runs.Items = append(runs.Items, *run.DeepCopy())
+		}
+	}
+	latest, err := workflowrun.LatestAttempt(root, runs.Items)
+	if err != nil {
+		return nil, nil, fmt.Errorf("resolve rerun attempts for WorkflowRun %q: %w", root.Name, err)
+	}
+	return root, latest, nil
 }
 
 func (h *Handler) loadRunPageData(ctx context.Context, run *actionsv1alpha1.WorkflowRun) (runPageData, error) {
@@ -931,7 +1063,12 @@ func splitPath(value string) []string {
 
 func safeNext(value string) string {
 	parsed, err := url.Parse(value)
-	if err != nil || parsed.IsAbs() || parsed.Host != "" || (parsed.Path != "/projects" && !strings.HasPrefix(parsed.Path, "/projects/")) {
+	if err != nil || parsed.IsAbs() || parsed.Host != "" {
+		return ""
+	}
+	projectPath := parsed.Path == "/projects" || strings.HasPrefix(parsed.Path, "/projects/")
+	runPath := strings.HasPrefix(parsed.Path, "/runs/")
+	if !projectPath && !runPath {
 		return ""
 	}
 	return value
