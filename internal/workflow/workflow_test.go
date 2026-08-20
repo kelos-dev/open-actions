@@ -333,38 +333,17 @@ func TestParseDogfoodCIWorkflow(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parse dogfood workflow: %v", err)
 	}
-	if len(definition.Jobs) != 3 {
-		t.Fatalf("jobs = %d, want 3", len(definition.Jobs))
+	if len(definition.Jobs) != 2 {
+		t.Fatalf("jobs = %d, want 2", len(definition.Jobs))
 	}
-}
-
-func TestParseDogfoodE2EWorkflow(t *testing.T) {
-	data, err := os.ReadFile("../../.open-actions/workflows/e2e.yaml")
-	if err != nil {
-		t.Fatal(err)
-	}
-	definition, err := Parse(data)
-	if err != nil {
-		t.Fatalf("parse dogfood e2e workflow: %v", err)
-	}
-	if !Matches(definition.On, Event{Name: "push", Ref: "refs/heads/main", RefName: "main"}) {
-		t.Error("dogfood e2e workflow does not match a main push")
-	}
-	if Matches(definition.On, Event{Name: "pull_request", Action: "synchronize", BaseRef: "main"}) {
-		t.Error("dogfood e2e workflow matches a pull request")
-	}
-	job, found := definition.Jobs["test-e2e"]
-	if !found {
-		t.Fatal("dogfood e2e workflow does not define test-e2e")
-	}
-	if got, want := []string(job.RunsOn), []string{"self-hosted", "linux", "x64", "docker"}; !slices.Equal(got, want) {
-		t.Errorf("runs-on = %v, want %v", got, want)
-	}
-	if len(job.Steps) < 4 || job.Steps[2].Uses != "azure/setup-helm@v4" || job.Steps[2].With["version"] != "3.20.1" {
-		t.Errorf("setup Helm step = %#v", job.Steps)
-	}
-	if len(job.Steps) < 4 || job.Steps[3].Uses != "helm/kind-action@v1" {
-		t.Errorf("kind action step = %#v", job.Steps)
+	for _, name := range []string{"confirm-first", "confirm-second"} {
+		job, found := definition.Jobs[name]
+		if !found {
+			t.Fatalf("dogfood workflow does not define %s", name)
+		}
+		if len(job.Steps) != 1 || job.Steps[0].Run == "" {
+			t.Fatalf("%s steps = %#v, want one command", name, job.Steps)
+		}
 	}
 }
 
