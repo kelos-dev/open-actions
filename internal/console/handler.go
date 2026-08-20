@@ -4,8 +4,10 @@ import (
 	"bufio"
 	"context"
 	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,6 +16,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -25,6 +28,7 @@ import (
 	"github.com/kelos-dev/open-actions/internal/workflowrun"
 	"github.com/kelos-dev/open-actions/internal/workflowstatus"
 	corev1 "k8s.io/api/core/v1"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -36,21 +40,31 @@ import (
 )
 
 const (
-	sessionCookieName  = "open_actions_console_session"
-	sessionLifetime    = 7 * 24 * time.Hour
-	streamHeartbeat    = 15 * time.Second
-	logBatchInterval   = 50 * time.Millisecond
-	logBatchEntryLimit = 200
-	logBatchByteLimit  = 64 << 10
-	maxLogLineBytes    = 256 << 10
-	truncatedLogMarker = " … [log line truncated]"
-	mainPageRunLimit   = 100
-	secretRequestSize  = 3*projectvalue.MaxValueBytes + (8 << 10)
-	adminRequestSize   = 8 << 10
-	maxRerunAttempt    = int32(2147483647)
+	sessionCookieName   = "open_actions_console_session"
+	sessionLifetime     = 7 * 24 * time.Hour
+	streamHeartbeat     = 15 * time.Second
+	logBatchInterval    = 50 * time.Millisecond
+	logBatchEntryLimit  = 200
+	logBatchByteLimit   = 64 << 10
+	maxLogLineBytes     = 256 << 10
+	truncatedLogMarker  = " … [log line truncated]"
+	mainPageRunLimit    = 100
+	secretRequestSize   = 3*projectvalue.MaxValueBytes + (8 << 10)
+	adminRequestSize    = 8 << 10
+	dispatchRequestSize = 12*65_535 + (16 << 10)
+	maxRerunAttempt     = int32(2147483647)
+	maxDispatchInputs   = 25
+	maxDispatchPayload  = 65_535
 )
 
 var errLogsUnavailable = errors.New("logs are no longer available")
+
+var (
+	dispatchInputNamePattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_-]{0,99}$`)
+	repositoryOwnerPattern   = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]*$`)
+	repositoryNamePattern    = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
+	invalidGitRefCharacter   = regexp.MustCompile(`[\x00-\x20\x7f~^:?*\[\\]`)
+)
 
 type secretCountLimitError struct {
 	name string
@@ -62,30 +76,33 @@ func (e *secretCountLimitError) Error() string {
 
 // Config contains required Console dependencies.
 type Config struct {
-	Client                    client.Client
-	Logs                      LogSource
-	Token                     string
-	SecretManagementNamespace string
-	SecureCookie              bool
-	Logger                    *slog.Logger
+	Client                             client.Client
+	Logs                               LogSource
+	Token                              string
+	SecretManagementNamespace          string
+	WorkflowRunTTLSecondsAfterFinished *int32
+	SecureCookie                       bool
+	Logger                             *slog.Logger
 }
 
-// Handler serves workflow run information and authenticated Project Secret management.
+// Handler serves workflow information and authenticated Console administration.
 type Handler struct {
-	client                    client.Client
-	logs                      LogSource
-	tokenDigest               [sha256.Size]byte
-	sessionValue              string
-	csrfToken                 string
-	secretManagementNamespace string
-	secureCookie              bool
-	logger                    *slog.Logger
-	loginPage                 *template.Template
-	mainPage                  *template.Template
-	projectsPage              *template.Template
-	projectPage               *template.Template
-	runPage                   *template.Template
-	logPage                   *template.Template
+	client                             client.Client
+	logs                               LogSource
+	tokenDigest                        [sha256.Size]byte
+	sessionValue                       string
+	csrfToken                          string
+	secretManagementNamespace          string
+	workflowRunTTLSecondsAfterFinished *int32
+	secureCookie                       bool
+	logger                             *slog.Logger
+	loginPage                          *template.Template
+	mainPage                           *template.Template
+	projectsPage                       *template.Template
+	projectPage                        *template.Template
+	dispatchPage                       *template.Template
+	runPage                            *template.Template
+	logPage                            *template.Template
 }
 
 type loginRequest struct {
@@ -147,6 +164,32 @@ type projectPageData struct {
 	CSRFToken         string
 }
 
+type dispatchPageData struct {
+	Projects        []dispatchProjectOption
+	SelectedProject string
+	RepositoryID    string
+	RepositoryOwner string
+	RepositoryName  string
+	RefType         string
+	RefName         string
+	Revision        string
+	WorkflowPath    string
+	Inputs          []dispatchInputPageData
+	CSRFToken       string
+	RequestID       string
+}
+
+type dispatchProjectOption struct {
+	Value    string
+	Label    string
+	Selected bool
+}
+
+type dispatchInputPageData struct {
+	Name  string
+	Value string
+}
+
 type runPageData struct {
 	RunURL         string
 	RerunURL       string
@@ -164,6 +207,7 @@ type runPageData struct {
 	StatusClass    string
 	Started        string
 	Duration       string
+	DispatchURL    string
 	Jobs           []jobPageData
 }
 
@@ -208,6 +252,9 @@ func New(config Config) (*Handler, error) {
 	if config.Logger == nil {
 		return nil, errors.New("Console logger is required")
 	}
+	if config.WorkflowRunTTLSecondsAfterFinished != nil && *config.WorkflowRunTTLSecondsAfterFinished < 0 {
+		return nil, errors.New("Console WorkflowRun TTL must not be negative")
+	}
 	loginPage, err := template.New("login").Parse(loginPageTemplate)
 	if err != nil {
 		return nil, err
@@ -224,6 +271,10 @@ func New(config Config) (*Handler, error) {
 	if err != nil {
 		return nil, err
 	}
+	dispatchPage, err := template.New("dispatch").Parse(dispatchPageTemplate)
+	if err != nil {
+		return nil, err
+	}
 	runPage, err := template.New("run").Parse(runPageTemplate)
 	if err != nil {
 		return nil, err
@@ -233,11 +284,17 @@ func New(config Config) (*Handler, error) {
 		return nil, err
 	}
 	tokenDigest := sha256.Sum256([]byte(config.Token))
+	var workflowRunTTLSecondsAfterFinished *int32
+	if config.WorkflowRunTTLSecondsAfterFinished != nil {
+		value := *config.WorkflowRunTTLSecondsAfterFinished
+		workflowRunTTLSecondsAfterFinished = &value
+	}
 	return &Handler{
 		client: config.Client, logs: config.Logs, tokenDigest: tokenDigest,
 		sessionValue: sessionValue(config.Token), csrfToken: csrfValue(config.Token), secretManagementNamespace: config.SecretManagementNamespace,
-		secureCookie: config.SecureCookie, logger: config.Logger,
-		loginPage: loginPage, mainPage: mainPage, projectsPage: projectsPage, projectPage: projectPage, runPage: runPage, logPage: logPage,
+		workflowRunTTLSecondsAfterFinished: workflowRunTTLSecondsAfterFinished,
+		secureCookie:                       config.SecureCookie, logger: config.Logger,
+		loginPage: loginPage, mainPage: mainPage, projectsPage: projectsPage, projectPage: projectPage, dispatchPage: dispatchPage, runPage: runPage, logPage: logPage,
 	}, nil
 }
 
@@ -255,6 +312,22 @@ func (h *Handler) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 		return
 	}
 	parts := splitPath(request.URL.Path)
+	if request.URL.Path == "/dispatch" {
+		if !h.authenticated(request) {
+			h.redirectToLogin(writer, request)
+			return
+		}
+		switch request.Method {
+		case http.MethodGet:
+			h.workflowDispatchPage(writer, request)
+		case http.MethodPost:
+			h.createWorkflowDispatch(writer, request)
+		default:
+			writer.Header().Set("Allow", http.MethodGet+", "+http.MethodPost)
+			http.Error(writer, "method not allowed", http.StatusMethodNotAllowed)
+		}
+		return
+	}
 	if request.Method == http.MethodPost && len(parts) == 4 && parts[0] == "runs" && parts[3] == "rerun" {
 		next := "/runs/" + url.PathEscape(parts[1]) + "/" + url.PathEscape(parts[2])
 		if !h.authenticated(request) {
@@ -309,6 +382,10 @@ func (h *Handler) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	default:
 		http.NotFound(writer, request)
 	}
+}
+
+func (h *Handler) redirectToLogin(writer http.ResponseWriter, request *http.Request) {
+	http.Redirect(writer, request, "/login?next="+url.QueryEscape(request.URL.RequestURI()), http.StatusFound)
 }
 
 func (h *Handler) resolveRun(ctx context.Context, namespace, name string) (*actionsv1alpha1.WorkflowRun, error) {
@@ -515,6 +592,307 @@ func (h *Handler) projectDetails(writer http.ResponseWriter, request *http.Reque
 	}
 	data.SecretNames = sortedSecretDataNames(secret.Data)
 	h.writeHTML(writer, h.projectPage, data)
+}
+
+func (h *Handler) workflowDispatchPage(writer http.ResponseWriter, request *http.Request) {
+	query := request.URL.Query()
+	if source := query.Get("source"); source != "" {
+		if _, _, valid := splitNamespacedValue(source); !valid {
+			http.Error(writer, "invalid workflow dispatch source", http.StatusBadRequest)
+			return
+		}
+	}
+	data, err := h.loadDispatchPageData(request.Context(), query)
+	if err != nil {
+		h.writeResolutionError(writer, request, err)
+		return
+	}
+	data.CSRFToken = h.csrfToken
+	data.RequestID, err = newDispatchRequestID()
+	if err != nil {
+		h.writeResolutionError(writer, request, fmt.Errorf("create workflow dispatch request ID: %w", err))
+		return
+	}
+	h.writeHTML(writer, h.dispatchPage, data)
+}
+
+func (h *Handler) loadDispatchPageData(ctx context.Context, query url.Values) (dispatchPageData, error) {
+	projects := &actionsv1alpha1.ProjectList{}
+	if err := h.client.List(ctx, projects); err != nil {
+		return dispatchPageData{}, fmt.Errorf("load Projects for workflow dispatch: %w", err)
+	}
+	sort.Slice(projects.Items, func(left, right int) bool {
+		if projects.Items[left].Namespace == projects.Items[right].Namespace {
+			return projects.Items[left].Name < projects.Items[right].Name
+		}
+		return projects.Items[left].Namespace < projects.Items[right].Namespace
+	})
+	data := dispatchPageData{SelectedProject: query.Get("project"), RefType: "branch"}
+	if source := query.Get("source"); source != "" {
+		namespace, name, valid := splitNamespacedValue(source)
+		if !valid {
+			return dispatchPageData{}, errors.New("workflow dispatch source run is invalid")
+		}
+		run, err := h.resolveRun(ctx, namespace, name)
+		if err != nil {
+			return dispatchPageData{}, fmt.Errorf("load workflow dispatch source WorkflowRun %q: %w", source, err)
+		}
+		githubSource := run.Spec.Source.GitHub
+		data.SelectedProject = namespacedValue(run.Namespace, run.Spec.ProjectRef.Name)
+		data.RepositoryID = strconv.FormatInt(githubSource.Repository.ID, 10)
+		data.RepositoryOwner = githubSource.Repository.Owner
+		data.RepositoryName = githubSource.Repository.Name
+		data.Revision = githubSource.Revision.SHA
+		data.WorkflowPath = run.Spec.WorkflowPath
+		switch {
+		case strings.HasPrefix(githubSource.Revision.Ref, "refs/heads/"):
+			data.RefName = strings.TrimPrefix(githubSource.Revision.Ref, "refs/heads/")
+		case strings.HasPrefix(githubSource.Revision.Ref, "refs/tags/"):
+			data.RefType = "tag"
+			data.RefName = strings.TrimPrefix(githubSource.Revision.Ref, "refs/tags/")
+		}
+		inputNames := make([]string, 0, len(githubSource.Event.Inputs))
+		for name := range githubSource.Event.Inputs {
+			inputNames = append(inputNames, name)
+		}
+		sort.Strings(inputNames)
+		for _, name := range inputNames {
+			data.Inputs = append(data.Inputs, dispatchInputPageData{Name: name, Value: githubSource.Event.Inputs[name]})
+		}
+	}
+	for index := range projects.Items {
+		project := &projects.Items[index]
+		if project.Spec.Source.Type != actionsv1alpha1.SourceTypeGitHub || project.Spec.Source.GitHub == nil {
+			continue
+		}
+		configured := meta.FindStatusCondition(project.Status.Conditions, actionsv1alpha1.ProjectConditionConfigured)
+		if configured == nil || configured.Status != metav1.ConditionTrue || configured.ObservedGeneration != project.Generation {
+			continue
+		}
+		value := namespacedValue(project.Namespace, project.Name)
+		data.Projects = append(data.Projects, dispatchProjectOption{Value: value, Label: value, Selected: value == data.SelectedProject})
+	}
+	selected := false
+	for _, project := range data.Projects {
+		if project.Selected {
+			selected = true
+			break
+		}
+	}
+	if !selected && len(data.Projects) > 0 {
+		data.SelectedProject = data.Projects[0].Value
+		data.Projects[0].Selected = true
+	}
+	return data, nil
+}
+
+func (h *Handler) createWorkflowDispatch(writer http.ResponseWriter, request *http.Request) {
+	request.Body = http.MaxBytesReader(writer, request.Body, dispatchRequestSize)
+	if err := request.ParseForm(); err != nil {
+		http.Error(writer, "invalid workflow dispatch", http.StatusBadRequest)
+		return
+	}
+	if !h.validCSRF(request.PostForm.Get("csrf")) {
+		http.Error(writer, "invalid CSRF token", http.StatusForbidden)
+		return
+	}
+	requestID := request.PostForm.Get("request-id")
+	if !validDispatchRequestID(requestID) {
+		http.Error(writer, "invalid workflow dispatch request ID", http.StatusBadRequest)
+		return
+	}
+	namespace, projectName, valid := splitNamespacedValue(request.PostForm.Get("project"))
+	if !valid {
+		http.Error(writer, "invalid Project", http.StatusBadRequest)
+		return
+	}
+	project := &actionsv1alpha1.Project{}
+	if err := h.client.Get(request.Context(), types.NamespacedName{Namespace: namespace, Name: projectName}, project); err != nil {
+		h.writeResolutionError(writer, request, fmt.Errorf("load Project %q: %w", namespacedValue(namespace, projectName), err))
+		return
+	}
+	configured := meta.FindStatusCondition(project.Status.Conditions, actionsv1alpha1.ProjectConditionConfigured)
+	if configured == nil || configured.Status != metav1.ConditionTrue || configured.ObservedGeneration != project.Generation {
+		http.Error(writer, fmt.Sprintf("Project %q is not configured", project.Name), http.StatusConflict)
+		return
+	}
+	if project.Spec.Source.Type != actionsv1alpha1.SourceTypeGitHub || project.Spec.Source.GitHub == nil {
+		http.Error(writer, fmt.Sprintf("Project %q source is not supported", project.Name), http.StatusConflict)
+		return
+	}
+	repositoryID, err := strconv.ParseInt(strings.TrimSpace(request.PostForm.Get("repository-id")), 10, 64)
+	if err != nil || repositoryID < 1 || repositoryID > 9_007_199_254_740_991 {
+		http.Error(writer, "invalid GitHub repository ID", http.StatusBadRequest)
+		return
+	}
+	repositoryOwner := strings.TrimSpace(request.PostForm.Get("repository-owner"))
+	if len(repositoryOwner) > 100 || !repositoryOwnerPattern.MatchString(repositoryOwner) {
+		http.Error(writer, "invalid GitHub repository owner", http.StatusBadRequest)
+		return
+	}
+	repositoryName := strings.TrimSpace(request.PostForm.Get("repository-name"))
+	if len(repositoryName) > 100 || repositoryName == "." || repositoryName == ".." || !repositoryNamePattern.MatchString(repositoryName) {
+		http.Error(writer, "invalid GitHub repository name", http.StatusBadRequest)
+		return
+	}
+	refType := request.PostForm.Get("ref-type")
+	if refType != "branch" && refType != "tag" {
+		http.Error(writer, "invalid Git ref type", http.StatusBadRequest)
+		return
+	}
+	refPrefix := "refs/heads/"
+	if refType == "tag" {
+		refPrefix = "refs/tags/"
+	}
+	ref := refPrefix + strings.TrimSpace(request.PostForm.Get("ref-name"))
+	if !validGitRef(ref) {
+		http.Error(writer, "invalid Git ref", http.StatusBadRequest)
+		return
+	}
+	revision := strings.TrimSpace(request.PostForm.Get("revision"))
+	if !validGitSHA(revision) {
+		http.Error(writer, "revision must be a full lowercase Git SHA", http.StatusBadRequest)
+		return
+	}
+	workflowPath := strings.TrimSpace(request.PostForm.Get("workflow-path"))
+	if !validWorkflowPath(workflowPath) {
+		http.Error(writer, "invalid workflow path", http.StatusBadRequest)
+		return
+	}
+	inputs, err := dispatchInputs(request.PostForm["input-name"], request.PostForm["input-value"])
+	if err != nil {
+		http.Error(writer, err.Error(), http.StatusBadRequest)
+		return
+	}
+	desired := &actionsv1alpha1.WorkflowRun{
+		ObjectMeta: metav1.ObjectMeta{Name: "dispatch-" + requestID, Namespace: project.Namespace},
+		Spec: actionsv1alpha1.WorkflowRunSpec{
+			ProjectRef:              corev1.LocalObjectReference{Name: project.Name},
+			TTLSecondsAfterFinished: h.workflowRunTTLSecondsAfterFinished,
+			Source: actionsv1alpha1.WorkflowRunSource{Type: actionsv1alpha1.SourceTypeGitHub, GitHub: &actionsv1alpha1.GitHubWorkflowRunSource{
+				Repository: actionsv1alpha1.GitHubRepository{ID: repositoryID, Owner: repositoryOwner, Name: repositoryName},
+				Event:      actionsv1alpha1.GitHubEvent{Name: actionsv1alpha1.GitHubEventNameWorkflowDispatch, Inputs: inputs},
+				Revision:   actionsv1alpha1.GitRevision{SHA: revision, Ref: ref},
+			}},
+			WorkflowPath: workflowPath,
+		},
+	}
+	if err := h.client.Create(request.Context(), desired); err != nil {
+		if apierrors.IsAlreadyExists(err) {
+			existing := &actionsv1alpha1.WorkflowRun{}
+			if getErr := h.client.Get(request.Context(), client.ObjectKeyFromObject(desired), existing); getErr != nil {
+				h.writeResolutionError(writer, request, fmt.Errorf("load existing WorkflowRun %q: %w", desired.Name, getErr))
+				return
+			}
+			if matchingWorkflowDispatch(existing, desired) {
+				http.Redirect(writer, request, runPath(existing), http.StatusSeeOther)
+				return
+			}
+			http.Error(writer, fmt.Sprintf("WorkflowRun %q already exists with different parameters", desired.Name), http.StatusConflict)
+			return
+		}
+		if apierrors.IsInvalid(err) {
+			http.Error(writer, "invalid workflow dispatch: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+		h.writeResolutionError(writer, request, fmt.Errorf("create WorkflowRun %q: %w", desired.Name, err))
+		return
+	}
+	h.logger.Info("Created workflow dispatch", "namespace", desired.Namespace, "workflow_run", desired.Name, "project", project.Name, "repository", repositoryOwner+"/"+repositoryName, "workflow", workflowPath)
+	http.Redirect(writer, request, runPath(desired), http.StatusSeeOther)
+}
+
+func newDispatchRequestID() (string, error) {
+	data := make([]byte, 10)
+	if _, err := rand.Read(data); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(data), nil
+}
+
+func validDispatchRequestID(value string) bool {
+	decoded, err := hex.DecodeString(value)
+	return err == nil && len(decoded) == 10 && value == strings.ToLower(value)
+}
+
+func dispatchInputs(names, values []string) (map[string]string, error) {
+	if len(names) != len(values) {
+		return nil, errors.New("workflow input names and values do not match")
+	}
+	if len(names) > maxDispatchInputs {
+		return nil, fmt.Errorf("workflow dispatch accepts at most %d inputs", maxDispatchInputs)
+	}
+	inputs := make(map[string]string, len(names))
+	canonicalNames := make(map[string]struct{}, len(names))
+	totalLength := 0
+	for index, name := range names {
+		name = strings.TrimSpace(name)
+		if !dispatchInputNamePattern.MatchString(name) {
+			return nil, fmt.Errorf("invalid workflow input name %q", name)
+		}
+		canonicalName := strings.ToLower(name)
+		if _, found := canonicalNames[canonicalName]; found {
+			return nil, fmt.Errorf("workflow input name %q is duplicated", name)
+		}
+		canonicalNames[canonicalName] = struct{}{}
+		value := values[index]
+		if !utf8.ValidString(value) {
+			return nil, fmt.Errorf("workflow input %q must be valid UTF-8", name)
+		}
+		if utf8.RuneCountInString(value) > maxDispatchPayload {
+			return nil, fmt.Errorf("workflow input %q exceeds %d characters", name, maxDispatchPayload)
+		}
+		totalLength += utf8.RuneCountInString(name) + utf8.RuneCountInString(value)
+		inputs[name] = value
+	}
+	if totalLength > maxDispatchPayload {
+		return nil, fmt.Errorf("workflow input names and values exceed %d characters", maxDispatchPayload)
+	}
+	if len(inputs) == 0 {
+		return nil, nil
+	}
+	return inputs, nil
+}
+
+func matchingWorkflowDispatch(existing, desired *actionsv1alpha1.WorkflowRun) bool {
+	existingSpec := existing.Spec.DeepCopy()
+	desiredSpec := desired.Spec.DeepCopy()
+	existingSpec.CancelRequested = false
+	desiredSpec.CancelRequested = false
+	existingSpec.TTLSecondsAfterFinished = nil
+	desiredSpec.TTLSecondsAfterFinished = nil
+	return apiequality.Semantic.DeepEqual(existingSpec, desiredSpec)
+}
+
+func validGitSHA(value string) bool {
+	decoded, err := hex.DecodeString(value)
+	return err == nil && len(decoded) == 20 && value == strings.ToLower(value)
+}
+
+func validGitRef(value string) bool {
+	return utf8.RuneCountInString(value) <= 1024 && (strings.HasPrefix(value, "refs/heads/") || strings.HasPrefix(value, "refs/tags/")) &&
+		len(strings.TrimPrefix(strings.TrimPrefix(value, "refs/heads/"), "refs/tags/")) > 0 &&
+		!invalidGitRefCharacter.MatchString(value) && !strings.Contains(value, "//") && !strings.Contains(value, "..") &&
+		!strings.Contains(value, "/.") && !strings.Contains(value, ".lock/") && !strings.HasSuffix(value, "/") &&
+		!strings.HasSuffix(value, ".") && !strings.HasSuffix(value, ".lock") && !strings.Contains(value, "@{")
+}
+
+func validWorkflowPath(value string) bool {
+	return utf8.RuneCountInString(value) <= 512 && (strings.HasSuffix(value, ".yaml") || strings.HasSuffix(value, ".yml")) &&
+		!strings.HasPrefix(value, "/") && !strings.HasPrefix(value, "./") && !strings.HasPrefix(value, "../") &&
+		!strings.Contains(value, "//") && !strings.Contains(value, "/./") && !strings.Contains(value, "/../")
+}
+
+func namespacedValue(namespace, name string) string {
+	return namespace + "/" + name
+}
+
+func splitNamespacedValue(value string) (string, string, bool) {
+	parts := strings.Split(value, "/")
+	if len(parts) != 2 || len(validation.IsDNS1123Label(parts[0])) > 0 || len(validation.IsDNS1123Subdomain(parts[1])) > 0 {
+		return "", "", false
+	}
+	return parts[0], parts[1], true
 }
 
 func (h *Handler) updateProjectSecret(writer http.ResponseWriter, request *http.Request, namespace, name string) {
@@ -762,6 +1140,9 @@ func (h *Handler) loadRunPageData(ctx context.Context, run *actionsv1alpha1.Work
 		ShortRevision: shortRevision(run.Spec.Source.GitHub.Revision.SHA),
 		RefName:       shortRef(run.Spec.Source.GitHub.Revision.Ref),
 		Status:        workflowstatus.Run(run),
+	}
+	if ref := run.Spec.Source.GitHub.Revision.Ref; strings.HasPrefix(ref, "refs/heads/") || strings.HasPrefix(ref, "refs/tags/") {
+		data.DispatchURL = "/dispatch?source=" + url.QueryEscape(namespacedValue(run.Namespace, run.Name))
 	}
 	data.StatusClass = statusClass(data.Status)
 	if data.WorkflowName == "" {
@@ -1098,9 +1479,10 @@ func safeNext(value string) string {
 	if err != nil || parsed.IsAbs() || parsed.Host != "" {
 		return ""
 	}
+	dispatchPath := parsed.Path == "/dispatch"
 	projectPath := parsed.Path == "/projects" || strings.HasPrefix(parsed.Path, "/projects/")
 	runPath := strings.HasPrefix(parsed.Path, "/runs/")
-	if !projectPath && !runPath {
+	if !dispatchPath && !projectPath && !runPath {
 		return ""
 	}
 	return value

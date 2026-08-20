@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -8,6 +9,15 @@ import (
 	"strings"
 	"testing"
 )
+
+func TestRunConsoleRejectsInvalidWorkflowRunTTL(t *testing.T) {
+	for _, value := range []string{"-1", "2147483648", "invalid"} {
+		err := runConsole(context.Background(), []string{"--workflow-run-ttl-seconds-after-finished=" + value})
+		if err == nil || !strings.Contains(err.Error(), "must be an integer between") {
+			t.Fatalf("runConsole() error = %v for TTL %q", err, value)
+		}
+	}
+}
 
 func TestReadTokenRejectsInvalidConfiguration(t *testing.T) {
 	emptyPath := filepath.Join(t.TempDir(), "empty-token")

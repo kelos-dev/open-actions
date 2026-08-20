@@ -40,11 +40,17 @@ controller's optional `--console-url` adds Console links to GitHub Check Runs.
 The Console serves HTTP on `--bind-address` (default
 `:8080`) and serves its read-only views without authentication. Anyone who can
 reach the Console can read Project and workflow metadata and runner logs. The
-required `--token-file` authenticates workflow reruns and Project Secret
-management. Set
+required `--token-file` authenticates workflow dispatches, workflow reruns, and
+Project Secret management. Set
 `--secure-cookie` when the Console is served through HTTPS. The Helm chart
 configures the administrator token and cookie security from its configured
 Secret and `console.publicURL`.
+
+The controller and Console both accept
+`--workflow-run-ttl-seconds-after-finished` as the default
+`spec.ttlSecondsAfterFinished` for the WorkflowRuns they create. Omit the flag
+to retain those runs indefinitely. The Helm chart passes
+`controller.workflowRunTTLSecondsAfterFinished` to both components.
 
 The Console landing page lists up to 100 WorkflowRuns across all namespaces,
 newest first, and links to each run's details and jobs. The Console presents
@@ -70,6 +76,13 @@ source, workflow path, and retention setting, clears any prior cancellation
 request, and redirects to the new run. Rerun actions are unavailable while the
 latest attempt is still active. The Helm chart grants the Console `create`
 access to WorkflowRuns across the namespaces it displays.
+
+An administrator can use **Run workflow** to create a `workflow_dispatch`
+WorkflowRun in any configured Project namespace. The form accepts a repository,
+workflow path, branch or tag, pinned commit SHA, and declared workflow inputs.
+Starting from an existing branch- or tag-backed run prepopulates its Project,
+repository, workflow, and revision. Each form instance carries a request ID, so
+resubmitting the same dispatch is idempotent and redirects to the existing run.
 
 The Projects page lists Project configuration across all namespaces. A Project
 detail page lists the names, but never the values, of keys in its referenced
@@ -631,6 +644,9 @@ the `X-GitHub-Delivery` value on webhook-backed events. The controller verifies
 that the workflow declares `workflow_dispatch`, validates the supplied inputs,
 and applies defaults before planning jobs. See
 [`config/samples/actions_v1alpha1_workflowrun-dispatch.yaml`](../config/samples/actions_v1alpha1_workflowrun-dispatch.yaml).
+The authenticated Console **Run workflow** form creates the same resource and
+can be prepopulated from a previous branch- or tag-backed run.
+
 Supported input types are `string`, `boolean`, `number`, `choice`, and
 `environment`; `choice` inputs require options. `workflow_call` declarations
 accept `string`, `boolean`, and `number` inputs with required types and use the
