@@ -799,6 +799,20 @@ func TestParseAcceptsWorkflowEnvironment(t *testing.T) {
 	}
 }
 
+func TestParseAcceptsGitHubEnvironmentVariables(t *testing.T) {
+	tests := []string{
+		"name: CI\non: push\nenv:\n  GITHUB_SHA: untrusted\n  GITHUB_TOKEN: '${{ secrets.GITHUB_TOKEN }}'\n" + minimalJob,
+		"name: CI\non: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    env:\n      GITHUB_SHA: untrusted\n      GITHUB_TOKEN: '${{ github.token }}'\n    steps:\n      - run: echo test\n",
+		"name: CI\non: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo test\n        env:\n          GITHUB_TOKEN: '${{ github.token }}'\n          GITHUB_WORKSPACE: untrusted\n          runner_os: Other\n",
+		"name: CI\non: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo test\n        env:\n          RUNNER_CUSTOM: value\n",
+	}
+	for _, data := range tests {
+		if _, err := Parse([]byte(data)); err != nil {
+			t.Fatalf("Parse() rejected a GitHub-compatible environment variable: %v", err)
+		}
+	}
+}
+
 func TestParseRejectsInvalidWorkflowEnvironment(t *testing.T) {
 	tests := []string{
 		"  '': value\n",
@@ -934,19 +948,6 @@ func TestParseRejectsInvalidOrUnavailableWorkflowExpressions(t *testing.T) {
 				t.Fatal("Parse() accepted an invalid workflow expression")
 			}
 		})
-	}
-}
-
-func TestParseRejectsReservedEnvironmentVariables(t *testing.T) {
-	tests := []string{
-		"name: CI\non: push\nenv:\n  github_sha: untrusted\n" + minimalJob,
-		"name: CI\non: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    env:\n      GITHUB_SHA: untrusted\n    steps:\n      - run: echo test\n",
-		"name: CI\non: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo test\n        env:\n          runner_os: Other\n",
-	}
-	for _, data := range tests {
-		if _, err := Parse([]byte(data)); err == nil {
-			t.Fatal("Parse() accepted a reserved environment variable")
-		}
 	}
 }
 

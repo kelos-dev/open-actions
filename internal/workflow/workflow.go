@@ -253,7 +253,7 @@ func Parse(data []byte) (*Definition, error) {
 			return nil, err
 		}
 	}
-	if _, err := validateEnvironmentMap("workflow env", definition.Env, workflowEnvironmentAvailability); err != nil {
+	if _, err := validateScalarMap("workflow env", definition.Env, workflowEnvironmentAvailability); err != nil {
 		return nil, err
 	}
 	if err := validateTrigger(definition.On); err != nil {
@@ -371,7 +371,7 @@ func validateJob(id string, job *Job, workflowEnv map[string]any) error {
 	for _, dependency := range job.Needs {
 		contentBytes += len(dependency)
 	}
-	if _, err := validateEnvironmentMap(fmt.Sprintf("job %q env", id), job.Env, jobEnvironmentAvailability); err != nil {
+	if _, err := validateScalarMap(fmt.Sprintf("job %q env", id), job.Env, jobEnvironmentAvailability); err != nil {
 		return err
 	}
 	contentBytes += mergedScalarMapBytes(workflowEnv, job.Env)
@@ -446,7 +446,7 @@ func validateJob(id string, job *Job, workflowEnv map[string]any) error {
 		if err != nil {
 			return err
 		}
-		stepEnvBytes, err := validateEnvironmentMap(fmt.Sprintf("job %q step %d env", id, i+1), step.Env, stepAvailability)
+		stepEnvBytes, err := validateScalarMap(fmt.Sprintf("job %q step %d env", id, i+1), step.Env, stepAvailability)
 		if err != nil {
 			return err
 		}
@@ -588,15 +588,6 @@ func validateJobOutputs(jobID string, outputs map[string]any) (int, error) {
 	return bytes, nil
 }
 
-func validateEnvironmentMap(field string, values map[string]any, availability expression.Availability) (int, error) {
-	for name := range values {
-		if reservedEnvironmentName(name) {
-			return 0, fmt.Errorf("%s contains reserved variable %q", field, name)
-		}
-	}
-	return validateScalarMap(field, values, availability)
-}
-
 func mergedScalarMapBytes(base, override map[string]any) int {
 	total := 0
 	for key, value := range base {
@@ -611,11 +602,6 @@ func mergedScalarMapBytes(base, override map[string]any) int {
 		total += len(key) + len(scalar)
 	}
 	return total
-}
-
-func reservedEnvironmentName(name string) bool {
-	name = strings.ToUpper(name)
-	return strings.HasPrefix(name, "GITHUB_") || strings.HasPrefix(name, "RUNNER_")
 }
 
 func validateScalarMap(field string, values map[string]any, availability expression.Availability) (int, error) {

@@ -19,11 +19,12 @@ import (
 	"github.com/kelos-dev/open-actions/internal/eventsnapshot"
 	"github.com/kelos-dev/open-actions/internal/expression"
 	"github.com/kelos-dev/open-actions/internal/workflow"
+	"github.com/kelos-dev/open-actions/internal/workflowenv"
 )
 
 const (
 	minimumPlanVersion = 1
-	PlanVersion        = 6
+	PlanVersion        = 7
 	ContainerName      = "runner"
 	GitHubTokenEnvVar  = "OPEN_ACTIONS_GITHUB_TOKEN"
 	ActionTokenEnvVar  = "OPEN_ACTIONS_ACTION_TOKEN"
@@ -727,17 +728,12 @@ func withinDirectory(root, relative string) (string, error) {
 
 func appendEnvironment(environment []string, values map[string]string) []string {
 	for name, value := range values {
-		if reservedEnvironmentName(name) {
+		if workflowenv.IsRunnerOwned(name) {
 			continue
 		}
 		environment = setEnvironment(environment, name, value)
 	}
 	return environment
-}
-
-func reservedEnvironmentName(name string) bool {
-	name = strings.ToUpper(name)
-	return strings.HasPrefix(name, "GITHUB_") || strings.HasPrefix(name, "RUNNER_")
 }
 
 func setEnvironment(environment []string, name, value string) []string {
