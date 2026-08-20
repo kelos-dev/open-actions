@@ -10,7 +10,6 @@ import (
 	"log/slog"
 	"net/http"
 	"path/filepath"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -19,10 +18,10 @@ import (
 	githubclient "github.com/kelos-dev/open-actions/internal/github"
 	"github.com/kelos-dev/open-actions/internal/gitrepository"
 	"github.com/kelos-dev/open-actions/internal/workflow"
+	"github.com/kelos-dev/open-actions/internal/workflowrun"
 	corev1 "k8s.io/api/core/v1"
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
@@ -601,114 +600,26 @@ func validateRerunCheck(project *actionsv1alpha1.Project, delivery *queuedDelive
 }
 
 func latestWorkflowRunAttempt(root *actionsv1alpha1.WorkflowRun, runs []actionsv1alpha1.WorkflowRun) (*actionsv1alpha1.WorkflowRun, error) {
-	latest := root
-	attempts := map[int32]struct{}{1: {}}
-	for index := range runs {
-		candidate := &runs[index]
-		rerun := candidate.Spec.Rerun
-		if rerun == nil || rerun.OriginalRunRef.Name != root.Name || rerun.OriginalRunRef.UID != root.UID {
-			continue
-		}
-		if candidate.Spec.ProjectRef != root.Spec.ProjectRef || candidate.Spec.WorkflowPath != root.Spec.WorkflowPath || !apiequality.Semantic.DeepEqual(candidate.Spec.Source, root.Spec.Source) {
-			continue
-		}
-		planned := meta.FindStatusCondition(candidate.Status.Conditions, actionsv1alpha1.WorkflowRunConditionPlanned)
-		if planned != nil && planned.Status == metav1.ConditionFalse && planned.Reason == "RerunInvalid" {
-			continue
-		}
-		if _, found := attempts[rerun.Attempt]; found {
-			return nil, fmt.Errorf("WorkflowRun rerun lineage has multiple attempt %d objects", rerun.Attempt)
-		}
-		attempts[rerun.Attempt] = struct{}{}
-		if latest.Spec.Rerun == nil || rerun.Attempt > latest.Spec.Rerun.Attempt {
-			latest = candidate
-		}
-	}
-	return latest, nil
+	return workflowrun.LatestAttempt(root, runs)
 }
 
 func workflowRunTerminal(run *actionsv1alpha1.WorkflowRun) bool {
-	condition := meta.FindStatusCondition(run.Status.Conditions, actionsv1alpha1.WorkflowRunConditionSucceeded)
-	return condition != nil && (condition.Status == metav1.ConditionTrue || condition.Status == metav1.ConditionFalse)
+	return workflowrun.Terminal(run)
 }
 
 func (r *DeliveryReconciler) rerunWorkflowJobIDs(ctx context.Context, run *actionsv1alpha1.WorkflowRun) ([]string, error) {
-	condition := meta.FindStatusCondition(run.Status.Conditions, actionsv1alpha1.WorkflowRunConditionSucceeded)
-	if condition == nil || condition.Status != metav1.ConditionFalse || condition.Reason != "JobFailed" {
+	if !workflowrun.Failed(run) {
 		return nil, nil
 	}
 	jobs := &actionsv1alpha1.WorkflowJobList{}
 	if err := r.APIReader.List(ctx, jobs, client.InNamespace(run.Namespace), client.MatchingLabels{actionsv1alpha1.LabelWorkflowRunUID: string(run.UID)}); err != nil {
 		return nil, err
 	}
-	if run.Status.Jobs == nil || int32(len(jobs.Items)) != run.Status.Jobs.Total {
-		return nil, fmt.Errorf("WorkflowRun %q does not have its complete WorkflowJob history", run.Name)
-	}
-	selected := make(map[string]struct{})
-	selectedLogicalIDs := make(map[string]struct{})
-	for index := range jobs.Items {
-		job := &jobs.Items[index]
-		succeeded := meta.FindStatusCondition(job.Status.Conditions, actionsv1alpha1.WorkflowJobConditionSucceeded)
-		if job.Status.Result == actionsv1alpha1.WorkflowJobResultFailure || (job.Status.Result == "" && succeeded != nil && succeeded.Status == metav1.ConditionFalse) {
-			selected[job.Spec.JobID] = struct{}{}
-			selectedLogicalIDs[workflowJobLogicalID(job)] = struct{}{}
-		}
-	}
-	if len(selected) == 0 {
-		return nil, fmt.Errorf("WorkflowRun %q reports failed jobs but no failed WorkflowJobs are available", run.Name)
-	}
-	for changed := true; changed; {
-		changed = false
-		for index := range jobs.Items {
-			job := &jobs.Items[index]
-			if _, found := selected[job.Spec.JobID]; found || !needsSelectedJob(job.Spec.Needs, selectedLogicalIDs) {
-				continue
-			}
-			selected[job.Spec.JobID] = struct{}{}
-			selectedLogicalIDs[workflowJobLogicalID(job)] = struct{}{}
-			changed = true
-		}
-	}
-	jobIDs := make([]string, 0, len(selected))
-	for id := range selected {
-		jobIDs = append(jobIDs, id)
-	}
-	sort.Strings(jobIDs)
-	return jobIDs, nil
-}
-
-func workflowJobLogicalID(job *actionsv1alpha1.WorkflowJob) string {
-	if job.Spec.Matrix != nil {
-		return job.Spec.Matrix.LogicalJobID
-	}
-	return job.Spec.JobID
-}
-
-func needsSelectedJob(needs []string, selectedLogicalIDs map[string]struct{}) bool {
-	for _, dependency := range needs {
-		if _, found := selectedLogicalIDs[dependency]; found {
-			return true
-		}
-	}
-	return false
+	return workflowrun.FailedJobIDs(run, jobs.Items)
 }
 
 func (r *DeliveryReconciler) createRerunWorkflowRun(ctx context.Context, root, previous *actionsv1alpha1.WorkflowRun, attempt int32, requestID string, jobIDs []string) error {
-	desired := &actionsv1alpha1.WorkflowRun{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: rerunWorkflowRunName(root, attempt), Namespace: root.Namespace,
-			Labels: map[string]string{actionsv1alpha1.LabelWorkflowRunRootUID: string(root.UID)},
-		},
-		Spec: *previous.Spec.DeepCopy(),
-	}
-	desired.Spec.CancelRequested = false
-	desired.Spec.Rerun = &actionsv1alpha1.WorkflowRunRerun{
-		OriginalRunRef: actionsv1alpha1.WorkflowRunReference{Name: root.Name, UID: root.UID},
-		PreviousRunRef: actionsv1alpha1.WorkflowRunReference{Name: previous.Name, UID: previous.UID},
-		Attempt:        attempt,
-		RequestID:      requestID,
-		JobIDs:         append([]string(nil), jobIDs...),
-	}
+	desired := workflowrun.NewRerun(root, previous, attempt, requestID, jobIDs)
 	if err := r.Create(ctx, desired); err != nil {
 		if !apierrors.IsAlreadyExists(err) {
 			return err
@@ -736,13 +647,7 @@ func matchingRerunRequest(existing, desired *actionsv1alpha1.WorkflowRun) bool {
 }
 
 func rerunWorkflowRunName(root *actionsv1alpha1.WorkflowRun, attempt int32) string {
-	digest := sha256.Sum256([]byte(root.UID))
-	suffix := fmt.Sprintf("-attempt-%d-%s", attempt, strings.ToLower(digestEncoding.EncodeToString(digest[:]))[:8])
-	base := sanitizeName(root.Name)
-	if len(base) > resourceNameMaxLength-len(suffix) {
-		base = strings.Trim(base[:resourceNameMaxLength-len(suffix)], "-")
-	}
-	return base + suffix
+	return workflowrun.RerunName(root, attempt)
 }
 
 func (r *DeliveryReconciler) createWorkflowRun(ctx context.Context, project *actionsv1alpha1.Project, delivery *queuedDelivery, selection workflowSelection) error {
