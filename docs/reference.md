@@ -459,9 +459,37 @@ Entries in an `env` map cannot depend on other entries in that map. In a step
 environment, an `env` expression sees only values inherited from the workflow
 and job, not entries being defined for that step. Each workflow, job, or step
 map may contain at most 100 entries. Names contain 1 to 256 characters and
-values are scalar values of at most 65,536 bytes. Names beginning with
-`GITHUB_` or `RUNNER_`, without regard to ASCII case, are reserved at every
-scope and are rejected.
+values are scalar values of at most 65,536 bytes.
+
+Open Actions supplies the following runner-owned names:
+
+- Action identity: `GITHUB_ACTION_PATH`, `GITHUB_ACTION_REPOSITORY`.
+- Workflow and repository identity: `GITHUB_ACTIONS`, `GITHUB_API_URL`,
+  `GITHUB_BASE_REF`, `GITHUB_EVENT_ACTION`, `GITHUB_EVENT_NAME`,
+  `GITHUB_EVENT_PATH`, `GITHUB_HEAD_REF`, `GITHUB_JOB`, `GITHUB_REF`,
+  `GITHUB_REF_NAME`, `GITHUB_REPOSITORY`, `GITHUB_SERVER_URL`, `GITHUB_SHA`,
+  `GITHUB_WORKFLOW`, `GITHUB_WORKSPACE`.
+- Command files: `GITHUB_ENV`, `GITHUB_OUTPUT`, `GITHUB_PATH`, `GITHUB_STATE`,
+  `GITHUB_STEP_SUMMARY`.
+- Runner identity and paths: `RUNNER_ARCH`, `RUNNER_OS`, `RUNNER_TEMP`,
+  `RUNNER_TOOL_CACHE`.
+
+Environment names are case-sensitive, matching GitHub Actions on Linux.
+Workflow, job, step, and composite-action maps may assign runner-owned names,
+but the runner-supplied value takes precedence in the process environment.
+Assignments to the exact names through `GITHUB_ENV` are also ignored. A name
+with different casing is a separate variable. `GITHUB_ENV` additionally cannot
+set `NODE_OPTIONS` under any casing; a workflow or step `env` map may set it.
+
+Other names with a `GITHUB_` or `RUNNER_` prefix are allowed. To pass the
+job-scoped installation token under the conventional name, assign
+`github.token` or `secrets.GITHUB_TOKEN` explicitly; the value remains secret
+and is masked in output:
+
+```yaml
+env:
+  GITHUB_TOKEN: ${{ github.token }}
+```
 
 Environment expressions remain unresolved in controller-visible job plans.
 The runner resolves them when the job starts, so values derived from

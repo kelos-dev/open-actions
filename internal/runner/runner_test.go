@@ -60,6 +60,46 @@ func TestExecuteRunSteps(t *testing.T) {
 	}
 }
 
+func TestExecuteAllowsGitHubTokenEnvironmentVariable(t *testing.T) {
+	plan := testPlan()
+	plan.Env = map[string]string{
+		"GITHUB_CUSTOM": "job",
+		"GITHUB_SHA":    "job-untrusted",
+		"GITHUB_TOKEN":  "${{ secrets.GITHUB_TOKEN }}",
+		"NODE_OPTIONS":  "job",
+		"RUNNER_OS":     "job-untrusted",
+		"github_sha":    "job-lower",
+		"runner_os":     "job-lower",
+	}
+	plan.Steps = []Step{
+		{
+			Run: `test "$GITHUB_CUSTOM" = job && test "$GITHUB_TOKEN" = installation-token && test "$GITHUB_SHA" = ` + strings.Repeat("a", 40) + ` && test "$github_sha" = job-lower && test "$RUNNER_OS" = Linux && test "$runner_os" = job-lower && test "$NODE_OPTIONS" = job && printf '%s\n' "$GITHUB_TOKEN"`,
+		},
+		{
+			Env: map[string]string{
+				"GITHUB_CUSTOM": "step",
+				"GITHUB_SHA":    "step-untrusted",
+				"GITHUB_TOKEN":  "${{ github.token }}",
+				"NODE_OPTIONS":  "step",
+				"RUNNER_OS":     "step-untrusted",
+				"github_sha":    "step-lower",
+				"runner_os":     "step-lower",
+			},
+			Run: `test "$GITHUB_CUSTOM" = step && test "$GITHUB_TOKEN" = installation-token && test "$GITHUB_SHA" = ` + strings.Repeat("a", 40) + ` && test "$github_sha" = step-lower && test "$RUNNER_OS" = Linux && test "$runner_os" = step-lower && test "$NODE_OPTIONS" = step && printf '%s\n' 'GITHUB_CUSTOM=command' 'GITHUB_TOKEN=command' 'GITHUB_SHA=command-untrusted' 'github_sha=command-lower' 'RUNNER_OS=command-untrusted' 'runner_os=command-lower' 'node_options=command' >> "$GITHUB_ENV"`,
+		},
+		{
+			Run: `test "$GITHUB_CUSTOM" = command && test "$GITHUB_TOKEN" = command && test "$GITHUB_SHA" = ` + strings.Repeat("a", 40) + ` && test "$github_sha" = command-lower && test "$RUNNER_OS" = Linux && test "$runner_os" = command-lower && test "$NODE_OPTIONS" = job && test -z "${node_options+x}"`,
+		},
+	}
+	var output bytes.Buffer
+	if err := testExecutor(t, &output, &output).Execute(context.Background(), plan, t.TempDir()); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(output.String(), "installation-token") || !strings.Contains(output.String(), "***") {
+		t.Fatalf("runner output did not mask GITHUB_TOKEN: %q", output.String())
+	}
+}
+
 func TestExecuteResolvesHashFiles(t *testing.T) {
 	workspace := t.TempDir()
 	contents := []byte("locked dependency")
@@ -1140,7 +1180,7 @@ fs.appendFileSync(process.env.GITHUB_STATE, 'pre_marker=saved\n');
 console.log('external pre ran');
 `,
 				"main.js": `const fs = require('fs');
-if (process.env.PRE_VALUE !== 'ready' || !process.env.PATH.startsWith('/external/bin:') || process.env.ACTION_SCOPE !== 'workflow' || process.env.ACTION_STEP_SCOPE !== 'step') {
+if (process.env.PRE_VALUE !== 'ready' || !process.env.PATH.startsWith('/external/bin:') || process.env.ACTION_SCOPE !== 'workflow' || process.env.ACTION_STEP_SCOPE !== 'step' || process.env.GITHUB_TOKEN !== 'installation-token' || process.env.GITHUB_WORKSPACE === 'untrusted') {
   throw new Error('pre command files were not applied');
 }
 fs.appendFileSync(process.env.GITHUB_ENV, 'ACTION_VALUE<<EOF\n' + process.env['INPUT_MESSAGE'] + '\nEOF\n');
@@ -1162,7 +1202,7 @@ console.log('external post ran');
 			plan.Outputs = map[string]string{"action": "${{ steps.external.outputs.modern }}"}
 			plan.Steps = []Step{
 				{Run: `printf '%s\n' "$RUNTIME_OVERRIDE" >> "$GITHUB_PATH"`, Env: map[string]string{"RUNTIME_OVERRIDE": overrideDirectory}},
-				{ID: "external", Uses: "actions/example@v1", With: map[string]string{"message": "${{ env.ACTION_MESSAGE }}"}, Env: map[string]string{"ACTION_STEP_SCOPE": "step"}},
+				{ID: "external", Uses: "actions/example@v1", With: map[string]string{"message": "${{ env.ACTION_MESSAGE }}"}, Env: map[string]string{"ACTION_STEP_SCOPE": "step", "GITHUB_TOKEN": "${{ github.token }}", "GITHUB_WORKSPACE": "untrusted"}},
 				{Run: `test "$ACTION_VALUE" = "external action ran" && case "$PATH" in /external/bin:*) ;; *) exit 1 ;; esac`},
 			}
 			var output bytes.Buffer
@@ -1371,7 +1411,9 @@ runs:
         test "$EXPECTED_OUTER" = "workflow action env"
         test "$STEP_SCOPE" = "workflow action step env"
         test "$EXPECTED_STEP_SCOPE" = "workflow action step env"
-        test "$TOKEN" = "installation-token"
+        test "$GITHUB_TOKEN" = "installation-token"
+        test "$GITHUB_WORKSPACE" != "untrusted"
+        test "$github_workspace" = "composite-lower"
         test "${{ env.LOCAL }}" = "composite-local"
         printf 'COMPOSITE_VALUE=%s\n' "${{ steps.nested.outputs.value }}" >> "$GITHUB_ENV"
       shell: bash
@@ -1380,7 +1422,9 @@ runs:
         EXPECTED_OUTER: ${{ env.OUTER }}
         EXPECTED_STEP_SCOPE: ${{ env.STEP_SCOPE }}
         LOCAL: composite-local
-        TOKEN: ${{ github.token }}
+        GITHUB_TOKEN: ${{ github.token }}
+        GITHUB_WORKSPACE: untrusted
+        github_workspace: composite-lower
 `,
 	})
 	createActionRepository(t, repositories, "actions", "parent", "v1", map[string]string{
@@ -1461,6 +1505,15 @@ runs:
 	err := testExecutor(t, io.Discard, io.Discard).Execute(context.Background(), plan, t.TempDir())
 	if err == nil || !strings.Contains(err.Error(), "cycle detected") {
 		t.Fatalf("execute cyclic composite action error = %v", err)
+	}
+}
+
+func TestValidateCompositeAcceptsRunnerOwnedEnvironmentVariable(t *testing.T) {
+	definition := actionDefinition{Runs: actionRuns{Steps: []compositeStep{{
+		Run: "true", Shell: "bash", Env: map[string]any{"GITHUB_WORKSPACE": "untrusted"},
+	}}}}
+	if err := validateComposite(definition); err != nil {
+		t.Fatalf("validateComposite() error = %v", err)
 	}
 }
 
@@ -1642,16 +1695,25 @@ func TestCommandFilesPreserveInlineHeredocMarkers(t *testing.T) {
 	}
 }
 
-func TestReservedEnvironmentVariablesCannotBeOverwritten(t *testing.T) {
-	environment := []string{"GITHUB_SHA=trusted", "RUNNER_OS=Linux", "CI=true"}
+func TestEnvironmentOverridesMatchGitHubActions(t *testing.T) {
+	environment := []string{"GITHUB_SHA=trusted", "RUNNER_OS=Linux", "GITHUB_TOKEN=initial", "CI=true"}
 	environment = appendEnvironment(environment, map[string]string{
-		"GITHUB_SHA": "untrusted", "runner_os": "Other", "CI": "false",
+		"GITHUB_SHA": "untrusted", "github_sha": "lower", "runner_os": "Other", "GITHUB_TOKEN": "job", "GITHUB_CUSTOM": "job", "NODE_OPTIONS": "job", "CI": "false",
 	})
 	applyEnvironmentUpdates(&environment, commandUpdates{environment: map[string]string{
-		"GITHUB_SHA": "command", "RUNNER_OS": "Command", "CI": "command",
+		"GITHUB_SHA": "command", "github_sha": "command-lower", "RUNNER_OS": "Command", "runner_os": "command-lower", "GITHUB_TOKEN": "command", "GITHUB_CUSTOM": "command", "node_options": "command", "CI": "command",
 	}})
 	if environmentValue(environment, "GITHUB_SHA") != "trusted" || environmentValue(environment, "RUNNER_OS") != "Linux" {
-		t.Fatalf("reserved environment changed: %v", environment)
+		t.Fatalf("runner-owned environment changed: %v", environment)
+	}
+	if environmentValue(environment, "github_sha") != "command-lower" || environmentValue(environment, "runner_os") != "command-lower" {
+		t.Fatalf("case-sensitive environment was not updated: %v", environment)
+	}
+	if environmentValue(environment, "GITHUB_TOKEN") != "command" || environmentValue(environment, "GITHUB_CUSTOM") != "command" {
+		t.Fatalf("allowed prefixed environment was not updated: %v", environment)
+	}
+	if environmentValue(environment, "NODE_OPTIONS") != "job" || environmentValue(environment, "node_options") != "" {
+		t.Fatalf("GITHUB_ENV changed NODE_OPTIONS: %v", environment)
 	}
 	if environmentValue(environment, "CI") != "command" {
 		t.Fatalf("CI = %q", environmentValue(environment, "CI"))

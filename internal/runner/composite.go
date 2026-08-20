@@ -13,6 +13,7 @@ import (
 	"github.com/kelos-dev/open-actions/internal/actionref"
 	workflowexpression "github.com/kelos-dev/open-actions/internal/expression"
 	"github.com/kelos-dev/open-actions/internal/workflow"
+	"github.com/kelos-dev/open-actions/internal/workflowenv"
 )
 
 const (
@@ -319,7 +320,7 @@ func resolveCompositeExpressions(value string, compositeContext *compositeContex
 
 func applyEnvironmentUpdates(environment *[]string, updates commandUpdates) {
 	for name, value := range updates.environment {
-		if reservedEnvironmentName(name) {
+		if workflowenv.IsRunnerOwned(name) || workflowenv.IsEnvironmentFileBlocked(name) {
 			continue
 		}
 		*environment = setEnvironment(*environment, name, value)
