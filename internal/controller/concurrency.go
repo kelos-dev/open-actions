@@ -71,7 +71,8 @@ func workflowRunConcurrencyScope(run *actionsv1alpha1.WorkflowRun) (concurrencyS
 	return concurrencyScope{project: run.Spec.ProjectRef.Name, repositoryID: run.Spec.Source.GitHub.Repository.ID}, nil
 }
 
-func workflowRunConcurrencyMember(run *actionsv1alpha1.WorkflowRun, cancelInProgress bool) concurrencyMember {
+func workflowRunConcurrencyMember(run *actionsv1alpha1.WorkflowRun) concurrencyMember {
+	cancelInProgress := run.Status.Concurrency != nil && run.Status.Concurrency.CancelInProgress
 	return concurrencyMember{Kind: "WorkflowRun", Name: run.Name, UID: run.UID, CancelInProgress: cancelInProgress}
 }
 
@@ -90,7 +91,7 @@ func (r *WorkflowRunReconciler) olderWorkflowRunPlanning(ctx context.Context, cu
 			continue
 		}
 		planned := meta.FindStatusCondition(other.Status.Conditions, actionsv1alpha1.WorkflowRunConditionPlanned)
-		if other.Status.ConcurrencyGroup == "" && (planned == nil || planned.Status == metav1.ConditionUnknown) {
+		if planned == nil || (planned.Status == metav1.ConditionUnknown && !waitingForConcurrencyCondition(planned)) {
 			return true, nil
 		}
 	}
@@ -105,7 +106,7 @@ func workflowRunOlderThan(left, right *actionsv1alpha1.WorkflowRun) bool {
 }
 
 func workflowJobConcurrencyMember(job *actionsv1alpha1.WorkflowJob) concurrencyMember {
-	cancelInProgress := job.Spec.Concurrency != nil && job.Spec.Concurrency.CancelInProgress
+	cancelInProgress := job.Status.Concurrency != nil && job.Status.Concurrency.CancelInProgress
 	return concurrencyMember{Kind: "WorkflowJob", Name: job.Name, UID: job.UID, CancelInProgress: cancelInProgress}
 }
 
@@ -332,11 +333,11 @@ func (r *WorkflowRunReconciler) bootstrapWorkflowRunConcurrency(ctx context.Cont
 	pending := make([]workflowRunConcurrencyCandidate, 0)
 	for index := range runs.Items {
 		run := &runs.Items[index]
-		if terminalRun(run) || !workflowRunMatchesConcurrencyScope(run, scope) || !strings.EqualFold(run.Status.ConcurrencyGroup, group) {
+		if terminalRun(run) || run.Status.Concurrency == nil || !workflowRunMatchesConcurrencyScope(run, scope) || !strings.EqualFold(run.Status.Concurrency.Group, group) {
 			continue
 		}
 		planned := meta.FindStatusCondition(run.Status.Conditions, actionsv1alpha1.WorkflowRunConditionPlanned)
-		item := workflowRunConcurrencyCandidate{member: workflowRunConcurrencyMember(run, planned != nil && planned.Reason == "WaitingForConcurrencyCancellation"), run: run}
+		item := workflowRunConcurrencyCandidate{member: workflowRunConcurrencyMember(run), run: run}
 		switch {
 		case planned != nil && planned.Status == metav1.ConditionTrue:
 			holders = append(holders, item)
@@ -590,5 +591,5 @@ func (r *WorkflowRunReconciler) requestConcurrencyCancellation(ctx context.Conte
 }
 
 func workflowJobConcurrencyRegistered(job *actionsv1alpha1.WorkflowJob) bool {
-	return job.Status.ConcurrencyGroup != "" || meta.FindStatusCondition(job.Status.Conditions, actionsv1alpha1.WorkflowJobConditionConcurrencyAcquired) != nil
+	return meta.FindStatusCondition(job.Status.Conditions, actionsv1alpha1.WorkflowJobConditionConcurrencyAcquired) != nil
 }

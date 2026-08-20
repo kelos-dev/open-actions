@@ -202,12 +202,12 @@ func (r *WorkflowRunReconciler) validateWorkflowRunRerun(ctx context.Context, ru
 
 func (r *WorkflowRunReconciler) reconcileWorkflowRun(ctx context.Context, run *actionsv1alpha1.WorkflowRun) (ctrl.Result, error) {
 	if terminalRun(run) {
-		if run.Status.ConcurrencyGroup != "" {
+		if run.Status.Concurrency != nil {
 			scope, err := workflowRunConcurrencyScope(run)
 			if err != nil {
 				return ctrl.Result{}, err
 			}
-			if err := r.releaseConcurrency(ctx, run.Namespace, scope, run.Status.ConcurrencyGroup, workflowRunConcurrencyMember(run, false)); err != nil {
+			if err := r.releaseConcurrency(ctx, run.Namespace, scope, run.Status.Concurrency.Group, workflowRunConcurrencyMember(run)); err != nil {
 				return ctrl.Result{}, err
 			}
 		}
@@ -218,18 +218,20 @@ func (r *WorkflowRunReconciler) reconcileWorkflowRun(ctx context.Context, run *a
 		if run.Status.Jobs == nil {
 			return ctrl.Result{}, fmt.Errorf("planned WorkflowRun %q has no job summary", run.Name)
 		}
-		return r.observeWorkflowJobs(ctx, run, run.Status.WorkflowName, run.Status.ConcurrencyGroup, run.Status.Jobs.Total)
+		return r.observeWorkflowJobs(ctx, run, run.Status.WorkflowName, run.Status.Jobs.Total)
 	}
 	if waitingForConcurrencyCondition(planned) && run.Status.Jobs != nil {
-		cancelInProgress := planned.Reason == "WaitingForConcurrencyCancellation"
-		waiting, err := r.handleConcurrency(ctx, run, run.Status.ConcurrencyGroup, cancelInProgress)
+		if run.Status.Concurrency == nil {
+			return ctrl.Result{}, fmt.Errorf("waiting WorkflowRun %q has no concurrency status", run.Name)
+		}
+		waiting, err := r.handleConcurrency(ctx, run)
 		if err != nil {
 			return ctrl.Result{}, err
 		}
 		if waiting {
-			return r.waitingForConcurrency(ctx, run, run.Status.WorkflowName, run.Status.ConcurrencyGroup, run.Status.Jobs.Total, cancelInProgress)
+			return r.waitingForConcurrency(ctx, run, run.Status.WorkflowName, run.Status.Jobs.Total)
 		}
-		return r.observeWorkflowJobs(ctx, run, run.Status.WorkflowName, run.Status.ConcurrencyGroup, run.Status.Jobs.Total)
+		return r.observeWorkflowJobs(ctx, run, run.Status.WorkflowName, run.Status.Jobs.Total)
 	}
 
 	project := &actionsv1alpha1.Project{}
@@ -303,9 +305,16 @@ func (r *WorkflowRunReconciler) reconcileWorkflowRun(ctx context.Context, run *a
 		return r.planningFailed(ctx, run, "TriggerInvalid", err, planningFailureTerminal)
 	}
 	variables := r.projectVariableContext(ctx, project)
-	concurrencyGroup, cancelInProgress, err := workflow.EvaluateConcurrency(definition, planningEvent, variables)
-	if err != nil {
-		return r.planningEvaluationFailed(ctx, run, err)
+	if run.Status.Concurrency == nil {
+		concurrencyGroup, cancelInProgress, err := workflow.EvaluateConcurrency(definition, planningEvent, variables)
+		if err != nil {
+			return r.planningEvaluationFailed(ctx, run, err)
+		}
+		if concurrencyGroup != "" {
+			if err := r.persistWorkflowRunConcurrencyDecision(ctx, run, concurrencyGroup, cancelInProgress); err != nil {
+				return ctrl.Result{}, err
+			}
+		}
 	}
 	plannedJobs, err := r.planWorkflowJobs(planningRun, definition, planningEvent.InputValues, variables, eventPayload)
 	if err != nil {
@@ -317,19 +326,30 @@ func (r *WorkflowRunReconciler) reconcileWorkflowRun(ctx context.Context, run *a
 	}
 	jobCount := int32(len(plannedJobs))
 	run.Status.WorkflowName = definition.Name
-	run.Status.ConcurrencyGroup = concurrencyGroup
 	run.Status.Jobs = &actionsv1alpha1.WorkflowRunJobStatus{Total: jobCount}
 	if err := r.ensureWorkflowJobs(ctx, run, project, plannedJobs); err != nil {
 		return r.planningFailed(ctx, run, "ChildCreationFailed", err, childCreationFailureDisposition(err))
 	}
-	waiting, err := r.handleConcurrency(ctx, run, concurrencyGroup, cancelInProgress)
+	waiting, err := r.handleConcurrency(ctx, run)
 	if err != nil {
 		return r.planningFailed(ctx, run, "ConcurrencyCheckFailed", err, planningFailureRetry)
 	}
 	if waiting {
-		return r.waitingForConcurrency(ctx, run, definition.Name, concurrencyGroup, jobCount, cancelInProgress)
+		return r.waitingForConcurrency(ctx, run, definition.Name, jobCount)
 	}
-	return r.observeWorkflowJobs(ctx, run, definition.Name, concurrencyGroup, jobCount)
+	return r.observeWorkflowJobs(ctx, run, definition.Name, jobCount)
+}
+
+func (r *WorkflowRunReconciler) persistWorkflowRunConcurrencyDecision(ctx context.Context, run *actionsv1alpha1.WorkflowRun, group string, cancelInProgress bool) error {
+	before := run.Status.DeepCopy()
+	run.Status.Concurrency = &actionsv1alpha1.ConcurrencyStatus{Group: group, CancelInProgress: cancelInProgress}
+	if apiEquality.Semantic.DeepEqual(before, &run.Status) {
+		return nil
+	}
+	if err := r.Status().Update(ctx, run); err != nil {
+		return fmt.Errorf("persist concurrency decision for WorkflowRun %q: %w", run.Name, err)
+	}
+	return nil
 }
 
 func (r *WorkflowRunReconciler) reconcileCompletedWorkflowRunTTL(ctx context.Context, run *actionsv1alpha1.WorkflowRun) (ctrl.Result, error) {
@@ -880,7 +900,8 @@ func (r *WorkflowRunReconciler) planWorkflowJobs(run *actionsv1alpha1.WorkflowRu
 			var concurrency *actionsv1alpha1.WorkflowJobConcurrency
 			if definitionJob.Concurrency.Group != "" {
 				concurrency = &actionsv1alpha1.WorkflowJobConcurrency{
-					Group: definitionJob.Concurrency.Group, CancelInProgress: definitionJob.Concurrency.CancelInProgress,
+					Group:            definitionJob.Concurrency.Group,
+					CancelInProgress: workflowJobConcurrencyCancellation(definitionJob.Concurrency.CancelInProgress),
 				}
 			}
 			plannedJobs = append(plannedJobs, plannedWorkflowJob{
@@ -898,6 +919,28 @@ func (r *WorkflowRunReconciler) planWorkflowJobs(run *actionsv1alpha1.WorkflowRu
 		}
 	}
 	return plannedJobs, nil
+}
+
+func workflowJobConcurrencyCancellation(input workflow.BooleanExpression) *actionsv1alpha1.WorkflowJobConcurrencyCancellation {
+	if input.Expression != "" {
+		return &actionsv1alpha1.WorkflowJobConcurrencyCancellation{Expression: input.Expression}
+	}
+	if !input.Value {
+		return nil
+	}
+	value := true
+	return &actionsv1alpha1.WorkflowJobConcurrencyCancellation{Value: &value}
+}
+
+func workflowJobCancellationExpression(input *actionsv1alpha1.WorkflowJobConcurrencyCancellation) workflow.BooleanExpression {
+	if input == nil {
+		return workflow.BooleanExpression{}
+	}
+	result := workflow.BooleanExpression{Expression: input.Expression}
+	if input.Value != nil {
+		result.Value = *input.Value
+	}
+	return result
 }
 
 func (r *WorkflowRunReconciler) effectiveJobTimeoutSeconds(requestedMinutes int64) int64 {
@@ -1438,7 +1481,7 @@ func runnerReviewEvent(event *actionsv1alpha1.GitHubReviewEvent) *runner.ReviewE
 	return &runner.ReviewEvent{Body: event.Body}
 }
 
-func (r *WorkflowRunReconciler) observeWorkflowJobs(ctx context.Context, run *actionsv1alpha1.WorkflowRun, workflowName, concurrencyGroup string, total int32) (ctrl.Result, error) {
+func (r *WorkflowRunReconciler) observeWorkflowJobs(ctx context.Context, run *actionsv1alpha1.WorkflowRun, workflowName string, total int32) (ctrl.Result, error) {
 	reader := r.APIReader
 	jobs := &actionsv1alpha1.WorkflowJobList{}
 	if err := reader.List(ctx, jobs, client.InNamespace(run.Namespace), client.MatchingLabels{actionsv1alpha1.LabelWorkflowRunUID: string(run.UID)}); err != nil {
@@ -1516,7 +1559,7 @@ func (r *WorkflowRunReconciler) observeWorkflowJobs(ctx context.Context, run *ac
 			startTime = job.Status.StartTime.DeepCopy()
 		}
 		result := workflowJobResult(job)
-		if result != "" && job.Status.ConcurrencyGroup != "" {
+		if result != "" && job.Status.Concurrency != nil {
 			active, err := r.workflowJobExecutionActive(ctx, job)
 			if err != nil {
 				return ctrl.Result{}, err
@@ -1528,7 +1571,7 @@ func (r *WorkflowRunReconciler) observeWorkflowJobs(ctx context.Context, run *ac
 				if err != nil {
 					return ctrl.Result{}, err
 				}
-				if err := r.releaseConcurrency(ctx, job.Namespace, scope, job.Status.ConcurrencyGroup, workflowJobConcurrencyMember(job)); err != nil {
+				if err := r.releaseConcurrency(ctx, job.Namespace, scope, job.Status.Concurrency.Group, workflowJobConcurrencyMember(job)); err != nil {
 					return ctrl.Result{}, err
 				}
 			}
@@ -1569,7 +1612,6 @@ func (r *WorkflowRunReconciler) observeWorkflowJobs(ctx context.Context, run *ac
 	before := run.Status.DeepCopy()
 	run.Status.ObservedGeneration = run.Generation
 	run.Status.WorkflowName = workflowName
-	run.Status.ConcurrencyGroup = concurrencyGroup
 	run.Status.Jobs = status
 	if run.Status.StartTime == nil && startTime != nil {
 		run.Status.StartTime = startTime
@@ -1664,7 +1706,7 @@ func workflowJobGraphNeedsExpressionContext(run *actionsv1alpha1.WorkflowRun, jo
 			continue
 		}
 		needsCondition := strings.TrimSpace(job.Spec.If) != ""
-		needsConcurrency := job.Spec.Concurrency != nil && job.Status.ConcurrencyGroup == ""
+		needsConcurrency := job.Spec.Concurrency != nil && job.Status.Concurrency == nil
 		if !needsCondition && !needsConcurrency {
 			continue
 		}
@@ -1679,7 +1721,7 @@ func workflowJobGraphNeedsExpressionContext(run *actionsv1alpha1.WorkflowRun, jo
 func (r *WorkflowRunReconciler) workflowJobGraphInputValues(ctx context.Context, jobs []actionsv1alpha1.WorkflowJob) (map[string]any, error) {
 	for index := range jobs {
 		job := &jobs[index]
-		if workflowJobTerminal(job) || strings.TrimSpace(job.Spec.If) == "" && (job.Spec.Concurrency == nil || job.Status.ConcurrencyGroup != "") {
+		if workflowJobTerminal(job) || strings.TrimSpace(job.Spec.If) == "" && (job.Spec.Concurrency == nil || job.Status.Concurrency != nil) {
 			continue
 		}
 		plan := &corev1.ConfigMap{}
@@ -1791,8 +1833,7 @@ func (r *WorkflowRunReconciler) reconcileWorkflowJobGraph(ctx context.Context, r
 			continue
 		}
 		if job.Spec.Concurrency != nil {
-			group := job.Status.ConcurrencyGroup
-			if group == "" {
+			if job.Status.Concurrency == nil {
 				expressionContext = r.jobExpressionContext(run, workflowName, inputValues, variables, eventPayload)
 				expressionContext.Values["needs"] = workflowNeedsContext(job, jobsByLogicalID)
 				if job.Spec.Matrix != nil {
@@ -1803,8 +1844,9 @@ func (r *WorkflowRunReconciler) reconcileWorkflowJobGraph(ctx context.Context, r
 					expressionContext.Values["matrix"] = matrix
 					expressionContext.Values["strategy"] = workflowJobStrategyContext(job.Spec.Matrix)
 				}
-				evaluatedGroup, _, err := workflow.EvaluateJobConcurrency(job.Spec.JobID, workflow.Concurrency{
-					Group: job.Spec.Concurrency.Group, CancelInProgress: job.Spec.Concurrency.CancelInProgress,
+				group, cancelInProgress, err := workflow.EvaluateJobConcurrency(job.Spec.JobID, workflow.Concurrency{
+					Group:            job.Spec.Concurrency.Group,
+					CancelInProgress: workflowJobCancellationExpression(job.Spec.Concurrency.CancelInProgress),
 				}, expressionContext)
 				if err != nil {
 					var unavailable *projectValuesUnavailableError
@@ -1816,8 +1858,11 @@ func (r *WorkflowRunReconciler) reconcileWorkflowJobGraph(ctx context.Context, r
 					}
 					continue
 				}
-				group = evaluatedGroup
+				if err := r.persistWorkflowJobConcurrencyDecision(ctx, job, group, cancelInProgress); err != nil {
+					return err
+				}
 			}
+			group := job.Status.Concurrency.Group
 			scope, err := workflowRunConcurrencyScope(run)
 			if err != nil {
 				return err
@@ -1844,12 +1889,12 @@ func (r *WorkflowRunReconciler) reconcileWorkflowJobGraph(ctx context.Context, r
 				}
 				continue
 			case concurrencyGateWaiting:
-				if err := r.setWorkflowJobConcurrencyState(ctx, job, group, false); err != nil {
+				if err := r.setWorkflowJobConcurrencyState(ctx, job, false); err != nil {
 					return err
 				}
 				continue
 			case concurrencyGateAcquired:
-				if err := r.setWorkflowJobConcurrencyState(ctx, job, group, true); err != nil {
+				if err := r.setWorkflowJobConcurrencyState(ctx, job, true); err != nil {
 					return err
 				}
 				continue
@@ -2034,13 +2079,25 @@ func (r *WorkflowRunReconciler) setWorkflowJobReady(ctx context.Context, job *ac
 	return r.Status().Update(ctx, job)
 }
 
-func (r *WorkflowRunReconciler) setWorkflowJobConcurrencyState(ctx context.Context, job *actionsv1alpha1.WorkflowJob, group string, acquired bool) error {
+func (r *WorkflowRunReconciler) persistWorkflowJobConcurrencyDecision(ctx context.Context, job *actionsv1alpha1.WorkflowJob, group string, cancelInProgress bool) error {
 	before := job.Status.DeepCopy()
-	if job.Status.ConcurrencyGroup != "" && !strings.EqualFold(job.Status.ConcurrencyGroup, group) {
-		return fmt.Errorf("WorkflowJob %q concurrency group changed from %q to %q", job.Name, job.Status.ConcurrencyGroup, group)
+	job.Status.ObservedGeneration = job.Generation
+	job.Status.Concurrency = &actionsv1alpha1.ConcurrencyStatus{Group: group, CancelInProgress: cancelInProgress}
+	if apiEquality.Semantic.DeepEqual(before, &job.Status) {
+		return nil
+	}
+	if err := r.Status().Update(ctx, job); err != nil {
+		return fmt.Errorf("persist concurrency decision for WorkflowJob %q: %w", job.Name, err)
+	}
+	return nil
+}
+
+func (r *WorkflowRunReconciler) setWorkflowJobConcurrencyState(ctx context.Context, job *actionsv1alpha1.WorkflowJob, acquired bool) error {
+	before := job.Status.DeepCopy()
+	if job.Status.Concurrency == nil {
+		return fmt.Errorf("WorkflowJob %q has no evaluated concurrency policy", job.Name)
 	}
 	job.Status.ObservedGeneration = job.Generation
-	job.Status.ConcurrencyGroup = group
 	status := metav1.ConditionUnknown
 	reason := concurrencyWaitingReason
 	message := "The workflow job is waiting for the concurrency group"
@@ -2244,10 +2301,11 @@ func podActive(pod *corev1.Pod) bool {
 	return pod.Status.Phase != corev1.PodSucceeded && pod.Status.Phase != corev1.PodFailed
 }
 
-func (r *WorkflowRunReconciler) handleConcurrency(ctx context.Context, run *actionsv1alpha1.WorkflowRun, group string, cancelInProgress bool) (bool, error) {
-	if group == "" {
+func (r *WorkflowRunReconciler) handleConcurrency(ctx context.Context, run *actionsv1alpha1.WorkflowRun) (bool, error) {
+	if run.Status.Concurrency == nil {
 		return false, nil
 	}
+	group := run.Status.Concurrency.Group
 	planning, err := r.olderWorkflowRunPlanning(ctx, run)
 	if err != nil || planning {
 		return planning, err
@@ -2258,7 +2316,7 @@ func (r *WorkflowRunReconciler) handleConcurrency(ctx context.Context, run *acti
 	}
 	planned := meta.FindStatusCondition(run.Status.Conditions, actionsv1alpha1.WorkflowRunConditionPlanned)
 	registered := waitingForConcurrencyCondition(planned) || planned != nil && planned.Status == metav1.ConditionTrue
-	result, err := r.acquireConcurrency(ctx, run.Namespace, scope, group, workflowRunConcurrencyMember(run, cancelInProgress), registered)
+	result, err := r.acquireConcurrency(ctx, run.Namespace, scope, group, workflowRunConcurrencyMember(run), registered)
 	if err != nil {
 		return false, err
 	}
@@ -2406,14 +2464,13 @@ func (r *WorkflowRunReconciler) executionWorkloadsRemain(ctx context.Context, ru
 	return len(pods.Items) > 0, nil
 }
 
-func (r *WorkflowRunReconciler) waitingForConcurrency(ctx context.Context, run *actionsv1alpha1.WorkflowRun, workflowName, group string, total int32, cancelInProgress bool) (ctrl.Result, error) {
+func (r *WorkflowRunReconciler) waitingForConcurrency(ctx context.Context, run *actionsv1alpha1.WorkflowRun, workflowName string, total int32) (ctrl.Result, error) {
 	before := run.Status.DeepCopy()
 	run.Status.ObservedGeneration = run.Generation
 	run.Status.WorkflowName = workflowName
-	run.Status.ConcurrencyGroup = group
 	run.Status.Jobs = &actionsv1alpha1.WorkflowRunJobStatus{Total: total, Queued: total}
 	reason := "WaitingForConcurrency"
-	if cancelInProgress {
+	if run.Status.Concurrency != nil && run.Status.Concurrency.CancelInProgress {
 		reason = "WaitingForConcurrencyCancellation"
 	}
 	meta.SetStatusCondition(&run.Status.Conditions, metav1.Condition{

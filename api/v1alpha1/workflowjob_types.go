@@ -108,10 +108,26 @@ type WorkflowJobConcurrency struct {
 	// +required
 	Group string `json:"group"`
 
-	// CancelInProgress requests cancellation of the executing member when this
-	// job becomes the pending member.
+	// CancelInProgress is evaluated after dependencies reach terminal results
+	// and matrix values are available. Omit it to leave the executing member
+	// running when this job becomes pending.
 	// +optional
-	CancelInProgress bool `json:"cancelInProgress,omitempty"`
+	CancelInProgress *WorkflowJobConcurrencyCancellation `json:"cancelInProgress,omitempty"`
+}
+
+// WorkflowJobConcurrencyCancellation preserves a cancellation literal or
+// expression until job concurrency is evaluated.
+// +kubebuilder:validation:XValidation:rule="has(self.value) != has(self.expression)",message="exactly one of value or expression must be specified"
+type WorkflowJobConcurrencyCancellation struct {
+	// Value is a literal cancellation decision.
+	// +optional
+	Value *bool `json:"value,omitempty"`
+
+	// Expression is a whole expression that evaluates to a Boolean.
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=65536
+	// +optional
+	Expression string `json:"expression,omitempty"`
 }
 
 // WorkflowJobMatrix identifies one expanded combination of a logical workflow
@@ -192,12 +208,11 @@ type WorkflowJobStatus struct {
 	// +optional
 	Outputs map[string]string `json:"outputs,omitempty"`
 
-	// ConcurrencyGroup is the evaluated job concurrency key. It is set before
+	// Concurrency records the evaluated job concurrency policy. It is set before
 	// the job enters the concurrency gate and remains stable for the job's
 	// lifetime.
-	// +kubebuilder:validation:MaxLength=256
 	// +optional
-	ConcurrencyGroup string `json:"concurrencyGroup,omitempty"`
+	Concurrency *ConcurrencyStatus `json:"concurrency,omitempty"`
 
 	// Conditions describe dependency readiness, concurrency acquisition, Runner
 	// assignment, cancellation, and the terminal result. When present, Ready is

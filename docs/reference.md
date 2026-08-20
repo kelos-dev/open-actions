@@ -167,8 +167,10 @@ afterward. A `WorkflowJob` spec is immutable, and `status.runnerRef` identifies
 its one-time Runner assignment. `spec.needs` records direct workflow
 dependencies, `spec.if` records its scheduling condition, and
 `spec.concurrency` records the unevaluated job concurrency policy.
-`status.concurrencyGroup` contains the evaluated group after dependencies and
-the job condition settle. For matrix jobs, `spec.matrix.jobIndex` and
+`status.concurrency` contains the evaluated group and cancellation decision
+after dependencies and the job condition settle. WorkflowRun uses the same
+`status.concurrency` shape for its evaluated workflow-level policy. For matrix
+jobs, `spec.matrix.jobIndex` and
 `spec.matrix.jobTotal` expose the values used by the `strategy` context.
 `spec.timeoutSeconds` records the effective execution timeout, and
 `status.result` contains `success`, `failure`, `skipped`, or `cancelled` after
@@ -203,13 +205,13 @@ spec:
 
 The Project remains unconfigured while a referenced object is missing or its
 contents violate these constraints. Variables needed for workflow concurrency,
-job names, or runner labels are read during planning; job conditions read them
-when their dependencies settle. Job and step expressions remain unresolved in
-the immutable plan. Kubernetes mounts the Secret and ConfigMap into runner-only,
-read-only volumes when a job Pod starts, and the runner reads a consistent
-snapshot at startup. Rotations apply to new jobs. The Docker sidecar does not
-mount these volumes, and workflow commands do not receive the internal files as
-ambient environment variables.
+job names, or runner labels are read during planning; job conditions and job
+concurrency read them when dependencies settle. Job and step expressions remain
+unresolved in the immutable plan. Kubernetes mounts the Secret and ConfigMap
+into runner-only, read-only volumes when a job Pod starts, and the runner reads
+a consistent snapshot at startup. Rotations apply to new jobs. The Docker
+sidecar does not mount these volumes, and workflow commands do not receive the
+internal files as ambient environment variables.
 
 See the [Project value source sample](../config/samples/actions_v1alpha1_project-values.yaml)
 for a complete Project manifest.
@@ -549,7 +551,7 @@ for graph cleanup jobs.
 ### Concurrency
 
 Workflow and `jobs.<id>.concurrency` accept either a scalar group or a mapping
-with `group` and a literal Boolean `cancel-in-progress`. Groups are
+with `group` and `cancel-in-progress`. Groups are
 case-insensitive, scoped by Project and repository, and shared by workflow runs
 and jobs. At most one member executes while one newer member waits. A newer
 waiting member cancels and replaces the existing waiting member. When
@@ -563,13 +565,41 @@ concurrency is evaluated after direct dependencies reach terminal results and
 the job condition passes, when `needs`, `strategy`, and `matrix` values are
 known. The job concurrency gate precedes Runner assignment, including matrix
 `max-parallel`. Matrix `fail-fast` and WorkflowRun cancellation can still cancel
-a job while it waits. The evaluated group and gate conditions are persisted, so
-controller restarts resume the same acquisition or replacement decision. A run
-waits for an older run in the same repository until that run has evaluated its
-workflow concurrency configuration.
+a job while it waits. Each WorkflowRun and WorkflowJob stores its evaluated
+group and cancellation decision under `status.concurrency` before entering the
+gate, so controller restarts resume the same acquisition or replacement
+decision. A run waits for an older run in the same repository until that run
+has evaluated its workflow concurrency configuration.
 
-Concurrency expressions reject unavailable contexts and empty evaluated
-groups. Event properties that do not exist evaluate to an empty string. Use
+At workflow scope, the `group` and `cancel-in-progress` expressions are
+evaluated together during planning. Both may use `github`, `inputs`, and `vars`;
+`secrets` and job-only contexts are unavailable. At job scope, both expressions
+are evaluated after dependencies and the job condition settle. They may use
+`github`, `needs`, `strategy`, `matrix`, `inputs`, and `vars`; `strategy` and
+`matrix` are populated for matrix jobs. Secrets are unavailable at both scopes.
+
+`cancel-in-progress` accepts a Boolean literal or one whole expression that
+evaluates to a Boolean. A true result requests graceful cancellation of the
+executing member. A false result leaves that member executing and makes the new
+member wait while retaining the normal one-pending-member replacement behavior.
+For example:
+
+```yaml
+concurrency:
+  group: deploy-${{ github.ref_name }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' && github.ref != 'refs/heads/main' }}
+
+jobs:
+  deploy:
+    concurrency:
+      group: deploy-${{ matrix.environment }}
+      cancel-in-progress: ${{ needs.build.result == 'success' && matrix.environment != 'production' }}
+```
+
+Concurrency expressions reject unavailable contexts, non-Boolean
+`cancel-in-progress` results, and empty evaluated groups. Missing event
+properties evaluate to an empty string, which is invalid as the whole result of
+`cancel-in-progress` but may be compared explicitly. Use
 `github.head_ref || github.ref_name` for workflows that need a ref fallback.
 Pull request and merge group target branches are available as
 `github.base_ref`.

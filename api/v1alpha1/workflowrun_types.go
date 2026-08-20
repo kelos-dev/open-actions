@@ -555,10 +555,11 @@ type WorkflowRunStatus struct {
 	// +optional
 	WorkflowName string `json:"workflowName,omitempty"`
 
-	// ConcurrencyGroup is the evaluated workflow concurrency key, when present.
-	// +kubebuilder:validation:MaxLength=256
+	// Concurrency records the evaluated workflow concurrency policy. It is set
+	// before the run enters the concurrency gate and remains stable for the
+	// run's lifetime.
 	// +optional
-	ConcurrencyGroup string `json:"concurrencyGroup,omitempty"`
+	Concurrency *ConcurrencyStatus `json:"concurrency,omitempty"`
 
 	// Jobs summarizes WorkflowJobs owned by this run.
 	// +optional

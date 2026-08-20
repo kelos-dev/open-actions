@@ -1637,10 +1637,10 @@ func (c *recordingDeleteClient) Delete(ctx context.Context, object client.Object
 
 func TestConcurrencyWaitsForOlderUnevaluatedRun(t *testing.T) {
 	older := concurrencyRun("older", "older", 1, time.Unix(1, 0), "", nil)
-	current := concurrencyRun("current", "current", 1, time.Unix(2, 0), "", nil)
+	current := concurrencyRun("current", "current", 1, time.Unix(2, 0), "deploy", nil)
 	reconciler, _ := concurrencyReconciler(t, older, current)
 
-	waiting, err := reconciler.handleConcurrency(context.Background(), current, "deploy", false)
+	waiting, err := reconciler.handleConcurrency(context.Background(), current)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1649,13 +1649,27 @@ func TestConcurrencyWaitsForOlderUnevaluatedRun(t *testing.T) {
 	}
 }
 
+func TestConcurrencyWaitsForOlderEvaluatedRunBeforeRegistration(t *testing.T) {
+	older := concurrencyRun("older", "older", 1, time.Unix(1, 0), "deploy", nil)
+	current := concurrencyRun("current", "current", 1, time.Unix(2, 0), "deploy", nil)
+	reconciler, _ := concurrencyReconciler(t, older, current)
+
+	waiting, err := reconciler.handleConcurrency(context.Background(), current)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !waiting {
+		t.Fatal("newer run did not wait for an older run before gate registration")
+	}
+}
+
 func TestConcurrencyIsRepositoryScoped(t *testing.T) {
 	condition := plannedCondition(metav1.ConditionTrue, "JobsPlanned")
 	otherRepository := concurrencyRun("other", "other", 2, time.Unix(1, 0), "deploy", &condition)
-	current := concurrencyRun("current", "current", 1, time.Unix(2, 0), "", nil)
+	current := concurrencyRun("current", "current", 1, time.Unix(2, 0), "deploy", nil)
 	reconciler, clusterClient := concurrencyReconciler(t, otherRepository, current)
 
-	waiting, err := reconciler.handleConcurrency(context.Background(), current, "deploy", true)
+	waiting, err := reconciler.handleConcurrency(context.Background(), current)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1672,10 +1686,10 @@ func TestConcurrencySupersedesPendingRun(t *testing.T) {
 	pendingCondition := plannedCondition(metav1.ConditionUnknown, "WaitingForConcurrency")
 	running := concurrencyRun("running", "running", 1, time.Unix(1, 0), "deploy", &runningCondition)
 	pending := concurrencyRun("pending", "pending", 1, time.Unix(2, 0), "deploy", &pendingCondition)
-	current := concurrencyRun("current", "current", 1, time.Unix(3, 0), "", nil)
+	current := concurrencyRun("current", "current", 1, time.Unix(3, 0), "deploy", nil)
 	reconciler, clusterClient := concurrencyReconciler(t, running, pending, current)
 
-	waiting, err := reconciler.handleConcurrency(context.Background(), current, "deploy", false)
+	waiting, err := reconciler.handleConcurrency(context.Background(), current)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1697,10 +1711,11 @@ func TestConcurrencySupersedesPendingRun(t *testing.T) {
 func TestConcurrencyCancelInProgressRequestsRunningMemberCancellation(t *testing.T) {
 	condition := plannedCondition(metav1.ConditionTrue, "JobsPlanned")
 	running := concurrencyRun("running", "running", 1, time.Unix(1, 0), "deploy", &condition)
-	current := concurrencyRun("current", "current", 1, time.Unix(2, 0), "", nil)
+	current := concurrencyRun("current", "current", 1, time.Unix(2, 0), "deploy", nil)
+	current.Status.Concurrency.CancelInProgress = true
 	reconciler, clusterClient := concurrencyReconciler(t, running, current)
 
-	waiting, err := reconciler.handleConcurrency(context.Background(), current, "deploy", true)
+	waiting, err := reconciler.handleConcurrency(context.Background(), current)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1817,7 +1832,10 @@ func TestJobConcurrencyCancellationDoesNotCancelWorkflowRun(t *testing.T) {
 	}
 	replacement := &actionsv1alpha1.WorkflowJob{
 		ObjectMeta: metav1.ObjectMeta{Name: "replacement", Namespace: run.Namespace, UID: "replacement-uid"},
-		Spec:       actionsv1alpha1.WorkflowJobSpec{WorkflowRunRef: corev1.LocalObjectReference{Name: run.Name}, JobID: "replacement", Concurrency: &actionsv1alpha1.WorkflowJobConcurrency{Group: "DEPLOY", CancelInProgress: true}},
+		Spec: actionsv1alpha1.WorkflowJobSpec{
+			WorkflowRunRef: corev1.LocalObjectReference{Name: run.Name}, JobID: "replacement",
+			Concurrency: &actionsv1alpha1.WorkflowJobConcurrency{Group: "DEPLOY", CancelInProgress: &actionsv1alpha1.WorkflowJobConcurrencyCancellation{Expression: "${{ true }}"}},
+		},
 	}
 	clusterClient := fake.NewClientBuilder().WithScheme(scheme).
 		WithStatusSubresource(&actionsv1alpha1.WorkflowJob{}).
@@ -1849,12 +1867,78 @@ func TestJobConcurrencyCancellationDoesNotCancelWorkflowRun(t *testing.T) {
 	if cancellation == nil || cancellation.Status != metav1.ConditionTrue || cancellation.Reason != concurrencyCancelledReason {
 		t.Fatalf("job cancellation condition = %#v", cancellation)
 	}
+	storedReplacement := &actionsv1alpha1.WorkflowJob{}
+	if err := clusterClient.Get(context.Background(), client.ObjectKeyFromObject(replacement), storedReplacement); err != nil {
+		t.Fatal(err)
+	}
+	if storedReplacement.Status.Concurrency == nil || storedReplacement.Status.Concurrency.Group != "DEPLOY" || !storedReplacement.Status.Concurrency.CancelInProgress {
+		t.Fatalf("replacement concurrency decision = %#v", storedReplacement.Status.Concurrency)
+	}
 	storedRun := &actionsv1alpha1.WorkflowRun{}
 	if err := clusterClient.Get(context.Background(), client.ObjectKeyFromObject(run), storedRun); err != nil {
 		t.Fatal(err)
 	}
 	if storedRun.Spec.CancelRequested {
 		t.Fatal("job concurrency cancelled the WorkflowRun")
+	}
+}
+
+func TestJobConcurrencyRestoresEvaluatedCancellationAfterRestart(t *testing.T) {
+	scheme := runtime.NewScheme()
+	for name, add := range map[string]func(*runtime.Scheme) error{
+		"actions": actionsv1alpha1.AddToScheme, "coordination": coordinationv1.AddToScheme, "core": corev1.AddToScheme,
+	} {
+		if err := add(scheme); err != nil {
+			t.Fatalf("add %s types: %v", name, err)
+		}
+	}
+	run := concurrencyRun("run", "run-uid", 1, time.Unix(1, 0), "", nil)
+	running := &actionsv1alpha1.WorkflowJob{
+		ObjectMeta: metav1.ObjectMeta{Name: "running", Namespace: run.Namespace, UID: "running-uid"},
+		Spec: actionsv1alpha1.WorkflowJobSpec{
+			WorkflowRunRef: corev1.LocalObjectReference{Name: run.Name}, JobID: "running",
+			Concurrency: &actionsv1alpha1.WorkflowJobConcurrency{Group: "deploy"},
+		},
+		Status: actionsv1alpha1.WorkflowJobStatus{
+			RunnerRef:   &corev1.LocalObjectReference{Name: "runner"},
+			Concurrency: &actionsv1alpha1.ConcurrencyStatus{Group: "deploy"},
+		},
+	}
+	replacement := &actionsv1alpha1.WorkflowJob{
+		ObjectMeta: metav1.ObjectMeta{Name: "replacement", Namespace: run.Namespace, UID: "replacement-uid"},
+		Spec: actionsv1alpha1.WorkflowJobSpec{
+			WorkflowRunRef: corev1.LocalObjectReference{Name: run.Name}, JobID: "replacement",
+			Concurrency: &actionsv1alpha1.WorkflowJobConcurrency{
+				Group: "deploy", CancelInProgress: &actionsv1alpha1.WorkflowJobConcurrencyCancellation{Expression: "${{ false }}"},
+			},
+		},
+		Status: actionsv1alpha1.WorkflowJobStatus{
+			Concurrency: &actionsv1alpha1.ConcurrencyStatus{Group: "deploy", CancelInProgress: true},
+		},
+	}
+	clusterClient := fake.NewClientBuilder().WithScheme(scheme).
+		WithStatusSubresource(&actionsv1alpha1.WorkflowJob{}).
+		WithObjects(run, running, replacement).Build()
+	scope, err := workflowRunConcurrencyScope(run)
+	if err != nil {
+		t.Fatal(err)
+	}
+	initial := &WorkflowRunReconciler{Client: clusterClient, APIReader: clusterClient}
+	if _, err := initial.acquireConcurrency(context.Background(), run.Namespace, scope, "deploy", workflowJobConcurrencyMember(running), false); err != nil {
+		t.Fatal(err)
+	}
+	restarted := &WorkflowRunReconciler{Client: clusterClient, APIReader: clusterClient}
+	jobs := []actionsv1alpha1.WorkflowJob{*running, *replacement}
+	if err := restarted.reconcileWorkflowJobGraph(context.Background(), run, "CI", nil, nil, nil, jobs); err != nil {
+		t.Fatal(err)
+	}
+	stored := &actionsv1alpha1.WorkflowJob{}
+	if err := clusterClient.Get(context.Background(), client.ObjectKeyFromObject(running), stored); err != nil {
+		t.Fatal(err)
+	}
+	cancellation := meta.FindStatusCondition(stored.Status.Conditions, actionsv1alpha1.WorkflowJobConditionCancellationRequested)
+	if cancellation == nil || cancellation.Status != metav1.ConditionTrue || cancellation.Reason != concurrencyCancelledReason {
+		t.Fatalf("restored cancellation decision condition = %#v", cancellation)
 	}
 }
 
@@ -2165,7 +2249,10 @@ func concurrencyRun(name string, uid types.UID, repositoryID int64, created time
 				GitHub: &actionsv1alpha1.GitHubWorkflowRunSource{Repository: actionsv1alpha1.GitHubRepository{ID: repositoryID}},
 			},
 		},
-		Status: actionsv1alpha1.WorkflowRunStatus{ConcurrencyGroup: group},
+		Status: actionsv1alpha1.WorkflowRunStatus{},
+	}
+	if group != "" {
+		run.Status.Concurrency = &actionsv1alpha1.ConcurrencyStatus{Group: group}
 	}
 	if condition != nil {
 		run.Status.Conditions = []metav1.Condition{*condition}
@@ -2785,10 +2872,11 @@ func TestWaitingWorkflowRunPersistsCancellationPolicy(t *testing.T) {
 	if err := actionsv1alpha1.AddToScheme(scheme); err != nil {
 		t.Fatal(err)
 	}
-	run := concurrencyRun("current", "run-current", 1, time.Now(), "", nil)
+	run := concurrencyRun("current", "run-current", 1, time.Now(), "deploy", nil)
+	run.Status.Concurrency.CancelInProgress = true
 	clusterClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&actionsv1alpha1.WorkflowRun{}).WithObjects(run).Build()
 	reconciler := &WorkflowRunReconciler{Client: clusterClient, APIReader: clusterClient}
-	if _, err := reconciler.waitingForConcurrency(context.Background(), run, "CI", "deploy", 1, true); err != nil {
+	if _, err := reconciler.waitingForConcurrency(context.Background(), run, "CI", 1); err != nil {
 		t.Fatal(err)
 	}
 	stored := &actionsv1alpha1.WorkflowRun{}
@@ -2798,6 +2886,63 @@ func TestWaitingWorkflowRunPersistsCancellationPolicy(t *testing.T) {
 	condition := meta.FindStatusCondition(stored.Status.Conditions, actionsv1alpha1.WorkflowRunConditionPlanned)
 	if condition == nil || condition.Status != metav1.ConditionUnknown || condition.Reason != "WaitingForConcurrencyCancellation" {
 		t.Fatalf("planned condition = %#v", condition)
+	}
+	if stored.Status.Concurrency == nil || stored.Status.Concurrency.Group != "deploy" || !stored.Status.Concurrency.CancelInProgress {
+		t.Fatalf("persisted concurrency decision = %#v", stored.Status.Concurrency)
+	}
+}
+
+func TestPersistWorkflowRunConcurrencyDecisionStoresFalse(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := actionsv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	run := concurrencyRun("current", "run-current", 1, time.Now(), "", nil)
+	clusterClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&actionsv1alpha1.WorkflowRun{}).WithObjects(run).Build()
+	reconciler := &WorkflowRunReconciler{Client: clusterClient, APIReader: clusterClient}
+	if err := reconciler.persistWorkflowRunConcurrencyDecision(context.Background(), run, "deploy", false); err != nil {
+		t.Fatal(err)
+	}
+	stored := &actionsv1alpha1.WorkflowRun{}
+	if err := clusterClient.Get(context.Background(), client.ObjectKeyFromObject(run), stored); err != nil {
+		t.Fatal(err)
+	}
+	if stored.Status.Concurrency == nil || stored.Status.Concurrency.Group != "deploy" || stored.Status.Concurrency.CancelInProgress {
+		t.Fatalf("persisted concurrency decision = %#v", stored.Status.Concurrency)
+	}
+}
+
+func TestWaitingWorkflowRunRestoresCancellationDecision(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := actionsv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := coordinationv1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	olderCondition := plannedCondition(metav1.ConditionTrue, "JobsPlanned")
+	waitingCondition := plannedCondition(metav1.ConditionUnknown, "WaitingForConcurrency")
+	older := concurrencyRun("older", "run-older", 1, time.Now().Add(-time.Minute), "deploy", &olderCondition)
+	current := concurrencyRun("current", "run-current", 1, time.Now(), "deploy", &waitingCondition)
+	current.Status.Concurrency.CancelInProgress = true
+	current.Status.WorkflowName = "CI"
+	current.Status.Jobs = &actionsv1alpha1.WorkflowRunJobStatus{Total: 1, Queued: 1}
+	clusterClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&actionsv1alpha1.WorkflowRun{}).WithObjects(older, current).Build()
+	reconciler := &WorkflowRunReconciler{Client: clusterClient, APIReader: clusterClient}
+
+	result, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(current)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.RequeueAfter != 2*time.Second {
+		t.Fatalf("requeue after = %v, want 2s", result.RequeueAfter)
+	}
+	storedOlder := &actionsv1alpha1.WorkflowRun{}
+	if err := clusterClient.Get(context.Background(), client.ObjectKeyFromObject(older), storedOlder); err != nil {
+		t.Fatal(err)
+	}
+	if !storedOlder.Spec.CancelRequested {
+		t.Fatal("restored cancellation decision did not cancel the executing run")
 	}
 }
 
@@ -2857,7 +3002,7 @@ func TestWorkflowRunCountsAssignedJobWithoutReloadingEventSnapshot(t *testing.T)
 		WithObjects(run, job, plan).
 		Build()
 	reconciler := &WorkflowRunReconciler{Client: clusterClient, APIReader: clusterClient}
-	if _, err := reconciler.observeWorkflowJobs(context.Background(), run, "CI", "", 1); err != nil {
+	if _, err := reconciler.observeWorkflowJobs(context.Background(), run, "CI", 1); err != nil {
 		t.Fatal(err)
 	}
 	stored := &actionsv1alpha1.WorkflowRun{}
@@ -2894,7 +3039,7 @@ func TestWorkflowRunAggregatesMatrixFailure(t *testing.T) {
 	clusterClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&actionsv1alpha1.WorkflowRun{}).WithObjects(jobs...).Build()
 	reconciler := &WorkflowRunReconciler{Client: clusterClient, APIReader: clusterClient}
 
-	if _, err := reconciler.observeWorkflowJobs(context.Background(), run, "Release", "", 2); err != nil {
+	if _, err := reconciler.observeWorkflowJobs(context.Background(), run, "Release", 2); err != nil {
 		t.Fatal(err)
 	}
 	stored := &actionsv1alpha1.WorkflowRun{}
@@ -2969,7 +3114,7 @@ func TestWorkflowRunTerminalConclusions(t *testing.T) {
 				WithObjects(objects...).
 				Build()
 			reconciler := &WorkflowRunReconciler{Client: clusterClient, APIReader: clusterClient}
-			if _, err := reconciler.observeWorkflowJobs(context.Background(), run, "CI", "", int32(len(test.results))); err != nil {
+			if _, err := reconciler.observeWorkflowJobs(context.Background(), run, "CI", int32(len(test.results))); err != nil {
 				t.Fatal(err)
 			}
 			stored := &actionsv1alpha1.WorkflowRun{}
@@ -3018,7 +3163,7 @@ func TestCancelledWorkflowRunWaitsForTerminatingWorkloads(t *testing.T) {
 		Build()
 	reconciler := &WorkflowRunReconciler{Client: clusterClient, APIReader: clusterClient}
 
-	result, err := reconciler.observeWorkflowJobs(context.Background(), run, "CI", "deploy", 1)
+	result, err := reconciler.observeWorkflowJobs(context.Background(), run, "CI", 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3040,7 +3185,7 @@ func TestCancelledWorkflowRunWaitsForTerminatingWorkloads(t *testing.T) {
 	if err := clusterClient.Delete(context.Background(), pod); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := reconciler.observeWorkflowJobs(context.Background(), stored, "CI", "deploy", 1); err != nil {
+	if _, err := reconciler.observeWorkflowJobs(context.Background(), stored, "CI", 1); err != nil {
 		t.Fatal(err)
 	}
 	if err := clusterClient.Get(context.Background(), client.ObjectKeyFromObject(run), stored); err != nil {

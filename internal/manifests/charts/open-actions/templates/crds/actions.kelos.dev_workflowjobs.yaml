@@ -72,9 +72,23 @@ spec:
                 properties:
                   cancelInProgress:
                     description: |-
-                      CancelInProgress requests cancellation of the executing member when this
-                      job becomes the pending member.
-                    type: boolean
+                      CancelInProgress is evaluated after dependencies reach terminal results
+                      and matrix values are available. Omit it to leave the executing member
+                      running when this job becomes pending.
+                    properties:
+                      expression:
+                        description: Expression is a whole expression that evaluates
+                          to a Boolean.
+                        maxLength: 65536
+                        minLength: 1
+                        type: string
+                      value:
+                        description: Value is a literal cancellation decision.
+                        type: boolean
+                    type: object
+                    x-kubernetes-validations:
+                    - message: exactly one of value or expression must be specified
+                      rule: has(self.value) != has(self.expression)
                   group:
                     description: |-
                       Group is a literal or expression template evaluated by the WorkflowRun
@@ -238,13 +252,24 @@ spec:
                 description: CompletionTime is when execution reached a terminal result.
                 format: date-time
                 type: string
-              concurrencyGroup:
+              concurrency:
                 description: |-
-                  ConcurrencyGroup is the evaluated job concurrency key. It is set before
+                  Concurrency records the evaluated job concurrency policy. It is set before
                   the job enters the concurrency gate and remains stable for the job's
                   lifetime.
-                maxLength: 256
-                type: string
+                properties:
+                  cancelInProgress:
+                    description: CancelInProgress is the evaluated cancellation decision.
+                    type: boolean
+                  group:
+                    description: Group is the evaluated, case-insensitive concurrency
+                      key.
+                    maxLength: 256
+                    minLength: 1
+                    type: string
+                required:
+                - group
+                type: object
               conditions:
                 description: |-
                   Conditions describe dependency readiness, concurrency acquisition, Runner
