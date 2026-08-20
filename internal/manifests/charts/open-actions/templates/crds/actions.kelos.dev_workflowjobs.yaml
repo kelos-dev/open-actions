@@ -156,6 +156,18 @@ spec:
                 minItems: 1
                 type: array
                 x-kubernetes-list-type: set
+              timeoutSeconds:
+                description: |-
+                  TimeoutSeconds is the effective execution timeout after applying the
+                  controller maximum. Cleanup may continue during the Pod termination grace
+                  period after this timeout expires. Omit it to apply the default 360-minute
+                  timeout, capped by the controller maximum.
+                  The maximum is 9223372036 seconds, the largest timeout the controller can
+                  represent.
+                format: int64
+                maximum: 9223372036
+                minimum: 60
+                type: integer
               workflowRunRef:
                 description: WorkflowRunRef identifies the owning WorkflowRun in the
                   same namespace.

@@ -81,6 +81,7 @@ func runManager(arguments []string) error {
 	githubServerURL := flags.String("github-server-url", "https://github.com", "GitHub web-server URL exposed to workflows")
 	actionCloneBaseURL := flags.String("action-clone-base-url", "", "Base URL used to clone external action repositories; defaults to the GitHub server URL")
 	consoleURL := flags.String("console-url", "", "Public URL for the Open Actions Console")
+	maxJobTimeout := flags.Duration("max-job-timeout", 6*time.Hour, "Maximum workflow job execution timeout")
 	var workflowRunTTLSecondsAfterFinished *int32
 	flags.Func("workflow-run-ttl-seconds-after-finished", "Default spec.ttlSecondsAfterFinished for generated WorkflowRuns; omit the flag to retain them indefinitely", func(value string) error {
 		seconds, err := strconv.ParseInt(value, 10, 32)
@@ -94,6 +95,9 @@ func runManager(arguments []string) error {
 	leaderElection := flags.Bool("leader-elect", false, "Use leader election for the controller manager")
 	if err := flags.Parse(arguments); err != nil {
 		return err
+	}
+	if *maxJobTimeout < time.Minute || *maxJobTimeout%time.Minute != 0 {
+		return fmt.Errorf("max job timeout must be a positive whole number of minutes")
 	}
 	normalizedGitHubAPIURL, err := githubclient.NormalizeAPIURL(*githubAPIURL)
 	if err != nil {
@@ -170,15 +174,17 @@ func runManager(arguments []string) error {
 		GitHubServerURL:    normalizedGitHubServerURL,
 		ActionCloneBaseURL: normalizedActionCloneBaseURL,
 		ConsoleURL:         normalizedConsoleURL,
+		MaxJobTimeout:      *maxJobTimeout,
 		Recorder:           controllerManager.GetEventRecorder("workflowrun-controller"),
 	}).SetupWithManager(controllerManager); err != nil {
 		return fmt.Errorf("configure WorkflowRun controller: %w", err)
 	}
 	if err := (&controller.RunnerReconciler{
-		Client:    controllerManager.GetClient(),
-		APIReader: controllerManager.GetAPIReader(),
-		GitHub:    github,
-		Recorder:  controllerManager.GetEventRecorder("runner-controller"),
+		Client:        controllerManager.GetClient(),
+		APIReader:     controllerManager.GetAPIReader(),
+		GitHub:        github,
+		MaxJobTimeout: *maxJobTimeout,
+		Recorder:      controllerManager.GetEventRecorder("runner-controller"),
 	}).SetupWithManager(controllerManager); err != nil {
 		return fmt.Errorf("configure Runner controller: %w", err)
 	}

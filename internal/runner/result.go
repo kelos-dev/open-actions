@@ -3,32 +3,48 @@ package runner
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"regexp"
 )
 
 const (
-	// ResultVersion identifies the result format assigned to PlanVersion. A runner
-	// that accepts multiple plan versions must emit the result version assigned to
-	// the received plan.
-	ResultVersion          = 1
+	// ResultVersion identifies the result format assigned to PlanVersion.
+	ResultVersion          = 2
 	MaxResultBytes         = 4 * 1024
 	MaxJobOutputs          = 100
 	MaxJobOutputNameLength = 256
+)
+
+type ResultConclusion string
+
+const (
+	ResultConclusionSuccess   ResultConclusion = "success"
+	ResultConclusionFailure   ResultConclusion = "failure"
+	ResultConclusionCancelled ResultConclusion = "cancelled"
+	ResultConclusionTimedOut  ResultConclusion = "timed_out"
 )
 
 var jobOutputNamePattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_-]*$`)
 
 // Result is the bounded document reported by a completed runner process.
 type Result struct {
-	Version int               `json:"version"`
-	Outputs map[string]string `json:"outputs,omitempty"`
+	Version    int               `json:"version"`
+	Conclusion ResultConclusion  `json:"conclusion,omitempty"`
+	Outputs    map[string]string `json:"outputs,omitempty"`
 }
 
-// NewResult validates and copies the supplied job outputs into a runner result.
-func NewResult(outputs map[string]string) (Result, error) {
-	result := Result{Version: ResultVersion}
+// NewResult validates and copies the supplied conclusion and job outputs.
+func NewResult(outputs map[string]string, conclusion ResultConclusion) (Result, error) {
+	return newResult(outputs, conclusion, ResultVersion)
+}
+
+func newResult(outputs map[string]string, conclusion ResultConclusion, version int) (Result, error) {
+	result := Result{Version: version}
+	if version >= 2 {
+		result.Conclusion = conclusion
+	}
 	if len(outputs) > 0 {
 		result.Outputs = make(map[string]string, len(outputs))
 		for name, value := range outputs {
@@ -36,9 +52,24 @@ func NewResult(outputs map[string]string) (Result, error) {
 		}
 	}
 	if _, err := EncodeResult(result); err != nil {
-		return Result{Version: ResultVersion}, err
+		fallback := conclusion
+		if fallback == ResultConclusionSuccess {
+			fallback = ResultConclusionFailure
+		}
+		return Result{Version: version, Conclusion: resultConclusion(version, fallback)}, err
 	}
 	return result, nil
+}
+
+func failureConclusion(version int) ResultConclusion {
+	return resultConclusion(version, ResultConclusionFailure)
+}
+
+func resultConclusion(version int, conclusion ResultConclusion) ResultConclusion {
+	if version >= 2 {
+		return conclusion
+	}
+	return ""
 }
 
 // EncodeResult validates and serializes a runner result.
@@ -80,8 +111,17 @@ func DecodeResult(data []byte) (Result, error) {
 }
 
 func validateResult(result Result) error {
-	if result.Version != ResultVersion {
+	if result.Version < 1 || result.Version > ResultVersion {
 		return fmt.Errorf("unsupported runner result version %d", result.Version)
+	}
+	if result.Version >= 2 {
+		switch result.Conclusion {
+		case ResultConclusionSuccess, ResultConclusionFailure, ResultConclusionCancelled, ResultConclusionTimedOut:
+		default:
+			return fmt.Errorf("runner result contains invalid conclusion %q", result.Conclusion)
+		}
+	} else if result.Conclusion != "" {
+		return errors.New("runner result version 1 must not contain a conclusion")
 	}
 	if len(result.Outputs) > MaxJobOutputs {
 		return fmt.Errorf("runner result defines %d outputs; maximum is %d", len(result.Outputs), MaxJobOutputs)

@@ -82,7 +82,7 @@ var _ = Describe("Project", func() {
 			}, 60*time.Second, time.Second).Should(Succeed())
 		},
 		Entry("for an unsupported trigger", "invalid-trigger", "21111111-2222-3333-4444-555555555555", "unsupported trigger"),
-		Entry("for an unsupported workflow field", "invalid-field", "31111111-2222-3333-4444-555555555555", "field timeout-minutes not found"),
+		Entry("for an unsupported workflow field", "invalid-field", "31111111-2222-3333-4444-555555555555", "field unsupported-field not found"),
 	)
 })
 

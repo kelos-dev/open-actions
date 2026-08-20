@@ -19,6 +19,7 @@ import (
 )
 
 const (
+	DefaultJobTimeoutMinutes  = int64(360)
 	maxWorkflowBytes          = 1_000_000
 	maxWorkflowNameLength     = 256
 	maxConcurrencyGroupLength = 256
@@ -122,16 +123,34 @@ func (schedule *Schedule) UnmarshalYAML(node *yaml.Node) error {
 }
 
 type Job struct {
-	Name      string         `yaml:"name"`
-	RunsOn    StringList     `yaml:"runs-on"`
-	Needs     StringList     `yaml:"needs"`
-	Outputs   map[string]any `yaml:"outputs"`
-	Steps     []Step         `yaml:"steps"`
-	Strategy  Strategy       `yaml:"strategy"`
-	Container yaml.Node      `yaml:"container"`
-	Services  yaml.Node      `yaml:"services"`
-	If        string         `yaml:"if"`
-	Env       map[string]any `yaml:"env"`
+	Name           string         `yaml:"name"`
+	RunsOn         StringList     `yaml:"runs-on"`
+	Needs          StringList     `yaml:"needs"`
+	Outputs        map[string]any `yaml:"outputs"`
+	Steps          []Step         `yaml:"steps"`
+	Strategy       Strategy       `yaml:"strategy"`
+	Container      yaml.Node      `yaml:"container"`
+	Services       yaml.Node      `yaml:"services"`
+	If             string         `yaml:"if"`
+	Env            map[string]any `yaml:"env"`
+	TimeoutMinutes JobTimeout     `yaml:"timeout-minutes"`
+}
+
+// JobTimeout is a positive whole-minute timeout or an expression that resolves
+// to one during job planning.
+type JobTimeout struct {
+	minutes    int64
+	expression string
+	configured bool
+}
+
+// Minutes returns the resolved timeout, including GitHub's default when the
+// workflow omits timeout-minutes.
+func (t JobTimeout) Minutes() int64 {
+	if !t.configured {
+		return DefaultJobTimeoutMinutes
+	}
+	return t.minutes
 }
 
 type Strategy struct {
@@ -346,6 +365,9 @@ func validateJob(id string, job *Job, workflowEnv map[string]any) error {
 	if err := validateStrategy(id, job.Strategy); err != nil {
 		return err
 	}
+	if err := job.TimeoutMinutes.validate(id); err != nil {
+		return err
+	}
 	if job.If != "" {
 		if len(job.If) > MaxConditionBytes {
 			return fmt.Errorf("job %q if exceeds %d bytes", id, MaxConditionBytes)
@@ -367,7 +389,7 @@ func validateJob(id string, job *Job, workflowEnv map[string]any) error {
 	if len(job.Steps) > maxSteps {
 		return fmt.Errorf("job %q defines %d steps; maximum is %d", id, len(job.Steps), maxSteps)
 	}
-	contentBytes := len(job.Name) + len(job.If)
+	contentBytes := len(job.Name) + len(job.If) + len(job.TimeoutMinutes.expression)
 	for _, dependency := range job.Needs {
 		contentBytes += len(dependency)
 	}
@@ -684,6 +706,10 @@ func EvaluateJob(id string, job Job, context expression.Context) (Job, error) {
 	}
 	if utf8.RuneCountInString(job.Name) > maxJobNameLength {
 		return Job{}, fmt.Errorf("job %q evaluated name exceeds %d characters", id, maxJobNameLength)
+	}
+	job.TimeoutMinutes, err = job.TimeoutMinutes.evaluate(id, context)
+	if err != nil {
+		return Job{}, err
 	}
 
 	job.RunsOn = append(StringList(nil), job.RunsOn...)
@@ -1120,6 +1146,95 @@ func lowerASCII(value string) string {
 		}
 	}
 	return string(buffer)
+}
+
+func (t *JobTimeout) UnmarshalYAML(node *yaml.Node) error {
+	t.configured = true
+	if node.Kind != yaml.ScalarNode {
+		return fmt.Errorf("timeout-minutes must be a positive integer or expression")
+	}
+	if node.Tag == "!!int" {
+		if err := node.Decode(&t.minutes); err != nil {
+			return fmt.Errorf("timeout-minutes must be a positive integer: %w", err)
+		}
+		return nil
+	}
+	if node.Tag == "!!str" && containsExpression(node.Value) {
+		t.expression = node.Value
+		return nil
+	}
+	return fmt.Errorf("timeout-minutes must be a positive integer or expression")
+}
+
+func (t JobTimeout) validate(jobID string) error {
+	if !t.configured {
+		return nil
+	}
+	if t.expression != "" {
+		if len(t.expression) > MaxConditionBytes {
+			return fmt.Errorf("job %q timeout-minutes exceeds %d bytes", jobID, MaxConditionBytes)
+		}
+		return validateTemplate(fmt.Sprintf("job %q timeout-minutes", jobID), t.expression, jobNameAvailability)
+	}
+	if t.minutes < 1 {
+		return fmt.Errorf("job %q timeout-minutes must be a positive integer", jobID)
+	}
+	return nil
+}
+
+func (t JobTimeout) evaluate(jobID string, context expression.Context) (JobTimeout, error) {
+	if !t.configured {
+		return JobTimeout{minutes: DefaultJobTimeoutMinutes, configured: true}, nil
+	}
+	if t.expression == "" {
+		return t, nil
+	}
+	program, err := expression.Parse(t.expression)
+	if err != nil {
+		return JobTimeout{}, fmt.Errorf("job %q timeout-minutes: %w", jobID, err)
+	}
+	result, err := program.Evaluate(context)
+	if err != nil {
+		return JobTimeout{}, fmt.Errorf("job %q timeout-minutes: %w", jobID, err)
+	}
+	minutes, valid := positiveWholeMinutes(result.Value)
+	if !valid {
+		return JobTimeout{}, fmt.Errorf("job %q timeout-minutes must evaluate to a positive integer", jobID)
+	}
+	return JobTimeout{minutes: minutes, configured: true}, nil
+}
+
+func positiveWholeMinutes(value any) (int64, bool) {
+	switch typed := value.(type) {
+	case int:
+		return int64(typed), typed > 0
+	case int32:
+		return int64(typed), typed > 0
+	case int64:
+		return typed, typed > 0
+	case uint:
+		if uint64(typed) > math.MaxInt64 {
+			return 0, false
+		}
+		return int64(typed), typed > 0
+	case uint32:
+		return int64(typed), typed > 0
+	case uint64:
+		if typed > math.MaxInt64 {
+			return 0, false
+		}
+		return int64(typed), typed > 0
+	case float64:
+		if math.IsNaN(typed) || math.IsInf(typed, 0) || typed < 1 || typed >= float64(math.MaxInt64) || math.Trunc(typed) != typed {
+			return 0, false
+		}
+		return int64(typed), true
+	case string:
+		minutes, err := strconv.ParseInt(typed, 10, 64)
+		return minutes, err == nil && minutes > 0
+	default:
+		return 0, false
+	}
 }
 
 func (s *Strategy) UnmarshalYAML(node *yaml.Node) error {

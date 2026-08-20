@@ -36,6 +36,22 @@ func TestProjectAcceptsValueSources(t *testing.T) {
 	validateSample(t, crd, "actions_v1alpha1_project-values.yaml")
 }
 
+func TestWorkflowRunAcceptsTimedOutCheckConclusion(t *testing.T) {
+	crd, _ := loadCRD(t, "actions.kelos.dev_workflowruns.yaml")
+	object := loadSample(t, "actions_v1alpha1_workflowrun.yaml")
+	normalizeWorkflowRunCELIntegers(object)
+	object["status"] = map[string]any{
+		"source": map[string]any{
+			"github": map[string]any{
+				"checkRun": map[string]any{"id": int64(1), "status": "completed", "conclusion": "timed_out"},
+			},
+		},
+	}
+	if errs := validateObject(t, crd, object, nil); len(errs) > 0 {
+		t.Fatalf("timed_out check conclusion was rejected: %v", errs.ToAggregate())
+	}
+}
+
 func TestWorkflowRunTTLIsMutable(t *testing.T) {
 	crd, _ := loadCRD(t, "actions.kelos.dev_workflowruns.yaml")
 	original := loadSample(t, "actions_v1alpha1_workflowrun.yaml")
@@ -900,6 +916,20 @@ func TestCRDRejectsInvalidCELValues(t *testing.T) {
 			},
 		},
 		{
+			name: "WorkflowJob timeout below minimum",
+			crd:  "actions.kelos.dev_workflowjobs.yaml", sample: "actions_v1alpha1_workflowjob.yaml",
+			mutate: func(object map[string]any) {
+				object["spec"].(map[string]any)["timeoutSeconds"] = int64(59)
+			},
+		},
+		{
+			name: "WorkflowJob timeout above maximum",
+			crd:  "actions.kelos.dev_workflowjobs.yaml", sample: "actions_v1alpha1_workflowjob.yaml",
+			mutate: func(object map[string]any) {
+				object["spec"].(map[string]any)["timeoutSeconds"] = int64(9223372037)
+			},
+		},
+		{
 			name: "WorkflowJob output with invalid name",
 			crd:  "actions.kelos.dev_workflowjobs.yaml", sample: "actions_v1alpha1_workflowjob.yaml",
 			mutate: func(object map[string]any) {
@@ -1204,14 +1234,14 @@ func workflowRunGitHub(object map[string]any) map[string]any {
 
 func TestWorkflowJobRunnerAssignmentIsSetOnce(t *testing.T) {
 	crd, _ := loadCRD(t, "actions.kelos.dev_workflowjobs.yaml")
-	queued := loadSample(t, "actions_v1alpha1_workflowjob.yaml")
-	assigned := loadSample(t, "actions_v1alpha1_workflowjob.yaml")
+	queued := loadWorkflowJobSample(t)
+	assigned := loadWorkflowJobSample(t)
 	assigned["status"] = map[string]any{"runnerRef": map[string]any{"name": "runner-1"}}
 	if errs := validateObject(t, crd, assigned, queued); len(errs) > 0 {
 		t.Fatalf("initial runner assignment was rejected: %v", errs.ToAggregate())
 	}
 
-	reassigned := loadSample(t, "actions_v1alpha1_workflowjob.yaml")
+	reassigned := loadWorkflowJobSample(t)
 	reassigned["status"] = map[string]any{"runnerRef": map[string]any{"name": "runner-2"}}
 	if errs := validateObject(t, crd, reassigned, assigned); len(errs) == 0 {
 		t.Fatal("runner reassignment passed CEL validation")
@@ -1220,18 +1250,28 @@ func TestWorkflowJobRunnerAssignmentIsSetOnce(t *testing.T) {
 
 func TestWorkflowJobResultIsSetOnce(t *testing.T) {
 	crd, _ := loadCRD(t, "actions.kelos.dev_workflowjobs.yaml")
-	queued := loadSample(t, "actions_v1alpha1_workflowjob.yaml")
-	completed := loadSample(t, "actions_v1alpha1_workflowjob.yaml")
+	queued := loadWorkflowJobSample(t)
+	completed := loadWorkflowJobSample(t)
 	completed["status"] = map[string]any{"result": "success"}
 	if errs := validateObject(t, crd, completed, queued); len(errs) > 0 {
 		t.Fatalf("initial result was rejected: %v", errs.ToAggregate())
 	}
 
-	changed := loadSample(t, "actions_v1alpha1_workflowjob.yaml")
+	changed := loadWorkflowJobSample(t)
 	changed["status"] = map[string]any{"result": "failure"}
 	if errs := validateObject(t, crd, changed, completed); len(errs) == 0 {
 		t.Fatal("result update passed CEL validation")
 	}
+}
+
+func loadWorkflowJobSample(t *testing.T) map[string]any {
+	t.Helper()
+	object := loadSample(t, "actions_v1alpha1_workflowjob.yaml")
+	spec := object["spec"].(map[string]any)
+	if timeout, ok := spec["timeoutSeconds"].(float64); ok {
+		spec["timeoutSeconds"] = int64(timeout)
+	}
+	return object
 }
 
 func validateSample(t *testing.T, crd *apiextensionsv1.CustomResourceDefinition, name string) {

@@ -15,6 +15,7 @@ import (
 	"sort"
 	"strings"
 	"sync/atomic"
+	"time"
 
 	"github.com/kelos-dev/open-actions/internal/eventsnapshot"
 	"github.com/kelos-dev/open-actions/internal/expression"
@@ -27,24 +28,27 @@ const (
 	ContainerName      = "runner"
 	GitHubTokenEnvVar  = "OPEN_ACTIONS_GITHUB_TOKEN"
 	ActionTokenEnvVar  = "OPEN_ACTIONS_ACTION_TOKEN"
+	CleanupTimeout     = 5 * time.Minute
 )
 
 const runnerLogMarker = "open_actions_runner"
 
 type Plan struct {
-	Version      int               `json:"version"`
-	Repository   Repository        `json:"repository"`
-	Event        Event             `json:"event"`
-	Revision     Revision          `json:"revision"`
-	Inputs       map[string]any    `json:"inputs,omitempty"`
-	WorkflowName string            `json:"workflowName"`
-	JobID        string            `json:"jobID"`
-	Matrix       map[string]any    `json:"matrix,omitempty"`
-	Env          map[string]string `json:"env,omitempty"`
-	Outputs      map[string]string `json:"outputs,omitempty"`
-	Steps        []Step            `json:"steps"`
-	eventPath    string
-	eventPayload map[string]any
+	Version               int               `json:"version"`
+	Repository            Repository        `json:"repository"`
+	Event                 Event             `json:"event"`
+	Revision              Revision          `json:"revision"`
+	Inputs                map[string]any    `json:"inputs,omitempty"`
+	WorkflowName          string            `json:"workflowName"`
+	JobID                 string            `json:"jobID"`
+	Matrix                map[string]any    `json:"matrix,omitempty"`
+	Env                   map[string]string `json:"env,omitempty"`
+	Outputs               map[string]string `json:"outputs,omitempty"`
+	TimeoutSeconds        int64             `json:"timeoutSeconds,omitempty"`
+	CleanupTimeoutSeconds int64             `json:"cleanupTimeoutSeconds,omitempty"`
+	Steps                 []Step            `json:"steps"`
+	eventPath             string
+	eventPayload          map[string]any
 }
 
 type Repository struct {
@@ -161,6 +165,44 @@ type executionState struct {
 	posts              []*actionInvocation
 	stepOutputs        map[string]map[string]any
 	resolvedContent    int
+	contexts           *executionContexts
+}
+
+type executionContexts struct {
+	job            context.Context
+	cleanupTimeout time.Duration
+	cleanup        context.Context
+	cancelCleanup  context.CancelFunc
+}
+
+func newExecutionContexts(job context.Context, cleanupTimeout time.Duration) *executionContexts {
+	return &executionContexts{job: job, cleanupTimeout: cleanupTimeout}
+}
+
+func (c *executionContexts) command() context.Context {
+	if c.job.Err() == nil {
+		return c.job
+	}
+	if c.cleanup == nil {
+		c.cleanup, c.cancelCleanup = context.WithTimeout(context.WithoutCancel(c.job), c.cleanupTimeout)
+	}
+	return c.cleanup
+}
+
+func (c *executionContexts) close() {
+	if c.cancelCleanup != nil {
+		c.cancelCleanup()
+	}
+}
+
+func (s *executionState) commandContext(ctx context.Context) context.Context {
+	if s.contexts != nil {
+		return s.contexts.command()
+	}
+	if ctx.Err() == nil {
+		return ctx
+	}
+	return context.WithoutCancel(ctx)
 }
 
 func NewExecutor(config ExecutorConfig) (*Executor, error) {
@@ -231,6 +273,10 @@ func LoadPlan(path string) (*Plan, error) {
 			return nil, errors.New("job plan pull request revision is incomplete")
 		}
 	}
+	const maxDurationSeconds = int64((1<<63 - 1) / time.Second)
+	if plan.Version >= 6 && (plan.TimeoutSeconds < 1 || plan.TimeoutSeconds > maxDurationSeconds || plan.CleanupTimeoutSeconds < 1 || plan.CleanupTimeoutSeconds > maxDurationSeconds) {
+		return nil, errors.New("job plan timeout configuration is incomplete")
+	}
 	return plan, nil
 }
 
@@ -282,15 +328,31 @@ func (e *Executor) Execute(ctx context.Context, plan *Plan, workspace string) er
 }
 
 func (e *Executor) ExecuteResult(ctx context.Context, plan *Plan, workspace string) (Result, error) {
-	result, err := e.executePlan(ctx, plan, workspace)
+	jobContext := ctx
+	cancel := func() {}
+	if plan.TimeoutSeconds > 0 {
+		jobContext, cancel = context.WithTimeout(ctx, time.Duration(plan.TimeoutSeconds)*time.Second)
+	}
+	defer cancel()
+	cleanupTimeout := CleanupTimeout
+	if plan.CleanupTimeoutSeconds > 0 {
+		cleanupTimeout = time.Duration(plan.CleanupTimeoutSeconds) * time.Second
+	}
+	result, err := e.executePlan(jobContext, plan, workspace, cleanupTimeout)
+	if err != nil && result.Version >= 2 && jobContext.Err() != nil {
+		result.Conclusion = executionConclusion(jobContext, err)
+	}
 	if err == nil {
 		return result, nil
 	}
 	return result, errors.New(e.masker.mask(err.Error()))
 }
 
-func (e *Executor) executePlan(ctx context.Context, plan *Plan, workspace string) (Result, error) {
-	emptyResult := Result{Version: ResultVersion}
+func (e *Executor) executePlan(ctx context.Context, plan *Plan, workspace string, cleanupTimeout time.Duration) (Result, error) {
+	resultVersion := resultVersionForPlan(plan.Version)
+	emptyResult := Result{Version: resultVersion, Conclusion: failureConclusion(resultVersion)}
+	contexts := newExecutionContexts(ctx, cleanupTimeout)
+	defer contexts.close()
 	if err := os.MkdirAll(workspace, 0o755); err != nil {
 		return emptyResult, fmt.Errorf("create workspace: %w", err)
 	}
@@ -361,8 +423,9 @@ func (e *Executor) executePlan(ctx context.Context, plan *Plan, workspace string
 		resolver:           newActionResolver(plan.Repository.ActionCloneBaseURL, filepath.Join(temporaryDirectory, "actions"), environment, actionTokenForClone(plan, e.actionToken), e.executeCommand),
 		stepOutputs:        map[string]map[string]any{},
 		resolvedContent:    jobContentBytes,
+		contexts:           contexts,
 	}
-	if err := state.resolver.prepareAll(executionContext(ctx), plan.Steps); err != nil {
+	if err := state.resolver.prepareAll(contexts.command(), plan.Steps); err != nil {
 		return emptyResult, fmt.Errorf("prepare job actions: %w", err)
 	}
 
@@ -412,7 +475,7 @@ func (e *Executor) executePlan(ctx context.Context, plan *Plan, workspace string
 		var outputs map[string]string
 		var stepError error
 		cancelledBeforeCommand := ctx.Err() != nil
-		stepContext := executionContext(ctx)
+		stepContext := contexts.command()
 		if step.Uses == "" {
 			outputs, stepError = e.runScript(stepContext, state, step)
 		} else {
@@ -439,17 +502,31 @@ func (e *Executor) executePlan(ctx context.Context, plan *Plan, workspace string
 		executionErrors = errors.Join(executionErrors, ctx.Err())
 	}
 	status := workflowStepStatus(failed, ctx.Err() != nil)
-	postError := e.runPostActions(executionContext(ctx), state, status)
+	postError := e.runPostActions(contexts.command(), state, status)
 	outputs, outputError := e.resolveJobOutputs(state)
-	result, resultError := NewResult(outputs)
-	return result, errors.Join(executionErrors, postError, outputError, resultError)
+	executionError := errors.Join(executionErrors, postError, outputError)
+	result, resultError := newResult(outputs, executionConclusion(ctx, executionError), resultVersionForPlan(plan.Version))
+	return result, errors.Join(executionError, resultError)
 }
 
-func executionContext(ctx context.Context) context.Context {
-	if ctx.Err() == nil {
-		return ctx
+func resultVersionForPlan(planVersion int) int {
+	if planVersion >= 6 {
+		return 2
 	}
-	return context.WithoutCancel(ctx)
+	return 1
+}
+
+func executionConclusion(ctx context.Context, executionError error) ResultConclusion {
+	if ctx.Err() != nil {
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			return ResultConclusionTimedOut
+		}
+		return ResultConclusionCancelled
+	}
+	if executionError != nil {
+		return ResultConclusionFailure
+	}
+	return ResultConclusionSuccess
 }
 
 func workflowStepStatus(failed, cancelled bool) expression.Status {

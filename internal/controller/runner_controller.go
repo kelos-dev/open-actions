@@ -53,7 +53,6 @@ const (
 	// The repository lives below the volume root so the runner owns its Git worktree.
 	workspacePath               = workspaceVolumeMountPath + "/repository"
 	jobTTLSeconds               = int32(3600)
-	jobTimeoutSeconds           = int64(50 * 60)
 	jobStartTimeout             = 5 * time.Minute
 	runnerFinalizer             = "actions.kelos.dev/runner-finalizer"
 	workflowJobQueuedIndex      = "actions.kelos.dev/workflow-job-queued"
@@ -72,9 +71,10 @@ type workflowJobCancellation struct {
 
 type RunnerReconciler struct {
 	client.Client
-	APIReader client.Reader
-	GitHub    *githubclient.Client
-	Recorder  events.EventRecorder
+	APIReader     client.Reader
+	GitHub        *githubclient.Client
+	MaxJobTimeout time.Duration
+	Recorder      events.EventRecorder
 }
 
 func (r *RunnerReconciler) Reconcile(ctx context.Context, request ctrl.Request) (ctrl.Result, error) {
@@ -611,7 +611,7 @@ func (r *RunnerReconciler) observeNativeJob(ctx context.Context, workflowJob *ac
 	var executionResult *runner.Result
 	var resultInvalid bool
 	if terminal {
-		if nativeJob.Annotations[actionsv1alpha1.AnnotationRunnerResultVersion] == jobResultVersion {
+		if runnerResultExpected(nativeJob.Annotations[actionsv1alpha1.AnnotationRunnerResultVersion]) {
 			var err error
 			executionResult, resultInvalid, err = r.workflowJobResult(ctx, workflowJob, nativeJob)
 			if err != nil {
@@ -630,6 +630,11 @@ func (r *RunnerReconciler) observeNativeJob(ctx context.Context, workflowJob *ac
 		}
 	}
 	return true, terminal, nil
+}
+
+func runnerResultExpected(version string) bool {
+	parsed, err := strconv.Atoi(version)
+	return err == nil && parsed >= 1 && parsed <= runner.ResultVersion
 }
 
 func (r *RunnerReconciler) workflowJobResult(ctx context.Context, workflowJob *actionsv1alpha1.WorkflowJob, nativeJob *batchv1.Job) (*runner.Result, bool, error) {
@@ -651,6 +656,10 @@ func (r *RunnerReconciler) workflowJobResult(ctx context.Context, workflowJob *a
 			}
 			result, err := runner.DecodeResult([]byte(container.State.Terminated.Message))
 			if err != nil {
+				return nil, true, nil
+			}
+			expectedVersion, err := strconv.Atoi(nativeJob.Annotations[actionsv1alpha1.AnnotationRunnerResultVersion])
+			if err != nil || result.Version != expectedVersion {
 				return nil, true, nil
 			}
 			return &result, false, nil
@@ -781,11 +790,20 @@ func (r *RunnerReconciler) buildJob(workflowJob *actionsv1alpha1.WorkflowJob, ru
 	if workflowJob.Spec.DisplayName != "" {
 		annotations[actionsv1alpha1.AnnotationWorkflowJobDisplayName] = workflowJob.Spec.DisplayName
 	}
+	timeoutSeconds := workflowJob.Spec.TimeoutSeconds
+	if timeoutSeconds == 0 {
+		timeoutSeconds = int64(defaultJobTimeout / time.Second)
+	}
+	if maximumSeconds := int64(configuredMaxJobTimeout(r.MaxJobTimeout) / time.Second); timeoutSeconds > maximumSeconds {
+		timeoutSeconds = maximumSeconds
+	}
+	cleanupTimeoutSeconds := int64(runner.CleanupTimeout / time.Second)
 	podTemplate := corev1.PodTemplateSpec{
 		ObjectMeta: metav1.ObjectMeta{Labels: labels, Annotations: annotations},
 		Spec: corev1.PodSpec{
-			AutomountServiceAccountToken: pointerTo(false),
-			RestartPolicy:                corev1.RestartPolicyNever,
+			TerminationGracePeriodSeconds: pointerTo(cleanupTimeoutSeconds),
+			AutomountServiceAccountToken:  pointerTo(false),
+			RestartPolicy:                 corev1.RestartPolicyNever,
 			SecurityContext: &corev1.PodSecurityContext{
 				FSGroup:      pointerTo(int64(65532)),
 				RunAsNonRoot: pointerTo(true),
@@ -858,7 +876,7 @@ func (r *RunnerReconciler) buildJob(workflowJob *actionsv1alpha1.WorkflowJob, ru
 			Annotations: annotations,
 		},
 		Spec: batchv1.JobSpec{
-			ActiveDeadlineSeconds: pointerTo(jobTimeoutSeconds),
+			ActiveDeadlineSeconds: pointerTo(timeoutSeconds),
 			BackoffLimit:          &backoffLimit,
 			Template:              podTemplate,
 		},
@@ -976,17 +994,33 @@ func (r *RunnerReconciler) updateWorkflowJobStatus(ctx context.Context, workflow
 	if nativeJob.Status.StartTime != nil {
 		workflowJob.Status.StartTime = nativeJob.Status.StartTime.DeepCopy()
 	}
-	switch jobResult(nativeJob) {
-	case metav1.ConditionTrue:
+	timedOut := nativeJobTimedOut(nativeJob) || executionResult != nil && executionResult.Conclusion == runner.ResultConclusionTimedOut
+	cancelled := executionResult != nil && executionResult.Conclusion == runner.ResultConclusionCancelled
+	switch {
+	case timedOut:
+		workflowJob.Status.Result = actionsv1alpha1.WorkflowJobResultFailure
+		workflowJob.Status.CompletionTime = completionTime(nativeJob)
+		if !resultInvalid && executionResult != nil {
+			workflowJob.Status.Outputs = copyStringMap(executionResult.Outputs)
+		}
+		meta.SetStatusCondition(&workflowJob.Status.Conditions, metav1.Condition{Type: actionsv1alpha1.WorkflowJobConditionSucceeded, Status: metav1.ConditionFalse, ObservedGeneration: workflowJob.Generation, Reason: "JobTimedOut", Message: "The workflow job exceeded its execution timeout"})
+	case cancelled:
+		workflowJob.Status.Result = actionsv1alpha1.WorkflowJobResultCancelled
+		workflowJob.Status.CompletionTime = completionTime(nativeJob)
+		if !resultInvalid {
+			workflowJob.Status.Outputs = copyStringMap(executionResult.Outputs)
+		}
+		meta.SetStatusCondition(&workflowJob.Status.Conditions, metav1.Condition{Type: actionsv1alpha1.WorkflowJobConditionSucceeded, Status: metav1.ConditionFalse, ObservedGeneration: workflowJob.Generation, Reason: "JobCancelled", Message: "The workflow job was cancelled"})
+	case jobResult(nativeJob) == metav1.ConditionTrue:
 		workflowJob.Status.Result = actionsv1alpha1.WorkflowJobResultSuccess
 		workflowJob.Status.CompletionTime = completionTime(nativeJob)
-		if resultInvalid || executionResult == nil {
+		if resultInvalid || executionResult == nil || executionResult.Conclusion != "" && executionResult.Conclusion != runner.ResultConclusionSuccess {
 			meta.SetStatusCondition(&workflowJob.Status.Conditions, metav1.Condition{Type: actionsv1alpha1.WorkflowJobConditionSucceeded, Status: metav1.ConditionFalse, ObservedGeneration: workflowJob.Generation, Reason: "JobResultInvalid", Message: "The workflow job completed without valid output metadata"})
 		} else {
 			workflowJob.Status.Outputs = copyStringMap(executionResult.Outputs)
 			meta.SetStatusCondition(&workflowJob.Status.Conditions, metav1.Condition{Type: actionsv1alpha1.WorkflowJobConditionSucceeded, Status: metav1.ConditionTrue, ObservedGeneration: workflowJob.Generation, Reason: "JobSucceeded", Message: "The workflow job succeeded"})
 		}
-	case metav1.ConditionFalse:
+	case jobResult(nativeJob) == metav1.ConditionFalse:
 		workflowJob.Status.Result = actionsv1alpha1.WorkflowJobResultFailure
 		workflowJob.Status.CompletionTime = completionTime(nativeJob)
 		if !resultInvalid && executionResult != nil {
@@ -1006,6 +1040,15 @@ func (r *RunnerReconciler) updateWorkflowJobStatus(ctx context.Context, workflow
 		recordConditionWarning(r.Recorder, workflowJob, before.Conditions, workflowJob.Status.Conditions, actionsv1alpha1.WorkflowJobConditionSucceeded)
 	}
 	return nil
+}
+
+func nativeJobTimedOut(job *batchv1.Job) bool {
+	for _, condition := range job.Status.Conditions {
+		if condition.Status == corev1.ConditionTrue && condition.Type == batchv1.JobFailed && condition.Reason == batchv1.JobReasonDeadlineExceeded {
+			return true
+		}
+	}
+	return false
 }
 
 func copyStringMap(values map[string]string) map[string]string {

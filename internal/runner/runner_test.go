@@ -410,6 +410,117 @@ func TestExecuteRunsCancelledStepsWithCleanupContext(t *testing.T) {
 	}
 }
 
+func TestExecuteTimeoutBoundsCleanupSteps(t *testing.T) {
+	workspace := t.TempDir()
+	plan := testPlan()
+	plan.Steps = []Step{
+		{Name: "Wait", Run: "exec sleep 30"},
+		{If: "cancelled()", Run: "touch cleanup-started"},
+		{If: "always()", Run: "exec sleep 30"},
+		{If: "always()", Run: "touch cleanup-finished"},
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	result, err := testExecutor(t, io.Discard, io.Discard).executePlan(ctx, plan, workspace, 2*time.Second)
+	if err == nil {
+		t.Fatal("executePlan() succeeded after timeout")
+	}
+	if result.Conclusion != ResultConclusionTimedOut {
+		t.Fatalf("conclusion = %q, want %q", result.Conclusion, ResultConclusionTimedOut)
+	}
+	if elapsed := time.Since(started); elapsed > 4*time.Second {
+		t.Fatalf("cleanup exceeded its bound: %s", elapsed)
+	}
+	if _, err := os.Stat(filepath.Join(workspace, "cleanup-started")); err != nil {
+		t.Fatalf("eligible cleanup step did not run: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(workspace, "cleanup-finished")); !os.IsNotExist(err) {
+		t.Fatalf("cleanup continued after its deadline: %v", err)
+	}
+}
+
+func TestExecuteResultAppliesPlanTimeout(t *testing.T) {
+	plan := testPlan()
+	plan.TimeoutSeconds = 1
+	plan.CleanupTimeoutSeconds = 1
+	plan.Steps = []Step{{Run: "exec sleep 30"}}
+	started := time.Now()
+	result, err := testExecutor(t, io.Discard, io.Discard).ExecuteResult(context.Background(), plan, t.TempDir())
+	if err == nil {
+		t.Fatal("ExecuteResult() succeeded after plan timeout")
+	}
+	if result.Conclusion != ResultConclusionTimedOut {
+		t.Fatalf("conclusion = %q, want %q", result.Conclusion, ResultConclusionTimedOut)
+	}
+	if elapsed := time.Since(started); elapsed > 3*time.Second {
+		t.Fatalf("plan timeout took %s", elapsed)
+	}
+}
+
+func TestExecuteResultReportsCancellationBeforeSetup(t *testing.T) {
+	plan := testPlan()
+	workspace := filepath.Join(t.TempDir(), "file")
+	if err := os.WriteFile(workspace, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	result, err := testExecutor(t, io.Discard, io.Discard).ExecuteResult(ctx, plan, workspace)
+	if err == nil {
+		t.Fatal("ExecuteResult() succeeded with an invalid workspace")
+	}
+	if result.Conclusion != ResultConclusionCancelled {
+		t.Fatalf("conclusion = %q, want %q", result.Conclusion, ResultConclusionCancelled)
+	}
+}
+
+func TestExecuteCancellationRunsPostActionWithinCleanupWindow(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git is not installed")
+	}
+	nodePath, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node is not installed")
+	}
+	repositories := t.TempDir()
+	createActionRepository(t, repositories, "actions", "cleanup", "v1", map[string]string{
+		"action.yml": "name: Cleanup fixture\nruns:\n  using: node20\n  main: main.js\n  post: post.js\n  post-if: always()\n",
+		"main.js":    `require('fs').writeFileSync(process.env.GITHUB_WORKSPACE + '/started', ''); setInterval(() => {}, 1000);`,
+		"post.js":    `require('fs').writeFileSync(process.env.GITHUB_WORKSPACE + '/post-ran', '');`,
+	})
+	plan := testPlan()
+	plan.Repository.ActionCloneBaseURL = "file://" + repositories
+	plan.Steps = []Step{{Uses: "actions/cleanup@v1"}}
+	workspace := t.TempDir()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	resultChannel := make(chan Result, 1)
+	errorChannel := make(chan error, 1)
+	executor := testExecutorWithEnvironment(t, setEnvironment(os.Environ(), "PATH", filepath.Dir(nodePath)+string(os.PathListSeparator)+os.Getenv("PATH")), io.Discard, io.Discard)
+	go func() {
+		result, executionError := executor.executePlan(ctx, plan, workspace, 5*time.Second)
+		resultChannel <- result
+		errorChannel <- executionError
+	}()
+	waitForFile(t, filepath.Join(workspace, "started"), "action main hook did not start")
+	cancel()
+	select {
+	case result := <-resultChannel:
+		if result.Conclusion != ResultConclusionCancelled {
+			t.Errorf("conclusion = %q, want %q", result.Conclusion, ResultConclusionCancelled)
+		}
+		if executionError := <-errorChannel; executionError == nil {
+			t.Fatal("executePlan() succeeded after cancellation")
+		}
+	case <-time.After(7 * time.Second):
+		t.Fatal("post action exceeded its cleanup window")
+	}
+	if _, err := os.Stat(filepath.Join(workspace, "post-ran")); err != nil {
+		t.Fatalf("post action did not run: %v", err)
+	}
+}
+
 func TestExecuteKeepsCancellationDistinctFromFailure(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git is not installed")
@@ -536,7 +647,7 @@ func TestLoadPlanSupportsCompatibleVersions(t *testing.T) {
 	for version := minimumPlanVersion; version <= PlanVersion; version++ {
 		t.Run(fmt.Sprintf("version %d", version), func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "job.json")
-			data := fmt.Sprintf(`{"version":%d,"repository":{"id":1,"owner":"acme","name":"example","serverURL":"https://github.com","apiURL":"https://api.github.com","actionCloneBaseURL":"https://github.com"},"event":{"name":"push","deliveryID":"delivery"},"revision":{"sha":"abc","ref":"refs/heads/main","refName":"main"},"workflowName":"CI","jobID":"build","steps":[{"run":"true"}]}`, version)
+			data := fmt.Sprintf(`{"version":%d,"repository":{"id":1,"owner":"acme","name":"example","serverURL":"https://github.com","apiURL":"https://api.github.com","actionCloneBaseURL":"https://github.com"},"event":{"name":"push","deliveryID":"delivery"},"revision":{"sha":"abc","ref":"refs/heads/main","refName":"main"},"workflowName":"CI","jobID":"build","timeoutSeconds":21600,"cleanupTimeoutSeconds":300,"steps":[{"run":"true"}]}`, version)
 			if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
 				t.Fatal(err)
 			}
@@ -2124,13 +2235,15 @@ func waitForFile(t *testing.T, path, timeoutMessage string) {
 
 func testPlan() *Plan {
 	return &Plan{
-		Version:      PlanVersion,
-		Repository:   Repository{ID: 1, Owner: "acme", Name: "example", ServerURL: "https://github.com", APIURL: "https://api.github.com", ActionCloneBaseURL: "https://github.com"},
-		Event:        Event{Name: "push", DeliveryID: "delivery"},
-		Revision:     Revision{SHA: strings.Repeat("a", 40), Ref: "refs/heads/main", RefName: "main"},
-		WorkflowName: "CI",
-		JobID:        "test",
-		Steps:        []Step{{Run: "true"}},
+		Version:               PlanVersion,
+		Repository:            Repository{ID: 1, Owner: "acme", Name: "example", ServerURL: "https://github.com", APIURL: "https://api.github.com", ActionCloneBaseURL: "https://github.com"},
+		Event:                 Event{Name: "push", DeliveryID: "delivery"},
+		Revision:              Revision{SHA: strings.Repeat("a", 40), Ref: "refs/heads/main", RefName: "main"},
+		WorkflowName:          "CI",
+		JobID:                 "test",
+		TimeoutSeconds:        int64((6 * time.Hour) / time.Second),
+		CleanupTimeoutSeconds: int64(CleanupTimeout / time.Second),
+		Steps:                 []Step{{Run: "true"}},
 	}
 }
 

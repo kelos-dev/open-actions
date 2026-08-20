@@ -34,6 +34,7 @@ spec:
             {{- if .Values.controller.actionCloneBaseURL }}
             - {{ printf "--action-clone-base-url=%s" .Values.controller.actionCloneBaseURL | quote }}
             {{- end }}
+            - {{ printf "--max-job-timeout=%s" .Values.controller.maxJobTimeout | quote }}
             {{- if ne .Values.controller.workflowRunTTLSecondsAfterFinished nil }}
             - {{ printf "--workflow-run-ttl-seconds-after-finished=%d" (int64 .Values.controller.workflowRunTTLSecondsAfterFinished) | quote }}
             {{- end }}

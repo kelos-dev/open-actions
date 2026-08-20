@@ -14,6 +14,7 @@ const (
 	failed     = "Failed"
 	skipped    = "Skipped"
 	cancelled  = "Cancelled"
+	timedOut   = "Timed out"
 	waiting    = "Waiting"
 )
 
@@ -33,6 +34,9 @@ func Run(run *actionsv1alpha1.WorkflowRun) string {
 		if condition.Reason == "JobCancelled" {
 			return cancelled
 		}
+		if condition.Reason == "JobTimedOut" {
+			return timedOut
+		}
 		return failed
 	default:
 		if run.Status.StartTime != nil {
@@ -44,6 +48,10 @@ func Run(run *actionsv1alpha1.WorkflowRun) string {
 
 // Job returns the user-facing status derived from a WorkflowJob's conditions and runner assignment.
 func Job(job *actionsv1alpha1.WorkflowJob) string {
+	condition := meta.FindStatusCondition(job.Status.Conditions, actionsv1alpha1.WorkflowJobConditionSucceeded)
+	if condition != nil && condition.Status == metav1.ConditionFalse && condition.Reason == "JobTimedOut" {
+		return timedOut
+	}
 	switch job.Status.Result {
 	case actionsv1alpha1.WorkflowJobResultSuccess:
 		return succeeded
@@ -54,7 +62,6 @@ func Job(job *actionsv1alpha1.WorkflowJob) string {
 	case actionsv1alpha1.WorkflowJobResultCancelled:
 		return cancelled
 	}
-	condition := meta.FindStatusCondition(job.Status.Conditions, actionsv1alpha1.WorkflowJobConditionSucceeded)
 	if condition != nil {
 		switch condition.Status {
 		case metav1.ConditionTrue:

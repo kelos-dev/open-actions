@@ -43,6 +43,8 @@ const (
 	workflowRunCancellationFinalizer = "actions.kelos.dev/concurrency-cancellation"
 	workflowRunCheckFinalizer        = "actions.kelos.dev/github-check"
 	workflowRunScheduleFinalizer     = "actions.kelos.dev/schedule-idempotency"
+	defaultJobTimeout                = time.Duration(workflow.DefaultJobTimeoutMinutes) * time.Minute
+	defaultMaxJobTimeout             = 6 * time.Hour
 )
 
 var digestEncoding = base32.StdEncoding.WithPadding(base32.NoPadding)
@@ -87,6 +89,7 @@ type WorkflowRunReconciler struct {
 	GitHubServerURL    string
 	ActionCloneBaseURL string
 	ConsoleURL         string
+	MaxJobTimeout      time.Duration
 	Now                func() time.Time
 	Recorder           events.EventRecorder
 }
@@ -570,9 +573,12 @@ func workflowRunCheckReport(run *actionsv1alpha1.WorkflowRun) checkRunReport {
 		report.summaryFromCondition(succeeded)
 	case succeeded != nil && succeeded.Status == metav1.ConditionFalse:
 		report.Status = "completed"
-		if succeeded.Reason == "JobCancelled" {
+		switch succeeded.Reason {
+		case "JobCancelled":
 			report.Conclusion = "cancelled"
-		} else {
+		case "JobTimedOut":
+			report.Conclusion = "timed_out"
+		default:
 			report.Conclusion = "failure"
 		}
 		report.summaryFromCondition(succeeded)
@@ -601,7 +607,7 @@ func workflowRunCheckReport(run *actionsv1alpha1.WorkflowRun) checkRunReport {
 	}
 	if run.Status.Jobs != nil {
 		jobs := run.Status.Jobs
-		report.Output.Text = fmt.Sprintf("Jobs: %d total, %d waiting, %d queued, %d active, %d succeeded, %d failed, %d skipped, %d cancelled.", jobs.Total, jobs.Waiting, jobs.Queued, jobs.Active, jobs.Succeeded, jobs.Failed, jobs.Skipped, jobs.Cancelled)
+		report.Output.Text = fmt.Sprintf("Jobs: %d total, %d waiting, %d queued, %d active, %d succeeded, %d failed, %d timed out, %d skipped, %d cancelled.", jobs.Total, jobs.Waiting, jobs.Queued, jobs.Active, jobs.Succeeded, jobs.Failed, jobs.TimedOut, jobs.Skipped, jobs.Cancelled)
 	}
 	if run.Spec.Rerun != nil {
 		report.Output.Title = fmt.Sprintf("%s (attempt %d)", title, run.Spec.Rerun.Attempt)
@@ -654,14 +660,15 @@ func workflowRunConsoleURL(baseURL string, run *actionsv1alpha1.WorkflowRun) str
 }
 
 type plannedWorkflowJob struct {
-	id            string
-	displayName   string
-	runsOn        []string
-	needs         []string
-	condition     string
-	matrix        *actionsv1alpha1.WorkflowJobMatrix
-	plan          string
-	resultVersion string
+	id             string
+	displayName    string
+	runsOn         []string
+	needs          []string
+	condition      string
+	matrix         *actionsv1alpha1.WorkflowJobMatrix
+	plan           string
+	resultVersion  string
+	timeoutSeconds int64
 }
 
 func selectRerunWorkflowJobs(run *actionsv1alpha1.WorkflowRun, plannedJobs []plannedWorkflowJob) ([]plannedWorkflowJob, error) {
@@ -758,6 +765,7 @@ func (r *WorkflowRunReconciler) ensureWorkflowJobs(ctx context.Context, run *act
 				Needs:          append([]string(nil), item.needs...),
 				If:             item.condition,
 				Matrix:         item.matrix.DeepCopy(),
+				TimeoutSeconds: item.timeoutSeconds,
 			},
 		}
 		if err := controllerutil.SetControllerReference(run, workflowJob, r.Scheme()); err != nil {
@@ -844,7 +852,8 @@ func (r *WorkflowRunReconciler) planWorkflowJobs(run *actionsv1alpha1.WorkflowRu
 			if matrix != nil {
 				displayName = matrixDisplayName(displayName, matrix, index)
 			}
-			plan, err := r.jobPlan(run, definition.Name, id, workflowEnv, resolvedJob, matrix, inputValues)
+			timeoutSeconds := r.effectiveJobTimeoutSeconds(resolvedJob.TimeoutMinutes.Minutes())
+			plan, err := r.jobPlan(run, definition.Name, id, workflowEnv, resolvedJob, matrix, inputValues, timeoutSeconds)
 			if err != nil {
 				return nil, err
 			}
@@ -855,23 +864,36 @@ func (r *WorkflowRunReconciler) planWorkflowJobs(run *actionsv1alpha1.WorkflowRu
 			if len(data) > maxJobPlanBytes {
 				return nil, fmt.Errorf("job plan for %q exceeds %d bytes", expandedID, maxJobPlanBytes)
 			}
-			resultVersion := ""
-			if len(resolvedJob.Outputs) > 0 {
-				resultVersion = jobResultVersion
-			}
 			plannedJobs = append(plannedJobs, plannedWorkflowJob{
-				id:            expandedID,
-				displayName:   displayName,
-				runsOn:        append([]string(nil), resolvedJob.RunsOn...),
-				needs:         append([]string(nil), resolvedJob.Needs...),
-				condition:     resolvedJob.If,
-				matrix:        matrixSpec,
-				plan:          string(data),
-				resultVersion: resultVersion,
+				id:             expandedID,
+				displayName:    displayName,
+				runsOn:         append([]string(nil), resolvedJob.RunsOn...),
+				needs:          append([]string(nil), resolvedJob.Needs...),
+				condition:      resolvedJob.If,
+				matrix:         matrixSpec,
+				plan:           string(data),
+				resultVersion:  jobResultVersion,
+				timeoutSeconds: timeoutSeconds,
 			})
 		}
 	}
 	return plannedJobs, nil
+}
+
+func (r *WorkflowRunReconciler) effectiveJobTimeoutSeconds(requestedMinutes int64) int64 {
+	maximum := configuredMaxJobTimeout(r.MaxJobTimeout)
+	maximumMinutes := int64(maximum / time.Minute)
+	if requestedMinutes > maximumMinutes {
+		requestedMinutes = maximumMinutes
+	}
+	return requestedMinutes * int64(time.Minute/time.Second)
+}
+
+func configuredMaxJobTimeout(value time.Duration) time.Duration {
+	if value == 0 {
+		return defaultMaxJobTimeout
+	}
+	return value
 }
 
 func matrixWorkflowJobID(logicalJobID string, index int) string {
@@ -1281,7 +1303,7 @@ func (r *WorkflowRunReconciler) ensurePlanConfigMap(ctx context.Context, workflo
 	return nil
 }
 
-func (r *WorkflowRunReconciler) jobPlan(run *actionsv1alpha1.WorkflowRun, workflowName, id string, workflowEnv map[string]string, job workflow.Job, matrix, inputValues map[string]any) (*runner.Plan, error) {
+func (r *WorkflowRunReconciler) jobPlan(run *actionsv1alpha1.WorkflowRun, workflowName, id string, workflowEnv map[string]string, job workflow.Job, matrix, inputValues map[string]any, timeoutSeconds int64) (*runner.Plan, error) {
 	githubSource := run.Spec.Source.GitHub
 	headRef, baseRef := githubSourcePullRequestRefs(githubSource)
 	jobEnv, err := stringMap(job.Env)
@@ -1347,11 +1369,13 @@ func (r *WorkflowRunReconciler) jobPlan(run *actionsv1alpha1.WorkflowRun, workfl
 			HeadRef:      headRef,
 			BaseRef:      baseRef,
 		},
-		JobID:   id,
-		Matrix:  matrix,
-		Env:     jobEnv,
-		Outputs: outputs,
-		Steps:   steps,
+		JobID:                 id,
+		Matrix:                matrix,
+		Env:                   jobEnv,
+		Outputs:               outputs,
+		TimeoutSeconds:        timeoutSeconds,
+		CleanupTimeoutSeconds: int64(runner.CleanupTimeout / time.Second),
+		Steps:                 steps,
 	}, nil
 }
 
@@ -1471,6 +1495,8 @@ func (r *WorkflowRunReconciler) observeWorkflowJobs(ctx context.Context, run *ac
 		switch {
 		case result == actionsv1alpha1.WorkflowJobResultSuccess:
 			status.Succeeded++
+		case workflowJobTimedOut(job):
+			status.TimedOut++
 		case result == actionsv1alpha1.WorkflowJobResultFailure:
 			status.Failed++
 		case result == actionsv1alpha1.WorkflowJobResultSkipped:
@@ -1533,7 +1559,7 @@ func (r *WorkflowRunReconciler) observeWorkflowJobs(ctx context.Context, run *ac
 		Reason:             "JobsPlanned",
 		Message:            "All WorkflowJobs have been created",
 	})
-	terminal := int32(len(jobs.Items)) == total && status.Succeeded+status.Failed+status.Skipped+status.Cancelled == status.Total
+	terminal := int32(len(jobs.Items)) == total && status.Succeeded+status.Failed+status.TimedOut+status.Skipped+status.Cancelled == status.Total
 	if terminal && status.Cancelled > 0 {
 		active, err := activeRuntimeWorkloads(ctx, reader, run)
 		if err != nil {
@@ -1549,10 +1575,14 @@ func (r *WorkflowRunReconciler) observeWorkflowJobs(ctx context.Context, run *ac
 		now := metav1.Now()
 		run.Status.CompletionTime = &now
 		meta.SetStatusCondition(&run.Status.Conditions, metav1.Condition{Type: actionsv1alpha1.WorkflowRunConditionSucceeded, Status: metav1.ConditionFalse, ObservedGeneration: run.Generation, Reason: "JobCancelled", Message: "At least one WorkflowJob was cancelled"})
-	case terminal && status.Failed > 0 && run.Spec.CancelRequested:
+	case terminal && (status.Failed > 0 || status.TimedOut > 0) && run.Spec.CancelRequested:
 		now := metav1.Now()
 		run.Status.CompletionTime = &now
 		meta.SetStatusCondition(&run.Status.Conditions, metav1.Condition{Type: actionsv1alpha1.WorkflowRunConditionSucceeded, Status: metav1.ConditionFalse, ObservedGeneration: run.Generation, Reason: "JobCancelled", Message: "Workflow cancellation was requested"})
+	case terminal && status.TimedOut > 0:
+		now := metav1.Now()
+		run.Status.CompletionTime = &now
+		meta.SetStatusCondition(&run.Status.Conditions, metav1.Condition{Type: actionsv1alpha1.WorkflowRunConditionSucceeded, Status: metav1.ConditionFalse, ObservedGeneration: run.Generation, Reason: "JobTimedOut", Message: "At least one WorkflowJob timed out"})
 	case terminal && status.Failed > 0:
 		now := metav1.Now()
 		run.Status.CompletionTime = &now
@@ -1936,6 +1966,11 @@ func workflowJobCancelledByMatrixFailFast(job *actionsv1alpha1.WorkflowJob) bool
 		}
 	}
 	return false
+}
+
+func workflowJobTimedOut(job *actionsv1alpha1.WorkflowJob) bool {
+	condition := meta.FindStatusCondition(job.Status.Conditions, actionsv1alpha1.WorkflowJobConditionSucceeded)
+	return condition != nil && condition.Status == metav1.ConditionFalse && condition.Reason == "JobTimedOut"
 }
 
 func (r *WorkflowRunReconciler) reconcileMatrixFailFast(ctx context.Context, jobs *actionsv1alpha1.WorkflowJobList) (bool, error) {

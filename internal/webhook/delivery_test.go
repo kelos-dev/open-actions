@@ -18,6 +18,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -236,6 +237,34 @@ func TestRerequestedCheckCreatesFailedJobRerun(t *testing.T) {
 	}
 	if storedDelivery.Data[deliveryStateKey] != deliveryStateCompleted || storedDelivery.Data[deliveryRunCountKey] != "1" {
 		t.Fatalf("delivery state = %#v", storedDelivery.Data)
+	}
+}
+
+func TestRerunWorkflowJobIDsIncludesTimedOutJobs(t *testing.T) {
+	scheme := deliveryTestScheme(t)
+	run := &actionsv1alpha1.WorkflowRun{
+		ObjectMeta: metav1.ObjectMeta{Name: "ci", Namespace: "default", UID: "run-uid"},
+		Status: actionsv1alpha1.WorkflowRunStatus{
+			Jobs:       &actionsv1alpha1.WorkflowRunJobStatus{Total: 1, TimedOut: 1},
+			Conditions: []metav1.Condition{{Type: actionsv1alpha1.WorkflowRunConditionSucceeded, Status: metav1.ConditionFalse, Reason: "JobTimedOut"}},
+		},
+	}
+	job := &actionsv1alpha1.WorkflowJob{
+		ObjectMeta: metav1.ObjectMeta{Name: "build", Namespace: run.Namespace, Labels: map[string]string{actionsv1alpha1.LabelWorkflowRunUID: string(run.UID)}},
+		Spec:       actionsv1alpha1.WorkflowJobSpec{JobID: "build"},
+		Status: actionsv1alpha1.WorkflowJobStatus{
+			Result:     actionsv1alpha1.WorkflowJobResultFailure,
+			Conditions: []metav1.Condition{{Type: actionsv1alpha1.WorkflowJobConditionSucceeded, Status: metav1.ConditionFalse, Reason: "JobTimedOut"}},
+		},
+	}
+	clusterClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(run, job).Build()
+	reconciler := &DeliveryReconciler{APIReader: clusterClient}
+	jobIDs, err := reconciler.rerunWorkflowJobIDs(context.Background(), run)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(jobIDs, []string{"build"}) {
+		t.Fatalf("rerun job IDs = %v", jobIDs)
 	}
 }
 

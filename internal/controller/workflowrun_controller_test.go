@@ -68,7 +68,7 @@ func TestJobPlanCoversSupportedSteps(t *testing.T) {
 		{Uses: "actions/setup-go@v5", With: map[string]any{"go-version-file": "go.mod"}},
 		{ID: "build", Name: "Build", Run: "make build"},
 	}}
-	plan, err := reconciler.jobPlan(run, "CI", "build", nil, job, nil, map[string]any{"enabled": false, "retries": float64(2)})
+	plan, err := reconciler.jobPlan(run, "CI", "build", nil, job, nil, map[string]any{"enabled": false, "retries": float64(2)}, 90*60)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -77,6 +77,9 @@ func TestJobPlanCoversSupportedSteps(t *testing.T) {
 	}
 	if plan.Version != runner.PlanVersion || plan.Repository.ID != 1 || plan.Event.DeliveryID != "delivery" || plan.Revision.BaseRef != "target" {
 		t.Errorf("plan identity = %#v", plan)
+	}
+	if plan.TimeoutSeconds != 90*60 || plan.CleanupTimeoutSeconds != int64(runner.CleanupTimeout/time.Second) {
+		t.Errorf("plan timeouts = execution %d, cleanup %d", plan.TimeoutSeconds, plan.CleanupTimeoutSeconds)
 	}
 	if plan.Inputs["enabled"] != false || plan.Inputs["retries"] != float64(2) {
 		t.Errorf("plan inputs = %#v", plan.Inputs)
@@ -291,7 +294,7 @@ func TestPlanWorkflowJobsSetsDisplayNames(t *testing.T) {
 	if len(planned) != 2 {
 		t.Fatalf("planned jobs = %d, want 2", len(planned))
 	}
-	if planned[0].id != "build" || planned[0].displayName != "Build main PR 7 from contributor/project at "+strings.Repeat("a", 40)+" for staging (staging)" || planned[0].resultVersion != jobResultVersion {
+	if planned[0].id != "build" || planned[0].displayName != "Build main PR 7 from contributor/project at "+strings.Repeat("a", 40)+" for staging (staging)" || planned[0].resultVersion != jobResultVersion || planned[0].timeoutSeconds != int64(defaultMaxJobTimeout/time.Second) {
 		t.Errorf("build job = %#v", planned[0])
 	}
 	plan := &runner.Plan{}
@@ -301,11 +304,41 @@ func TestPlanWorkflowJobsSetsDisplayNames(t *testing.T) {
 	if plan.Event.PullRequest == nil || plan.Event.PullRequest.Number != 7 || plan.Event.PullRequest.HeadRepository.Owner != "contributor" || plan.Event.PullRequest.HeadSHA != strings.Repeat("b", 40) {
 		t.Fatalf("plan pull request = %#v", plan.Event.PullRequest)
 	}
-	if planned[1].id != "lint" || planned[1].displayName != "lint" || planned[1].resultVersion != "" {
+	if planned[1].id != "lint" || planned[1].displayName != "lint" || planned[1].resultVersion != jobResultVersion {
 		t.Errorf("lint job = %#v", planned[1])
 	}
 	if len(planned[1].needs) != 1 || planned[1].needs[0] != "build" || planned[1].condition != "always()" {
 		t.Errorf("lint graph = %#v", planned[1])
+	}
+}
+
+func TestPlanWorkflowJobsCapsTimeout(t *testing.T) {
+	definition, err := workflow.Parse([]byte("name: CI\non: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    timeout-minutes: 120\n    steps:\n      - run: true\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := &actionsv1alpha1.WorkflowRun{Spec: actionsv1alpha1.WorkflowRunSpec{Source: actionsv1alpha1.WorkflowRunSource{
+		Type: actionsv1alpha1.SourceTypeGitHub,
+		GitHub: &actionsv1alpha1.GitHubWorkflowRunSource{
+			Repository: actionsv1alpha1.GitHubRepository{ID: 1, Owner: "acme", Name: "example"},
+			Event:      actionsv1alpha1.GitHubEvent{Name: "push", DeliveryID: "delivery"},
+			Revision:   actionsv1alpha1.GitRevision{SHA: strings.Repeat("a", 40), Ref: "refs/heads/main"},
+		},
+	}}}
+	reconciler := &WorkflowRunReconciler{MaxJobTimeout: 90 * time.Minute}
+	planned, err := reconciler.planWorkflowJobs(run, definition, nil, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(planned) != 1 || planned[0].timeoutSeconds != 90*60 {
+		t.Fatalf("planned timeout = %#v", planned)
+	}
+	plan := &runner.Plan{}
+	if err := json.Unmarshal([]byte(planned[0].plan), plan); err != nil {
+		t.Fatal(err)
+	}
+	if plan.TimeoutSeconds != 90*60 {
+		t.Fatalf("runner timeout = %d, want %d", plan.TimeoutSeconds, 90*60)
 	}
 }
 
@@ -1286,6 +1319,10 @@ func TestWorkflowRunCheckReportMapsLifecycle(t *testing.T) {
 	if report := workflowRunCheckReport(run); report.Status != "completed" || report.Conclusion != "cancelled" {
 		t.Fatalf("cancelled report = %#v", report)
 	}
+	meta.SetStatusCondition(&run.Status.Conditions, metav1.Condition{Type: actionsv1alpha1.WorkflowRunConditionSucceeded, Status: metav1.ConditionFalse, Reason: "JobTimedOut", Message: "A job timed out", LastTransitionTime: completion})
+	if report := workflowRunCheckReport(run); report.Status != "completed" || report.Conclusion != "timed_out" {
+		t.Fatalf("timed-out report = %#v", report)
+	}
 	deletionTime := metav1.NewTime(time.Unix(1_700_000_000, 0))
 	canceled := &actionsv1alpha1.WorkflowRun{ObjectMeta: metav1.ObjectMeta{DeletionTimestamp: &deletionTime}}
 	if report := workflowRunCheckReport(canceled); report.Status != "completed" || report.Conclusion != "cancelled" || report.CompletedAt != deletionTime.UTC().Format(time.RFC3339) {
@@ -1957,7 +1994,7 @@ func TestEnsureWorkflowJobsCreatesReadableNames(t *testing.T) {
 	reconciler := &WorkflowRunReconciler{Client: clusterClient, APIReader: clusterClient}
 
 	if err := reconciler.ensureWorkflowJobs(context.Background(), run, project, []plannedWorkflowJob{{
-		id: "build", displayName: "Build and test", runsOn: []string{"linux"}, plan: "{}", resultVersion: jobResultVersion,
+		id: "build", displayName: "Build and test", runsOn: []string{"linux"}, plan: "{}", resultVersion: jobResultVersion, timeoutSeconds: 5400,
 	}}); err != nil {
 		t.Fatal(err)
 	}
@@ -1971,6 +2008,9 @@ func TestEnsureWorkflowJobsCreatesReadableNames(t *testing.T) {
 	job := &jobs.Items[0]
 	if job.Name != workflowJobName(run.Name, "build") || job.Spec.DisplayName != "Build and test" {
 		t.Errorf("WorkflowJob = %#v", job)
+	}
+	if job.Spec.TimeoutSeconds != 5400 {
+		t.Errorf("WorkflowJob timeout = %d, want 5400", job.Spec.TimeoutSeconds)
 	}
 	if job.Annotations[actionsv1alpha1.AnnotationRunnerResultVersion] != jobResultVersion {
 		t.Errorf("runner result version = %q", job.Annotations[actionsv1alpha1.AnnotationRunnerResultVersion])
@@ -2607,6 +2647,7 @@ func TestWorkflowRunTerminalConclusions(t *testing.T) {
 		cancelRequested bool
 		results         []actionsv1alpha1.WorkflowJobResult
 		failFast        bool
+		timedOut        bool
 		wantStatus      metav1.ConditionStatus
 		wantReason      string
 		wantMessage     string
@@ -2614,6 +2655,7 @@ func TestWorkflowRunTerminalConclusions(t *testing.T) {
 		{name: "success with skipped job", results: []actionsv1alpha1.WorkflowJobResult{actionsv1alpha1.WorkflowJobResultSuccess, actionsv1alpha1.WorkflowJobResultSkipped}, wantStatus: metav1.ConditionTrue, wantReason: "JobsSucceeded", wantMessage: "All required WorkflowJobs succeeded"},
 		{name: "cancellation after successful completion", cancelRequested: true, results: []actionsv1alpha1.WorkflowJobResult{actionsv1alpha1.WorkflowJobResultSuccess, actionsv1alpha1.WorkflowJobResultSuccess}, wantStatus: metav1.ConditionTrue, wantReason: "JobsSucceeded", wantMessage: "All required WorkflowJobs succeeded"},
 		{name: "failure", results: []actionsv1alpha1.WorkflowJobResult{actionsv1alpha1.WorkflowJobResultSuccess, actionsv1alpha1.WorkflowJobResultFailure}, wantStatus: metav1.ConditionFalse, wantReason: "JobFailed", wantMessage: "At least one WorkflowJob failed"},
+		{name: "timeout", results: []actionsv1alpha1.WorkflowJobResult{actionsv1alpha1.WorkflowJobResultSuccess, actionsv1alpha1.WorkflowJobResultFailure}, timedOut: true, wantStatus: metav1.ConditionFalse, wantReason: "JobTimedOut", wantMessage: "At least one WorkflowJob timed out"},
 		{name: "cancellation request takes precedence over failure", cancelRequested: true, results: []actionsv1alpha1.WorkflowJobResult{actionsv1alpha1.WorkflowJobResultSuccess, actionsv1alpha1.WorkflowJobResultFailure}, wantStatus: metav1.ConditionFalse, wantReason: "JobCancelled", wantMessage: "Workflow cancellation was requested"},
 		{name: "cancelled job takes precedence over failure", results: []actionsv1alpha1.WorkflowJobResult{actionsv1alpha1.WorkflowJobResultFailure, actionsv1alpha1.WorkflowJobResultCancelled}, wantStatus: metav1.ConditionFalse, wantReason: "JobCancelled", wantMessage: "At least one WorkflowJob was cancelled"},
 		{name: "matrix fail-fast preserves failure", results: []actionsv1alpha1.WorkflowJobResult{actionsv1alpha1.WorkflowJobResultFailure, actionsv1alpha1.WorkflowJobResultCancelled}, failFast: true, wantStatus: metav1.ConditionFalse, wantReason: "JobFailed", wantMessage: "At least one WorkflowJob failed"},
@@ -2643,6 +2685,9 @@ func TestWorkflowRunTerminalConclusions(t *testing.T) {
 					},
 					Spec:   actionsv1alpha1.WorkflowJobSpec{JobID: name},
 					Status: actionsv1alpha1.WorkflowJobStatus{Result: result},
+				}
+				if test.timedOut && result == actionsv1alpha1.WorkflowJobResultFailure {
+					job.Status.Conditions = []metav1.Condition{{Type: actionsv1alpha1.WorkflowJobConditionSucceeded, Status: metav1.ConditionFalse, Reason: "JobTimedOut"}}
 				}
 				if test.failFast && result == actionsv1alpha1.WorkflowJobResultCancelled {
 					job.Status.Conditions = []metav1.Condition{{Type: actionsv1alpha1.WorkflowJobConditionScheduled, Status: metav1.ConditionFalse, Reason: matrixFailFastReason}}

@@ -116,7 +116,7 @@ on: push
 jobs:
   test:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    unsupported-field: true
     steps:
       - run: echo test
 `

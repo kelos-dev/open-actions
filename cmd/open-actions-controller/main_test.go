@@ -23,6 +23,8 @@ func TestRunManagerRejectsInvalidEndpointURLs(t *testing.T) {
 		{name: "Console URL", arguments: []string{"--console-url=https://actions.example/open-actions"}, want: "Console URL must not include a path"},
 		{name: "negative WorkflowRun TTL", arguments: []string{"--workflow-run-ttl-seconds-after-finished=-1"}, want: "must be an integer between"},
 		{name: "excessive WorkflowRun TTL", arguments: []string{"--workflow-run-ttl-seconds-after-finished=2147483648"}, want: "must be an integer between"},
+		{name: "short maximum job timeout", arguments: []string{"--max-job-timeout=59s"}, want: "max job timeout must be a positive whole number of minutes"},
+		{name: "fractional maximum job timeout", arguments: []string{"--max-job-timeout=90s"}, want: "max job timeout must be a positive whole number of minutes"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			err := runManager(tt.arguments)
