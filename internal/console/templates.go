@@ -15,7 +15,7 @@ const loginPageTemplate = `<!doctype html>
     <div class="mark" aria-hidden="true">OA</div>
     <h1>Administrator sign in</h1>
     <form class="card" id="login">
-      <p class="hint">Use the administrator token configured for this Console.</p>
+      <p class="hint">Use the administrator token configured for this Console to run workflows and manage Project Secrets.</p>
       <label for="token">Administrator token</label>
       <input id="token" name="token" type="password" autocomplete="current-password" required autofocus>
       <button type="submit">Sign in</button>
@@ -28,7 +28,7 @@ const loginPageTemplate = `<!doctype html>
     form.addEventListener('submit',async event=>{event.preventDefault();error.textContent='';button.disabled=true;
       try{const response=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({token:form.token.value})});
         if(!response.ok){error.textContent='The token is invalid.';return}
-        const next=new URLSearchParams(location.search).get('next');location.assign(next&&(next==='/projects'||next.startsWith('/projects/')||next.startsWith('/runs/'))?next:'/projects');
+        const next=new URLSearchParams(location.search).get('next');location.assign(next&&(next==='/dispatch'||next.startsWith('/dispatch?')||next==='/projects'||next.startsWith('/projects/')||next.startsWith('/runs/'))?next:'/projects');
       }catch(_){error.textContent='The Console is unavailable.'}finally{button.disabled=false}
     });
   </script>
@@ -46,7 +46,7 @@ const mainPageTemplate = `<!doctype html>
   </style>
 </head>
 <body>
-  <nav class="topbar" aria-label="Global"><a class="brand" href="/"><span class="brand-mark" aria-hidden="true">OA</span><span>Open Actions</span></a><a href="/projects">Projects</a></nav>
+  <nav class="topbar" aria-label="Global"><a class="brand" href="/"><span class="brand-mark" aria-hidden="true">OA</span><span>Open Actions</span></a><a href="/projects">Projects</a><a href="/dispatch">Run workflow</a></nav>
   <main class="page">
     <header class="page-heading"><div><h1>Workflow runs</h1><p>Workflow activity across all namespaces{{if .Truncated}} · Showing {{.Limit}} most recent runs{{end}}</p></div><span class="count" aria-label="Workflow run count">{{len .Runs}}</span></header>
     <section class="runs" aria-label="Workflow runs">
@@ -73,7 +73,7 @@ const projectsPageTemplate = `<!doctype html>
   </style>
 </head>
 <body>
-  <nav class="topbar" aria-label="Global"><a class="brand" href="/"><span class="brand-mark" aria-hidden="true">OA</span><span>Open Actions</span></a><a href="/projects">Projects</a></nav>
+  <nav class="topbar" aria-label="Global"><a class="brand" href="/"><span class="brand-mark" aria-hidden="true">OA</span><span>Open Actions</span></a><a href="/projects">Projects</a><a href="/dispatch">Run workflow</a></nav>
   <main class="page">
     <header class="page-heading"><div><h1>Projects</h1><p>Workflow sources and Project-scoped configuration</p></div><span class="count">{{len .Projects}}</span></header>
     <section class="projects" aria-label="Projects">
@@ -98,7 +98,7 @@ const projectPageTemplate = `<!doctype html>
   </style>
 </head>
 <body>
-  <nav class="topbar" aria-label="Global"><a class="brand" href="/"><span class="brand-mark" aria-hidden="true">OA</span><span>Open Actions</span></a><a href="/projects">Projects</a></nav>
+  <nav class="topbar" aria-label="Global"><a class="brand" href="/"><span class="brand-mark" aria-hidden="true">OA</span><span>Open Actions</span></a><a href="/projects">Projects</a><a href="/dispatch">Run workflow</a></nav>
   <main class="page">
     <div class="breadcrumbs"><a href="/projects">Projects</a><span>/</span><span>{{.Namespace}}</span><span>/</span><span>{{.Name}}</span></div>
     <header class="heading"><div><h1>{{.Name}}</h1><span class="muted">{{.Namespace}}</span></div><div class="pill"><span class="status-mark {{.StatusClass}}" aria-hidden="true"></span><span>{{.Status}}</span></div></header>
@@ -130,6 +130,45 @@ const projectPageTemplate = `<!doctype html>
 </body>
 </html>`
 
+const dispatchPageTemplate = `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Run workflow · Open Actions</title>
+  <style>
+    :root{color-scheme:dark;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#0d1117;color:#f0f6fc}*{box-sizing:border-box}body{margin:0;background:#0d1117;color:#f0f6fc;font-size:14px}a{color:#58a6ff;text-decoration:none}a:hover{text-decoration:underline}.topbar{height:64px;display:flex;align-items:center;gap:24px;padding:0 24px;border-bottom:1px solid #21262d;background:#010409}.brand{display:flex;align-items:center;gap:10px;color:#f0f6fc;font-weight:600}.brand:hover{text-decoration:none}.brand-mark{display:grid;place-items:center;width:30px;height:30px;border:1px solid #30363d;border-radius:7px;color:#58a6ff;font-size:12px;font-weight:800}.page{width:min(900px,100%);margin:0 auto;padding:32px 32px 56px}.heading{margin-bottom:22px}.heading h1{margin:0 0 7px;font-size:24px}.muted,.hint{color:#8b949e;line-height:1.5}.panel{padding:22px;border:1px solid #30363d;border-radius:6px}.form-grid{display:grid;grid-template-columns:1fr 1fr;gap:18px}.field.full{grid-column:1/-1}.field label{display:block;margin-bottom:7px;font-size:13px;font-weight:600}.field input,.field select,.field textarea{width:100%;padding:7px 10px;border:1px solid #30363d;border-radius:6px;background:#0d1117;color:#f0f6fc;font:inherit}.field input,.field select{height:36px}.field textarea{min-height:72px;resize:vertical}.field input:focus,.field select:focus,.field textarea:focus{border-color:#2f81f7;outline:none;box-shadow:0 0 0 3px #2f81f74d}.ref{display:grid;grid-template-columns:120px 1fr;gap:10px}.inputs-heading{display:flex;align-items:center;justify-content:space-between;gap:16px;margin:28px 0 10px}.inputs-heading h2{margin:0;font-size:16px}.input-row{display:grid;grid-template-columns:minmax(180px,.55fr) minmax(240px,1fr) auto;align-items:end;gap:10px;padding:12px 0;border-top:1px solid #21262d}.button{height:36px;padding:0 14px;border:1px solid #2ea043;border-radius:6px;background:#238636;color:#fff;font-weight:600;cursor:pointer}.button:hover{background:#2ea043}.button.secondary{border-color:#30363d;background:#21262d;color:#c9d1d9}.button.secondary:hover{background:#30363d}.submit{margin-top:24px}.notice{padding:16px;border:1px solid #30363d;border-radius:6px;background:#161b22;color:#c9d1d9}@media(max-width:800px){.topbar{padding:0 16px}}@media(max-width:680px){.page{padding:24px 16px}.form-grid{grid-template-columns:1fr}.field.full{grid-column:auto}.input-row{grid-template-columns:1fr}.ref{grid-template-columns:1fr}}
+  </style>
+</head>
+<body>
+  <nav class="topbar" aria-label="Global"><a class="brand" href="/"><span class="brand-mark" aria-hidden="true">OA</span><span>Open Actions</span></a><a href="/projects">Projects</a><a href="/dispatch">Run workflow</a></nav>
+  <main class="page">
+    <header class="heading"><h1>Run workflow</h1><div class="muted">Create a manual workflow run at a pinned branch or tag revision.</div></header>
+    {{if .Projects}}<form class="panel" method="post" action="/dispatch" autocomplete="off">
+      <input type="hidden" name="csrf" value="{{.CSRFToken}}"><input type="hidden" name="request-id" value="{{.RequestID}}">
+      <div class="form-grid">
+        <div class="field full"><label for="project">Project</label><select id="project" name="project" required>{{range .Projects}}<option value="{{.Value}}"{{if .Selected}} selected{{end}}>{{.Label}}</option>{{end}}</select></div>
+        <div class="field"><label for="repository-owner">Repository owner</label><input id="repository-owner" name="repository-owner" value="{{.RepositoryOwner}}" pattern="[A-Za-z0-9][A-Za-z0-9_-]*" maxlength="100" required></div>
+        <div class="field"><label for="repository-name">Repository name</label><input id="repository-name" name="repository-name" value="{{.RepositoryName}}" pattern="[A-Za-z0-9._-]+" maxlength="100" required></div>
+        <div class="field"><label for="repository-id">Repository ID</label><input id="repository-id" name="repository-id" type="number" min="1" max="9007199254740991" value="{{.RepositoryID}}" required></div>
+        <div class="field"><label for="revision">Commit SHA</label><input id="revision" name="revision" value="{{.Revision}}" pattern="[0-9a-f]{40}" maxlength="40" spellcheck="false" required></div>
+        <div class="field full"><label for="ref-name">Branch or tag</label><div class="ref"><select name="ref-type" aria-label="Git ref type"><option value="branch"{{if eq .RefType "branch"}} selected{{end}}>Branch</option><option value="tag"{{if eq .RefType "tag"}} selected{{end}}>Tag</option></select><input id="ref-name" name="ref-name" value="{{.RefName}}" maxlength="1013" placeholder="main" spellcheck="false" required></div></div>
+        <div class="field full"><label for="workflow-path">Workflow path</label><input id="workflow-path" name="workflow-path" value="{{.WorkflowPath}}" maxlength="512" placeholder=".open-actions/workflows/deploy.yaml" spellcheck="false" required></div>
+      </div>
+      <div class="inputs-heading"><div><h2>Inputs</h2><span class="hint">Supply only inputs declared by the workflow; omitted defaults are resolved by the controller.</span></div><button class="button secondary" id="add-input" type="button">Add input</button></div>
+      <div id="inputs">{{range .Inputs}}<div class="input-row"><div class="field"><label>Input name</label><input name="input-name" value="{{.Name}}" pattern="[A-Za-z_][A-Za-z0-9_-]{0,99}" maxlength="100" required></div><div class="field"><label>Value</label><textarea name="input-value" maxlength="65535">{{.Value}}</textarea></div><button class="button secondary remove-input" type="button">Remove</button></div>{{end}}</div>
+      <button class="button submit" type="submit">Run workflow</button>
+    </form>{{else}}<p class="notice">No GitHub Projects are configured.</p>{{end}}
+  </main>
+  <template id="input-template"><div class="input-row"><div class="field"><label>Input name</label><input name="input-name" pattern="[A-Za-z_][A-Za-z0-9_-]{0,99}" maxlength="100" required></div><div class="field"><label>Value</label><textarea name="input-value" maxlength="65535"></textarea></div><button class="button secondary remove-input" type="button">Remove</button></div></template>
+  <script>
+    const inputs=document.getElementById('inputs');const add=document.getElementById('add-input');const template=document.getElementById('input-template');
+    if(add)add.addEventListener('click',()=>{const row=template.content.cloneNode(true);inputs.append(row);inputs.lastElementChild.querySelector('input').focus()});
+    if(inputs)inputs.addEventListener('click',event=>{if(event.target.classList.contains('remove-input'))event.target.closest('.input-row').remove()});
+  </script>
+</body>
+</html>`
+
 const runPageTemplate = `<!doctype html>
 <html lang="en">
 <head>
@@ -141,12 +180,12 @@ const runPageTemplate = `<!doctype html>
   </style>
 </head>
 <body>
-  <nav class="topbar" aria-label="Global"><a class="brand" href="/"><span class="brand-mark" aria-hidden="true">OA</span><span>Open Actions</span></a><a href="/projects">Projects</a></nav>
+  <nav class="topbar" aria-label="Global"><a class="brand" href="/"><span class="brand-mark" aria-hidden="true">OA</span><span>Open Actions</span></a><a href="/projects">Projects</a><a href="/dispatch">Run workflow</a></nav>
   <main class="page">
     <div class="breadcrumbs"><strong>{{.Repository}}</strong><span>/</span><span>Actions</span><span>/</span><span>{{.WorkflowName}}</span></div>
     <div class="run-heading">
       <div><h1>{{.WorkflowName}}</h1><div class="muted workflow-path">{{.WorkflowPath}}</div></div>
-      {{if .RerunURL}}<div class="run-actions">{{if .CanRerun}}{{if .CanRerunFailed}}<form method="post" action="{{.RerunURL}}"><input type="hidden" name="csrf" value="{{.CSRFToken}}"><input type="hidden" name="jobs" value="failed"><button class="run-action" type="submit">Re-run failed jobs</button></form>{{end}}<form method="post" action="{{.RerunURL}}"><input type="hidden" name="csrf" value="{{.CSRFToken}}"><input type="hidden" name="jobs" value="all"><button class="run-action" type="submit">Re-run all jobs</button></form>{{else}}<a class="run-action" href="{{.LoginURL}}">Sign in to re-run</a>{{end}}</div>{{end}}
+      <div class="run-actions">{{if .DispatchURL}}<a class="run-action" href="{{.DispatchURL}}">Run workflow</a>{{end}}{{if .RerunURL}}{{if .CanRerun}}{{if .CanRerunFailed}}<form method="post" action="{{.RerunURL}}"><input type="hidden" name="csrf" value="{{.CSRFToken}}"><input type="hidden" name="jobs" value="failed"><button class="run-action" type="submit">Re-run failed jobs</button></form>{{end}}<form method="post" action="{{.RerunURL}}"><input type="hidden" name="csrf" value="{{.CSRFToken}}"><input type="hidden" name="jobs" value="all"><button class="run-action" type="submit">Re-run all jobs</button></form>{{else}}<a class="run-action" href="{{.LoginURL}}">Sign in to re-run</a>{{end}}{{end}}</div>
     </div>
     <section class="summary" aria-label="Workflow run summary">
       <span class="status-mark {{.StatusClass}}" aria-hidden="true"></span>
@@ -178,7 +217,7 @@ const logPageTemplate = `<!doctype html>
   </style>
 </head>
 <body data-stream-url="{{.StreamURL}}">
-  <nav class="topbar" aria-label="Global"><a class="brand" href="/"><span class="brand-mark" aria-hidden="true">OA</span><span>Open Actions</span></a><a href="/projects">Projects</a></nav>
+  <nav class="topbar" aria-label="Global"><a class="brand" href="/"><span class="brand-mark" aria-hidden="true">OA</span><span>Open Actions</span></a><a href="/projects">Projects</a><a href="/dispatch">Run workflow</a></nav>
   <main class="page">
     <div class="breadcrumbs"><strong>{{.Repository}}</strong><span>/</span><span>Actions</span><span>/</span><a href="{{.RunURL}}">{{.WorkflowName}}</a></div>
     <div class="layout">

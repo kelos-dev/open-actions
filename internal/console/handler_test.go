@@ -38,6 +38,7 @@ func TestConsoleTopbarsUseConsistentSpacing(t *testing.T) {
 		"workflow runs": mainPageTemplate,
 		"projects":      projectsPageTemplate,
 		"project":       projectPageTemplate,
+		"dispatch":      dispatchPageTemplate,
 		"workflow run":  runPageTemplate,
 		"runner logs":   logPageTemplate,
 	}
@@ -492,6 +493,211 @@ func TestConsoleShowsRerunWhenOriginalWorkflowRunIsGone(t *testing.T) {
 	}
 }
 
+func TestConsoleCreatesWorkflowDispatch(t *testing.T) {
+	handler := newTestHandler(t, false)
+
+	unauthenticated := httptest.NewRecorder()
+	handler.ServeHTTP(unauthenticated, httptest.NewRequest(http.MethodGet, "/dispatch?source=default%2Fci", nil))
+	if unauthenticated.Code != http.StatusFound || !strings.HasPrefix(unauthenticated.Header().Get("Location"), "/login?next=") {
+		t.Fatalf("unauthenticated dispatch page = %d, %q", unauthenticated.Code, unauthenticated.Header().Get("Location"))
+	}
+	invalidSourceRequest := httptest.NewRequest(http.MethodGet, "/dispatch?source=invalid", nil)
+	invalidSourceRequest.Header.Set("Authorization", "Bearer "+testConsoleToken)
+	invalidSource := httptest.NewRecorder()
+	handler.ServeHTTP(invalidSource, invalidSourceRequest)
+	if invalidSource.Code != http.StatusBadRequest {
+		t.Fatalf("invalid workflow dispatch source = %d, %q", invalidSource.Code, invalidSource.Body.String())
+	}
+
+	pageRequest := httptest.NewRequest(http.MethodGet, "/dispatch?source=default%2Fci", nil)
+	pageRequest.Header.Set("Authorization", "Bearer "+testConsoleToken)
+	page := httptest.NewRecorder()
+	handler.ServeHTTP(page, pageRequest)
+	pageBody := page.Body.String()
+	for _, expected := range []string{`value="default/project" selected`, `value="123"`, `value="acme"`, `value="example"`, `value="main"`, `value="` + strings.Repeat("a", 40) + `"`, `value=".open-actions/workflows/ci.yaml"`} {
+		if page.Code != http.StatusOK || !strings.Contains(pageBody, expected) {
+			t.Fatalf("dispatch page does not contain %q: %d, %s", expected, page.Code, pageBody)
+		}
+	}
+
+	requestID := "0123456789abcdefabcd"
+	form := url.Values{
+		"csrf":             {handler.csrfToken},
+		"request-id":       {requestID},
+		"project":          {"default/project"},
+		"repository-id":    {"123"},
+		"repository-owner": {"acme"},
+		"repository-name":  {"example"},
+		"ref-type":         {"branch"},
+		"ref-name":         {"main"},
+		"revision":         {strings.Repeat("b", 40)},
+		"workflow-path":    {".open-actions/workflows/deploy.yaml"},
+		"input-name":       {"environment", "retries"},
+		"input-value":      {"staging", "2"},
+	}
+	dispatch := func(values url.Values) *httptest.ResponseRecorder {
+		request := httptest.NewRequest(http.MethodPost, "/dispatch", strings.NewReader(values.Encode()))
+		request.Header.Set("Authorization", "Bearer "+testConsoleToken)
+		request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		return response
+	}
+	response := dispatch(form)
+	wantLocation := "/runs/default/dispatch-" + requestID
+	if response.Code != http.StatusSeeOther || response.Header().Get("Location") != wantLocation {
+		t.Fatalf("workflow dispatch response = %d, %q, want %q", response.Code, response.Header().Get("Location"), wantLocation)
+	}
+	created := &actionsv1alpha1.WorkflowRun{}
+	if err := handler.client.Get(context.Background(), client.ObjectKey{Namespace: "default", Name: "dispatch-" + requestID}, created); err != nil {
+		t.Fatal(err)
+	}
+	github := created.Spec.Source.GitHub
+	if created.Spec.ProjectRef.Name != "project" || created.Spec.WorkflowPath != ".open-actions/workflows/deploy.yaml" || created.Spec.TTLSecondsAfterFinished == nil || *created.Spec.TTLSecondsAfterFinished != 604800 || github == nil ||
+		github.Repository.ID != 123 || github.Repository.Owner != "acme" || github.Repository.Name != "example" ||
+		github.Event.Name != actionsv1alpha1.GitHubEventNameWorkflowDispatch || github.Event.DeliveryID != "" || github.Event.Inputs["environment"] != "staging" || github.Event.Inputs["retries"] != "2" ||
+		github.Revision.Ref != "refs/heads/main" || github.Revision.SHA != strings.Repeat("b", 40) {
+		t.Fatalf("created WorkflowRun = %#v", created)
+	}
+	changedTTL := int32(1)
+	created.Spec.CancelRequested = true
+	created.Spec.TTLSecondsAfterFinished = &changedTTL
+	if err := handler.client.Update(context.Background(), created); err != nil {
+		t.Fatal(err)
+	}
+	if retryResponse := dispatch(form); retryResponse.Code != http.StatusSeeOther || retryResponse.Header().Get("Location") != wantLocation {
+		t.Fatalf("workflow dispatch retry = %d, %q", retryResponse.Code, retryResponse.Header().Get("Location"))
+	}
+	form.Set("revision", strings.Repeat("c", 40))
+	if conflict := dispatch(form); conflict.Code != http.StatusConflict {
+		t.Fatalf("conflicting workflow dispatch = %d, %q", conflict.Code, conflict.Body.String())
+	}
+	form.Set("request-id", "abcdef0123456789abcd")
+	form.Set("ref-type", "tag")
+	form.Set("ref-name", "v1.2.3")
+	if tagResponse := dispatch(form); tagResponse.Code != http.StatusSeeOther {
+		t.Fatalf("tag workflow dispatch = %d, %q", tagResponse.Code, tagResponse.Body.String())
+	}
+	tagRun := &actionsv1alpha1.WorkflowRun{}
+	if err := handler.client.Get(context.Background(), client.ObjectKey{Namespace: "default", Name: "dispatch-abcdef0123456789abcd"}, tagRun); err != nil {
+		t.Fatal(err)
+	}
+	if tagRun.Spec.Source.GitHub.Revision.Ref != "refs/tags/v1.2.3" {
+		t.Fatalf("tag workflow dispatch ref = %q", tagRun.Spec.Source.GitHub.Revision.Ref)
+	}
+}
+
+func TestWorkflowDispatchValidation(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		value string
+		valid bool
+	}{
+		{name: "branch", value: "refs/heads/feature/dispatch", valid: true},
+		{name: "tag", value: "refs/tags/v1.2.3", valid: true},
+		{name: "empty branch", value: "refs/heads/"},
+		{name: "space", value: "refs/heads/release candidate"},
+		{name: "empty component", value: "refs/heads/feature//dispatch"},
+		{name: "parent component", value: "refs/heads/feature/../dispatch"},
+		{name: "lock suffix", value: "refs/tags/release.lock"},
+		{name: "reflog syntax", value: "refs/heads/main@{1}"},
+	} {
+		t.Run("ref "+test.name, func(t *testing.T) {
+			if got := validGitRef(test.value); got != test.valid {
+				t.Fatalf("validGitRef(%q) = %t, want %t", test.value, got, test.valid)
+			}
+		})
+	}
+	for _, test := range []struct {
+		name  string
+		value string
+		valid bool
+	}{
+		{name: "yaml", value: ".open-actions/workflows/deploy.yaml", valid: true},
+		{name: "yml", value: "workflows/release.yml", valid: true},
+		{name: "absolute", value: "/workflows/deploy.yaml"},
+		{name: "current directory", value: "./workflows/deploy.yaml"},
+		{name: "parent directory", value: "../workflows/deploy.yaml"},
+		{name: "embedded parent", value: "workflows/../deploy.yaml"},
+		{name: "empty component", value: "workflows//deploy.yaml"},
+		{name: "extension", value: "workflows/deploy.json"},
+	} {
+		t.Run("path "+test.name, func(t *testing.T) {
+			if got := validWorkflowPath(test.value); got != test.valid {
+				t.Fatalf("validWorkflowPath(%q) = %t, want %t", test.value, got, test.valid)
+			}
+		})
+	}
+	for _, test := range []struct {
+		name  string
+		value string
+		valid bool
+	}{
+		{name: "full lowercase", value: strings.Repeat("a", 40), valid: true},
+		{name: "uppercase", value: strings.Repeat("A", 40)},
+		{name: "short", value: strings.Repeat("a", 39)},
+		{name: "non hexadecimal", value: strings.Repeat("g", 40)},
+	} {
+		t.Run("SHA "+test.name, func(t *testing.T) {
+			if got := validGitSHA(test.value); got != test.valid {
+				t.Fatalf("validGitSHA(%q) = %t, want %t", test.value, got, test.valid)
+			}
+		})
+	}
+}
+
+func TestWorkflowDispatchInputValidation(t *testing.T) {
+	inputs, err := dispatchInputs([]string{"environment", "retries"}, []string{"staging", "2"})
+	if err != nil || inputs["environment"] != "staging" || inputs["retries"] != "2" {
+		t.Fatalf("dispatchInputs() = %#v, %v", inputs, err)
+	}
+	manyNames := make([]string, maxDispatchInputs+1)
+	manyValues := make([]string, len(manyNames))
+	for index := range manyNames {
+		manyNames[index] = fmt.Sprintf("input_%d", index)
+	}
+	for _, test := range []struct {
+		name   string
+		names  []string
+		values []string
+		want   string
+	}{
+		{name: "mismatched fields", names: []string{"one"}, want: "do not match"},
+		{name: "too many", names: manyNames, values: manyValues, want: "at most 25"},
+		{name: "invalid name", names: []string{"invalid.name"}, values: []string{"value"}, want: "invalid workflow input name"},
+		{name: "case insensitive duplicate", names: []string{"Target", "target"}, values: []string{"one", "two"}, want: "duplicated"},
+		{name: "invalid UTF-8", names: []string{"target"}, values: []string{string([]byte{0xff})}, want: "valid UTF-8"},
+		{name: "value too long", names: []string{"target"}, values: []string{strings.Repeat("x", maxDispatchPayload+1)}, want: "exceeds"},
+		{name: "payload too long", names: []string{"first", "second"}, values: []string{strings.Repeat("x", maxDispatchPayload/2), strings.Repeat("y", maxDispatchPayload/2)}, want: "names and values exceed"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := dispatchInputs(test.names, test.values)
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("dispatchInputs() error = %v, want %q", err, test.want)
+			}
+		})
+	}
+}
+
+func TestConsoleRequiresAuthenticationForWorkflowDispatch(t *testing.T) {
+	handler := newTestHandler(t, false)
+	form := url.Values{"csrf": {handler.csrfToken}, "request-id": {"0123456789abcdefabcd"}}
+	request := httptest.NewRequest(http.MethodPost, "/dispatch", strings.NewReader(form.Encode()))
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusFound || !strings.HasPrefix(response.Header().Get("Location"), "/login?next=") {
+		t.Fatalf("unauthenticated workflow dispatch = %d, %q", response.Code, response.Header().Get("Location"))
+	}
+	runs := &actionsv1alpha1.WorkflowRunList{}
+	if err := handler.client.List(context.Background(), runs); err != nil {
+		t.Fatal(err)
+	}
+	if len(runs.Items) != 2 {
+		t.Fatalf("WorkflowRuns after unauthenticated dispatch = %d, want 2", len(runs.Items))
+	}
+}
+
 func TestConsoleManagesReferencedProjectSecretWithoutDisplayingValues(t *testing.T) {
 	handler := newTestHandler(t, false)
 
@@ -746,17 +952,30 @@ func TestNewRequiresToken(t *testing.T) {
 	}
 }
 
+func TestNewRejectsNegativeWorkflowRunTTL(t *testing.T) {
+	scheme := runtime.NewScheme()
+	negative := int32(-1)
+	handler, err := New(Config{
+		Client: fake.NewClientBuilder().WithScheme(scheme).Build(),
+		Logs:   &testLogSource{pod: &corev1.Pod{}}, Token: testConsoleToken,
+		WorkflowRunTTLSecondsAfterFinished: &negative,
+		Logger:                             slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	if err == nil || handler != nil || !strings.Contains(err.Error(), "TTL must not be negative") {
+		t.Fatalf("New() = %#v, %v", handler, err)
+	}
+}
+
 func TestSafeNextRejectsExternalURLs(t *testing.T) {
 	for _, value := range []string{"https://example.com/projects/default/project", "//example.com/projects/default/project", "/", "/login"} {
 		if next := safeNext(value); next != "" {
 			t.Fatalf("safeNext(%q) = %q", value, next)
 		}
 	}
-	if next := safeNext("/projects/default/project?tab=secrets"); next != "/projects/default/project?tab=secrets" {
-		t.Fatalf("safeNext() = %q", next)
-	}
-	if next := safeNext("/runs/default/ci"); next != "/runs/default/ci" {
-		t.Fatalf("safeNext() = %q", next)
+	for _, value := range []string{"/projects/default/project?tab=secrets", "/runs/default/ci", "/dispatch?source=default%2Fci"} {
+		if next := safeNext(value); next != value {
+			t.Fatalf("safeNext(%q) = %q", value, next)
+		}
 	}
 }
 
@@ -808,9 +1027,11 @@ func newTestHandler(t *testing.T, secureCookie bool) *Handler {
 	secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "project-secrets", Namespace: "default"}, Data: map[string][]byte{"DEPLOY_TOKEN": []byte("existing-secret-value")}}
 	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "build", Namespace: "default", Labels: map[string]string{actionsv1alpha1.LabelWorkflowJobUID: string(job.UID)}}}
 	clusterClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(run, newerRun, job, project, secret).Build()
+	workflowRunTTLSecondsAfterFinished := int32(604800)
 	handler, err := New(Config{
 		Client: clusterClient, Logs: &testLogSource{pod: pod, logs: "build output\n"}, Token: testConsoleToken,
-		SecretManagementNamespace: "default", SecureCookie: secureCookie, Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		SecretManagementNamespace: "default", WorkflowRunTTLSecondsAfterFinished: &workflowRunTTLSecondsAfterFinished,
+		SecureCookie: secureCookie, Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
 	})
 	if err != nil {
 		t.Fatal(err)

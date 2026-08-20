@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -32,6 +33,16 @@ func runConsole(ctx context.Context, arguments []string) error {
 	bindAddress := flags.String("bind-address", ":8080", "Address used by the Console HTTP server")
 	tokenFile := flags.String("token-file", "", "File containing the Console administrator token")
 	secretManagementNamespace := flags.String("secret-management-namespace", "", "Namespace in which Console administrators may manage Project Secrets")
+	var workflowRunTTLSecondsAfterFinished *int32
+	flags.Func("workflow-run-ttl-seconds-after-finished", "Default spec.ttlSecondsAfterFinished for Console-generated WorkflowRuns; omit the flag to retain them indefinitely", func(value string) error {
+		seconds, err := strconv.ParseInt(value, 10, 32)
+		if err != nil || seconds < 0 {
+			return fmt.Errorf("must be an integer between 0 and %d", int64(1<<31-1))
+		}
+		parsed := int32(seconds)
+		workflowRunTTLSecondsAfterFinished = &parsed
+		return nil
+	})
 	secureCookie := flags.Bool("secure-cookie", false, "Restrict the Console session cookie to HTTPS")
 	if err := flags.Parse(arguments); err != nil {
 		return err
@@ -63,7 +74,8 @@ func runConsole(ctx context.Context, arguments []string) error {
 	}
 	handler, err := console.New(console.Config{
 		Client: kubernetesClient, Logs: console.NewKubernetesLogSource(clientset),
-		Token: token, SecretManagementNamespace: *secretManagementNamespace, SecureCookie: *secureCookie, Logger: logger,
+		Token: token, SecretManagementNamespace: *secretManagementNamespace, WorkflowRunTTLSecondsAfterFinished: workflowRunTTLSecondsAfterFinished,
+		SecureCookie: *secureCookie, Logger: logger,
 	})
 	if err != nil {
 		return fmt.Errorf("configure Console: %w", err)
