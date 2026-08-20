@@ -37,6 +37,7 @@ import (
 
 const (
 	jobPlanKey                       = "job.json"
+	jobNeedsKey                      = "needs.json"
 	maxJobPlanBytes                  = 900_000
 	resourceNameMaxLength            = 63
 	workflowJobNameDigestLength      = 16
@@ -71,6 +72,18 @@ func (e *terminalPlanningError) Error() string {
 }
 
 func (e *terminalPlanningError) Unwrap() error {
+	return e.cause
+}
+
+type terminalNeedsContextError struct {
+	cause error
+}
+
+func (e *terminalNeedsContextError) Error() string {
+	return e.cause.Error()
+}
+
+func (e *terminalNeedsContextError) Unwrap() error {
 	return e.cause
 }
 
@@ -1457,6 +1470,44 @@ func (r *WorkflowRunReconciler) ensurePlanConfigMap(ctx context.Context, workflo
 	return nil
 }
 
+func (r *WorkflowRunReconciler) ensureNeedsContextConfigMap(ctx context.Context, workflowJob *actionsv1alpha1.WorkflowJob, needs runner.Needs) error {
+	data, err := runner.EncodeNeedsContext(needs)
+	if err != nil {
+		return &terminalNeedsContextError{cause: fmt.Errorf("encode needs context for WorkflowJob %q: %w", workflowJob.Name, err)}
+	}
+	configMap := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      childName(workflowJob.Name, "needs"),
+			Namespace: workflowJob.Namespace,
+			Labels: map[string]string{
+				actionsv1alpha1.LabelWorkflowRunUID: workflowJob.Labels[actionsv1alpha1.LabelWorkflowRunUID],
+				actionsv1alpha1.LabelWorkflowJobUID: string(workflowJob.UID),
+			},
+		},
+		Immutable: pointerTo(true),
+		Data:      map[string]string{jobNeedsKey: string(data)},
+	}
+	if err := controllerutil.SetControllerReference(workflowJob, configMap, r.Scheme()); err != nil {
+		return &terminalNeedsContextError{cause: fmt.Errorf("set WorkflowJob %q as owner of needs context ConfigMap %q: %w", workflowJob.Name, configMap.Name, err)}
+	}
+	if err := r.Create(ctx, configMap); err != nil {
+		if !apierrors.IsAlreadyExists(err) {
+			return fmt.Errorf("create needs context ConfigMap %q for WorkflowJob %q: %w", configMap.Name, workflowJob.Name, err)
+		}
+		existing := &corev1.ConfigMap{}
+		if err := r.APIReader.Get(ctx, client.ObjectKeyFromObject(configMap), existing); err != nil {
+			return fmt.Errorf("get existing needs context ConfigMap %q for WorkflowJob %q: %w", configMap.Name, workflowJob.Name, err)
+		}
+		if !metav1.IsControlledBy(existing, workflowJob) {
+			return &terminalNeedsContextError{cause: fmt.Errorf("needs context ConfigMap %q is not controlled by WorkflowJob %q", existing.Name, workflowJob.Name)}
+		}
+		if existing.Immutable == nil || !*existing.Immutable || existing.Data[jobNeedsKey] != string(data) {
+			return &terminalNeedsContextError{cause: fmt.Errorf("needs context ConfigMap %q does not contain the expected immutable snapshot", existing.Name)}
+		}
+	}
+	return nil
+}
+
 func (r *WorkflowRunReconciler) jobPlan(run *actionsv1alpha1.WorkflowRun, workflowName, id string, workflowEnv map[string]string, job workflow.Job, matrix, inputValues map[string]any, timeoutSeconds int64) (*runner.Plan, error) {
 	githubSource := run.Spec.Source.GitHub
 	identity := run.Status.Identity
@@ -1872,10 +1923,11 @@ func (r *WorkflowRunReconciler) reconcileWorkflowJobGraph(ctx context.Context, r
 			continue
 		}
 
+		needsContext := workflowNeedsContext(job, jobsByLogicalID)
 		expressionContext := workflowexpression.Context{Status: workflowJobAncestorStatus(job, jobsByLogicalID, run.Spec.CancelRequested)}
 		if strings.TrimSpace(job.Spec.If) != "" {
 			expressionContext = r.jobExpressionContext(run, workflowName, inputValues, variables, eventPayload)
-			expressionContext.Values["needs"] = workflowNeedsContext(job, jobsByLogicalID)
+			expressionContext.Values["needs"] = needsContext.ExpressionValues()
 			expressionContext.Status = workflowJobAncestorStatus(job, jobsByLogicalID, run.Spec.CancelRequested)
 		}
 		runnable, err := workflow.EvaluateJobCondition(job.Spec.JobID, job.Spec.If, expressionContext)
@@ -1903,6 +1955,18 @@ func (r *WorkflowRunReconciler) reconcileWorkflowJobGraph(ctx context.Context, r
 			}
 			continue
 		}
+		if len(job.Spec.Needs) > 0 {
+			if err := r.ensureNeedsContextConfigMap(ctx, job, needsContext); err != nil {
+				terminal := &terminalNeedsContextError{}
+				if !errors.As(err, &terminal) {
+					return err
+				}
+				if statusErr := r.completeUnscheduledWorkflowJob(ctx, job, actionsv1alpha1.WorkflowJobResultFailure, "PlanUnavailable", err.Error()); statusErr != nil {
+					return statusErr
+				}
+				continue
+			}
+		}
 		if err := r.setWorkflowJobReady(ctx, job); err != nil {
 			return err
 		}
@@ -1914,7 +1978,7 @@ func (r *WorkflowRunReconciler) reconcileAssignedWorkflowJobCancellation(ctx con
 	expressionContext := workflowexpression.Context{Status: workflowJobAncestorStatus(job, jobs, true)}
 	if strings.TrimSpace(job.Spec.If) != "" {
 		expressionContext = r.jobExpressionContext(run, workflowName, inputValues, variables, eventPayload)
-		expressionContext.Values["needs"] = workflowNeedsContext(job, jobs)
+		expressionContext.Values["needs"] = workflowNeedsContext(job, jobs).ExpressionValues()
 		expressionContext.Status = workflowJobAncestorStatus(job, jobs, true)
 	}
 	continueRunning, err := workflow.EvaluateJobCondition(job.Spec.JobID, job.Spec.If, expressionContext)
@@ -1931,23 +1995,20 @@ func (r *WorkflowRunReconciler) reconcileAssignedWorkflowJobCancellation(ctx con
 	return r.setWorkflowJobCancellationRequested(ctx, job, true, "CancellationRequested", "The workflow job condition does not permit execution during cancellation")
 }
 
-func workflowNeedsContext(job *actionsv1alpha1.WorkflowJob, jobs map[string][]*actionsv1alpha1.WorkflowJob) map[string]any {
-	needs := make(map[string]any, len(job.Spec.Needs))
+func workflowNeedsContext(job *actionsv1alpha1.WorkflowJob, jobs map[string][]*actionsv1alpha1.WorkflowJob) runner.Needs {
+	needs := make(runner.Needs, len(job.Spec.Needs))
 	for _, dependency := range job.Spec.Needs {
 		dependencyJobs := append([]*actionsv1alpha1.WorkflowJob(nil), jobs[dependency]...)
 		sort.Slice(dependencyJobs, func(left, right int) bool {
 			return dependencyJobs[left].Spec.JobID < dependencyJobs[right].Spec.JobID
 		})
-		outputs := map[string]any{}
+		outputs := map[string]string{}
 		for _, dependencyJob := range dependencyJobs {
 			for name, value := range dependencyJob.Status.Outputs {
 				outputs[name] = value
 			}
 		}
-		needs[dependency] = map[string]any{
-			"result":  string(workflowJobGroupResult(dependencyJobs)),
-			"outputs": outputs,
-		}
+		needs[dependency] = runner.Need{Result: string(workflowJobGroupResult(dependencyJobs)), Outputs: outputs}
 	}
 	return needs
 }

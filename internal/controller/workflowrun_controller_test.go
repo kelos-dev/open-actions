@@ -363,6 +363,9 @@ func TestWorkflowJobGraphSchedulesAndPropagatesResults(t *testing.T) {
 	if err := actionsv1alpha1.AddToScheme(scheme); err != nil {
 		t.Fatal(err)
 	}
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
 	run := &actionsv1alpha1.WorkflowRun{
 		ObjectMeta: metav1.ObjectMeta{Name: "ci", Namespace: "default", UID: types.UID("run-uid")},
 		Spec: actionsv1alpha1.WorkflowRunSpec{Source: actionsv1alpha1.WorkflowRunSource{
@@ -447,6 +450,36 @@ func TestWorkflowJobGraphSchedulesAndPropagatesResults(t *testing.T) {
 			}
 		})
 	}
+
+	inputNeeds := &corev1.ConfigMap{}
+	if err := clusterClient.Get(context.Background(), client.ObjectKey{Namespace: run.Namespace, Name: childName("input-condition", "needs")}, inputNeeds); err != nil {
+		t.Fatal(err)
+	}
+	if inputNeeds.Immutable == nil || !*inputNeeds.Immutable {
+		t.Fatal("needs context ConfigMap is mutable")
+	}
+	inputSnapshot, err := runner.DecodeNeedsContext([]byte(inputNeeds.Data[jobNeedsKey]))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(inputSnapshot) != 1 || inputSnapshot["build"].Result != "success" || inputSnapshot["build"].Outputs["artifact"] != "ready" {
+		t.Fatalf("input-condition needs = %#v", inputSnapshot)
+	}
+
+	diamondNeeds := &corev1.ConfigMap{}
+	if err := clusterClient.Get(context.Background(), client.ObjectKey{Namespace: run.Namespace, Name: childName("diamond-report", "needs")}, diamondNeeds); err != nil {
+		t.Fatal(err)
+	}
+	diamondSnapshot, err := runner.DecodeNeedsContext([]byte(diamondNeeds.Data[jobNeedsKey]))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(diamondSnapshot) != 2 || diamondSnapshot["left"].Result != "success" || diamondSnapshot["right"].Result != "success" {
+		t.Fatalf("diamond-report needs = %#v", diamondSnapshot)
+	}
+	if _, found := diamondSnapshot["build"]; found {
+		t.Fatalf("diamond-report includes transitive dependency: %#v", diamondSnapshot)
+	}
 }
 
 func TestWorkflowJobGraphRetriesUnavailableVariables(t *testing.T) {
@@ -502,6 +535,9 @@ func TestWorkflowJobGraphWaitsForMatrixDependencies(t *testing.T) {
 	if err := actionsv1alpha1.AddToScheme(scheme); err != nil {
 		t.Fatal(err)
 	}
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
 	run := &actionsv1alpha1.WorkflowRun{
 		ObjectMeta: metav1.ObjectMeta{Name: "release", Namespace: "default", UID: types.UID("run-uid")},
 		Spec: actionsv1alpha1.WorkflowRunSpec{Source: actionsv1alpha1.WorkflowRunSource{
@@ -514,6 +550,10 @@ func TestWorkflowJobGraphWaitsForMatrixDependencies(t *testing.T) {
 		}},
 	}
 	matrixJob := func(id, arch string, result actionsv1alpha1.WorkflowJobResult) *actionsv1alpha1.WorkflowJob {
+		outputs := map[string]string{"artifact": arch}
+		for index := 0; index < 51; index++ {
+			outputs[fmt.Sprintf("%s_%d", arch, index)] = "available"
+		}
 		return &actionsv1alpha1.WorkflowJob{
 			ObjectMeta: metav1.ObjectMeta{Name: id, Namespace: run.Namespace},
 			Spec: actionsv1alpha1.WorkflowJobSpec{
@@ -523,7 +563,7 @@ func TestWorkflowJobGraphWaitsForMatrixDependencies(t *testing.T) {
 					Values:       map[string]string{"arch": arch},
 				},
 			},
-			Status: actionsv1alpha1.WorkflowJobStatus{Result: result, Outputs: map[string]string{"artifact": arch}},
+			Status: actionsv1alpha1.WorkflowJobStatus{Result: result, Outputs: outputs},
 		}
 	}
 	amd64 := matrixJob("build-matrix-1", "amd64", actionsv1alpha1.WorkflowJobResultSuccess)
@@ -579,6 +619,20 @@ func TestWorkflowJobGraphWaitsForMatrixDependencies(t *testing.T) {
 	ready = meta.FindStatusCondition(storedReport.Status.Conditions, actionsv1alpha1.WorkflowJobConditionReady)
 	if ready == nil || ready.Status != metav1.ConditionTrue {
 		t.Fatalf("ready condition after matrix completion = %#v", ready)
+	}
+	needsConfigMap := &corev1.ConfigMap{}
+	if err := clusterClient.Get(context.Background(), client.ObjectKey{Namespace: run.Namespace, Name: childName(report.Name, "needs")}, needsConfigMap); err != nil {
+		t.Fatal(err)
+	}
+	needs, err := runner.DecodeNeedsContext([]byte(needsConfigMap.Data[jobNeedsKey]))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(needs) != 1 || needs["build"].Result != "success" || needs["build"].Outputs["artifact"] != "arm64" || len(needs["build"].Outputs) != 103 {
+		t.Fatalf("matrix needs = %#v", needs)
+	}
+	if err := reconciler.ensureNeedsContextConfigMap(context.Background(), storedReport, needs); err != nil {
+		t.Fatalf("reconcile persisted needs context after restart: %v", err)
 	}
 }
 

@@ -11,10 +11,10 @@ import (
 )
 
 var (
-	runnerJobAvailability          = workflowexpression.NewAvailability("github", "open_actions", "matrix", "vars", "secrets", "inputs")
+	runnerJobAvailability          = workflowexpression.NewAvailability("github", "open_actions", "matrix", "needs", "vars", "secrets", "inputs")
 	actionDefaultAvailability      = workflowexpression.NewAvailability("github", "open_actions")
-	runnerStepAvailability         = workflowexpression.NewAvailability("github", "open_actions", "matrix", "runner", "env", "vars", "secrets", "inputs", "steps").WithHashFiles()
-	runnerConditionAvailability    = workflowexpression.NewAvailability("github", "open_actions", "matrix", "runner", "env", "vars", "inputs", "steps").WithStatusFunctions().WithHashFiles()
+	runnerStepAvailability         = workflowexpression.NewAvailability("github", "open_actions", "matrix", "needs", "runner", "env", "vars", "secrets", "inputs", "steps").WithHashFiles()
+	runnerConditionAvailability    = workflowexpression.NewAvailability("github", "open_actions", "matrix", "needs", "runner", "env", "vars", "inputs", "steps").WithStatusFunctions().WithHashFiles()
 	compositeAvailability          = workflowexpression.NewAvailability("github", "open_actions", "runner", "env", "inputs", "steps").WithHashFiles()
 	compositeConditionAvailability = workflowexpression.NewAvailability("github", "open_actions", "runner", "env", "inputs", "steps").WithStatusFunctions().WithHashFiles()
 )
@@ -142,6 +142,7 @@ func expressionContext(plan *Plan, environment []string, actionPath string, extr
 		},
 		"inputs":  plan.Inputs,
 		"matrix":  plan.Matrix,
+		"needs":   plan.Needs.ExpressionValues(),
 		"secrets": secretContext(token, secrets),
 		"vars":    variables,
 		"runner": map[string]any{

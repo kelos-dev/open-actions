@@ -481,10 +481,10 @@ evaluation when the corresponding execution feature has not supplied it.
 | Workflow environment | `github`, `open_actions`, `secrets`, `inputs`, `vars` | All listed contexts |
 | Workflow job condition | `github`, `open_actions`, `needs`, `vars`, `inputs`, and status functions | `github`, `open_actions`, direct dependency results and outputs, `vars`, `inputs`, and status functions |
 | Job name, timeout, and runner labels | `github`, `open_actions`, `needs`, `strategy`, `matrix`, `vars`, `inputs` | `github`, `open_actions`, `inputs`, `vars`, and `matrix` for matrix jobs |
-| Job environment | `github`, `open_actions`, `needs`, `strategy`, `matrix`, `vars`, `secrets`, `inputs` | `github`, `open_actions`, `inputs`, `vars`, `secrets`, and `matrix` for matrix jobs |
-| Workflow step name, run script, working directory, environment, and inputs | `github`, `open_actions`, `needs`, `strategy`, `matrix`, `job`, `runner`, `env`, `vars`, `secrets`, `steps`, `inputs`, and `hashFiles` | `github`, `open_actions`, `matrix`, `runner`, `env`, `vars`, `secrets`, `inputs`, `steps`, and `hashFiles` |
-| Workflow step condition | Step contexts except `secrets`, plus status functions and `hashFiles` | `github`, `open_actions`, `matrix`, `runner`, `env`, `vars`, `inputs`, `steps`, status functions, and `hashFiles` |
-| Job outputs | Workflow step contexts without `hashFiles` | `github`, `open_actions`, `matrix`, `runner`, `env`, `vars`, `secrets`, `inputs`, `steps` |
+| Job environment | `github`, `open_actions`, `needs`, `strategy`, `matrix`, `vars`, `secrets`, `inputs` | `github`, `open_actions`, direct dependency results and outputs, `inputs`, `vars`, `secrets`, and `matrix` for matrix jobs |
+| Workflow step name, run script, working directory, environment, and inputs | `github`, `open_actions`, `needs`, `strategy`, `matrix`, `job`, `runner`, `env`, `vars`, `secrets`, `steps`, `inputs`, and `hashFiles` | `github`, `open_actions`, direct dependency results and outputs, `matrix`, `runner`, `env`, `vars`, `secrets`, `inputs`, `steps`, and `hashFiles` |
+| Workflow step condition | Step contexts except `secrets`, plus status functions and `hashFiles` | `github`, `open_actions`, direct dependency results and outputs, `matrix`, `runner`, `env`, `vars`, `inputs`, `steps`, status functions, and `hashFiles` |
+| Job outputs | Workflow step contexts without `hashFiles` | `github`, `open_actions`, direct dependency results and outputs, `matrix`, `runner`, `env`, `vars`, `secrets`, `inputs`, `steps` |
 | Composite step fields and outputs | `github`, `open_actions`, `runner`, `env`, `inputs`, `steps`, and `hashFiles` | All listed contexts and functions |
 | Composite step condition | Composite contexts, status functions, and `hashFiles` | All listed contexts and functions |
 | Action input default | `github`, `open_actions` | All listed contexts |
@@ -593,11 +593,23 @@ without an explicit status function also require successful ancestors.
 `failure()` includes failures anywhere in the transitive dependency chain,
 while the `needs` context contains only direct dependencies. Each direct entry
 supplies `needs.<job>.result` as `success`, `failure`, `skipped`, or `cancelled`
-and exposes persisted values through `needs.<job>.outputs`. A matrix dependency
-becomes terminal only after every expanded job finishes, and its child results
-are aggregated under the logical job ID. A false condition records the job as
-skipped without assigning a Runner. `always()`, `failure()`, and `cancelled()`
-can allow report or cleanup jobs to run after unsuccessful dependencies.
+and exposes persisted values through `needs.<job>.outputs`. Missing output
+properties evaluate to an empty string. Outputs omitted as sensitive are not
+present in this context.
+
+The controller records one immutable, versioned dependency snapshot after all
+direct dependencies finish and before the dependent job becomes runnable. The
+same snapshot is used for the job environment, every workflow step expression,
+and job outputs, and remains available across controller restarts. The encoded
+snapshot is limited to 900,000 bytes; a snapshot that exceeds the limit fails
+the dependent job with reason `PlanUnavailable`. Jobs cannot access entries
+they did not name in `needs`.
+
+A matrix dependency becomes terminal only after every expanded job finishes,
+and its child results and outputs are aggregated under the logical job ID. A
+false condition records the job as skipped without assigning a Runner.
+`always()`, `failure()`, and `cancelled()` can allow report or cleanup jobs to
+run after unsuccessful dependencies.
 
 Graceful cancellation sets `spec.cancelRequested`. Assigned jobs are cancelled
 unless their job condition still evaluates to true, and unassigned jobs are

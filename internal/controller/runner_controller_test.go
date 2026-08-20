@@ -204,6 +204,31 @@ func TestRunnerUsesDefaultDeadlineWhenWorkflowJobOmitsTimeout(t *testing.T) {
 	}
 }
 
+func TestRunnerMountsNeedsContextForDependentJob(t *testing.T) {
+	scheme := runnerTestScheme(t)
+	reconciler := &RunnerReconciler{Client: fake.NewClientBuilder().WithScheme(scheme).Build()}
+	workflowJob := &actionsv1alpha1.WorkflowJob{
+		ObjectMeta: metav1.ObjectMeta{Name: "report", Namespace: "default", UID: types.UID("job-uid")},
+		Spec:       actionsv1alpha1.WorkflowJobSpec{Needs: []string{"build"}},
+	}
+	runnerObject := &actionsv1alpha1.Runner{Spec: actionsv1alpha1.RunnerSpec{Execution: actionsv1alpha1.RunnerExecutionSpec{Image: "runner:test"}}}
+	job, err := reconciler.buildJob(workflowJob, &actionsv1alpha1.WorkflowRun{}, &actionsv1alpha1.Project{}, runnerObject)
+	if err != nil {
+		t.Fatal(err)
+	}
+	container := job.Spec.Template.Spec.Containers[0]
+	if !slices.Contains(container.Args, "--needs-file="+jobNeedsMountPath+"/"+jobNeedsKey) ||
+		!slices.Contains(container.VolumeMounts, corev1.VolumeMount{Name: jobNeedsVolume, MountPath: jobNeedsMountPath, ReadOnly: true}) {
+		t.Fatalf("runner needs context configuration = args %#v, mounts %#v", container.Args, container.VolumeMounts)
+	}
+	for _, volume := range job.Spec.Template.Spec.Volumes {
+		if volume.Name == jobNeedsVolume && volume.ConfigMap != nil && volume.ConfigMap.Name == childName(workflowJob.Name, "needs") {
+			return
+		}
+	}
+	t.Fatalf("runner volumes = %#v", job.Spec.Template.Spec.Volumes)
+}
+
 func TestRunnerBuildsJobWithProjectValues(t *testing.T) {
 	scheme := runnerTestScheme(t)
 	reconciler := &RunnerReconciler{Client: fake.NewClientBuilder().WithScheme(scheme).Build()}
@@ -1215,6 +1240,63 @@ func TestMissingPlanFailsAssignedWorkflowJob(t *testing.T) {
 	}
 	condition := meta.FindStatusCondition(stored.Status.Conditions, actionsv1alpha1.WorkflowJobConditionSucceeded)
 	if condition == nil || condition.Status != metav1.ConditionFalse || condition.Reason != "PlanUnavailable" {
+		t.Fatalf("succeeded condition = %#v", condition)
+	}
+	if err := clusterClient.Get(context.Background(), client.ObjectKeyFromObject(authSecret), &corev1.Secret{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("authentication Secret still exists: %v", err)
+	}
+}
+
+func TestMissingNeedsContextFailsAssignedWorkflowJob(t *testing.T) {
+	scheme := runnerTestScheme(t)
+	run := &actionsv1alpha1.WorkflowRun{
+		TypeMeta:   metav1.TypeMeta{APIVersion: actionsv1alpha1.GroupVersion.String(), Kind: "WorkflowRun"},
+		ObjectMeta: metav1.ObjectMeta{Name: "ci", Namespace: "default", UID: types.UID("run-uid")},
+		Spec:       actionsv1alpha1.WorkflowRunSpec{ProjectRef: corev1.LocalObjectReference{Name: "project"}},
+	}
+	workflowJob := &actionsv1alpha1.WorkflowJob{
+		TypeMeta: metav1.TypeMeta{APIVersion: actionsv1alpha1.GroupVersion.String(), Kind: "WorkflowJob"},
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "report", Namespace: "default", UID: types.UID("job-uid"),
+		},
+		Spec: actionsv1alpha1.WorkflowJobSpec{
+			WorkflowRunRef: corev1.LocalObjectReference{Name: run.Name},
+			Needs:          []string{"build"},
+		},
+		Status: actionsv1alpha1.WorkflowJobStatus{RunnerRef: &corev1.LocalObjectReference{Name: "runner"}},
+	}
+	if err := controllerutil.SetControllerReference(run, workflowJob, scheme); err != nil {
+		t.Fatal(err)
+	}
+	plan := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: childName(workflowJob.Name, "plan"), Namespace: workflowJob.Namespace}}
+	if err := controllerutil.SetControllerReference(workflowJob, plan, scheme); err != nil {
+		t.Fatal(err)
+	}
+	authSecret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: childName(workflowJob.Name, "auth"), Namespace: workflowJob.Namespace}}
+	if err := controllerutil.SetControllerReference(workflowJob, authSecret, scheme); err != nil {
+		t.Fatal(err)
+	}
+	project := &actionsv1alpha1.Project{ObjectMeta: metav1.ObjectMeta{Name: "project", Namespace: "default"}}
+	runnerObject := &actionsv1alpha1.Runner{ObjectMeta: metav1.ObjectMeta{Name: "runner", Namespace: "default"}}
+	clusterClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&actionsv1alpha1.WorkflowJob{}).
+		WithObjects(run, workflowJob, plan, authSecret).
+		Build()
+	reconciler := &RunnerReconciler{Client: clusterClient, APIReader: clusterClient}
+	terminal, err := reconciler.executeWorkflowJob(context.Background(), runnerObject, workflowJob, project)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !terminal {
+		t.Fatal("missing needs context did not terminate the WorkflowJob")
+	}
+	stored := &actionsv1alpha1.WorkflowJob{}
+	if err := clusterClient.Get(context.Background(), client.ObjectKeyFromObject(workflowJob), stored); err != nil {
+		t.Fatal(err)
+	}
+	condition := meta.FindStatusCondition(stored.Status.Conditions, actionsv1alpha1.WorkflowJobConditionSucceeded)
+	if condition == nil || condition.Status != metav1.ConditionFalse || condition.Reason != "PlanUnavailable" || !strings.Contains(condition.Message, "Needs context ConfigMap") {
 		t.Fatalf("succeeded condition = %#v", condition)
 	}
 	if err := clusterClient.Get(context.Background(), client.ObjectKeyFromObject(authSecret), &corev1.Secret{}); !apierrors.IsNotFound(err) {

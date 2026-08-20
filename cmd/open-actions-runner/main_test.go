@@ -61,6 +61,66 @@ echo 'value=ready' >> "$GITHUB_OUTPUT"`,
 	}
 }
 
+func TestRunLoadsNeedsContext(t *testing.T) {
+	directory := t.TempDir()
+	plan := runner.Plan{
+		Version: runner.PlanVersion,
+		Run:     runner.Run{ID: 1, Number: 1, Attempt: 1, Actor: "octocat"},
+		Repository: runner.Repository{
+			ID: 1, Owner: "acme", Name: "example", ServerURL: "https://github.com", APIURL: "https://api.github.com", ActionCloneBaseURL: "https://github.com",
+		},
+		Event:                 runner.Event{Name: "push", DeliveryID: "delivery"},
+		Revision:              runner.Revision{SHA: strings.Repeat("a", 40), Ref: "refs/heads/main", RefName: "main"},
+		WorkflowName:          "CI",
+		JobID:                 "report",
+		TimeoutSeconds:        int64((6 * time.Hour) / time.Second),
+		CleanupTimeoutSeconds: int64(runner.CleanupTimeout / time.Second),
+		Outputs:               map[string]string{"artifact": "${{ needs.build.outputs.artifact }}"},
+		Steps: []runner.Step{{
+			If:  "needs.build.result == 'success'",
+			Run: `test "${{ needs.build.outputs.artifact }}" = ready`,
+		}},
+	}
+	planData, err := json.Marshal(plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	planPath := filepath.Join(directory, "plan.json")
+	if err := os.WriteFile(planPath, planData, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	needsData, err := runner.EncodeNeedsContext(runner.Needs{"build": {Result: "success", Outputs: map[string]string{"artifact": "ready"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	needsPath := filepath.Join(directory, "needs.json")
+	if err := os.WriteFile(needsPath, needsData, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(runner.GitHubTokenEnvVar, "installation-token")
+	t.Setenv(runner.ActionTokenEnvVar, "action-installation-token")
+	resultPath := filepath.Join(directory, "result.json")
+	if err := run(context.Background(), []string{
+		"--job-file=" + planPath,
+		"--needs-file=" + needsPath,
+		"--result-file=" + resultPath,
+		"--workspace=" + filepath.Join(directory, "workspace"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	resultData, err := os.ReadFile(resultPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := runner.DecodeResult(resultData)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Conclusion != runner.ResultConclusionSuccess || result.Outputs["artifact"] != "ready" {
+		t.Fatalf("result = %#v", result)
+	}
+}
+
 func TestWithoutEnvironmentVariables(t *testing.T) {
 	environment := withoutEnvironmentVariables([]string{
 		"PATH=/usr/bin",
