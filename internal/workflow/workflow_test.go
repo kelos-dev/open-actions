@@ -792,6 +792,31 @@ func TestParseAcceptsStepIDsAndJobOutputs(t *testing.T) {
 	}
 }
 
+func TestParseAcceptsWorkflowEnvironment(t *testing.T) {
+	definition, err := Parse([]byte("name: CI\non: workflow_dispatch\nenv:\n  REPOSITORY: '${{ github.repository }}'\n  TOKEN: '${{ secrets.TOKEN }}'\n  TARGET: '${{ inputs.target }}'\n  REGION: '${{ vars.REGION }}'\n  ENABLED: true\n" + minimalJob))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if definition.Env["REPOSITORY"] != "${{ github.repository }}" || definition.Env["ENABLED"] != true {
+		t.Fatalf("workflow environment = %#v", definition.Env)
+	}
+}
+
+func TestParseRejectsInvalidWorkflowEnvironment(t *testing.T) {
+	tests := []string{
+		"  '': value\n",
+		"  " + strings.Repeat("K", maxMapKeyLength+1) + ": value\n",
+		"  VALUE: [not, scalar]\n",
+		"  VALUE: " + strings.Repeat("x", MaxMapValueBytes+1) + "\n",
+	}
+	for _, environment := range tests {
+		data := "name: CI\non: push\nenv:\n" + environment + minimalJob
+		if _, err := Parse([]byte(data)); err == nil {
+			t.Fatal("Parse() accepted an invalid workflow environment")
+		}
+	}
+}
+
 func TestParseRejectsInvalidOrDuplicateStepIDs(t *testing.T) {
 	for _, steps := range []string{
 		"      - id: 1build\n        run: true\n",
@@ -890,6 +915,14 @@ func TestParseRejectsInvalidOrUnavailableWorkflowExpressions(t *testing.T) {
 			data: "name: CI\non: push\nconcurrency: '${{ secrets.TOKEN }}'\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo test\n",
 		},
 		{
+			name: "workflow environment dependency",
+			data: "name: CI\non: push\nenv:\n  FIRST: value\n  SECOND: '${{ env.FIRST }}'\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo test\n",
+		},
+		{
+			name: "matrix in workflow environment",
+			data: "name: CI\non: push\nenv:\n  ARCH: '${{ matrix.arch }}'\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo test\n",
+		},
+		{
 			name: "hash files in job environment",
 			data: "name: CI\non: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    env:\n      HASH: \"${{ hashFiles('**') }}\"\n    steps:\n      - run: echo test\n",
 		},
@@ -909,12 +942,12 @@ func TestParseRejectsInvalidOrUnavailableWorkflowExpressions(t *testing.T) {
 
 func TestParseRejectsReservedEnvironmentVariables(t *testing.T) {
 	tests := []string{
-		"    env:\n      GITHUB_SHA: untrusted\n    steps:\n      - run: echo test\n",
-		"    steps:\n      - run: echo test\n        env:\n          runner_os: Other\n",
+		"name: CI\non: push\nenv:\n  github_sha: untrusted\n" + minimalJob,
+		"name: CI\non: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    env:\n      GITHUB_SHA: untrusted\n    steps:\n      - run: echo test\n",
+		"name: CI\non: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo test\n        env:\n          runner_os: Other\n",
 	}
-	for _, job := range tests {
-		data := []byte("name: CI\non: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n" + job)
-		if _, err := Parse(data); err == nil {
+	for _, data := range tests {
+		if _, err := Parse([]byte(data)); err == nil {
 			t.Fatal("Parse() accepted a reserved environment variable")
 		}
 	}
@@ -1015,8 +1048,10 @@ func TestParseEnforcesWorkflowConfigurationBounds(t *testing.T) {
 		{name: "condition", data: base + "      - if: ${{ '" + strings.Repeat("x", MaxConditionBytes+1) + "' }}\n        run: true\n"},
 		{name: "aggregate job content", data: base + "      - run: " + strings.Repeat("x", 60_000) + "\n      - run: " + strings.Repeat("x", 60_000) + "\n"},
 		{name: "condition aggregate content", data: base + "      - if: ${{ '" + strings.Repeat("x", 50_000) + "' }}\n        run: " + strings.Repeat("x", 60_000) + "\n"},
+		{name: "workflow environment aggregate content", data: "name: CI\non: push\nenv:\n  VALUE: " + strings.Repeat("x", 50_000) + "\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: " + strings.Repeat("x", 60_000) + "\n"},
 		{name: "branch patterns", data: workflowWithBranchPatterns(maxBranchPatterns + 1)},
 		{name: "environment entries", data: workflowWithEnvironment(maxMapEntries + 1)},
+		{name: "workflow environment entries", data: workflowWithWorkflowEnvironment(maxMapEntries + 1)},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -1049,6 +1084,16 @@ func workflowWithEnvironment(count int) string {
 		fmt.Fprintf(&builder, "      KEY_%d: value\n", index)
 	}
 	builder.WriteString("    steps:\n      - run: true\n")
+	return builder.String()
+}
+
+func workflowWithWorkflowEnvironment(count int) string {
+	var builder strings.Builder
+	builder.WriteString("name: CI\non: push\nenv:\n")
+	for index := 0; index < count; index++ {
+		fmt.Fprintf(&builder, "  KEY_%d: value\n", index)
+	}
+	builder.WriteString(minimalJob)
 	return builder.String()
 }
 

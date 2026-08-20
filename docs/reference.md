@@ -350,6 +350,28 @@ Workflow files must define a non-empty `name` of at most 256 characters.
 Unsupported workflow fields and action reference forms are rejected during
 planning. Unsupported action runtimes fail explicitly during execution.
 
+### Workflow, job, and step environments
+
+A top-level `env` map supplies defaults to every job in a workflow. A job-level
+entry overrides a workflow entry with the same name, and a step-level entry
+overrides both while that step executes. The effective environment is available
+to run steps, external actions, and composite actions. Step fields and action
+inputs that use the `env` context see the same effective values.
+
+Entries in an `env` map cannot depend on other entries in that map. In a step
+environment, an `env` expression sees only values inherited from the workflow
+and job, not entries being defined for that step. Each workflow, job, or step
+map may contain at most 100 entries. Names contain 1 to 256 characters and
+values are scalar values of at most 65,536 bytes. Names beginning with
+`GITHUB_` or `RUNNER_`, without regard to ASCII case, are reserved at every
+scope and are rejected.
+
+Environment expressions remain unresolved in controller-visible job plans.
+The runner resolves them when the job starts, so values derived from
+`github.token` or `secrets` do not enter custom resources, plan ConfigMaps,
+controller logs, or diagnostics and receive the masking behavior described
+under Project secrets and variables.
+
 ### Expressions
 
 Open Actions parses expression templates independently from YAML. A value made
@@ -383,6 +405,7 @@ evaluation when the corresponding execution feature has not supplied it.
 | Phase | Allowed contexts and functions | Currently supplied |
 | --- | --- | --- |
 | Workflow concurrency | `github`, `inputs`, `vars` | All listed contexts |
+| Workflow environment | `github`, `secrets`, `inputs`, `vars` | All listed contexts |
 | Workflow job condition | `github`, `needs`, `vars`, `inputs`, and status functions | `github`, direct dependency results and outputs, `vars`, `inputs`, and status functions |
 | Job name and runner labels | `github`, `needs`, `strategy`, `matrix`, `vars`, `inputs` | `github`, `inputs`, `vars`, and `matrix` for matrix jobs |
 | Job environment | `github`, `needs`, `strategy`, `matrix`, `vars`, `secrets`, `inputs` | `github`, `inputs`, `vars`, `secrets`, and `matrix` for matrix jobs |
@@ -663,7 +686,8 @@ Workflow definitions must satisfy these limits:
   output metadata.
 - A run script may contain at most 65,536 bytes.
 - A step condition may contain at most 65,536 bytes.
-- Each `env` or `with` map may contain at most 100 entries.
+- Each workflow, job, or step `env` map and each `with` map may contain at most
+  100 entries.
 
 Names, branch patterns, action references, paths, map keys, and values are also
 bounded during workflow validation. Field and aggregate content limits are
