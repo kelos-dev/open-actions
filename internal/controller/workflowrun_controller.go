@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"net/url"
 	"sort"
 	"strconv"
@@ -27,6 +28,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/client-go/tools/events"
 	"k8s.io/client-go/util/retry"
@@ -38,6 +40,8 @@ import (
 const (
 	jobPlanKey                       = "job.json"
 	jobNeedsKey                      = "needs.json"
+	matrixPlanKey                    = "matrix.json"
+	workflowPlanKey                  = "workflow.json"
 	maxJobPlanBytes                  = 900_000
 	resourceNameMaxLength            = 63
 	workflowJobNameDigestLength      = 16
@@ -427,18 +431,26 @@ func (r *WorkflowRunReconciler) reconcileWorkflowRun(ctx context.Context, run *a
 	if err != nil {
 		return r.planningEvaluationFailed(ctx, run, err)
 	}
-	plannedJobs, err := r.planWorkflowJobs(planningRun, definition, planningEvent.InputValues, variables, eventPayload)
+	plannedJobs, deferredMatrices, err := r.planWorkflowJobs(planningRun, definition, planningEvent.InputValues, variables, eventPayload)
 	if err != nil {
 		return r.planningEvaluationFailed(ctx, run, err)
+	}
+	if len(deferredMatrices) > 0 && run.Spec.Rerun != nil && len(run.Spec.Rerun.JobIDs) > 0 {
+		return r.planningFailed(ctx, run, "RerunInvalid", fmt.Errorf("WorkflowRun %q does not support selective reruns with dynamic matrices", run.Name), planningFailureTerminal)
 	}
 	plannedJobs, err = selectRerunWorkflowJobs(run, plannedJobs)
 	if err != nil {
 		return r.planningFailed(ctx, run, "RerunInvalid", err, planningFailureTerminal)
 	}
-	jobCount := int32(len(plannedJobs))
+	jobCount := int32(len(plannedJobs) + len(deferredMatrices))
 	run.Status.WorkflowName = definition.Name
 	run.Status.ConcurrencyGroup = concurrencyGroup
 	run.Status.Jobs = &actionsv1alpha1.WorkflowRunJobStatus{Total: jobCount}
+	if len(deferredMatrices) > 0 {
+		if err := r.ensureWorkflowPlan(ctx, run, project, plannedJobs, deferredMatrices); err != nil {
+			return r.planningFailed(ctx, run, "ChildCreationFailed", err, childCreationFailureDisposition(err))
+		}
+	}
 	if err := r.ensureWorkflowJobs(ctx, run, project, plannedJobs); err != nil {
 		return r.planningFailed(ctx, run, "ChildCreationFailed", err, childCreationFailureDisposition(err))
 	}
@@ -812,6 +824,22 @@ type plannedWorkflowJob struct {
 	timeoutSeconds int64
 }
 
+type deferredMatrixPlan struct {
+	JobID        string            `json:"jobID"`
+	WorkflowName string            `json:"workflowName"`
+	WorkflowEnv  map[string]string `json:"workflowEnv,omitempty"`
+	EventPayload map[string]any    `json:"eventPayload,omitempty"`
+	Variables    map[string]any    `json:"variables,omitempty"`
+	Job          workflow.Job      `json:"job"`
+	InputValues  map[string]any    `json:"inputValues,omitempty"`
+}
+
+type workflowPlanManifest struct {
+	JobIDs    []string          `json:"jobIDs"`
+	SourceIDs []string          `json:"sourceIDs"`
+	Matrices  map[string]string `json:"matrices"`
+}
+
 func selectRerunWorkflowJobs(run *actionsv1alpha1.WorkflowRun, plannedJobs []plannedWorkflowJob) ([]plannedWorkflowJob, error) {
 	if run.Spec.Rerun == nil || len(run.Spec.Rerun.JobIDs) == 0 {
 		return plannedJobs, nil
@@ -938,11 +966,13 @@ func (r *WorkflowRunReconciler) ensureWorkflowJobs(ctx context.Context, run *act
 	return nil
 }
 
-func (r *WorkflowRunReconciler) planWorkflowJobs(run *actionsv1alpha1.WorkflowRun, definition *workflow.Definition, inputValues map[string]any, variables any, eventPayload map[string]any) ([]plannedWorkflowJob, error) {
+func (r *WorkflowRunReconciler) planWorkflowJobs(run *actionsv1alpha1.WorkflowRun, definition *workflow.Definition, inputValues map[string]any, variables any, eventPayload map[string]any) ([]plannedWorkflowJob, []deferredMatrixPlan, error) {
 	workflowEnv, err := stringMap(definition.Env)
 	if err != nil {
-		return nil, fmt.Errorf("workflow env: %w", err)
+		return nil, nil, fmt.Errorf("workflow env: %w", err)
 	}
+	var variableSnapshot map[string]any
+	variablesSnapshotted := false
 	jobIDs := make([]string, 0, len(definition.Jobs))
 	for id := range definition.Jobs {
 		jobIDs = append(jobIDs, id)
@@ -950,73 +980,112 @@ func (r *WorkflowRunReconciler) planWorkflowJobs(run *actionsv1alpha1.WorkflowRu
 	sort.Strings(jobIDs)
 	plannedJobs := make([]plannedWorkflowJob, 0, len(jobIDs))
 	plannedIDs := make(map[string]struct{})
+	deferredMatrices := make([]deferredMatrixPlan, 0)
 	sourceIDs := make(map[string]struct{}, len(jobIDs))
 	for _, id := range jobIDs {
 		sourceIDs[id] = struct{}{}
 	}
 	for _, id := range jobIDs {
 		definitionJob := definition.Jobs[id]
-		combinations := workflow.MatrixCombinations(definitionJob.Strategy)
+		if workflow.MatrixUsesNeeds(definitionJob.Strategy) {
+			if !variablesSnapshotted {
+				variableSnapshot, err = snapshotExpressionVariables(variables)
+				if err != nil {
+					return nil, nil, err
+				}
+				variablesSnapshotted = true
+			}
+			deferredMatrices = append(deferredMatrices, deferredMatrixPlan{
+				JobID: id, WorkflowName: definition.Name, WorkflowEnv: workflowEnv, EventPayload: eventPayload, Variables: variableSnapshot, Job: definitionJob, InputValues: inputValues,
+			})
+			if len(plannedJobs)+len(deferredMatrices) > workflow.MaxJobs {
+				return nil, nil, fmt.Errorf("workflow expands to more than %d jobs", workflow.MaxJobs)
+			}
+			continue
+		}
+		expressionContext := r.jobExpressionContext(run, definition.Name, inputValues, variables, eventPayload)
+		combinations, err := workflow.EvaluateMatrix(id, definitionJob.Strategy, expressionContext)
+		if err != nil {
+			return nil, nil, err
+		}
 		if len(combinations) == 0 {
 			combinations = []map[string]any{nil}
 		}
-		for index, matrix := range combinations {
-			expandedID := id
-			var matrixSpec *actionsv1alpha1.WorkflowJobMatrix
-			if matrix != nil {
-				expandedID = uniqueMatrixWorkflowJobID(id, index, sourceIDs, plannedIDs)
-				matrixSpec = &actionsv1alpha1.WorkflowJobMatrix{
-					LogicalJobID: id,
-					Values:       matrixStringValues(matrix),
-					MaxParallel:  definitionJob.Strategy.MaxParallel,
-					FailFast:     pointerTo(definitionJob.Strategy.FailFast),
-				}
-			}
-			if _, found := plannedIDs[expandedID]; found {
-				return nil, fmt.Errorf("expanded job ID %q is not unique", expandedID)
-			}
-			plannedIDs[expandedID] = struct{}{}
-
-			expressionContext := r.jobExpressionContext(run, definition.Name, inputValues, variables, eventPayload)
-			if matrix != nil {
-				expressionContext.Availability = workflowexpression.NewAvailability("github", "open_actions", "matrix", "inputs", "vars")
-				expressionContext.Values["matrix"] = matrix
-			}
-			resolvedJob, err := workflow.EvaluateJob(id, definitionJob, expressionContext)
-			if err != nil {
-				return nil, err
-			}
-			displayName := resolvedJob.Name
-			if displayName == "" {
-				displayName = id
-			}
-			if matrix != nil {
-				displayName = matrixDisplayName(displayName, matrix, index)
-			}
-			timeoutSeconds := r.effectiveJobTimeoutSeconds(resolvedJob.TimeoutMinutes.Minutes())
-			plan, err := r.jobPlan(run, definition.Name, id, workflowEnv, resolvedJob, matrix, inputValues, timeoutSeconds)
-			if err != nil {
-				return nil, err
-			}
-			data, err := json.Marshal(plan)
-			if err != nil {
-				return nil, fmt.Errorf("encode job plan: %w", err)
-			}
-			if len(data) > maxJobPlanBytes {
-				return nil, fmt.Errorf("job plan for %q exceeds %d bytes", expandedID, maxJobPlanBytes)
-			}
-			plannedJobs = append(plannedJobs, plannedWorkflowJob{
-				id:             expandedID,
-				displayName:    displayName,
-				runsOn:         append([]string(nil), resolvedJob.RunsOn...),
-				needs:          append([]string(nil), resolvedJob.Needs...),
-				condition:      resolvedJob.If,
-				matrix:         matrixSpec,
-				plan:           string(data),
-				resultVersion:  jobResultVersion,
-				timeoutSeconds: timeoutSeconds,
-			})
+		expanded, err := r.expandPlannedWorkflowJob(run, definition.Name, id, workflowEnv, definitionJob, inputValues, expressionContext, combinations, sourceIDs, plannedIDs)
+		if err != nil {
+			return nil, nil, err
 		}
+		plannedJobs = append(plannedJobs, expanded...)
+		if len(plannedJobs)+len(deferredMatrices) > workflow.MaxJobs {
+			return nil, nil, fmt.Errorf("workflow expands to more than %d jobs", workflow.MaxJobs)
+		}
+	}
+	return plannedJobs, deferredMatrices, nil
+}
+
+func (r *WorkflowRunReconciler) expandPlannedWorkflowJob(run *actionsv1alpha1.WorkflowRun, workflowName, id string, workflowEnv map[string]string, definitionJob workflow.Job, inputValues map[string]any, expressionContext workflowexpression.Context, combinations []map[string]any, sourceIDs, plannedIDs map[string]struct{}) ([]plannedWorkflowJob, error) {
+	plannedJobs := make([]plannedWorkflowJob, 0, len(combinations))
+	for index, matrix := range combinations {
+		expandedID := id
+		var matrixSpec *actionsv1alpha1.WorkflowJobMatrix
+		if matrix != nil {
+			expandedID = uniqueMatrixWorkflowJobID(id, index, sourceIDs, plannedIDs)
+			matrixSpec = &actionsv1alpha1.WorkflowJobMatrix{
+				LogicalJobID: id,
+				Values:       matrixStringValues(matrix),
+				MaxParallel:  definitionJob.Strategy.MaxParallel,
+				FailFast:     pointerTo(definitionJob.Strategy.FailFast),
+			}
+		}
+		if _, found := plannedIDs[expandedID]; found {
+			return nil, fmt.Errorf("expanded job ID %q is not unique", expandedID)
+		}
+		plannedIDs[expandedID] = struct{}{}
+
+		jobContext := expressionContext
+		jobContext.Values = maps.Clone(expressionContext.Values)
+		if matrix != nil {
+			contexts := []string{"github", "open_actions", "matrix", "inputs", "vars"}
+			if _, found := jobContext.Values["needs"]; found {
+				contexts = append(contexts, "needs")
+			}
+			jobContext.Availability = workflowexpression.NewAvailability(contexts...)
+			jobContext.Values["matrix"] = matrix
+		}
+		resolvedJob, err := workflow.EvaluateJob(id, definitionJob, jobContext)
+		if err != nil {
+			return nil, err
+		}
+		displayName := resolvedJob.Name
+		if displayName == "" {
+			displayName = id
+		}
+		if matrix != nil {
+			displayName = matrixDisplayName(displayName, matrix, index)
+		}
+		timeoutSeconds := r.effectiveJobTimeoutSeconds(resolvedJob.TimeoutMinutes.Minutes())
+		plan, err := r.jobPlan(run, workflowName, id, workflowEnv, resolvedJob, matrix, inputValues, timeoutSeconds)
+		if err != nil {
+			return nil, err
+		}
+		data, err := json.Marshal(plan)
+		if err != nil {
+			return nil, fmt.Errorf("encode job plan: %w", err)
+		}
+		if len(data) > maxJobPlanBytes {
+			return nil, fmt.Errorf("job plan for %q exceeds %d bytes", expandedID, maxJobPlanBytes)
+		}
+		plannedJobs = append(plannedJobs, plannedWorkflowJob{
+			id:             expandedID,
+			displayName:    displayName,
+			runsOn:         append([]string(nil), resolvedJob.RunsOn...),
+			needs:          append([]string(nil), resolvedJob.Needs...),
+			condition:      resolvedJob.If,
+			matrix:         matrixSpec,
+			plan:           string(data),
+			resultVersion:  jobResultVersion,
+			timeoutSeconds: timeoutSeconds,
+		})
 	}
 	return plannedJobs, nil
 }
@@ -1275,6 +1344,25 @@ func (r *WorkflowRunReconciler) projectVariableContext(ctx context.Context, proj
 	return workflowexpression.DeferredObjectMap{Resolve: resolve, Values: all}
 }
 
+func snapshotExpressionVariables(variables any) (map[string]any, error) {
+	switch values := variables.(type) {
+	case nil:
+		return nil, nil
+	case workflowexpression.DeferredObjectMap:
+		return values.Values()
+	case map[string]any:
+		return maps.Clone(values), nil
+	case map[string]string:
+		result := make(map[string]any, len(values))
+		for name, value := range values {
+			result[name] = value
+		}
+		return result, nil
+	default:
+		return nil, fmt.Errorf("snapshot vars context: unsupported value %T", variables)
+	}
+}
+
 func (r *WorkflowRunReconciler) workflowRunVariableContext(ctx context.Context, run *actionsv1alpha1.WorkflowRun) workflowexpression.DeferredObjectMap {
 	var variables workflowexpression.DeferredObjectMap
 	var loadError error
@@ -1508,6 +1596,112 @@ func (r *WorkflowRunReconciler) ensureNeedsContextConfigMap(ctx context.Context,
 	return nil
 }
 
+func (r *WorkflowRunReconciler) ensureWorkflowPlan(ctx context.Context, run *actionsv1alpha1.WorkflowRun, project *actionsv1alpha1.Project, plannedJobs []plannedWorkflowJob, deferredMatrices []deferredMatrixPlan) error {
+	manifest := workflowPlanManifest{
+		JobIDs:    make([]string, 0, len(plannedJobs)),
+		SourceIDs: make([]string, 0, len(plannedJobs)+len(deferredMatrices)),
+		Matrices:  make(map[string]string, len(deferredMatrices)),
+	}
+	sourceIDs := map[string]struct{}{}
+	for _, job := range plannedJobs {
+		manifest.JobIDs = append(manifest.JobIDs, job.id)
+		sourceID := job.id
+		if job.matrix != nil {
+			sourceID = job.matrix.LogicalJobID
+		}
+		sourceIDs[sourceID] = struct{}{}
+	}
+	sort.Strings(manifest.JobIDs)
+	for index := range deferredMatrices {
+		plan := &deferredMatrices[index]
+		sourceIDs[plan.JobID] = struct{}{}
+		name := matrixPlanConfigMapName(run.Name, plan.JobID)
+		manifest.Matrices[plan.JobID] = name
+		data, err := json.Marshal(plan)
+		if err != nil {
+			return &terminalPlanningError{cause: fmt.Errorf("encode dynamic matrix plan for job %q: %w", plan.JobID, err)}
+		}
+		if len(data) > maxJobPlanBytes {
+			return &terminalPlanningError{cause: fmt.Errorf("dynamic matrix plan for job %q exceeds %d bytes", plan.JobID, maxJobPlanBytes)}
+		}
+		configMap := &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      name,
+				Namespace: run.Namespace,
+				Labels: map[string]string{
+					actionsv1alpha1.LabelProjectUID:     string(project.UID),
+					actionsv1alpha1.LabelWorkflowRunUID: string(run.UID),
+				},
+				Annotations: map[string]string{
+					actionsv1alpha1.AnnotationProjectName: project.Name,
+					actionsv1alpha1.AnnotationMatrixPlan:  plan.JobID,
+				},
+			},
+			Immutable: pointerTo(true),
+			Data:      map[string]string{matrixPlanKey: string(data)},
+		}
+		if err := r.ensureWorkflowOwnedConfigMap(ctx, run, configMap, matrixPlanKey); err != nil {
+			return err
+		}
+	}
+	for id := range sourceIDs {
+		manifest.SourceIDs = append(manifest.SourceIDs, id)
+	}
+	sort.Strings(manifest.SourceIDs)
+	data, err := json.Marshal(manifest)
+	if err != nil {
+		return &terminalPlanningError{cause: fmt.Errorf("encode WorkflowRun %q plan: %w", run.Name, err)}
+	}
+	configMap := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      workflowPlanConfigMapName(run.Name),
+			Namespace: run.Namespace,
+			Labels:    map[string]string{actionsv1alpha1.LabelWorkflowRunUID: string(run.UID)},
+		},
+		Immutable: pointerTo(true),
+		Data:      map[string]string{workflowPlanKey: string(data)},
+	}
+	if err := r.ensureWorkflowOwnedConfigMap(ctx, run, configMap, workflowPlanKey); err != nil {
+		return err
+	}
+	if run.Annotations[actionsv1alpha1.AnnotationWorkflowPlan] == configMap.Name {
+		return nil
+	}
+	before := run.DeepCopy()
+	if run.Annotations == nil {
+		run.Annotations = map[string]string{}
+	}
+	run.Annotations[actionsv1alpha1.AnnotationWorkflowPlan] = configMap.Name
+	return r.Patch(ctx, run, client.MergeFrom(before))
+}
+
+func (r *WorkflowRunReconciler) ensureWorkflowOwnedConfigMap(ctx context.Context, run *actionsv1alpha1.WorkflowRun, desired *corev1.ConfigMap, dataKey string) error {
+	if err := controllerutil.SetControllerReference(run, desired, r.Scheme()); err != nil {
+		return &terminalPlanningError{cause: err}
+	}
+	if err := r.Create(ctx, desired); err != nil {
+		if !apierrors.IsAlreadyExists(err) {
+			return err
+		}
+		existing := &corev1.ConfigMap{}
+		if err := r.APIReader.Get(ctx, client.ObjectKeyFromObject(desired), existing); err != nil {
+			return err
+		}
+		if !metav1.IsControlledBy(existing, run) || existing.Immutable == nil || !*existing.Immutable || existing.Data[dataKey] != desired.Data[dataKey] {
+			return &terminalPlanningError{cause: fmt.Errorf("planning ConfigMap %q does not contain the expected immutable data for WorkflowRun %q", existing.Name, run.Name)}
+		}
+	}
+	return nil
+}
+
+func workflowPlanConfigMapName(runName string) string {
+	return childName(runName, "workflow-plan")
+}
+
+func matrixPlanConfigMapName(runName, jobID string) string {
+	return childName(workflowJobName(runName, jobID), "matrix-plan")
+}
+
 func (r *WorkflowRunReconciler) jobPlan(run *actionsv1alpha1.WorkflowRun, workflowName, id string, workflowEnv map[string]string, job workflow.Job, matrix, inputValues map[string]any, timeoutSeconds int64) (*runner.Plan, error) {
 	githubSource := run.Spec.Source.GitHub
 	identity := run.Status.Identity
@@ -1632,22 +1826,298 @@ func runnerReviewEvent(event *actionsv1alpha1.GitHubReviewEvent) *runner.ReviewE
 	return &runner.ReviewEvent{Body: event.Body}
 }
 
+type workflowPlanState struct {
+	active   bool
+	changed  bool
+	pending  map[string]struct{}
+	expected map[string]struct{}
+}
+
+func (r *WorkflowRunReconciler) reconcileDynamicMatrices(ctx context.Context, run *actionsv1alpha1.WorkflowRun, jobs *actionsv1alpha1.WorkflowJobList) (workflowPlanState, error) {
+	state := workflowPlanState{}
+	planName := run.Annotations[actionsv1alpha1.AnnotationWorkflowPlan]
+	if planName == "" {
+		return state, nil
+	}
+	configMap := &corev1.ConfigMap{}
+	key := client.ObjectKey{Namespace: run.Namespace, Name: planName}
+	if err := r.APIReader.Get(ctx, key, configMap); err != nil {
+		if apierrors.IsNotFound(err) {
+			return state, nil
+		}
+		return state, err
+	}
+	if !metav1.IsControlledBy(configMap, run) || configMap.Immutable == nil || !*configMap.Immutable {
+		return state, &terminalPlanningError{cause: fmt.Errorf("planning ConfigMap %q is not immutable and controlled by WorkflowRun %q", configMap.Name, run.Name)}
+	}
+	manifest := workflowPlanManifest{}
+	if err := json.Unmarshal([]byte(configMap.Data[workflowPlanKey]), &manifest); err != nil {
+		return state, &terminalPlanningError{cause: fmt.Errorf("decode planning ConfigMap %q for WorkflowRun %q: %w", configMap.Name, run.Name, err)}
+	}
+	state.active = true
+	state.pending = map[string]struct{}{}
+	state.expected = make(map[string]struct{}, len(manifest.JobIDs)+len(manifest.Matrices))
+	for _, id := range manifest.JobIDs {
+		if _, found := state.expected[id]; found {
+			return state, &terminalPlanningError{cause: fmt.Errorf("WorkflowRun %q plan repeats job %q", run.Name, id)}
+		}
+		state.expected[id] = struct{}{}
+	}
+
+	jobsByID := make(map[string]*actionsv1alpha1.WorkflowJob, len(jobs.Items))
+	jobsByLogicalID := make(map[string][]*actionsv1alpha1.WorkflowJob, len(jobs.Items))
+	for index := range jobs.Items {
+		job := &jobs.Items[index]
+		if existing := jobsByID[job.Spec.JobID]; existing != nil {
+			return state, fmt.Errorf("WorkflowJobs %q and %q both represent job %q in WorkflowRun %q", existing.Name, job.Name, job.Spec.JobID, run.Name)
+		}
+		jobsByID[job.Spec.JobID] = job
+		logicalID := job.Spec.JobID
+		if job.Spec.Matrix != nil {
+			logicalID = job.Spec.Matrix.LogicalJobID
+		}
+		jobsByLogicalID[logicalID] = append(jobsByLogicalID[logicalID], job)
+	}
+
+	sourceIDs := make(map[string]struct{}, len(manifest.SourceIDs))
+	for _, id := range manifest.SourceIDs {
+		sourceIDs[id] = struct{}{}
+	}
+	matrixIDs := make([]string, 0, len(manifest.Matrices))
+	for id := range manifest.Matrices {
+		matrixIDs = append(matrixIDs, id)
+	}
+	sort.Strings(matrixIDs)
+	for _, id := range matrixIDs {
+		planConfigMap := &corev1.ConfigMap{}
+		planKey := client.ObjectKey{Namespace: run.Namespace, Name: manifest.Matrices[id]}
+		if err := r.APIReader.Get(ctx, planKey, planConfigMap); err != nil {
+			if apierrors.IsNotFound(err) {
+				return state, &terminalPlanningError{cause: fmt.Errorf("dynamic matrix plan ConfigMap %q for job %q is missing from WorkflowRun %q", planKey.Name, id, run.Name)}
+			}
+			return state, err
+		}
+		if !metav1.IsControlledBy(planConfigMap, run) || planConfigMap.Immutable == nil || !*planConfigMap.Immutable || planConfigMap.Annotations[actionsv1alpha1.AnnotationMatrixPlan] != id {
+			return state, &terminalPlanningError{cause: fmt.Errorf("dynamic matrix plan ConfigMap %q does not match job %q in WorkflowRun %q", planConfigMap.Name, id, run.Name)}
+		}
+		plan := deferredMatrixPlan{}
+		decoder := json.NewDecoder(strings.NewReader(planConfigMap.Data[matrixPlanKey]))
+		decoder.UseNumber()
+		if err := decoder.Decode(&plan); err != nil {
+			return state, &terminalPlanningError{cause: fmt.Errorf("decode dynamic matrix plan ConfigMap %q: %w", planConfigMap.Name, err)}
+		}
+		if plan.JobID != id {
+			return state, &terminalPlanningError{cause: fmt.Errorf("dynamic matrix plan ConfigMap %q identifies job %q, want %q", planConfigMap.Name, plan.JobID, id)}
+		}
+		if resultJob := jobsByID[id]; resultJob != nil && workflowJobTerminal(resultJob) {
+			state.expected[id] = struct{}{}
+			continue
+		}
+		matrixExpanded := false
+		for _, job := range jobsByLogicalID[id] {
+			if job.Spec.Matrix != nil && job.Spec.Matrix.LogicalJobID == id {
+				matrixExpanded = true
+				break
+			}
+		}
+
+		dependenciesReady := true
+		for _, dependency := range plan.Job.Needs {
+			needed := jobsByLogicalID[dependency]
+			if len(needed) == 0 {
+				dependenciesReady = false
+				break
+			}
+			for _, dependencyJob := range needed {
+				if !workflowJobTerminal(dependencyJob) {
+					dependenciesReady = false
+					break
+				}
+			}
+		}
+		if !dependenciesReady {
+			state.pending[id] = struct{}{}
+			continue
+		}
+
+		logicalJob := &actionsv1alpha1.WorkflowJob{Spec: actionsv1alpha1.WorkflowJobSpec{JobID: id, Needs: append([]string(nil), plan.Job.Needs...), If: plan.Job.If}}
+		expressionContext := r.jobExpressionContext(run, plan.WorkflowName, plan.InputValues, plan.Variables, plan.EventPayload)
+		expressionContext.Values["needs"] = workflowNeedsContext(logicalJob, jobsByLogicalID).ExpressionValues()
+		expressionContext.Status = workflowJobAncestorStatus(logicalJob, jobsByLogicalID, run.Spec.CancelRequested)
+		if !matrixExpanded {
+			runnable, err := workflow.EvaluateJobCondition(id, plan.Job.If, expressionContext)
+			if err != nil {
+				changed, resultErr := r.completeDynamicMatrix(ctx, run, planConfigMap, plan, jobsByID[id], actionsv1alpha1.WorkflowJobResultFailure, "ConditionEvaluationFailed", err.Error())
+				state.changed = state.changed || changed
+				state.expected[id] = struct{}{}
+				return state, resultErr
+			}
+			if !runnable {
+				result := actionsv1alpha1.WorkflowJobResultSkipped
+				reason := "ConditionFalse"
+				message := "The workflow job condition evaluated to false before matrix expansion"
+				if run.Spec.CancelRequested {
+					result = actionsv1alpha1.WorkflowJobResultCancelled
+					reason = "CancellationRequested"
+					message = "The workflow job was cancelled before matrix expansion"
+				}
+				changed, resultErr := r.completeDynamicMatrix(ctx, run, planConfigMap, plan, jobsByID[id], result, reason, message)
+				state.changed = state.changed || changed
+				state.expected[id] = struct{}{}
+				return state, resultErr
+			}
+		}
+
+		combinations, err := workflow.EvaluateMatrix(id, plan.Job.Strategy, expressionContext)
+		if err != nil {
+			var unavailable *projectValuesUnavailableError
+			if errors.As(err, &unavailable) {
+				return state, err
+			}
+			changed, resultErr := r.completeDynamicMatrix(ctx, run, planConfigMap, plan, jobsByID[id], actionsv1alpha1.WorkflowJobResultFailure, "MatrixEvaluationFailed", err.Error())
+			state.changed = state.changed || changed
+			state.expected[id] = struct{}{}
+			return state, resultErr
+		}
+		if projectedWorkflowJobCount(len(jobs.Items), jobsByLogicalID, matrixIDs, id, len(combinations)) > workflow.MaxJobs {
+			message := fmt.Sprintf("workflow expands to more than %d jobs", workflow.MaxJobs)
+			changed, resultErr := r.completeDynamicMatrix(ctx, run, planConfigMap, plan, jobsByID[id], actionsv1alpha1.WorkflowJobResultFailure, "MatrixEvaluationFailed", message)
+			state.changed = state.changed || changed
+			state.expected[id] = struct{}{}
+			return state, resultErr
+		}
+
+		plannedIDs := make(map[string]struct{}, len(jobsByID)+len(manifest.JobIDs))
+		for existingID, existing := range jobsByID {
+			if existing.Spec.Matrix == nil || existing.Spec.Matrix.LogicalJobID != id {
+				plannedIDs[existingID] = struct{}{}
+			}
+		}
+		for expectedID := range state.expected {
+			plannedIDs[expectedID] = struct{}{}
+		}
+		expanded, err := r.expandPlannedWorkflowJob(run, plan.WorkflowName, id, plan.WorkflowEnv, plan.Job, plan.InputValues, expressionContext, combinations, sourceIDs, plannedIDs)
+		if err != nil {
+			var unavailable *projectValuesUnavailableError
+			if errors.As(err, &unavailable) {
+				return state, err
+			}
+			changed, resultErr := r.completeDynamicMatrix(ctx, run, planConfigMap, plan, jobsByID[id], actionsv1alpha1.WorkflowJobResultFailure, "MatrixEvaluationFailed", err.Error())
+			state.changed = state.changed || changed
+			state.expected[id] = struct{}{}
+			return state, resultErr
+		}
+		for _, job := range expanded {
+			state.expected[job.id] = struct{}{}
+			if jobsByID[job.id] == nil {
+				state.changed = true
+			}
+		}
+		project := &actionsv1alpha1.Project{ObjectMeta: metav1.ObjectMeta{
+			Name: planConfigMap.Annotations[actionsv1alpha1.AnnotationProjectName],
+			UID:  types.UID(planConfigMap.Labels[actionsv1alpha1.LabelProjectUID]),
+		}}
+		if err := r.ensureWorkflowJobs(ctx, run, project, expanded); err != nil {
+			return state, err
+		}
+		if state.changed {
+			return state, nil
+		}
+	}
+	return state, nil
+}
+
+func projectedWorkflowJobCount(existingJobs int, jobsByLogicalID map[string][]*actionsv1alpha1.WorkflowJob, matrixIDs []string, currentID string, combinations int) int {
+	result := existingJobs - len(jobsByLogicalID[currentID]) + combinations
+	for _, id := range matrixIDs {
+		if id != currentID && len(jobsByLogicalID[id]) == 0 {
+			result++
+		}
+	}
+	return result
+}
+
+func (r *WorkflowRunReconciler) completeDynamicMatrix(ctx context.Context, run *actionsv1alpha1.WorkflowRun, planConfigMap *corev1.ConfigMap, plan deferredMatrixPlan, existing *actionsv1alpha1.WorkflowJob, result actionsv1alpha1.WorkflowJobResult, reason, message string) (bool, error) {
+	project := &actionsv1alpha1.Project{ObjectMeta: metav1.ObjectMeta{UID: types.UID(planConfigMap.Labels[actionsv1alpha1.LabelProjectUID])}}
+	desired := &actionsv1alpha1.WorkflowJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        workflowJobName(run.Name, plan.JobID),
+			Namespace:   run.Namespace,
+			Labels:      workflowJobLabels(run, project, plan.JobID),
+			Annotations: map[string]string{actionsv1alpha1.AnnotationProjectName: planConfigMap.Annotations[actionsv1alpha1.AnnotationProjectName]},
+		},
+		Spec: actionsv1alpha1.WorkflowJobSpec{
+			WorkflowRunRef: corev1.LocalObjectReference{Name: run.Name},
+			JobID:          plan.JobID,
+			DisplayName:    plan.JobID,
+			RunsOn:         []string{"matrix-evaluation"},
+			Needs:          append([]string(nil), plan.Job.Needs...),
+			If:             plan.Job.If,
+		},
+	}
+	if err := controllerutil.SetControllerReference(run, desired, r.Scheme()); err != nil {
+		return false, &terminalPlanningError{cause: err}
+	}
+	job := desired
+	created := false
+	if existing != nil {
+		if !workflowJobIdentityMatches(existing, desired, run) {
+			return false, &terminalPlanningError{cause: fmt.Errorf("WorkflowJob %q does not match dynamic matrix job %q in WorkflowRun %q", existing.Name, plan.JobID, run.Name)}
+		}
+		job = existing
+	} else if err := r.Create(ctx, desired); err != nil {
+		if !apierrors.IsAlreadyExists(err) {
+			return false, err
+		}
+		job = &actionsv1alpha1.WorkflowJob{}
+		if err := r.APIReader.Get(ctx, client.ObjectKey{Namespace: run.Namespace, Name: workflowJobName(run.Name, plan.JobID)}, job); err != nil {
+			return false, err
+		}
+		if !workflowJobIdentityMatches(job, desired, run) {
+			return false, &terminalPlanningError{cause: fmt.Errorf("WorkflowJob %q does not match dynamic matrix job %q in WorkflowRun %q", job.Name, plan.JobID, run.Name)}
+		}
+	} else {
+		created = true
+	}
+	if workflowJobTerminal(job) {
+		return created, nil
+	}
+	if err := r.completeUnscheduledWorkflowJob(ctx, job, result, reason, message); err != nil {
+		return created, err
+	}
+	return true, nil
+}
+
 func (r *WorkflowRunReconciler) observeWorkflowJobs(ctx context.Context, run *actionsv1alpha1.WorkflowRun, workflowName, concurrencyGroup string, total int32) (ctrl.Result, error) {
 	reader := r.APIReader
 	jobs := &actionsv1alpha1.WorkflowJobList{}
 	if err := reader.List(ctx, jobs, client.InNamespace(run.Namespace), client.MatchingLabels{actionsv1alpha1.LabelWorkflowRunUID: string(run.UID)}); err != nil {
 		return ctrl.Result{}, err
 	}
+	planState, err := r.reconcileDynamicMatrices(ctx, run, jobs)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if planState.changed {
+		return ctrl.Result{Requeue: true}, nil
+	}
+	expectedObjects := int(total)
+	pendingMatrices := map[string]struct{}{}
+	if planState.active {
+		expectedObjects = len(planState.expected)
+		pendingMatrices = planState.pending
+		total = int32(expectedObjects + len(pendingMatrices))
+	}
 	failFastPending, err := r.reconcileMatrixFailFast(ctx, jobs)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	status := &actionsv1alpha1.WorkflowRunJobStatus{Total: total}
+	status := &actionsv1alpha1.WorkflowRunJobStatus{Total: total, Waiting: int32(len(pendingMatrices))}
 	var startTime *metav1.Time
 	lostState := ""
 	waitingForRuntimeState := false
 	hasNonFailFastCancellation := false
-	if int32(len(jobs.Items)) != total {
+	if len(jobs.Items) != expectedObjects {
 		active, err := activeRuntimeWorkloads(ctx, reader, run)
 		if err != nil {
 			return ctrl.Result{}, err
@@ -1655,10 +2125,10 @@ func (r *WorkflowRunReconciler) observeWorkflowJobs(ctx context.Context, run *ac
 		if active {
 			waitingForRuntimeState = true
 		} else {
-			lostState = fmt.Sprintf("expected %d WorkflowJobs, found %d", total, len(jobs.Items))
+			lostState = fmt.Sprintf("expected %d WorkflowJobs, found %d", expectedObjects, len(jobs.Items))
 		}
 	}
-	if int32(len(jobs.Items)) == total {
+	if len(jobs.Items) == expectedObjects {
 		var inputValues map[string]any
 		var eventPayload map[string]any
 		if workflowJobGraphNeedsExpressionContext(run, jobs.Items) {
@@ -1672,7 +2142,7 @@ func (r *WorkflowRunReconciler) observeWorkflowJobs(ctx context.Context, run *ac
 			}
 		}
 		variables := r.workflowRunVariableContext(ctx, run)
-		if err := r.reconcileWorkflowJobGraph(ctx, run, workflowName, inputValues, variables, eventPayload, jobs.Items); err != nil {
+		if err := r.reconcileWorkflowJobGraph(ctx, run, workflowName, inputValues, variables, eventPayload, jobs.Items, pendingMatrices); err != nil {
 			return ctrl.Result{}, err
 		}
 	}
@@ -1766,14 +2236,18 @@ func (r *WorkflowRunReconciler) observeWorkflowJobs(ctx context.Context, run *ac
 		}
 		return ctrl.Result{}, nil
 	}
+	plannedMessage := "All WorkflowJobs have been created"
+	if planState.active {
+		plannedMessage = "The workflow plan is ready"
+	}
 	meta.SetStatusCondition(&run.Status.Conditions, metav1.Condition{
 		Type:               actionsv1alpha1.WorkflowRunConditionPlanned,
 		Status:             metav1.ConditionTrue,
 		ObservedGeneration: run.Generation,
 		Reason:             "JobsPlanned",
-		Message:            "All WorkflowJobs have been created",
+		Message:            plannedMessage,
 	})
-	terminal := int32(len(jobs.Items)) == total && status.Succeeded+status.Failed+status.TimedOut+status.Skipped+status.Cancelled == status.Total
+	terminal := len(pendingMatrices) == 0 && len(jobs.Items) == expectedObjects && status.Succeeded+status.Failed+status.TimedOut+status.Skipped+status.Cancelled == status.Total
 	if terminal && status.Cancelled > 0 {
 		active, err := activeRuntimeWorkloads(ctx, reader, run)
 		if err != nil {
@@ -1872,7 +2346,11 @@ func (r *WorkflowRunReconciler) workflowJobGraphInputValues(ctx context.Context,
 	return nil, nil
 }
 
-func (r *WorkflowRunReconciler) reconcileWorkflowJobGraph(ctx context.Context, run *actionsv1alpha1.WorkflowRun, workflowName string, inputValues map[string]any, variables any, eventPayload map[string]any, jobs []actionsv1alpha1.WorkflowJob) error {
+func (r *WorkflowRunReconciler) reconcileWorkflowJobGraph(ctx context.Context, run *actionsv1alpha1.WorkflowRun, workflowName string, inputValues map[string]any, variables any, eventPayload map[string]any, jobs []actionsv1alpha1.WorkflowJob, pendingMatrixSets ...map[string]struct{}) error {
+	pendingMatrices := map[string]struct{}{}
+	if len(pendingMatrixSets) > 0 {
+		pendingMatrices = pendingMatrixSets[0]
+	}
 	jobsByID := make(map[string]*actionsv1alpha1.WorkflowJob, len(jobs))
 	jobsByLogicalID := make(map[string][]*actionsv1alpha1.WorkflowJob, len(jobs))
 	for index := range jobs {
@@ -1908,6 +2386,10 @@ func (r *WorkflowRunReconciler) reconcileWorkflowJobGraph(ctx context.Context, r
 		for _, dependency := range job.Spec.Needs {
 			needed := jobsByLogicalID[dependency]
 			if len(needed) == 0 {
+				if _, pending := pendingMatrices[dependency]; pending {
+					dependenciesReady = false
+					continue
+				}
 				return fmt.Errorf("WorkflowJob %q needs missing job %q in WorkflowRun %q", job.Name, dependency, run.Name)
 			}
 			for _, dependencyJob := range needed {
@@ -2651,6 +3133,8 @@ func stringMap(values map[string]any) (map[string]string, error) {
 		switch typed := value.(type) {
 		case string:
 			result[key] = typed
+		case json.Number:
+			result[key] = typed.String()
 		case bool, int, int64, uint64, float64:
 			result[key] = fmt.Sprint(typed)
 		default:

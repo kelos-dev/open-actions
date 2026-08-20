@@ -13,4 +13,6 @@ const (
 	AnnotationRunnerName             = "actions.kelos.dev/runner-name"
 	AnnotationRunnerResultVersion    = "actions.kelos.dev/runner-result-version"
 	AnnotationProjectName            = "actions.kelos.dev/project-name"
+	AnnotationWorkflowPlan           = "actions.kelos.dev/workflow-plan"
+	AnnotationMatrixPlan             = "actions.kelos.dev/matrix-plan"
 )

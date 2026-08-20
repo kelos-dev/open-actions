@@ -19,6 +19,7 @@ import (
 
 const workflowPath = ".open-actions/workflows/ci.yaml"
 const preparationWorkflowPath = ".open-actions/workflows/preparation.yaml"
+const dynamicMatrixWorkflowPath = ".open-actions/workflows/dynamic-matrix.yaml"
 const fixtureJobToken = "fixture-job-token"
 const fixtureActionToken = "fixture-action-token"
 
@@ -80,6 +81,28 @@ const preparationSteps = `      - name: Block action downloads
 `
 
 var preparationWorkflowData = strings.Replace(workflowData, "    steps:\n", "    steps:\n"+preparationSteps, 1)
+
+const dynamicMatrixWorkflowData = `name: Dynamic matrix
+on: push
+jobs:
+  prepare:
+    runs-on: [ubuntu-latest, docker]
+    outputs:
+      matrix: ${{ steps.matrix.outputs.value }}
+    steps:
+      - id: matrix
+        run: |
+          printf 'value={"target":["first","second"]}\n' >> "$GITHUB_OUTPUT"
+  execute:
+    needs: prepare
+    strategy:
+      max-parallel: 1
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    name: Execute ${{ matrix.target }}
+    runs-on: [ubuntu-latest, docker]
+    steps:
+      - run: test "${{ matrix.target }}" = first || test "${{ matrix.target }}" = second
+`
 
 const pullRequestWorkflowPath = ".open-actions/workflows/pull-request.yaml"
 
@@ -494,6 +517,9 @@ func main() {
 	})
 	mux.HandleFunc("/repos/acme/example/contents/"+preparationWorkflowPath, func(writer http.ResponseWriter, _ *http.Request) {
 		writeJSON(writer, map[string]string{"encoding": "base64", "content": base64.StdEncoding.EncodeToString([]byte(preparationWorkflowData))})
+	})
+	mux.HandleFunc("/repos/acme/example/contents/"+dynamicMatrixWorkflowPath, func(writer http.ResponseWriter, _ *http.Request) {
+		writeJSON(writer, map[string]string{"encoding": "base64", "content": base64.StdEncoding.EncodeToString([]byte(dynamicMatrixWorkflowData))})
 	})
 	checkRunMutex := sync.RWMutex{}
 	checkRuns := map[string]map[string]any{}

@@ -191,6 +191,40 @@ func (p *Program) UsesStatusFunction() bool {
 	return false
 }
 
+// UsesContext reports whether the program reads the named context.
+func (p *Program) UsesContext(name string) bool {
+	for _, item := range p.segments {
+		if usesContext(item.expression, name) {
+			return true
+		}
+	}
+	return false
+}
+
+func usesContext(input node, name string) bool {
+	switch typed := input.(type) {
+	case nil, literalNode, wildcardNode:
+		return false
+	case contextNode:
+		return strings.EqualFold(typed.name, name)
+	case propertyNode:
+		return usesContext(typed.target, name)
+	case indexNode:
+		return usesContext(typed.target, name) || usesContext(typed.index, name)
+	case unaryNode:
+		return usesContext(typed.operand, name)
+	case binaryNode:
+		return usesContext(typed.left, name) || usesContext(typed.right, name)
+	case callNode:
+		for _, argument := range typed.arguments {
+			if usesContext(argument, name) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func usesStatusFunction(input node) bool {
 	switch typed := input.(type) {
 	case nil, literalNode, contextNode, wildcardNode:

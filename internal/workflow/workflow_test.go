@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"maps"
 	"os"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -651,6 +652,136 @@ func TestParseAndExpandMatrixStrategy(t *testing.T) {
 		if got != want[index] {
 			t.Errorf("combination %d = %q, want %q", index, got, want[index])
 		}
+	}
+}
+
+func TestEvaluateMatrixFromDependencyOutput(t *testing.T) {
+	definition, err := Parse([]byte("name: Release\non: push\njobs:\n  prepare:\n    runs-on: ubuntu-latest\n    steps:\n      - run: prepare\n  build:\n    needs: prepare\n    strategy:\n      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}\n    runs-on: '${{ matrix.runner }}'\n    steps:\n      - run: build\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	strategy := definition.Jobs["build"].Strategy
+	if !MatrixRequiresEvaluation(strategy) || !MatrixUsesNeeds(strategy) {
+		t.Fatalf("dynamic matrix was not recognized: %#v", strategy.Matrix)
+	}
+	combinations, err := EvaluateMatrix("build", strategy, workflowexpression.Context{Values: map[string]any{
+		"needs": map[string]any{"prepare": map[string]any{"outputs": map[string]any{
+			"matrix": `{"runner":["ubuntu-latest","ubuntu-24.04-arm"],"exclude":[{"runner":"ubuntu-latest"}],"include":[{"runner":"self-hosted","arch":"amd64"}]}`,
+		}}},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(combinations) != 2 || combinations[0]["runner"] != "ubuntu-24.04-arm" || combinations[1]["runner"] != "self-hosted" || combinations[1]["arch"] != "amd64" {
+		t.Fatalf("matrix combinations = %#v", combinations)
+	}
+}
+
+func TestEvaluateMatrixAxisExpression(t *testing.T) {
+	definition, err := Parse([]byte("name: Release\non: push\njobs:\n  prepare:\n    runs-on: ubuntu-latest\n    steps:\n      - run: prepare\n  build:\n    needs: prepare\n    strategy:\n      matrix:\n        arch: ${{ fromJSON(needs.prepare.outputs.arches) }}\n        mode: [default, '${{ inputs.mode }}']\n    runs-on: ubuntu-latest\n    steps:\n      - run: build\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	combinations, err := EvaluateMatrix("build", definition.Jobs["build"].Strategy, workflowexpression.Context{Values: map[string]any{
+		"needs":  map[string]any{"prepare": map[string]any{"outputs": map[string]any{"arches": `["amd64","arm64"]`}}},
+		"inputs": map[string]any{"mode": "race"},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"amd64/default", "amd64/race", "arm64/default", "arm64/race"}
+	for index, combination := range combinations {
+		if got := fmt.Sprintf("%v/%v", combination["arch"], combination["mode"]); got != want[index] {
+			t.Errorf("combination %d = %q, want %q", index, got, want[index])
+		}
+	}
+}
+
+func TestMatrixIncludeAndExclude(t *testing.T) {
+	definition, err := Parse([]byte("name: Release\non: push\njobs:\n  build:\n    strategy:\n      matrix:\n        fruit: [apple, pear]\n        animal: [cat, dog]\n        exclude:\n          - animal: dog\n            fruit: pear\n        include:\n          - color: green\n          - color: pink\n            animal: cat\n          - fruit: banana\n          - fruit: banana\n            animal: cat\n    runs-on: ubuntu-latest\n    steps:\n      - run: build\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	combinations := MatrixCombinations(definition.Jobs["build"].Strategy)
+	want := []map[string]any{
+		{"animal": "cat", "fruit": "apple", "color": "pink"},
+		{"animal": "cat", "fruit": "pear", "color": "pink"},
+		{"animal": "dog", "fruit": "apple", "color": "green"},
+		{"fruit": "banana"},
+		{"animal": "cat", "fruit": "banana"},
+	}
+	if !reflect.DeepEqual(combinations, want) {
+		t.Fatalf("matrix combinations = %#v, want %#v", combinations, want)
+	}
+}
+
+func TestMatrixIncludeOnly(t *testing.T) {
+	definition, err := Parse([]byte("name: Release\non: push\njobs:\n  build:\n    strategy:\n      matrix:\n        include:\n          - runner: ubuntu-latest\n            arch: amd64\n          - runner: ubuntu-24.04-arm\n            arch: arm64\n    runs-on: ${{ matrix.runner }}\n    steps:\n      - run: build\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	combinations := MatrixCombinations(definition.Jobs["build"].Strategy)
+	want := []map[string]any{
+		{"runner": "ubuntu-latest", "arch": "amd64"},
+		{"runner": "ubuntu-24.04-arm", "arch": "arm64"},
+	}
+	if !reflect.DeepEqual(combinations, want) {
+		t.Fatalf("matrix combinations = %#v, want %#v", combinations, want)
+	}
+}
+
+func TestMatrixLimitAppliesAfterTransformations(t *testing.T) {
+	values := make([]any, maxMatrixJobs)
+	for index := range values {
+		values[index] = index
+	}
+	strategy := Strategy{configured: true, Matrix: MatrixDefinition{
+		Axes:    map[string]MatrixAxis{"index": {Values: values}},
+		Include: MatrixEntries{Values: []map[string]any{{"index": "extra"}}},
+	}}
+	_, err := EvaluateMatrix("build", strategy, workflowexpression.Context{})
+	if err == nil || !strings.Contains(err.Error(), "more than 256 jobs") {
+		t.Fatalf("error = %v, want final matrix size error", err)
+	}
+}
+
+func TestMatrixLimitBoundsExcludedCartesianProduct(t *testing.T) {
+	axes := make(map[string]MatrixAxis)
+	for _, name := range []string{"a", "b", "c", "d", "e", "f", "g", "h", "i"} {
+		axes[name] = MatrixAxis{Values: []any{1, 2}}
+	}
+	strategy := Strategy{configured: true, Matrix: MatrixDefinition{
+		Axes: axes,
+		Exclude: MatrixEntries{Values: []map[string]any{
+			{"i": 1},
+			{"i": 2},
+		}},
+	}}
+	_, err := EvaluateMatrix("build", strategy, workflowexpression.Context{})
+	if err == nil || !strings.Contains(err.Error(), "more than 256 jobs") {
+		t.Fatalf("error = %v, want matrix size error", err)
+	}
+}
+
+func TestEvaluateMatrixRejectsInvalidDynamicResults(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		output string
+		want   string
+	}{
+		{name: "invalid JSON", output: "not-json", want: "parse JSON"},
+		{name: "unsupported shape", output: `["amd64"]`, want: "must evaluate to a mapping"},
+		{name: "empty axis", output: `{"arch":[]}`, want: "must define at least one value"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			strategy := Strategy{configured: true, Matrix: MatrixDefinition{Expression: "${{ fromJSON(needs.prepare.outputs.matrix) }}"}}
+			_, err := EvaluateMatrix("build", strategy, workflowexpression.Context{Values: map[string]any{
+				"needs": map[string]any{"prepare": map[string]any{"outputs": map[string]any{"matrix": test.output}}},
+			}})
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("error = %v, want %q", err, test.want)
+			}
+		})
 	}
 }
 
