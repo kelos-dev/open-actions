@@ -23,8 +23,10 @@ import (
 	"time"
 
 	actionsv1alpha1 "github.com/kelos-dev/open-actions/api/v1alpha1"
+	"github.com/kelos-dev/open-actions/internal/eventsnapshot"
 	githubclient "github.com/kelos-dev/open-actions/internal/github"
 	"github.com/kelos-dev/open-actions/internal/gitrepository"
+	"github.com/kelos-dev/open-actions/internal/workflowrun"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -132,6 +134,9 @@ func TestQueuedDeliveryReadsRepositoryFromPayload(t *testing.T) {
 	if delivery.Repository.ID != 1 || delivery.Repository.Owner != "acme" || delivery.Repository.Name != "example" {
 		t.Fatalf("delivery repository = %#v", delivery.Repository)
 	}
+	if delivery.EventSnapshot != "" {
+		t.Fatalf("legacy delivery event snapshot = %q", delivery.EventSnapshot)
+	}
 	pullRequestData := []byte(`{"projectName":"default","projectUID":"project-uid","payload":{"repository":{"id":1,"owner":{"login":"acme"},"name":"example","default_branch":"main"}},"event":{"name":"pull_request","ref":"refs/pull/7/merge","resolveRef":"refs/pull/7/merge","headSHA":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},"replayID":"replay","deliveryID":"delivery"}`)
 	if err := json.Unmarshal(pullRequestData, &delivery); err != nil {
 		t.Fatal(err)
@@ -237,10 +242,24 @@ func TestRerequestedCheckCreatesFailedJobRerun(t *testing.T) {
 func TestConcurrentRerunRequestsDoNotShareAnAttempt(t *testing.T) {
 	scheme := deliveryTestScheme(t)
 	root := &actionsv1alpha1.WorkflowRun{
-		ObjectMeta: metav1.ObjectMeta{Name: "ci", Namespace: "default", UID: "root-uid"},
-		Spec:       actionsv1alpha1.WorkflowRunSpec{CancelRequested: true},
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "ci", Namespace: "default", UID: "root-uid",
+			Annotations: map[string]string{eventsnapshot.Annotation: "event-snapshot"},
+		},
+		Spec: actionsv1alpha1.WorkflowRunSpec{CancelRequested: true},
 	}
-	clusterClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+	immutable := true
+	snapshot := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "event-snapshot", Namespace: root.Namespace,
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: actionsv1alpha1.GroupVersion.String(), Kind: "WorkflowRun", Name: root.Name, UID: root.UID,
+			}},
+		},
+		Immutable: &immutable,
+		Data:      map[string][]byte{eventsnapshot.DataKey: []byte(`{"repository":{"full_name":"acme/example"}}`)},
+	}
+	clusterClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(snapshot).Build()
 	reconciler := &DeliveryReconciler{Client: clusterClient, APIReader: clusterClient}
 
 	if err := reconciler.createRerunWorkflowRun(context.Background(), root, root, 2, "delivery-a", []string{"unit"}); err != nil {
@@ -253,8 +272,98 @@ func TestConcurrentRerunRequestsDoNotShareAnAttempt(t *testing.T) {
 	if retry.Spec.CancelRequested {
 		t.Fatal("rerun retained the previous cancellation request")
 	}
+	if retry.Annotations[eventsnapshot.Annotation] != snapshot.Name {
+		t.Fatalf("rerun event snapshot = %q", retry.Annotations[eventsnapshot.Annotation])
+	}
+	if err := clusterClient.Get(context.Background(), client.ObjectKeyFromObject(snapshot), snapshot); err != nil {
+		t.Fatal(err)
+	}
+	foundOwner := false
+	for _, owner := range snapshot.OwnerReferences {
+		foundOwner = foundOwner || owner.Kind == "WorkflowRun" && owner.Name == retry.Name
+	}
+	if !foundOwner {
+		t.Fatalf("snapshot owners = %#v", snapshot.OwnerReferences)
+	}
 	if err := reconciler.createRerunWorkflowRun(context.Background(), root, root, 2, "delivery-b", []string{"unit"}); !errors.Is(err, errRerunAttemptClaimed) {
 		t.Fatalf("second rerun error = %v", err)
+	}
+}
+
+func TestRerunDeliveryRepairsSnapshotOwnerBeforeCompleting(t *testing.T) {
+	scheme := deliveryTestScheme(t)
+	project := &actionsv1alpha1.Project{ObjectMeta: metav1.ObjectMeta{Name: "project", Namespace: "default", UID: "project-uid"}}
+	root := &actionsv1alpha1.WorkflowRun{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "ci", Namespace: project.Namespace, UID: "root-uid",
+			Labels:      map[string]string{actionsv1alpha1.LabelWorkflowRunRootUID: "root-uid"},
+			Annotations: map[string]string{eventsnapshot.Annotation: "event-snapshot"},
+		},
+		Spec: actionsv1alpha1.WorkflowRunSpec{
+			ProjectRef: corev1.LocalObjectReference{Name: project.Name},
+			Source: actionsv1alpha1.WorkflowRunSource{Type: actionsv1alpha1.SourceTypeGitHub, GitHub: &actionsv1alpha1.GitHubWorkflowRunSource{
+				Repository: actionsv1alpha1.GitHubRepository{ID: 1, Owner: "acme", Name: "example"},
+				Event:      actionsv1alpha1.GitHubEvent{Name: actionsv1alpha1.GitHubEventNamePush, DeliveryID: "original-delivery"},
+				Revision:   actionsv1alpha1.GitRevision{SHA: strings.Repeat("a", 40), Ref: "refs/heads/main"},
+			}},
+		},
+		Status: actionsv1alpha1.WorkflowRunStatus{
+			Source:     &actionsv1alpha1.WorkflowRunSourceStatus{GitHub: &actionsv1alpha1.GitHubWorkflowRunStatus{CheckRun: &actionsv1alpha1.GitHubCheckRunStatus{ID: 42}}},
+			Conditions: []metav1.Condition{{Type: actionsv1alpha1.WorkflowRunConditionSucceeded, Status: metav1.ConditionTrue}},
+		},
+	}
+	delivery := queuedDelivery{
+		ProjectName: project.Name,
+		ProjectUID:  string(project.UID),
+		Repository:  deliveryRepository{ID: 1, Owner: "acme", Name: "example"},
+		Rerun:       &normalizedRerun{CheckRunID: 42, RootRunUID: string(root.UID), HeadSHA: strings.Repeat("a", 40)},
+		ReplayID:    "rerun-replay",
+		DeliveryID:  "rerun-delivery",
+	}
+	retry := workflowrun.NewRerun(root, root, 2, delivery.DeliveryID, nil)
+	retry.UID = "retry-uid"
+	retry.Annotations = map[string]string{eventsnapshot.Annotation: "event-snapshot"}
+	immutable := true
+	snapshot := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "event-snapshot", Namespace: root.Namespace,
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: actionsv1alpha1.GroupVersion.String(), Kind: "WorkflowRun", Name: root.Name, UID: root.UID,
+			}},
+		},
+		Immutable: &immutable,
+		Data:      map[string][]byte{eventsnapshot.DataKey: []byte(`{"repository":{"full_name":"acme/example"}}`)},
+	}
+	data, err := json.Marshal(delivery)
+	if err != nil {
+		t.Fatal(err)
+	}
+	controller := true
+	queued := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{
+		Name: "delivery-rerun", Namespace: project.Namespace, Labels: map[string]string{deliveryLabel: "true"},
+		OwnerReferences: []metav1.OwnerReference{{APIVersion: actionsv1alpha1.GroupVersion.String(), Kind: "Project", Name: project.Name, UID: project.UID, Controller: &controller}},
+	}, Data: map[string]string{deliveryDataKey: string(data)}}
+	clusterClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(project, root, retry, snapshot, queued).Build()
+	reconciler := &DeliveryReconciler{Client: clusterClient, APIReader: clusterClient, Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
+
+	if _, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(queued)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := clusterClient.Get(context.Background(), client.ObjectKeyFromObject(snapshot), snapshot); err != nil {
+		t.Fatal(err)
+	}
+	foundOwner := false
+	for _, owner := range snapshot.OwnerReferences {
+		foundOwner = foundOwner || owner.Kind == "WorkflowRun" && owner.Name == retry.Name && owner.UID == retry.UID
+	}
+	if !foundOwner {
+		t.Fatalf("snapshot owners = %#v", snapshot.OwnerReferences)
+	}
+	if err := clusterClient.Get(context.Background(), client.ObjectKeyFromObject(queued), queued); err != nil {
+		t.Fatal(err)
+	}
+	if queued.Data[deliveryStateKey] != deliveryStateCompleted || queued.Data[deliveryRunCountKey] != "1" {
+		t.Fatalf("delivery state = %#v", queued.Data)
 	}
 }
 
@@ -344,10 +453,19 @@ func TestCreateWorkflowRunIsIdempotent(t *testing.T) {
 	event.Repository.Owner.Login = "acme"
 	event.Repository.Name = "example"
 	normalized := normalizedEvent{Name: "push", SHA: strings.Repeat("a", 40), Ref: "refs/heads/main"}
-	delivery := &queuedDelivery{Repository: deliveryRepository{ID: 1, Owner: "acme", Name: "example"}, Event: normalized, ReplayID: "replay", DeliveryID: "delivery"}
+	delivery := &queuedDelivery{
+		Repository: deliveryRepository{ID: 1, Owner: "acme", Name: "example"}, Event: normalized,
+		EventSnapshot: eventSnapshotName("replay"), ReplayID: "replay", DeliveryID: "delivery",
+	}
 	ttl := int32(604800)
+	immutable := true
+	snapshot := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: eventSnapshotName(delivery.ReplayID), Namespace: project.Namespace},
+		Immutable:  &immutable,
+		Data:       map[string][]byte{eventsnapshot.DataKey: []byte(`{"repository":{"full_name":"acme/example"}}`)},
+	}
 
-	clusterClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+	clusterClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(snapshot).Build()
 	reconciler := &DeliveryReconciler{Client: clusterClient, APIReader: clusterClient, WorkflowRunTTLSecondsAfterFinished: &ttl}
 	selection := workflowSelection{Path: ".open-actions/workflows/ci.yaml", Event: delivery.Event}
 	if err := reconciler.createWorkflowRun(context.Background(), project, delivery, selection); err != nil {
@@ -360,6 +478,19 @@ func TestCreateWorkflowRunIsIdempotent(t *testing.T) {
 	}
 	if run.Spec.TTLSecondsAfterFinished == nil || *run.Spec.TTLSecondsAfterFinished != ttl {
 		t.Fatalf("WorkflowRun TTL = %v, want %d", run.Spec.TTLSecondsAfterFinished, ttl)
+	}
+	if run.Annotations[eventsnapshot.Annotation] != snapshot.Name {
+		t.Fatalf("WorkflowRun event snapshot = %q, want %q", run.Annotations[eventsnapshot.Annotation], snapshot.Name)
+	}
+	if err := clusterClient.Get(context.Background(), client.ObjectKeyFromObject(snapshot), snapshot); err != nil {
+		t.Fatal(err)
+	}
+	foundSnapshotOwner := false
+	for _, owner := range snapshot.OwnerReferences {
+		foundSnapshotOwner = foundSnapshotOwner || owner.Kind == "WorkflowRun" && owner.Name == run.Name
+	}
+	if !foundSnapshotOwner {
+		t.Fatalf("snapshot owners = %#v", snapshot.OwnerReferences)
 	}
 	updatedTTL := int32(3600)
 	run.Spec.TTLSecondsAfterFinished = &updatedTTL
@@ -374,6 +505,29 @@ func TestCreateWorkflowRunIsIdempotent(t *testing.T) {
 	}
 	if run.Spec.TTLSecondsAfterFinished == nil || *run.Spec.TTLSecondsAfterFinished != updatedTTL {
 		t.Fatalf("replayed WorkflowRun TTL = %v, want %d", run.Spec.TTLSecondsAfterFinished, updatedTTL)
+	}
+	forgedSnapshot := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "forged-snapshot", Namespace: project.Namespace},
+		Immutable:  &immutable,
+		Data:       map[string][]byte{eventsnapshot.DataKey: []byte(`{"sender":{"login":"attacker"}}`)},
+	}
+	if err := clusterClient.Create(context.Background(), forgedSnapshot); err != nil {
+		t.Fatal(err)
+	}
+	run.Annotations[eventsnapshot.Annotation] = forgedSnapshot.Name
+	if err := clusterClient.Update(context.Background(), run); err != nil {
+		t.Fatal(err)
+	}
+	if err := reconciler.createWorkflowRun(context.Background(), project, delivery, selection); !apierrors.IsConflict(err) {
+		t.Fatalf("replay with a different event snapshot error = %v, want conflict", err)
+	}
+	if err := clusterClient.Get(context.Background(), client.ObjectKeyFromObject(forgedSnapshot), forgedSnapshot); err != nil {
+		t.Fatal(err)
+	}
+	for _, owner := range forgedSnapshot.OwnerReferences {
+		if owner.Kind == "WorkflowRun" && owner.Name == run.Name {
+			t.Fatalf("forged snapshot owners = %#v", forgedSnapshot.OwnerReferences)
+		}
 	}
 
 	workflowPath := ".open-actions/workflows/deploy.yaml"

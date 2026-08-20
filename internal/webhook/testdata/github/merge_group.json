@@ -1,0 +1,11 @@
+{
+  "action": "checks_requested",
+  "merge_group": {
+    "head_sha": "4444444444444444444444444444444444444444",
+    "head_ref": "refs/heads/gh-readonly-queue/main/pr-42",
+    "base_ref": "refs/heads/main"
+  },
+  "repository": {"id": 1001, "name": "example", "full_name": "acme/example", "default_branch": "main", "owner": {"login": "acme"}},
+  "installation": {"id": 2002},
+  "sender": {"login": "github-merge-queue"}
+}

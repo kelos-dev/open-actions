@@ -1,6 +1,7 @@
 package webhook
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/base32"
@@ -15,6 +16,7 @@ import (
 	"time"
 
 	actionsv1alpha1 "github.com/kelos-dev/open-actions/api/v1alpha1"
+	"github.com/kelos-dev/open-actions/internal/eventsnapshot"
 	githubclient "github.com/kelos-dev/open-actions/internal/github"
 	"github.com/kelos-dev/open-actions/internal/gitrepository"
 	"github.com/kelos-dev/open-actions/internal/workflow"
@@ -54,13 +56,14 @@ const (
 )
 
 type queuedDelivery struct {
-	ProjectName string             `json:"projectName"`
-	ProjectUID  string             `json:"projectUID"`
-	Repository  deliveryRepository `json:"repository"`
-	Event       normalizedEvent    `json:"event"`
-	Rerun       *normalizedRerun   `json:"rerun,omitempty"`
-	ReplayID    string             `json:"replayID"`
-	DeliveryID  string             `json:"deliveryID"`
+	ProjectName   string             `json:"projectName"`
+	ProjectUID    string             `json:"projectUID"`
+	Repository    deliveryRepository `json:"repository"`
+	Event         normalizedEvent    `json:"event"`
+	EventSnapshot string             `json:"eventSnapshot,omitempty"`
+	Rerun         *normalizedRerun   `json:"rerun,omitempty"`
+	ReplayID      string             `json:"replayID"`
+	DeliveryID    string             `json:"deliveryID"`
 }
 
 type deliveryRepository struct {
@@ -71,14 +74,15 @@ type deliveryRepository struct {
 
 func (delivery *queuedDelivery) UnmarshalJSON(data []byte) error {
 	document := struct {
-		ProjectName string             `json:"projectName"`
-		ProjectUID  string             `json:"projectUID"`
-		Repository  deliveryRepository `json:"repository"`
-		Payload     *payload           `json:"payload"`
-		Event       normalizedEvent    `json:"event"`
-		Rerun       *normalizedRerun   `json:"rerun,omitempty"`
-		ReplayID    string             `json:"replayID"`
-		DeliveryID  string             `json:"deliveryID"`
+		ProjectName   string             `json:"projectName"`
+		ProjectUID    string             `json:"projectUID"`
+		Repository    deliveryRepository `json:"repository"`
+		Payload       *payload           `json:"payload"`
+		Event         normalizedEvent    `json:"event"`
+		EventSnapshot string             `json:"eventSnapshot,omitempty"`
+		Rerun         *normalizedRerun   `json:"rerun,omitempty"`
+		ReplayID      string             `json:"replayID"`
+		DeliveryID    string             `json:"deliveryID"`
 	}{}
 	if err := json.Unmarshal(data, &document); err != nil {
 		return err
@@ -98,7 +102,7 @@ func (delivery *queuedDelivery) UnmarshalJSON(data []byte) error {
 	}
 	*delivery = queuedDelivery{
 		ProjectName: document.ProjectName, ProjectUID: document.ProjectUID, Repository: document.Repository,
-		Event: document.Event, Rerun: document.Rerun, ReplayID: document.ReplayID, DeliveryID: document.DeliveryID,
+		Event: document.Event, EventSnapshot: document.EventSnapshot, Rerun: document.Rerun, ReplayID: document.ReplayID, DeliveryID: document.DeliveryID,
 	}
 	return nil
 }
@@ -119,17 +123,19 @@ type workflowSelection struct {
 }
 
 func (h *GitHubHandler) enqueueDelivery(ctx context.Context, project *actionsv1alpha1.Project, event *payload, normalized normalizedEvent, deliveryID string, signedBody []byte) error {
+	replayID := webhookReplayID(signedBody)
 	delivery := queuedDelivery{
 		ProjectName: project.Name,
 		ProjectUID:  string(project.UID),
 		Repository: deliveryRepository{
 			ID: event.Repository.ID, Owner: event.Repository.Owner.Login, Name: event.Repository.Name,
 		},
-		Event:      normalized,
-		ReplayID:   webhookReplayID(signedBody),
-		DeliveryID: deliveryID,
+		Event:         normalized,
+		EventSnapshot: eventSnapshotName(replayID),
+		ReplayID:      replayID,
+		DeliveryID:    deliveryID,
 	}
-	return h.enqueueQueuedDelivery(ctx, project, delivery, signedBody)
+	return h.enqueueQueuedDelivery(ctx, project, delivery, signedBody, signedBody)
 }
 
 func (h *GitHubHandler) enqueueRerunDelivery(ctx context.Context, project *actionsv1alpha1.Project, event *payload, rerun *normalizedRerun, deliveryID string) error {
@@ -144,10 +150,10 @@ func (h *GitHubHandler) enqueueRerunDelivery(ctx context.Context, project *actio
 		ReplayID:   webhookReplayID(identity),
 		DeliveryID: deliveryID,
 	}
-	return h.enqueueQueuedDelivery(ctx, project, delivery, identity)
+	return h.enqueueQueuedDelivery(ctx, project, delivery, identity, nil)
 }
 
-func (h *GitHubHandler) enqueueQueuedDelivery(ctx context.Context, project *actionsv1alpha1.Project, delivery queuedDelivery, identity []byte) error {
+func (h *GitHubHandler) enqueueQueuedDelivery(ctx context.Context, project *actionsv1alpha1.Project, delivery queuedDelivery, identity, eventSnapshot []byte) error {
 	data, err := json.Marshal(delivery)
 	if err != nil {
 		return err
@@ -163,6 +169,7 @@ func (h *GitHubHandler) enqueueQueuedDelivery(ctx context.Context, project *acti
 	if err := controllerutil.SetControllerReference(project, object, h.Client.Scheme()); err != nil {
 		return err
 	}
+	stored := object
 	if err := h.Client.Create(ctx, object); err != nil {
 		if !apierrors.IsAlreadyExists(err) {
 			return err
@@ -177,8 +184,44 @@ func (h *GitHubHandler) enqueueQueuedDelivery(ctx context.Context, project *acti
 		if !metav1.IsControlledBy(existing, project) || decodeErr != nil || !apiequality.Semantic.DeepEqual(existingDelivery, delivery) {
 			return apierrors.NewConflict(corev1.Resource("configmaps"), object.Name, errors.New("existing webhook delivery does not match the signed payload"))
 		}
+		stored = existing
+	}
+	if eventSnapshot != nil {
+		return h.ensureEventSnapshot(ctx, stored, delivery.EventSnapshot, eventSnapshot)
 	}
 	return nil
+}
+
+func (h *GitHubHandler) ensureEventSnapshot(ctx context.Context, delivery *corev1.ConfigMap, name string, data []byte) error {
+	if _, err := eventsnapshot.Decode(data); err != nil {
+		return err
+	}
+	immutable := true
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: delivery.Namespace},
+		Immutable:  &immutable,
+		Data:       map[string][]byte{eventsnapshot.DataKey: data},
+	}
+	if err := controllerutil.SetControllerReference(delivery, secret, h.Client.Scheme()); err != nil {
+		return err
+	}
+	if err := h.Client.Create(ctx, secret); err == nil {
+		return nil
+	} else if !apierrors.IsAlreadyExists(err) {
+		return err
+	}
+	existing := &corev1.Secret{}
+	if err := h.APIReader.Get(ctx, client.ObjectKeyFromObject(secret), existing); err != nil {
+		return err
+	}
+	if !metav1.IsControlledBy(existing, delivery) || existing.Immutable == nil || !*existing.Immutable || !bytes.Equal(existing.Data[eventsnapshot.DataKey], data) {
+		return apierrors.NewConflict(corev1.Resource("secrets"), secret.Name, errors.New("existing GitHub event snapshot does not match the signed payload"))
+	}
+	return nil
+}
+
+func eventSnapshotName(replayID string) string {
+	return "event-" + replayID
 }
 
 func webhookDeliveryName(body []byte) string {
@@ -278,6 +321,9 @@ func (r *DeliveryReconciler) Reconcile(ctx context.Context, request ctrl.Request
 	delivery := queuedDelivery{}
 	if err := json.Unmarshal([]byte(object.Data[deliveryDataKey]), &delivery); err != nil {
 		return ctrl.Result{}, r.finish(ctx, object, deliveryStateFailed, 0, fmt.Sprintf("decode delivery: %v", err))
+	}
+	if delivery.EventSnapshot != "" && delivery.EventSnapshot != eventSnapshotName(delivery.ReplayID) {
+		return ctrl.Result{}, r.finish(ctx, object, deliveryStateFailed, 0, "delivery contains an invalid event snapshot reference")
 	}
 	if revision := object.Data[deliveryRevisionKey]; revision != "" {
 		if !validGitSHA(revision) {
@@ -521,7 +567,10 @@ func (r *DeliveryReconciler) reconcileRerun(ctx context.Context, object *corev1.
 	if err != nil {
 		return ctrl.Result{}, r.finish(ctx, object, deliveryStateFailed, 0, err.Error())
 	}
-	if workflowRunAttemptForRequest(root, runs.Items, delivery.DeliveryID) != nil {
+	if existing := workflowRunAttemptForRequest(root, runs.Items, delivery.DeliveryID); existing != nil {
+		if err := r.ensureEventSnapshotOwner(ctx, existing); err != nil {
+			return ctrl.Result{}, err
+		}
 		return ctrl.Result{}, r.finish(ctx, object, deliveryStateCompleted, 1, "")
 	}
 	if !workflowRunTerminal(latest) {
@@ -619,7 +668,14 @@ func (r *DeliveryReconciler) rerunWorkflowJobIDs(ctx context.Context, run *actio
 }
 
 func (r *DeliveryReconciler) createRerunWorkflowRun(ctx context.Context, root, previous *actionsv1alpha1.WorkflowRun, attempt int32, requestID string, jobIDs []string) error {
+	snapshotName, err := r.rerunEventSnapshot(ctx, root)
+	if err != nil {
+		return err
+	}
 	desired := workflowrun.NewRerun(root, previous, attempt, requestID, jobIDs)
+	if snapshotName != "" {
+		desired.Annotations = map[string]string{eventsnapshot.Annotation: snapshotName}
+	}
 	if err := r.Create(ctx, desired); err != nil {
 		if !apierrors.IsAlreadyExists(err) {
 			return err
@@ -631,9 +687,38 @@ func (r *DeliveryReconciler) createRerunWorkflowRun(ctx context.Context, root, p
 		if matchingRerunRequest(existing, desired) {
 			return errRerunAttemptClaimed
 		}
-		return matchingWorkflowRun(existing, desired)
+		if err := matchingWorkflowRun(existing, desired); err != nil {
+			return err
+		}
+		return r.ensureEventSnapshotOwner(ctx, existing)
 	}
-	return nil
+	return r.ensureEventSnapshotOwner(ctx, desired)
+}
+
+func (r *DeliveryReconciler) rerunEventSnapshot(ctx context.Context, root *actionsv1alpha1.WorkflowRun) (string, error) {
+	name := root.Annotations[eventsnapshot.Annotation]
+	if name == "" {
+		return "", nil
+	}
+	secret := &corev1.Secret{}
+	if err := r.APIReader.Get(ctx, client.ObjectKey{Namespace: root.Namespace, Name: name}, secret); err != nil {
+		return "", fmt.Errorf("get GitHub event snapshot Secret %q for WorkflowRun %q: %w", name, root.Name, err)
+	}
+	owned := false
+	for _, owner := range secret.OwnerReferences {
+		if owner.APIVersion == actionsv1alpha1.GroupVersion.String() && owner.Kind == "WorkflowRun" && owner.Name == root.Name && owner.UID == root.UID {
+			owned = true
+			break
+		}
+	}
+	data, found := secret.Data[eventsnapshot.DataKey]
+	if !owned || secret.Immutable == nil || !*secret.Immutable || !found {
+		return "", fmt.Errorf("GitHub event snapshot Secret %q is invalid for WorkflowRun %q", name, root.Name)
+	}
+	if _, err := eventsnapshot.Decode(data); err != nil {
+		return "", fmt.Errorf("GitHub event snapshot Secret %q is invalid for WorkflowRun %q: %w", name, root.Name, err)
+	}
+	return name, nil
 }
 
 func matchingRerunRequest(existing, desired *actionsv1alpha1.WorkflowRun) bool {
@@ -656,8 +741,15 @@ func (r *DeliveryReconciler) createWorkflowRun(ctx context.Context, project *act
 		replayID += ":pull_request_target"
 	}
 	name := workflowRunName(selection.Path, string(project.UID), replayID)
+	annotations := map[string]string{}
+	if delivery.EventSnapshot != "" {
+		annotations[eventsnapshot.Annotation] = delivery.EventSnapshot
+	}
 	desired := &actionsv1alpha1.WorkflowRun{
-		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: project.Namespace},
+		ObjectMeta: metav1.ObjectMeta{
+			Name: name, Namespace: project.Namespace,
+			Annotations: annotations,
+		},
 		Spec: actionsv1alpha1.WorkflowRunSpec{
 			ProjectRef:              corev1.LocalObjectReference{Name: project.Name},
 			TTLSecondsAfterFinished: r.WorkflowRunTTLSecondsAfterFinished,
@@ -675,7 +767,10 @@ func (r *DeliveryReconciler) createWorkflowRun(ctx context.Context, project *act
 	alias := &actionsv1alpha1.WorkflowRun{}
 	aliasKey := client.ObjectKey{Namespace: desired.Namespace, Name: fullDigestWorkflowRunName(selection.Path, replayID)}
 	if err := r.APIReader.Get(ctx, aliasKey, alias); err == nil {
-		return matchingWorkflowRun(alias, desired)
+		if err := matchingWorkflowRun(alias, desired); err != nil {
+			return err
+		}
+		return r.ensureEventSnapshotOwner(ctx, alias)
 	} else if !apierrors.IsNotFound(err) {
 		return err
 	}
@@ -687,9 +782,33 @@ func (r *DeliveryReconciler) createWorkflowRun(ctx context.Context, project *act
 		if err := r.APIReader.Get(ctx, client.ObjectKeyFromObject(desired), existing); err != nil {
 			return err
 		}
-		return matchingWorkflowRun(existing, desired)
+		if err := matchingWorkflowRun(existing, desired); err != nil {
+			return err
+		}
+		return r.ensureEventSnapshotOwner(ctx, existing)
 	}
-	return nil
+	return r.ensureEventSnapshotOwner(ctx, desired)
+}
+
+func (r *DeliveryReconciler) ensureEventSnapshotOwner(ctx context.Context, run *actionsv1alpha1.WorkflowRun) error {
+	name := run.Annotations[eventsnapshot.Annotation]
+	if name == "" {
+		return nil
+	}
+	secret := &corev1.Secret{}
+	if err := r.APIReader.Get(ctx, client.ObjectKey{Namespace: run.Namespace, Name: name}, secret); err != nil {
+		return err
+	}
+	for _, owner := range secret.OwnerReferences {
+		if owner.APIVersion == actionsv1alpha1.GroupVersion.String() && owner.Kind == "WorkflowRun" && owner.Name == run.Name && owner.UID == run.UID {
+			return nil
+		}
+	}
+	before := secret.DeepCopy()
+	secret.OwnerReferences = append(secret.OwnerReferences, metav1.OwnerReference{
+		APIVersion: actionsv1alpha1.GroupVersion.String(), Kind: "WorkflowRun", Name: run.Name, UID: run.UID,
+	})
+	return r.Patch(ctx, secret, client.MergeFrom(before))
 }
 
 func workflowRunEvent(event normalizedEvent, deliveryID string) actionsv1alpha1.GitHubEvent {
@@ -746,6 +865,13 @@ func workflowRunRevision(event normalizedEvent) actionsv1alpha1.GitRevision {
 }
 
 func matchingWorkflowRun(existing, desired *actionsv1alpha1.WorkflowRun) error {
+	if existing.Annotations[eventsnapshot.Annotation] != desired.Annotations[eventsnapshot.Annotation] {
+		return apierrors.NewConflict(
+			actionsv1alpha1.GroupVersion.WithResource("workflowruns").GroupResource(),
+			existing.Name,
+			errors.New("existing WorkflowRun does not match the webhook delivery"),
+		)
+	}
 	existingSpec := existing.Spec.DeepCopy()
 	desiredSpec := desired.Spec.DeepCopy()
 	existingSpec.TTLSecondsAfterFinished = nil

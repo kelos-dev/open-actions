@@ -10,6 +10,7 @@ import (
 	"time"
 
 	actionsv1alpha1 "github.com/kelos-dev/open-actions/api/v1alpha1"
+	"github.com/kelos-dev/open-actions/internal/eventsnapshot"
 	"github.com/kelos-dev/open-actions/internal/runner"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -122,6 +123,32 @@ func TestRunnerBuildsOwnedJob(t *testing.T) {
 	if len(job.Spec.Template.Spec.Volumes) != 2 {
 		t.Errorf("volumes = %#v", job.Spec.Template.Spec.Volumes)
 	}
+}
+
+func TestRunnerMountsGitHubEventSnapshot(t *testing.T) {
+	scheme := runnerTestScheme(t)
+	reconciler := &RunnerReconciler{Client: fake.NewClientBuilder().WithScheme(scheme).Build()}
+	run := &actionsv1alpha1.WorkflowRun{ObjectMeta: metav1.ObjectMeta{
+		Name: "ci", Namespace: "default", UID: types.UID("run-uid"),
+		Annotations: map[string]string{eventsnapshot.Annotation: "event-snapshot"},
+	}}
+	workflowJob := &actionsv1alpha1.WorkflowJob{ObjectMeta: metav1.ObjectMeta{Name: "build", Namespace: "default", UID: types.UID("job-uid")}}
+	runnerObject := &actionsv1alpha1.Runner{Spec: actionsv1alpha1.RunnerSpec{Execution: actionsv1alpha1.RunnerExecutionSpec{Image: "runner:test"}}}
+	job, err := reconciler.buildJob(workflowJob, run, &actionsv1alpha1.Project{}, runnerObject)
+	if err != nil {
+		t.Fatal(err)
+	}
+	container := job.Spec.Template.Spec.Containers[0]
+	if !slices.Contains(container.Args, "--event-file="+jobEventMountPath+"/"+eventsnapshot.DataKey) ||
+		!slices.Contains(container.VolumeMounts, corev1.VolumeMount{Name: jobEventVolume, MountPath: jobEventMountPath, ReadOnly: true}) {
+		t.Fatalf("runner event snapshot configuration = args %#v, mounts %#v", container.Args, container.VolumeMounts)
+	}
+	for _, volume := range job.Spec.Template.Spec.Volumes {
+		if volume.Name == jobEventVolume && volume.Secret != nil && volume.Secret.SecretName == "event-snapshot" {
+			return
+		}
+	}
+	t.Fatalf("runner volumes = %#v", job.Spec.Template.Spec.Volumes)
 }
 
 func TestRunnerBuildsJobWithProjectValues(t *testing.T) {

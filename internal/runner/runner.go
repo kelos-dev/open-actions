@@ -16,13 +16,14 @@ import (
 	"strings"
 	"sync/atomic"
 
+	"github.com/kelos-dev/open-actions/internal/eventsnapshot"
 	"github.com/kelos-dev/open-actions/internal/expression"
 	"github.com/kelos-dev/open-actions/internal/workflow"
 )
 
 const (
 	minimumPlanVersion = 1
-	PlanVersion        = 5
+	PlanVersion        = 6
 	ContainerName      = "runner"
 	GitHubTokenEnvVar  = "OPEN_ACTIONS_GITHUB_TOKEN"
 	ActionTokenEnvVar  = "OPEN_ACTIONS_ACTION_TOKEN"
@@ -42,6 +43,8 @@ type Plan struct {
 	Env          map[string]string `json:"env,omitempty"`
 	Outputs      map[string]string `json:"outputs,omitempty"`
 	Steps        []Step            `json:"steps"`
+	eventPath    string
+	eventPayload map[string]any
 }
 
 type Repository struct {
@@ -231,6 +234,20 @@ func LoadPlan(path string) (*Plan, error) {
 	return plan, nil
 }
 
+func LoadEventSnapshot(plan *Plan, path string) error {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("read GitHub event snapshot: %w", err)
+	}
+	payload, err := eventsnapshot.Decode(data)
+	if err != nil {
+		return err
+	}
+	plan.eventPath = path
+	plan.eventPayload = payload
+	return nil
+}
+
 func validGitSHA(value string) bool {
 	if len(value) != 40 {
 		return false
@@ -287,13 +304,16 @@ func (e *Executor) executePlan(ctx context.Context, plan *Plan, workspace string
 			return emptyResult, fmt.Errorf("create runner directory: %w", err)
 		}
 	}
-	eventPath := filepath.Join(temporaryDirectory, "event.json")
-	eventDocument, err := githubEventDocument(plan)
-	if err != nil {
-		return emptyResult, err
-	}
-	if err := os.WriteFile(eventPath, eventDocument, 0o600); err != nil {
-		return emptyResult, fmt.Errorf("create event file: %w", err)
+	eventPath := plan.eventPath
+	if eventPath == "" {
+		eventPath = filepath.Join(temporaryDirectory, "event.json")
+		eventDocument, err := githubEventDocument(plan)
+		if err != nil {
+			return emptyResult, err
+		}
+		if err := os.WriteFile(eventPath, eventDocument, 0o600); err != nil {
+			return emptyResult, fmt.Errorf("create event file: %w", err)
+		}
 	}
 
 	environment := append(append([]string(nil), e.environment...),
@@ -437,6 +457,13 @@ func workflowStepStatus(failed, cancelled bool) expression.Status {
 }
 
 func githubEventDocument(plan *Plan) ([]byte, error) {
+	if plan.eventPayload != nil {
+		data, err := json.Marshal(plan.eventPayload)
+		if err != nil {
+			return nil, fmt.Errorf("create event file: %w", err)
+		}
+		return append(data, '\n'), nil
+	}
 	repository := map[string]any{
 		"id":        plan.Repository.ID,
 		"name":      plan.Repository.Name,

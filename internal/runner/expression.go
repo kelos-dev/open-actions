@@ -159,6 +159,9 @@ func secretContext(token string, secrets map[string]string) map[string]any {
 }
 
 func githubExpressionEvent(plan *Plan) map[string]any {
+	if plan.eventPayload != nil {
+		return plan.eventPayload
+	}
 	result := map[string]any{"action": plan.Event.Action}
 	if len(plan.Inputs) > 0 {
 		result["inputs"] = eventInputValues(plan.Inputs)

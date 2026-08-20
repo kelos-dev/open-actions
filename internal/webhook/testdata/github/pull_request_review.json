@@ -1,0 +1,15 @@
+{
+  "action": "submitted",
+  "pull_request": {
+    "number": 42,
+    "body": "Pull request body",
+    "html_url": "https://github.com/acme/example/pull/42",
+    "state": "open",
+    "head": {"ref": "feature", "sha": "2222222222222222222222222222222222222222", "repo": {"id": 1001, "name": "example", "full_name": "acme/example", "owner": {"login": "acme"}}},
+    "base": {"ref": "main", "sha": "1111111111111111111111111111111111111111"}
+  },
+  "review": {"id": 8008, "body": "Review body", "state": "approved", "html_url": "https://github.com/acme/example/pull/42#pullrequestreview-8008"},
+  "repository": {"id": 1001, "name": "example", "full_name": "acme/example", "default_branch": "main", "owner": {"login": "acme"}},
+  "installation": {"id": 2002},
+  "sender": {"login": "reviewer"}
+}

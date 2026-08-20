@@ -172,6 +172,7 @@ type Event struct {
 	Issue        *IssueEvent
 	Comment      *CommentEvent
 	Review       *ReviewEvent
+	Payload      map[string]any
 }
 
 type PullRequest struct {
@@ -781,6 +782,9 @@ func EvaluateConcurrency(definition *Definition, event Event, variables any) (st
 }
 
 func eventExpressionValue(event Event) map[string]any {
+	if event.Payload != nil {
+		return event.Payload
+	}
 	eventValues := map[string]any{"action": event.Action}
 	if len(event.Inputs) > 0 {
 		eventValues["inputs"] = event.Inputs
