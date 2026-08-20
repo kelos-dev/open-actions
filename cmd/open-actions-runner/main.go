@@ -27,6 +27,7 @@ func main() {
 func run(ctx context.Context, arguments []string) error {
 	flags := flag.NewFlagSet("open-actions-runner", flag.ContinueOnError)
 	jobFile := flags.String("job-file", "/var/run/open-actions/job.json", "Path to the workflow job plan")
+	eventFile := flags.String("event-file", "", "Path to the immutable GitHub event snapshot")
 	resultFile := flags.String("result-file", "/dev/termination-log", "Path used to report the workflow job result")
 	secretsDirectory := flags.String("secrets-directory", "", "Directory containing Project secret values")
 	variablesDirectory := flags.String("variables-directory", "", "Directory containing Project variable values")
@@ -37,6 +38,11 @@ func run(ctx context.Context, arguments []string) error {
 	plan, err := runner.LoadPlan(*jobFile)
 	if err != nil {
 		return err
+	}
+	if *eventFile != "" {
+		if err := runner.LoadEventSnapshot(plan, *eventFile); err != nil {
+			return err
+		}
 	}
 	secrets, err := loadValues(*secretsDirectory)
 	if err != nil {

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	actionsv1alpha1 "github.com/kelos-dev/open-actions/api/v1alpha1"
+	"github.com/kelos-dev/open-actions/internal/eventsnapshot"
 	githubclient "github.com/kelos-dev/open-actions/internal/github"
 	"github.com/kelos-dev/open-actions/internal/runner"
 	batchv1 "k8s.io/api/batch/v1"
@@ -34,12 +35,14 @@ var (
 
 const (
 	jobPlanVolume            = "open-actions-job"
+	jobEventVolume           = "open-actions-event"
 	jobSecretsVolume         = "open-actions-secrets"
 	jobVariablesVolume       = "open-actions-variables"
 	workspaceVolume          = "open-actions-workspace"
 	dockerSocketVolume       = "open-actions-docker-socket"
 	dockerStorageVolume      = "open-actions-docker-storage"
 	jobPlanMountPath         = "/var/run/open-actions"
+	jobEventMountPath        = "/var/run/open-actions/event"
 	jobContextMountPath      = "/var/run/open-actions/context"
 	workspaceVolumeMountPath = "/workspace"
 	jobResultPath            = "/dev/termination-log"
@@ -470,6 +473,9 @@ func (r *RunnerReconciler) executeWorkflowJob(ctx context.Context, runnerObject 
 	if !metav1.IsControlledBy(plan, workflowJob) {
 		return false, fmt.Errorf("job plan ConfigMap %q is not controlled by WorkflowJob %q", plan.Name, workflowJob.Name)
 	}
+	if err := r.validateEventSnapshot(ctx, run); err != nil {
+		return false, err
+	}
 	if err := validateProjectSecretValues(ctx, r.APIReader, project); err != nil {
 		return false, err
 	}
@@ -830,6 +836,18 @@ func (r *RunnerReconciler) buildJob(workflowJob *actionsv1alpha1.WorkflowJob, ru
 	if runnerObject.Spec.Execution.Docker != nil {
 		configureDockerExecution(&podTemplate.Spec, &podTemplate.Spec.Containers[0], runnerObject.Spec.Execution.Docker)
 	}
+	if snapshotName := run.Annotations[eventsnapshot.Annotation]; snapshotName != "" {
+		mode := int32(0o440)
+		podTemplate.Spec.Volumes = append(podTemplate.Spec.Volumes, corev1.Volume{
+			Name: jobEventVolume,
+			VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{
+				SecretName: snapshotName, DefaultMode: &mode,
+			}},
+		})
+		container := &podTemplate.Spec.Containers[0]
+		container.VolumeMounts = append(container.VolumeMounts, corev1.VolumeMount{Name: jobEventVolume, MountPath: jobEventMountPath, ReadOnly: true})
+		container.Args = append(container.Args, "--event-file="+jobEventMountPath+"/"+eventsnapshot.DataKey)
+	}
 	configureProjectValues(&podTemplate.Spec, &podTemplate.Spec.Containers[0], project)
 	backoffLimit := int32(0)
 	job := &batchv1.Job{
@@ -849,6 +867,32 @@ func (r *RunnerReconciler) buildJob(workflowJob *actionsv1alpha1.WorkflowJob, ru
 		return nil, err
 	}
 	return job, nil
+}
+
+func (r *RunnerReconciler) validateEventSnapshot(ctx context.Context, run *actionsv1alpha1.WorkflowRun) error {
+	name := run.Annotations[eventsnapshot.Annotation]
+	if name == "" {
+		return nil
+	}
+	secret := &corev1.Secret{}
+	if err := r.APIReader.Get(ctx, client.ObjectKey{Namespace: run.Namespace, Name: name}, secret); err != nil {
+		return fmt.Errorf("get GitHub event snapshot Secret %q for WorkflowRun %q: %w", name, run.Name, err)
+	}
+	owned := false
+	for _, owner := range secret.OwnerReferences {
+		if owner.APIVersion == actionsv1alpha1.GroupVersion.String() && owner.Kind == "WorkflowRun" && owner.Name == run.Name && owner.UID == run.UID {
+			owned = true
+			break
+		}
+	}
+	data, found := secret.Data[eventsnapshot.DataKey]
+	if !owned || secret.Immutable == nil || !*secret.Immutable || !found {
+		return fmt.Errorf("GitHub event snapshot Secret %q is invalid for WorkflowRun %q", name, run.Name)
+	}
+	if _, err := eventsnapshot.Decode(data); err != nil {
+		return fmt.Errorf("GitHub event snapshot Secret %q is invalid for WorkflowRun %q: %w", name, run.Name, err)
+	}
+	return nil
 }
 
 func configureProjectValues(pod *corev1.PodSpec, container *corev1.Container, project *actionsv1alpha1.Project) {

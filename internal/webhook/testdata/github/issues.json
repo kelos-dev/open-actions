@@ -1,0 +1,7 @@
+{
+  "action": "opened",
+  "issue": {"number": 17, "body": "Issue body", "html_url": "https://github.com/acme/example/issues/17"},
+  "repository": {"id": 1001, "name": "example", "full_name": "acme/example", "default_branch": "main", "owner": {"login": "acme"}},
+  "installation": {"id": 2002},
+  "sender": {"login": "octocat"}
+}

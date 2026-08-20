@@ -1,0 +1,14 @@
+{
+  "action": "completed",
+  "workflow_run": {
+    "id": 5005,
+    "name": "Release",
+    "head_branch": "main",
+    "head_sha": "5555555555555555555555555555555555555555",
+    "conclusion": "success",
+    "html_url": "https://github.com/acme/example/actions/runs/5005"
+  },
+  "repository": {"id": 1001, "name": "example", "full_name": "acme/example", "default_branch": "main", "owner": {"login": "acme"}},
+  "installation": {"id": 2002},
+  "sender": {"login": "octocat"}
+}

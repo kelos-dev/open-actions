@@ -471,6 +471,24 @@ func TestEvaluateConcurrency(t *testing.T) {
 	}
 }
 
+func TestEvaluateConcurrencyUsesEventPayload(t *testing.T) {
+	definition := &Definition{Name: "CI", Concurrency: Concurrency{Group: "pr-${{ github.event.pull_request.number }}-${{ github.event.sender.login }}"}}
+	event := Event{
+		Name: "pull_request",
+		Payload: map[string]any{
+			"pull_request": map[string]any{"number": float64(42)},
+			"sender":       map[string]any{"login": "octocat"},
+		},
+	}
+	group, _, err := EvaluateConcurrency(definition, event, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if group != "pr-42-octocat" {
+		t.Fatalf("concurrency group = %q", group)
+	}
+}
+
 func TestEvaluateConcurrencyUsesRefNameFallback(t *testing.T) {
 	definition := &Definition{
 		Name:        "CI",

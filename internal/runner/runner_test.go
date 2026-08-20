@@ -648,6 +648,36 @@ func TestExpressionContextIncludesBoundedEventMetadata(t *testing.T) {
 	}
 }
 
+func TestLoadEventSnapshotUsesProviderPayload(t *testing.T) {
+	plan := testPlan()
+	plan.Event.Name = "pull_request"
+	fixturePath := filepath.Join("..", "webhook", "testdata", "github", "pull_request.json")
+	absolutePath, err := filepath.Abs(fixturePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := LoadEventSnapshot(plan, absolutePath); err != nil {
+		t.Fatal(err)
+	}
+	event := githubExpressionEvent(plan)
+	pullRequest := event["pull_request"].(map[string]any)
+	head := pullRequest["head"].(map[string]any)
+	base := pullRequest["base"].(map[string]any)
+	if pullRequest["number"] != float64(42) || pullRequest["html_url"] != "https://github.com/acme/example/pull/42" ||
+		head["sha"] != strings.Repeat("2", 40) || base["sha"] != strings.Repeat("1", 40) ||
+		head["repo"].(map[string]any)["full_name"] != "acme/example" {
+		t.Fatalf("github.event.pull_request = %#v", pullRequest)
+	}
+	if plan.eventPath != absolutePath || event["sender"].(map[string]any)["login"] != "octocat" {
+		t.Fatalf("loaded event snapshot = path %q, event %#v", plan.eventPath, event)
+	}
+	plan.Env = map[string]string{"EXPECTED_EVENT_PATH": absolutePath}
+	plan.Steps = []Step{{Run: `cmp "$GITHUB_EVENT_PATH" "$EXPECTED_EVENT_PATH" && test "${{ github.event.sender.login }}" = octocat`}}
+	if err := testExecutor(t, io.Discard, io.Discard).Execute(context.Background(), plan, t.TempDir()); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestLoadPlanValidatesDeliveryIdentityByEvent(t *testing.T) {
 	for _, tt := range []struct {
 		name  string

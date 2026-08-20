@@ -1,0 +1,7 @@
+{
+  "action": "published",
+  "release": {"id": 9009, "tag_name": "v1.2.3", "draft": false, "html_url": "https://github.com/acme/example/releases/tag/v1.2.3"},
+  "repository": {"id": 1001, "name": "example", "full_name": "acme/example", "default_branch": "main", "owner": {"login": "acme"}},
+  "installation": {"id": 2002},
+  "sender": {"login": "octocat"}
+}

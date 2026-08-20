@@ -369,6 +369,14 @@ replay-and-path digest form is also recognized as an idempotency alias. Rerun
 names contain their attempt number and a stable digest of the original
 WorkflowRun UID.
 
+Webhook-created WorkflowRuns carry an
+`actions.kelos.dev/github-event-snapshot` annotation naming the immutable Secret
+that holds the authenticated provider payload. The annotation is a bounded
+reference; the payload is not embedded in the WorkflowRun or WorkflowJob API.
+One snapshot is shared by all workflows selected from the delivery and by their
+reruns. Kubernetes garbage collection removes it after the delivery record and
+all referencing WorkflowRuns have been deleted.
+
 ## Workflow API
 
 Workflow files must define a non-empty `name` of at most 256 characters.
@@ -533,10 +541,11 @@ events are reported on the trusted default-branch revision,
 and ordinary `pull_request` checks are reported on the pull request head
 revision.
 
-For an ordinary open `pull_request`, `github.sha` and
-`github.event.pull_request.merge_commit_sha` identify the locally constructed
-integration commit, and `github.event.pull_request.base.sha` and
-`github.event.pull_request.head.sha` identify its pinned parents. The default
+For an ordinary open `pull_request`, `github.sha` identifies the locally
+constructed integration commit. `github.event.pull_request.merge_commit_sha`
+retains the value received from GitHub, while
+`github.event.pull_request.base.sha` and `github.event.pull_request.head.sha`
+identify its pinned parents. The default
 checkout of the current repository with `actions/checkout` fetches the pinned
 commits and reconstructs that integration commit in the workspace. Setting an
 explicit `ref` other than the integration SHA, or checking out another
@@ -555,8 +564,9 @@ pinned to the base commit from the signed webhook instead of resolving the
 mutable branch during asynchronous delivery processing. Bounded untrusted
 metadata is recorded separately under `event.pullRequest`: the pull request
 number and body, HTML URL, head repository, head branch and SHA, and base branch.
-The normalized `github.event.pull_request` object exposes the same values and
-derives `merge_ref` from the pull request number. For this event,
+The complete authenticated webhook payload is exposed through
+`github.event.pull_request` without rewriting its base, head, repository,
+number, URL, or merge fields. For this event,
 `github.sha` and `github.event.pull_request.base.sha` are both the pinned trusted
 base SHA; `github.event.pull_request.head.sha` remains the untrusted fork head.
 Open Actions does not
@@ -567,7 +577,7 @@ metadata.
 #### Trusted fork checkout
 
 Treat every value under `github.event.pull_request.head` and all content fetched
-from `github.event.pull_request.merge_ref` as untrusted. Each `synchronize`
+from `refs/pull/<number>/merge` as untrusted. Each `synchronize`
 delivery records its own immutable head SHA and creates a distinct WorkflowRun,
 so an approval system must bind approval to that SHA or to the exact
 WorkflowJob. An approval attached to an earlier delivery must not authorize a
@@ -590,7 +600,7 @@ any pull-request-controlled command:
 ```yaml
 - uses: actions/checkout@v4
   with:
-    ref: ${{ github.event.pull_request.merge_ref }}
+    ref: refs/pull/${{ github.event.pull_request.number }}/merge
     fetch-depth: 2
     persist-credentials: false
     allow-unsafe-pr-checkout: true
@@ -618,15 +628,12 @@ downloads of actions from the fork repository.
 GitHub App `workflow_run` webhooks. It does not synthesize a GitHub
 `workflow_run` delivery when an Open Actions run completes.
 
-Webhook-backed runs persist only the bounded event fields exposed by Open
-Actions. `github.event.workflow_run` contains `conclusion` and `head_sha`;
-`github.event.issue` contains `number` and `body`; `github.event.comment` and
-`github.event.review` contain `body`; and `github.event.release` contains
-`tag_name`, derived from the canonical revision tag ref. Draft release
-activities are ignored. Pull-request-backed events expose the pull request
-number, body, HTML URL, head repository, head branch and SHA, and base branch.
-These objects have the same shape in planning expressions and
-`GITHUB_EVENT_PATH`; the raw webhook payload is not persisted.
+Webhook-backed runs expose the complete authenticated GitHub payload through
+`github.event`. The exact signed bytes are stored in an immutable Secret and
+mounted as `GITHUB_EVENT_PATH`, while expressions decode that same snapshot.
+The payload remains outside CRD spec and status fields and job-plan ConfigMaps.
+Controller logs and diagnostics identify the snapshot Secret without including
+provider payload fields. Draft release activities are ignored.
 
 Issue, comment, review, and pull request bodies contain at most 48,000
 characters. Pull request HTML URLs contain at most 2,048 characters.
@@ -741,14 +748,14 @@ Node, composite, and Bash steps can use Docker when assigned to a Runner with
 `spec.execution.docker`. This capability supports tools such as kind but does
 not add support for action metadata declaring `runs.using: docker`.
 
-`GITHUB_EVENT_PATH` contains a bounded normalized document with repository
-identity, trigger action, event-specific metadata described above, manual or
-reusable inputs, the selected cron expression, and revision fields used by the
-supported event. Actions that require other fields from GitHub's raw webhook
-payload are not supported.
+For webhook-backed events, `GITHUB_EVENT_PATH` contains the exact authenticated
+GitHub payload, limited to 900,000 bytes, and `github.event` is decoded from the
+same immutable snapshot. Synthetic `workflow_dispatch`, `schedule`, and
+`workflow_call` runs use a bounded generated document containing their inputs,
+schedule, repository identity, and supported event metadata.
 
-The controller emits job-plan version 5, and the runner accepts versions 1
-through 5. When a release changes the job-plan version, update every Runner
+The controller emits job-plan version 6, and the runner accepts versions 1
+through 6. When a release changes the job-plan version, update every Runner
 `spec.execution.image` to an image that accepts both the installed and target
 controller versions before upgrading the controller. The received job-plan
 version also determines the runner result version. A runner that accepts more
@@ -771,9 +778,9 @@ available. Open Actions does not archive logs.
 
 ## Webhook API
 
-The webhook endpoint accepts only signed GitHub `POST` deliveries up to 10 MiB
-and requires exactly one configured project for the installation. Supported
-deliveries return HTTP 202 with `{"accepted":true,"queued":true}`. Unsupported
+The webhook endpoint accepts only signed GitHub `POST` deliveries up to 900,000
+bytes and requires exactly one configured project for the installation.
+Supported deliveries return HTTP 202 with `{"accepted":true,"queued":true}`. Unsupported
 event names return HTTP 202 with `{"accepted":true,"queued":false}`. For an
 ordinary open pull request, the controller resolves the merge base and
 constructs a deterministic integration commit from the base and head SHAs in

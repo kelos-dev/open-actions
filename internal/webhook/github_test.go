@@ -11,10 +11,13 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	actionsv1alpha1 "github.com/kelos-dev/open-actions/api/v1alpha1"
+	"github.com/kelos-dev/open-actions/internal/eventsnapshot"
 	githubclient "github.com/kelos-dev/open-actions/internal/github"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -34,6 +37,16 @@ func TestValidSignature(t *testing.T) {
 	}
 	if validSignature(body, secret, signature[:len(signature)-1]+"0") {
 		t.Fatal("invalid signature was accepted")
+	}
+}
+
+func TestGitHubHandlerRejectsOversizedSnapshot(t *testing.T) {
+	handler := &GitHubHandler{}
+	request := httptest.NewRequest(http.MethodPost, "/", bytes.NewReader(make([]byte, maxPayloadBytes+1)))
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("response status = %d, want %d", response.Code, http.StatusRequestEntityTooLarge)
 	}
 }
 
@@ -349,6 +362,81 @@ func TestGitHubHandlerQueuesCheckRerequestByDeliveryID(t *testing.T) {
 	}
 	if delivery.Rerun == nil || delivery.Rerun.CheckRunID != 42 || delivery.Rerun.RootRunUID != "root-uid" {
 		t.Fatalf("queued rerun = %#v", delivery.Rerun)
+	}
+}
+
+func TestGitHubHandlerPreservesSupportedEventFixtures(t *testing.T) {
+	for _, eventName := range []string{
+		"push", "pull_request", "merge_group", "workflow_run", "issues", "issue_comment",
+		"pull_request_review_comment", "pull_request_review", "release",
+	} {
+		t.Run(eventName, func(t *testing.T) {
+			body, err := os.ReadFile(filepath.Join("testdata", "github", eventName+".json"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if eventName == "pull_request" {
+				parsed := &payload{}
+				if err := json.Unmarshal(body, parsed); err != nil {
+					t.Fatal(err)
+				}
+				normalized, supported, err := normalize(eventName, parsed)
+				if err != nil || !supported {
+					t.Fatalf("normalize pull request fixture: supported %v, error %v", supported, err)
+				}
+				events := deliveryEvents(normalized)
+				if len(events) != 2 || events[0].Name != "pull_request" || events[1].Name != "pull_request_target" {
+					t.Fatalf("pull request fixture events = %#v", events)
+				}
+			}
+			scheme := runtime.NewScheme()
+			if err := actionsv1alpha1.AddToScheme(scheme); err != nil {
+				t.Fatal(err)
+			}
+			if err := corev1.AddToScheme(scheme); err != nil {
+				t.Fatal(err)
+			}
+			project := &actionsv1alpha1.Project{
+				ObjectMeta: metav1.ObjectMeta{Name: "project", Namespace: "default", UID: "project-uid", Generation: 1},
+				Spec: actionsv1alpha1.ProjectSpec{Source: actionsv1alpha1.ProjectSource{Type: actionsv1alpha1.SourceTypeGitHub, GitHub: &actionsv1alpha1.GitHubAppConfiguration{
+					InstallationID:   2002,
+					WebhookSecretRef: corev1.SecretKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: "github"}, Key: "webhook-secret"},
+				}}},
+				Status: actionsv1alpha1.ProjectStatus{Conditions: []metav1.Condition{{Type: actionsv1alpha1.ProjectConditionConfigured, Status: metav1.ConditionTrue, ObservedGeneration: 1}}},
+			}
+			webhookSecret := []byte("secret")
+			credential := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "github", Namespace: project.Namespace}, Data: map[string][]byte{"webhook-secret": webhookSecret}}
+			clusterClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(project, credential).Build()
+			logs := &bytes.Buffer{}
+			handler := &GitHubHandler{Client: clusterClient, APIReader: clusterClient, Logger: slog.New(slog.NewTextHandler(logs, nil))}
+			digest := hmac.New(sha256.New, webhookSecret)
+			digest.Write(body)
+			request := httptest.NewRequest(http.MethodPost, "/", bytes.NewReader(body))
+			request.Header.Set("X-GitHub-Event", eventName)
+			request.Header.Set("X-GitHub-Delivery", "delivery-"+eventName)
+			request.Header.Set("X-Hub-Signature-256", "sha256="+hex.EncodeToString(digest.Sum(nil)))
+			response := httptest.NewRecorder()
+
+			handler.ServeHTTP(response, request)
+			if response.Code != http.StatusAccepted {
+				t.Fatalf("response status = %d, body = %s", response.Code, response.Body.String())
+			}
+			replayID := webhookReplayID(body)
+			delivery := &corev1.ConfigMap{}
+			if err := clusterClient.Get(context.Background(), client.ObjectKey{Namespace: project.Namespace, Name: webhookDeliveryName(body)}, delivery); err != nil {
+				t.Fatal(err)
+			}
+			snapshot := &corev1.Secret{}
+			if err := clusterClient.Get(context.Background(), client.ObjectKey{Namespace: project.Namespace, Name: eventSnapshotName(replayID)}, snapshot); err != nil {
+				t.Fatal(err)
+			}
+			if snapshot.Immutable == nil || !*snapshot.Immutable || !metav1.IsControlledBy(snapshot, delivery) || !bytes.Equal(snapshot.Data[eventsnapshot.DataKey], body) {
+				t.Fatalf("stored event snapshot = %#v", snapshot)
+			}
+			if strings.Contains(delivery.Data[deliveryDataKey], "private@example.com") || strings.Contains(logs.String(), "private@example.com") {
+				t.Fatal("sensitive provider field appeared outside the event snapshot")
+			}
+		})
 	}
 }
 

@@ -13,6 +13,7 @@ import (
 	"time"
 
 	actionsv1alpha1 "github.com/kelos-dev/open-actions/api/v1alpha1"
+	"github.com/kelos-dev/open-actions/internal/eventsnapshot"
 	workflowexpression "github.com/kelos-dev/open-actions/internal/expression"
 	githubclient "github.com/kelos-dev/open-actions/internal/github"
 	"github.com/kelos-dev/open-actions/internal/gitrepository"
@@ -229,6 +230,15 @@ func (r *WorkflowRunReconciler) reconcileWorkflowRun(ctx context.Context, run *a
 	}
 	githubConfig := project.Spec.Source.GitHub
 	githubSource := run.Spec.Source.GitHub
+	eventPayload, err := r.githubEventSnapshot(ctx, run)
+	if err != nil {
+		disposition := planningFailureRetry
+		terminal := &terminalPlanningError{}
+		if errors.As(err, &terminal) {
+			disposition = planningFailureTerminal
+		}
+		return r.planningFailed(ctx, run, "EventSnapshotUnavailable", err, disposition)
+	}
 	privateKey, err := secretValue(ctx, r.APIReader, project.Namespace, githubConfig.PrivateKeySecretRef)
 	if err != nil {
 		return r.planningFailed(ctx, run, "CredentialsUnavailable", err, planningFailureRetry)
@@ -276,7 +286,7 @@ func (r *WorkflowRunReconciler) reconcileWorkflowRun(ctx context.Context, run *a
 	if err != nil {
 		return r.planningFailed(ctx, run, "WorkflowInvalid", err, planningFailureTerminal)
 	}
-	planningRun, planningEvent, err := resolvePlanningEvent(run, definition)
+	planningRun, planningEvent, err := resolvePlanningEvent(run, definition, eventPayload)
 	if err != nil {
 		return r.planningFailed(ctx, run, "TriggerInvalid", err, planningFailureTerminal)
 	}
@@ -285,7 +295,7 @@ func (r *WorkflowRunReconciler) reconcileWorkflowRun(ctx context.Context, run *a
 	if err != nil {
 		return r.planningEvaluationFailed(ctx, run, err)
 	}
-	plannedJobs, err := r.planWorkflowJobs(planningRun, definition, planningEvent.InputValues, variables)
+	plannedJobs, err := r.planWorkflowJobs(planningRun, definition, planningEvent.InputValues, variables, eventPayload)
 	if err != nil {
 		return r.planningEvaluationFailed(ctx, run, err)
 	}
@@ -370,9 +380,10 @@ func (r *WorkflowRunReconciler) now() time.Time {
 	return time.Now()
 }
 
-func resolvePlanningEvent(run *actionsv1alpha1.WorkflowRun, definition *workflow.Definition) (*actionsv1alpha1.WorkflowRun, workflow.Event, error) {
+func resolvePlanningEvent(run *actionsv1alpha1.WorkflowRun, definition *workflow.Definition, eventPayload map[string]any) (*actionsv1alpha1.WorkflowRun, workflow.Event, error) {
 	githubSource := run.Spec.Source.GitHub
 	event := workflowEvent(githubSource)
+	event.Payload = eventPayload
 	if githubSource.Event.Name != actionsv1alpha1.GitHubEventNameWorkflowDispatch && githubSource.Event.Name != actionsv1alpha1.GitHubEventNameWorkflowCall && githubSource.Event.Name != actionsv1alpha1.GitHubEventNameSchedule {
 		return run, event, nil
 	}
@@ -778,7 +789,7 @@ func (r *WorkflowRunReconciler) ensureWorkflowJobs(ctx context.Context, run *act
 	return nil
 }
 
-func (r *WorkflowRunReconciler) planWorkflowJobs(run *actionsv1alpha1.WorkflowRun, definition *workflow.Definition, inputValues map[string]any, variables any) ([]plannedWorkflowJob, error) {
+func (r *WorkflowRunReconciler) planWorkflowJobs(run *actionsv1alpha1.WorkflowRun, definition *workflow.Definition, inputValues map[string]any, variables any, eventPayload map[string]any) ([]plannedWorkflowJob, error) {
 	workflowEnv, err := stringMap(definition.Env)
 	if err != nil {
 		return nil, fmt.Errorf("workflow env: %w", err)
@@ -817,7 +828,7 @@ func (r *WorkflowRunReconciler) planWorkflowJobs(run *actionsv1alpha1.WorkflowRu
 			}
 			plannedIDs[expandedID] = struct{}{}
 
-			expressionContext := r.jobExpressionContext(run, definition.Name, inputValues, variables)
+			expressionContext := r.jobExpressionContext(run, definition.Name, inputValues, variables, eventPayload)
 			if matrix != nil {
 				expressionContext.Availability = workflowexpression.NewAvailability("github", "matrix", "inputs", "vars")
 				expressionContext.Values["matrix"] = matrix
@@ -992,10 +1003,10 @@ func githubSourcePullRequestRefs(source *actionsv1alpha1.GitHubWorkflowRunSource
 	return source.Revision.HeadRef, source.Revision.BaseRef
 }
 
-func (r *WorkflowRunReconciler) jobExpressionContext(run *actionsv1alpha1.WorkflowRun, workflowName string, inputValues map[string]any, variables any) workflowexpression.Context {
+func (r *WorkflowRunReconciler) jobExpressionContext(run *actionsv1alpha1.WorkflowRun, workflowName string, inputValues map[string]any, variables any, eventPayload map[string]any) workflowexpression.Context {
 	githubSource := run.Spec.Source.GitHub
 	headRef, baseRef := githubSourcePullRequestRefs(githubSource)
-	eventValues := githubEventExpressionValue(githubSource, inputValues)
+	eventValues := githubEventExpressionValue(githubSource, inputValues, eventPayload)
 	return workflowexpression.Context{
 		Availability: workflowexpression.NewAvailability("github", "inputs", "vars"),
 		Values: map[string]any{
@@ -1108,7 +1119,40 @@ func (r *WorkflowRunReconciler) workflowRunVariableContext(ctx context.Context, 
 	return workflowexpression.DeferredObjectMap{Resolve: resolve, Values: all}
 }
 
-func githubEventExpressionValue(source *actionsv1alpha1.GitHubWorkflowRunSource, inputValues map[string]any) map[string]any {
+func (r *WorkflowRunReconciler) githubEventSnapshot(ctx context.Context, run *actionsv1alpha1.WorkflowRun) (map[string]any, error) {
+	name := run.Annotations[eventsnapshot.Annotation]
+	if name == "" {
+		return nil, nil
+	}
+	secret := &corev1.Secret{}
+	if err := r.APIReader.Get(ctx, client.ObjectKey{Namespace: run.Namespace, Name: name}, secret); err != nil {
+		return nil, fmt.Errorf("get GitHub event snapshot Secret %q for WorkflowRun %q: %w", name, run.Name, err)
+	}
+	owned := false
+	for _, owner := range secret.OwnerReferences {
+		if owner.APIVersion == actionsv1alpha1.GroupVersion.String() && owner.Kind == "WorkflowRun" && owner.Name == run.Name && owner.UID == run.UID {
+			owned = true
+			break
+		}
+	}
+	data, found := secret.Data[eventsnapshot.DataKey]
+	if !owned {
+		return nil, fmt.Errorf("GitHub event snapshot Secret %q is not owned by WorkflowRun %q", name, run.Name)
+	}
+	if secret.Immutable == nil || !*secret.Immutable || !found {
+		return nil, &terminalPlanningError{cause: fmt.Errorf("GitHub event snapshot Secret %q is invalid for WorkflowRun %q", name, run.Name)}
+	}
+	payload, err := eventsnapshot.Decode(data)
+	if err != nil {
+		return nil, &terminalPlanningError{cause: fmt.Errorf("GitHub event snapshot Secret %q is invalid for WorkflowRun %q: %w", name, run.Name, err)}
+	}
+	return payload, nil
+}
+
+func githubEventExpressionValue(source *actionsv1alpha1.GitHubWorkflowRunSource, inputValues map[string]any, eventPayload map[string]any) map[string]any {
+	if eventPayload != nil {
+		return eventPayload
+	}
 	event := source.Event
 	eventValues := map[string]any{"action": event.Action}
 	if len(inputValues) > 0 {
@@ -1377,12 +1421,20 @@ func (r *WorkflowRunReconciler) observeWorkflowJobs(ctx context.Context, run *ac
 		}
 	}
 	if int32(len(jobs.Items)) == total {
-		inputValues, err := r.workflowJobGraphInputValues(ctx, jobs.Items)
-		if err != nil {
-			return ctrl.Result{}, err
+		var inputValues map[string]any
+		var eventPayload map[string]any
+		if workflowJobGraphNeedsExpressionContext(run, jobs.Items) {
+			inputValues, err = r.workflowJobGraphInputValues(ctx, jobs.Items)
+			if err != nil {
+				return ctrl.Result{}, err
+			}
+			eventPayload, err = r.githubEventSnapshot(ctx, run)
+			if err != nil {
+				return ctrl.Result{}, err
+			}
 		}
 		variables := r.workflowRunVariableContext(ctx, run)
-		if err := r.reconcileWorkflowJobGraph(ctx, run, workflowName, inputValues, variables, jobs.Items); err != nil {
+		if err := r.reconcileWorkflowJobGraph(ctx, run, workflowName, inputValues, variables, eventPayload, jobs.Items); err != nil {
 			return ctrl.Result{}, err
 		}
 	}
@@ -1534,6 +1586,20 @@ func (r *WorkflowRunReconciler) observeWorkflowJobs(ctx context.Context, run *ac
 	return ctrl.Result{}, nil
 }
 
+func workflowJobGraphNeedsExpressionContext(run *actionsv1alpha1.WorkflowRun, jobs []actionsv1alpha1.WorkflowJob) bool {
+	for index := range jobs {
+		job := &jobs[index]
+		if workflowJobTerminal(job) || strings.TrimSpace(job.Spec.If) == "" {
+			continue
+		}
+		if !run.Spec.CancelRequested && (job.Status.RunnerRef != nil || workflowJobReadyCondition(job)) {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
 func (r *WorkflowRunReconciler) workflowJobGraphInputValues(ctx context.Context, jobs []actionsv1alpha1.WorkflowJob) (map[string]any, error) {
 	for index := range jobs {
 		job := &jobs[index]
@@ -1562,7 +1628,7 @@ func (r *WorkflowRunReconciler) workflowJobGraphInputValues(ctx context.Context,
 	return nil, nil
 }
 
-func (r *WorkflowRunReconciler) reconcileWorkflowJobGraph(ctx context.Context, run *actionsv1alpha1.WorkflowRun, workflowName string, inputValues map[string]any, variables any, jobs []actionsv1alpha1.WorkflowJob) error {
+func (r *WorkflowRunReconciler) reconcileWorkflowJobGraph(ctx context.Context, run *actionsv1alpha1.WorkflowRun, workflowName string, inputValues map[string]any, variables any, eventPayload map[string]any, jobs []actionsv1alpha1.WorkflowJob) error {
 	jobsByID := make(map[string]*actionsv1alpha1.WorkflowJob, len(jobs))
 	jobsByLogicalID := make(map[string][]*actionsv1alpha1.WorkflowJob, len(jobs))
 	for index := range jobs {
@@ -1585,7 +1651,7 @@ func (r *WorkflowRunReconciler) reconcileWorkflowJobGraph(ctx context.Context, r
 		}
 		if job.Status.RunnerRef != nil {
 			if run.Spec.CancelRequested {
-				if err := r.reconcileAssignedWorkflowJobCancellation(ctx, run, workflowName, inputValues, variables, job, jobsByLogicalID); err != nil {
+				if err := r.reconcileAssignedWorkflowJobCancellation(ctx, run, workflowName, inputValues, variables, eventPayload, job, jobsByLogicalID); err != nil {
 					return err
 				}
 			}
@@ -1615,7 +1681,7 @@ func (r *WorkflowRunReconciler) reconcileWorkflowJobGraph(ctx context.Context, r
 
 		expressionContext := workflowexpression.Context{Status: workflowJobAncestorStatus(job, jobsByLogicalID, run.Spec.CancelRequested)}
 		if strings.TrimSpace(job.Spec.If) != "" {
-			expressionContext = r.jobExpressionContext(run, workflowName, inputValues, variables)
+			expressionContext = r.jobExpressionContext(run, workflowName, inputValues, variables, eventPayload)
 			expressionContext.Values["needs"] = workflowNeedsContext(job, jobsByLogicalID)
 			expressionContext.Status = workflowJobAncestorStatus(job, jobsByLogicalID, run.Spec.CancelRequested)
 		}
@@ -1651,10 +1717,10 @@ func (r *WorkflowRunReconciler) reconcileWorkflowJobGraph(ctx context.Context, r
 	return nil
 }
 
-func (r *WorkflowRunReconciler) reconcileAssignedWorkflowJobCancellation(ctx context.Context, run *actionsv1alpha1.WorkflowRun, workflowName string, inputValues map[string]any, variables any, job *actionsv1alpha1.WorkflowJob, jobs map[string][]*actionsv1alpha1.WorkflowJob) error {
+func (r *WorkflowRunReconciler) reconcileAssignedWorkflowJobCancellation(ctx context.Context, run *actionsv1alpha1.WorkflowRun, workflowName string, inputValues map[string]any, variables any, eventPayload map[string]any, job *actionsv1alpha1.WorkflowJob, jobs map[string][]*actionsv1alpha1.WorkflowJob) error {
 	expressionContext := workflowexpression.Context{Status: workflowJobAncestorStatus(job, jobs, true)}
 	if strings.TrimSpace(job.Spec.If) != "" {
-		expressionContext = r.jobExpressionContext(run, workflowName, inputValues, variables)
+		expressionContext = r.jobExpressionContext(run, workflowName, inputValues, variables, eventPayload)
 		expressionContext.Values["needs"] = workflowNeedsContext(job, jobs)
 		expressionContext.Status = workflowJobAncestorStatus(job, jobs, true)
 	}

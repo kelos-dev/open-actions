@@ -16,6 +16,7 @@ import (
 	"unicode/utf8"
 
 	actionsv1alpha1 "github.com/kelos-dev/open-actions/api/v1alpha1"
+	"github.com/kelos-dev/open-actions/internal/eventsnapshot"
 	githubclient "github.com/kelos-dev/open-actions/internal/github"
 	"github.com/kelos-dev/open-actions/internal/workflow"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -26,7 +27,7 @@ import (
 )
 
 const (
-	maxPayloadBytes       = 10 << 20
+	maxPayloadBytes       = eventsnapshot.MaxBytes
 	maxEventBodyLength    = 48_000
 	maxEventURLLength     = 2_048
 	maxEventTagNameLength = 1_014

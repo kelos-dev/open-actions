@@ -1,0 +1,8 @@
+{
+  "action": "created",
+  "issue": {"number": 17, "body": "Issue body", "html_url": "https://github.com/acme/example/issues/17"},
+  "comment": {"id": 6006, "body": "/kelos pick-up", "html_url": "https://github.com/acme/example/issues/17#issuecomment-6006"},
+  "repository": {"id": 1001, "name": "example", "full_name": "acme/example", "default_branch": "main", "owner": {"login": "acme"}},
+  "installation": {"id": 2002},
+  "sender": {"login": "octocat"}
+}
