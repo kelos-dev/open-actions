@@ -40,8 +40,8 @@ controller's optional `--console-url` adds Console links to GitHub Check Runs.
 The Console serves HTTP on `--bind-address` (default
 `:8080`) and serves its read-only views without authentication. Anyone who can
 reach the Console can read Project and workflow metadata and runner logs. The
-required `--token-file` authenticates workflow dispatches, workflow reruns, and
-Project Secret management. Set
+required `--token-file` authenticates workflow dispatches, cancellation,
+reruns, and Project Secret management. Set
 `--secure-cookie` when the Console is served through HTTPS. The Helm chart
 configures the administrator token and cookie security from its configured
 Secret and `console.publicURL`.
@@ -67,15 +67,22 @@ sequences are discarded. Log lines larger than 256 KiB are truncated so a
 workflow cannot retain unbounded Console memory.
 
 After signing in with the Console administrator token, an administrator can
-rerun all jobs from the latest completed attempt in a workflow lineage. When
+gracefully cancel an active workflow attempt. The Console sets that
+WorkflowRun's `spec.cancelRequested` field, after which ordinary jobs stop while
+cancellation-aware reporting and cleanup jobs may finish. A requested run is
+shown as `Cancelling` until it reaches a terminal result. Cancellation requests
+are idempotent and are unavailable for completed attempts.
+
+An administrator can also rerun all jobs from the latest completed attempt in
+a workflow lineage. When
 the attempt failed because one or more jobs failed, the administrator can
 instead rerun the failed expanded job IDs and their transitive dependents; the
 controller also includes the prerequisite jobs needed by that selected graph.
 The Console creates a new immutable WorkflowRun attempt with the same project,
 source, workflow path, and retention setting, clears any prior cancellation
 request, and redirects to the new run. Rerun actions are unavailable while the
-latest attempt is still active. The Helm chart grants the Console `create`
-access to WorkflowRuns across the namespaces it displays.
+latest attempt is still active. The Helm chart grants the Console `create` and
+`update` access to WorkflowRuns across the namespaces it displays.
 
 An administrator can use **Run workflow** to create a `workflow_dispatch`
 WorkflowRun in any configured Project namespace. The form accepts a repository,

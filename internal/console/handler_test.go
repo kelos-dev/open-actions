@@ -294,6 +294,107 @@ func TestConsoleMainPageLimitsWorkflowRuns(t *testing.T) {
 	}
 }
 
+func TestConsoleCancelsActiveWorkflow(t *testing.T) {
+	handler := newTestHandler(t, false)
+	runURL := "/runs/default/ci"
+	cancelURL := runURL + "/cancel"
+
+	page := httptest.NewRecorder()
+	handler.ServeHTTP(page, httptest.NewRequest(http.MethodGet, runURL, nil))
+	if page.Code != http.StatusOK || !strings.Contains(page.Body.String(), "Sign in to cancel") || strings.Contains(page.Body.String(), handler.csrfToken) {
+		t.Fatalf("unauthenticated run page = %d, %q", page.Code, page.Body.String())
+	}
+
+	form := url.Values{"csrf": {handler.csrfToken}}
+	unauthenticated := httptest.NewRequest(http.MethodPost, cancelURL, strings.NewReader(form.Encode()))
+	unauthenticated.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	unauthenticatedResponse := httptest.NewRecorder()
+	handler.ServeHTTP(unauthenticatedResponse, unauthenticated)
+	if unauthenticatedResponse.Code != http.StatusFound || unauthenticatedResponse.Header().Get("Location") != "/login?next=%2Fruns%2Fdefault%2Fci" {
+		t.Fatalf("unauthenticated cancellation response = %d, %q", unauthenticatedResponse.Code, unauthenticatedResponse.Header().Get("Location"))
+	}
+
+	authenticatedPageRequest := httptest.NewRequest(http.MethodGet, runURL, nil)
+	authenticatedPageRequest.Header.Set("Authorization", "Bearer "+testConsoleToken)
+	authenticatedPage := httptest.NewRecorder()
+	handler.ServeHTTP(authenticatedPage, authenticatedPageRequest)
+	if authenticatedPage.Code != http.StatusOK || !strings.Contains(authenticatedPage.Body.String(), `action="`+cancelURL+`"`) || !strings.Contains(authenticatedPage.Body.String(), "Cancel workflow") || !strings.Contains(authenticatedPage.Body.String(), handler.csrfToken) {
+		t.Fatalf("authenticated run page = %d, %q", authenticatedPage.Code, authenticatedPage.Body.String())
+	}
+
+	invalidRequest := httptest.NewRequest(http.MethodPost, cancelURL, strings.NewReader("csrf=invalid"))
+	invalidRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	invalidRequest.Header.Set("Authorization", "Bearer "+testConsoleToken)
+	invalidResponse := httptest.NewRecorder()
+	handler.ServeHTTP(invalidResponse, invalidRequest)
+	if invalidResponse.Code != http.StatusForbidden {
+		t.Fatalf("invalid CSRF response = %d, want %d", invalidResponse.Code, http.StatusForbidden)
+	}
+
+	request := httptest.NewRequest(http.MethodPost, cancelURL, strings.NewReader(form.Encode()))
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.Header.Set("Authorization", "Bearer "+testConsoleToken)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusSeeOther || response.Header().Get("Location") != runURL {
+		t.Fatalf("cancellation response = %d, %q", response.Code, response.Header().Get("Location"))
+	}
+	run := &actionsv1alpha1.WorkflowRun{}
+	if err := handler.client.Get(context.Background(), client.ObjectKey{Namespace: "default", Name: "ci"}, run); err != nil {
+		t.Fatal(err)
+	}
+	if !run.Spec.CancelRequested {
+		t.Fatal("WorkflowRun cancellation was not requested")
+	}
+
+	cancellingPageRequest := httptest.NewRequest(http.MethodGet, runURL, nil)
+	cancellingPageRequest.Header.Set("Authorization", "Bearer "+testConsoleToken)
+	cancellingPage := httptest.NewRecorder()
+	handler.ServeHTTP(cancellingPage, cancellingPageRequest)
+	if cancellingPage.Code != http.StatusOK || !strings.Contains(cancellingPage.Body.String(), "Workflow run Cancelling") || strings.Contains(cancellingPage.Body.String(), "Cancel workflow") {
+		t.Fatalf("cancelling run page = %d, %q", cancellingPage.Code, cancellingPage.Body.String())
+	}
+
+	repeatedRequest := httptest.NewRequest(http.MethodPost, cancelURL, strings.NewReader(form.Encode()))
+	repeatedRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	repeatedRequest.Header.Set("Authorization", "Bearer "+testConsoleToken)
+	repeatedResponse := httptest.NewRecorder()
+	handler.ServeHTTP(repeatedResponse, repeatedRequest)
+	if repeatedResponse.Code != http.StatusSeeOther || repeatedResponse.Header().Get("Location") != runURL {
+		t.Fatalf("repeated cancellation response = %d, %q", repeatedResponse.Code, repeatedResponse.Header().Get("Location"))
+	}
+}
+
+func TestConsoleRejectsCancellationAfterWorkflowCompletes(t *testing.T) {
+	handler := newTestHandler(t, false)
+	run := &actionsv1alpha1.WorkflowRun{}
+	if err := handler.client.Get(context.Background(), client.ObjectKey{Namespace: "default", Name: "ci"}, run); err != nil {
+		t.Fatal(err)
+	}
+	run.Status.Conditions = []metav1.Condition{{
+		Type: actionsv1alpha1.WorkflowRunConditionSucceeded, Status: metav1.ConditionTrue, Reason: "JobsSucceeded",
+	}}
+	if err := handler.client.Update(context.Background(), run); err != nil {
+		t.Fatal(err)
+	}
+
+	form := url.Values{"csrf": {handler.csrfToken}}
+	request := httptest.NewRequest(http.MethodPost, "/runs/default/ci/cancel", strings.NewReader(form.Encode()))
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.Header.Set("Authorization", "Bearer "+testConsoleToken)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusConflict || !strings.Contains(response.Body.String(), `WorkflowRun "ci" is already complete`) {
+		t.Fatalf("cancellation response = %d, %q", response.Code, response.Body.String())
+	}
+	if err := handler.client.Get(context.Background(), client.ObjectKeyFromObject(run), run); err != nil {
+		t.Fatal(err)
+	}
+	if run.Spec.CancelRequested {
+		t.Fatal("completed WorkflowRun cancellation was requested")
+	}
+}
+
 func TestConsoleRerunsCompletedWorkflow(t *testing.T) {
 	handler := newTestHandler(t, false)
 	run := &actionsv1alpha1.WorkflowRun{}

@@ -192,9 +192,11 @@ type dispatchInputPageData struct {
 
 type runPageData struct {
 	RunURL         string
+	CancelURL      string
 	RerunURL       string
 	LoginURL       string
 	CSRFToken      string
+	CanCancel      bool
 	CanRerun       bool
 	CanRerunFailed bool
 	Repository     string
@@ -326,6 +328,15 @@ func (h *Handler) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 			writer.Header().Set("Allow", http.MethodGet+", "+http.MethodPost)
 			http.Error(writer, "method not allowed", http.StatusMethodNotAllowed)
 		}
+		return
+	}
+	if request.Method == http.MethodPost && len(parts) == 4 && parts[0] == "runs" && parts[3] == "cancel" {
+		next := "/runs/" + url.PathEscape(parts[1]) + "/" + url.PathEscape(parts[2])
+		if !h.authenticated(request) {
+			http.Redirect(writer, request, "/login?next="+url.QueryEscape(next), http.StatusFound)
+			return
+		}
+		h.cancelWorkflow(writer, request, parts[1], parts[2])
 		return
 	}
 	if request.Method == http.MethodPost && len(parts) == 4 && parts[0] == "runs" && parts[3] == "rerun" {
@@ -1007,12 +1018,22 @@ func (h *Handler) runDetails(writer http.ResponseWriter, request *http.Request, 
 		h.writeResolutionError(writer, request, err)
 		return
 	}
+	authenticated := h.authenticated(request)
+	if !workflowrun.Terminal(run) && !run.Spec.CancelRequested {
+		data.CancelURL = runPath(run) + "/cancel"
+		if authenticated {
+			data.CanCancel = true
+			data.CSRFToken = h.csrfToken
+		} else {
+			data.LoginURL = "/login?next=" + url.QueryEscape(runPath(run))
+		}
+	}
 	_, latest, err := h.workflowRunLineage(request.Context(), run)
 	if err != nil {
 		h.logger.Warn("Unable to load WorkflowRun lineage", "namespace", run.Namespace, "workflow_run", run.Name, "error", err)
 	} else if workflowrun.Terminal(latest) && (latest.Spec.Rerun == nil || latest.Spec.Rerun.Attempt < maxRerunAttempt) {
 		data.RerunURL = runPath(run) + "/rerun"
-		if h.authenticated(request) {
+		if authenticated {
 			data.CanRerun = true
 			data.CanRerunFailed = workflowrun.Failed(latest)
 			data.CSRFToken = h.csrfToken
@@ -1021,6 +1042,50 @@ func (h *Handler) runDetails(writer http.ResponseWriter, request *http.Request, 
 		}
 	}
 	h.writeHTML(writer, h.runPage, data)
+}
+
+func (h *Handler) cancelWorkflow(writer http.ResponseWriter, request *http.Request, namespace, name string) {
+	request.Body = http.MaxBytesReader(writer, request.Body, adminRequestSize)
+	if err := request.ParseForm(); err != nil {
+		http.Error(writer, "invalid cancellation request", http.StatusBadRequest)
+		return
+	}
+	if !h.validCSRF(request.PostForm.Get("csrf")) {
+		http.Error(writer, "invalid CSRF token", http.StatusForbidden)
+		return
+	}
+	alreadyRequested := false
+	completed := false
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		alreadyRequested = false
+		completed = false
+		run, err := h.resolveRun(request.Context(), namespace, name)
+		if err != nil {
+			return err
+		}
+		if run.Spec.CancelRequested {
+			alreadyRequested = true
+			return nil
+		}
+		if workflowrun.Terminal(run) {
+			completed = true
+			return nil
+		}
+		run.Spec.CancelRequested = true
+		return h.client.Update(request.Context(), run)
+	})
+	if err != nil {
+		h.writeResolutionError(writer, request, fmt.Errorf("request cancellation for WorkflowRun %q: %w", name, err))
+		return
+	}
+	if completed {
+		http.Error(writer, fmt.Sprintf("WorkflowRun %q is already complete", name), http.StatusConflict)
+		return
+	}
+	if !alreadyRequested {
+		h.logger.Info("Requested WorkflowRun cancellation", "namespace", namespace, "workflow_run", name)
+	}
+	http.Redirect(writer, request, "/runs/"+url.PathEscape(namespace)+"/"+url.PathEscape(name), http.StatusSeeOther)
 }
 
 func (h *Handler) rerunWorkflow(writer http.ResponseWriter, request *http.Request, namespace, name string) {
