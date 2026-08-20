@@ -260,7 +260,10 @@ rerequests. `jobIDs` is an optional set of expanded WorkflowJob IDs; the
 controller also includes their prerequisite jobs so the dependency graph is
 complete. Omitting `jobIDs` reruns every job. The rerun fields are immutable.
 The controller also requires the project, source, workflow path, lineage, and
-attempt number to match the previous run before it executes a rerun.
+attempt number to match the previous run before it executes a rerun. Workflows
+with output-derived dynamic matrices currently require a full rerun with
+`jobIDs` omitted because their expanded IDs do not exist until dependencies
+finish.
 
 Runner labels are canonical lowercase ASCII in Kubernetes resources. Workflow
 `runs-on` labels use the same representation. Each Runner is one reusable
@@ -299,13 +302,34 @@ trusted. See
 [`config/samples/actions_v1alpha1_docker_runner.yaml`](../config/samples/actions_v1alpha1_docker_runner.yaml)
 for a Docker-enabled Runner.
 
-A job strategy may define scalar matrix axes, an optional positive
-`max-parallel`, and an optional Boolean `fail-fast`. The controller creates one
-`WorkflowJob` per Cartesian-product combination in deterministic order. Each
-child has a unique `spec.jobID`, while `spec.matrix.logicalJobID`, `values`,
-`maxParallel`, and `failFast` preserve its logical identity and strategy.
-`max-parallel` limits active children in that group independently of the number
-of matching Runners.
+A job strategy may define scalar matrix axes, `include` and `exclude`
+transformations, an optional positive `max-parallel`, and an optional Boolean
+`fail-fast`. An axis may be an array or an expression that evaluates to an
+array. The complete `matrix` value may also be an expression that evaluates to
+a mapping of axes and transformations. `include` and `exclude` may be literal
+arrays of scalar mappings or expressions that produce those arrays. Exclusions
+partially match and remove Cartesian-product combinations. Includes are applied
+in declaration order: compatible entries augment base combinations and
+incompatible entries add standalone combinations. Include-only matrices are
+supported.
+
+Matrix expressions may use `github`, `needs`, `vars`, and `inputs`. If an
+expression reads `needs`, expansion waits until every direct dependency is
+terminal and its outputs are persisted. The controller then evaluates the job
+condition before the matrix. A failed, skipped, or cancelled dependency
+therefore skips the dynamic job under the default success condition; an
+explicit status function such as `always()` can permit evaluation. Missing
+outputs, invalid JSON, non-array axes, non-mapping complete matrices,
+non-scalar final values, empty axes, and oversized results finish the logical
+job with `MatrixEvaluationFailed` rather than leaving it pending.
+
+The controller creates one `WorkflowJob` per final combination in deterministic
+order. Each child has a unique `spec.jobID`, while
+`spec.matrix.logicalJobID`, `values`, `maxParallel`, and `failFast` preserve its
+logical identity and strategy. Deferred matrix plans are immutable resources
+owned by the WorkflowRun, so the same children are recovered across controller
+restarts. `max-parallel` limits active children in that group independently of
+the number of matching Runners.
 
 `fail-fast` defaults to `true`. After a matrix child fails, queued combinations
 in the same WorkflowRun and logical matrix job finish with `MatrixFailFast`, and
@@ -359,12 +383,12 @@ The resources expose these condition contracts:
 | `WorkflowRun` | `Succeeded` | `False` | `ProjectUnavailable`, `WorkflowFetchFailed`, `WorkflowInvalid`, `TriggerInvalid`, `RerunInvalid`, `ChildCreationFailed`, `JobFailed`, `JobTimedOut`, `JobCancelled`, `ExecutionStateLost` |
 | `WorkflowJob` | `Ready` | `Unknown` | `DependenciesPending` |
 | `WorkflowJob` | `Ready` | `True` | `ConditionPassed` |
-| `WorkflowJob` | `Ready` | `False` | `ConditionFalse`, `ConditionEvaluationFailed`, `CancellationRequested`, `MatrixFailFast` |
+| `WorkflowJob` | `Ready` | `False` | `ConditionFalse`, `ConditionEvaluationFailed`, `MatrixEvaluationFailed`, `CancellationRequested`, `MatrixFailFast` |
 | `WorkflowJob` | `Scheduled` | `True` | `RunnerAssigned` |
-| `WorkflowJob` | `Scheduled` | `False` | `ConditionFalse`, `ConditionEvaluationFailed`, `CancellationRequested`, `MatrixFailFast`, `ProjectRecreated` |
+| `WorkflowJob` | `Scheduled` | `False` | `ConditionFalse`, `ConditionEvaluationFailed`, `MatrixEvaluationFailed`, `CancellationRequested`, `MatrixFailFast`, `ProjectRecreated` |
 | `WorkflowJob` | `Succeeded` | `Unknown` | `JobRunning` |
 | `WorkflowJob` | `Succeeded` | `True` | `JobSucceeded` |
-| `WorkflowJob` | `Succeeded` | `False` | `JobFailed`, `JobTimedOut`, `JobCancelled`, `JobResultInvalid`, `ConditionEvaluationFailed`, `PlanUnavailable`, `JobStartFailed`, `ExecutionStateLost`, `CancellationRequested`, `MatrixFailFast`, `ProjectRecreated` |
+| `WorkflowJob` | `Succeeded` | `False` | `JobFailed`, `JobTimedOut`, `JobCancelled`, `JobResultInvalid`, `ConditionEvaluationFailed`, `MatrixEvaluationFailed`, `PlanUnavailable`, `JobStartFailed`, `ExecutionStateLost`, `CancellationRequested`, `MatrixFailFast`, `ProjectRecreated` |
 | `WorkflowJob` | `CancellationRequested` | `True` | `CancellationRequested`, `ConditionEvaluationFailed`, `MatrixFailFast` |
 | `WorkflowJob` | `CancellationRequested` | `False` | `ConditionPassed` |
 
@@ -479,8 +503,9 @@ evaluation when the corresponding execution feature has not supplied it.
 | --- | --- | --- |
 | Workflow concurrency | `github`, `inputs`, `vars` | All listed contexts |
 | Workflow environment | `github`, `open_actions`, `secrets`, `inputs`, `vars` | All listed contexts |
+| Matrix expansion | `github`, `open_actions`, `needs`, `vars`, `inputs` | All listed contexts; `needs` contains terminal direct dependencies |
 | Workflow job condition | `github`, `open_actions`, `needs`, `vars`, `inputs`, and status functions | `github`, `open_actions`, direct dependency results and outputs, `vars`, `inputs`, and status functions |
-| Job name, timeout, and runner labels | `github`, `open_actions`, `needs`, `strategy`, `matrix`, `vars`, `inputs` | `github`, `open_actions`, `inputs`, `vars`, and `matrix` for matrix jobs |
+| Job name, timeout, and runner labels | `github`, `open_actions`, `needs`, `strategy`, `matrix`, `vars`, `inputs` | `github`, `open_actions`, `inputs`, `vars`, and `matrix` for matrix jobs; deferred matrix jobs also receive `needs` |
 | Job environment | `github`, `open_actions`, `needs`, `strategy`, `matrix`, `vars`, `secrets`, `inputs` | `github`, `open_actions`, direct dependency results and outputs, `inputs`, `vars`, `secrets`, and `matrix` for matrix jobs |
 | Workflow step name, run script, working directory, environment, and inputs | `github`, `open_actions`, `needs`, `strategy`, `matrix`, `job`, `runner`, `env`, `vars`, `secrets`, `steps`, `inputs`, and `hashFiles` | `github`, `open_actions`, direct dependency results and outputs, `matrix`, `runner`, `env`, `vars`, `secrets`, `inputs`, `steps`, and `hashFiles` |
 | Workflow step condition | Step contexts except `secrets`, plus status functions and `hashFiles` | `github`, `open_actions`, direct dependency results and outputs, `matrix`, `runner`, `env`, `vars`, `inputs`, `steps`, status functions, and `hashFiles` |
@@ -610,6 +635,15 @@ and its child results and outputs are aggregated under the logical job ID. A
 false condition records the job as skipped without assigning a Runner.
 `always()`, `failure()`, and `cancelled()` can allow report or cleanup jobs to
 run after unsuccessful dependencies.
+
+Outputs used by a dynamic matrix are read only from direct `needs` entries and
+use persisted `WorkflowJob.status.outputs` values. A producer that omits a
+referenced output supplies the normal empty missing-property value; functions
+such as `fromJSON` then report that empty value as an evaluation error.
+Output-derived matrices are deterministically re-evaluated from immutable
+terminal outputs and the Project variable values captured during initial
+planning. Changes to Project variables while a run is active do not alter its
+matrix children during controller recovery.
 
 Graceful cancellation sets `spec.cancelRequested`. Assigned jobs are cancelled
 unless their job condition still evaluates to true, and unassigned jobs are
@@ -829,8 +863,10 @@ Workflow definitions must satisfy these limits:
   65,535 characters.
 - A `schedule` trigger may contain at most 20 cron expressions, each at most
   256 characters.
-- A matrix may define at most 100 axes and expand one logical job into at most
-  256 jobs. A workflow may expand to at most 1,000 jobs in total.
+- A matrix may define at most 100 axes. `include` and `exclude` may each contain
+  at most 256 mappings. The resolved, transformed matrix may expand one logical
+  job into at most 256 jobs, and a workflow may expand to at most 1,000 jobs in
+  total. Limits are checked before children for that dynamic matrix are created.
 - Matrix axis names contain at most 256 characters, and scalar matrix values
   contain at most 1,024 characters.
 - A job may contain at most 100 steps and 100,000 bytes of aggregate planned
@@ -883,8 +919,8 @@ always the latest result version supported by the runner binary. Integration
 commit construction is part of this versioned contract; changing its merge
 behavior or commit metadata requires a job-plan version transition.
 
-Docker and local actions, matrix `include` and `exclude`, service containers,
-caches, and artifacts are not supported. Expressions outside the documented
+Docker and local actions, service containers, caches, and artifacts are not
+supported. Expressions outside the documented
 fields and runtime contexts are rejected during planning or execution and are
 never interpreted as literal values.
 `WorkflowJob` resources are not retried or reassigned when a Runner is removed.

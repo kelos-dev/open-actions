@@ -221,6 +221,60 @@ var _ = Describe("Runner", func() {
 		}, 60*time.Second, time.Second).Should(Succeed())
 	})
 
+	It("expands a matrix from a dependency output", func() {
+		ctx := context.Background()
+		run := &actionsv1alpha1.WorkflowRun{
+			ObjectMeta: metav1.ObjectMeta{Name: "dynamic-matrix", Namespace: e2eNamespace},
+			Spec: actionsv1alpha1.WorkflowRunSpec{
+				ProjectRef: corev1.LocalObjectReference{Name: "default"},
+				Source: actionsv1alpha1.WorkflowRunSource{
+					Type: actionsv1alpha1.SourceTypeGitHub,
+					GitHub: &actionsv1alpha1.GitHubWorkflowRunSource{
+						Repository: actionsv1alpha1.GitHubRepository{ID: 123456789, Owner: "acme", Name: "example"},
+						Event: actionsv1alpha1.GitHubEvent{
+							Name:       "push",
+							DeliveryID: "51111111-2222-3333-4444-555555555555",
+						},
+						Revision: actionsv1alpha1.GitRevision{SHA: fixtureRevision, Ref: "refs/heads/main"},
+					},
+				},
+				WorkflowPath: dynamicMatrixWorkflowPath,
+			},
+		}
+		Expect(clusterClient.Create(ctx, run)).To(Succeed())
+
+		Eventually(func(g Gomega) {
+			stored := &actionsv1alpha1.WorkflowRun{}
+			g.Expect(clusterClient.Get(ctx, client.ObjectKeyFromObject(run), stored)).To(Succeed())
+			condition := meta.FindStatusCondition(stored.Status.Conditions, actionsv1alpha1.WorkflowRunConditionSucceeded)
+			g.Expect(condition).NotTo(BeNil())
+			if condition != nil {
+				g.Expect(condition.Status).To(Equal(metav1.ConditionTrue), condition.Message)
+			}
+			g.Expect(stored.Status.Jobs).NotTo(BeNil())
+			if stored.Status.Jobs != nil {
+				g.Expect(stored.Status.Jobs.Total).To(Equal(int32(3)))
+				g.Expect(stored.Status.Jobs.Succeeded).To(Equal(int32(3)))
+			}
+		}, 180*time.Second, time.Second).Should(Succeed())
+
+		jobs := &actionsv1alpha1.WorkflowJobList{}
+		Expect(clusterClient.List(ctx, jobs, client.InNamespace(e2eNamespace), client.MatchingLabels{actionsv1alpha1.LabelWorkflowRunUID: string(run.UID)})).To(Succeed())
+		Expect(jobs.Items).To(HaveLen(3))
+		matrixValues := map[string]bool{}
+		for index := range jobs.Items {
+			job := &jobs.Items[index]
+			if job.Spec.Matrix == nil {
+				continue
+			}
+			Expect(job.Spec.Matrix.LogicalJobID).To(Equal("execute"))
+			Expect(job.Spec.Matrix.MaxParallel).To(Equal(int32(1)))
+			Expect(job.Status.Result).To(Equal(actionsv1alpha1.WorkflowJobResultSuccess))
+			matrixValues[job.Spec.Matrix.Values["target"]] = true
+		}
+		Expect(matrixValues).To(Equal(map[string]bool{"first": true, "second": true}))
+	})
+
 	It("executes a pull request checkout with persisted credentials", func() {
 		ctx := context.Background()
 		run := &actionsv1alpha1.WorkflowRun{

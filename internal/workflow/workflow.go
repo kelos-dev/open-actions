@@ -2,6 +2,7 @@ package workflow
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"io"
 	"math"
@@ -23,7 +24,7 @@ const (
 	maxWorkflowBytes          = 1_000_000
 	maxWorkflowNameLength     = 256
 	maxConcurrencyGroupLength = 256
-	maxJobs                   = 1000
+	MaxJobs                   = 1000
 	maxMatrixJobs             = 256
 	maxMatrixValueLength      = 1024
 	maxJobIDLength            = 256
@@ -154,11 +155,30 @@ func (t JobTimeout) Minutes() int64 {
 }
 
 type Strategy struct {
-	Matrix         map[string][]any
+	Matrix         MatrixDefinition
 	MaxParallel    int32
 	FailFast       bool
 	configured     bool
 	maxParallelSet bool
+}
+
+// MatrixDefinition is an unevaluated matrix strategy. Expressions may define
+// the complete matrix, an axis, or individual scalar values.
+type MatrixDefinition struct {
+	Expression string
+	Axes       map[string]MatrixAxis
+	Include    MatrixEntries
+	Exclude    MatrixEntries
+}
+
+type MatrixAxis struct {
+	Expression string
+	Values     []any
+}
+
+type MatrixEntries struct {
+	Expression string
+	Values     []map[string]any
 }
 
 type Step struct {
@@ -234,6 +254,7 @@ var (
 	jobNameAvailability             = expression.NewAvailability("github", "open_actions", "needs", "strategy", "matrix", "vars", "inputs")
 	jobEnvironmentAvailability      = expression.NewAvailability("github", "open_actions", "needs", "strategy", "matrix", "vars", "secrets", "inputs")
 	jobConditionAvailability        = expression.NewAvailability("github", "open_actions", "needs", "vars", "inputs").WithStatusFunctions()
+	matrixAvailability              = expression.NewAvailability("github", "open_actions", "needs", "vars", "inputs")
 	stepAvailability                = expression.NewAvailability("github", "open_actions", "needs", "strategy", "matrix", "job", "runner", "env", "vars", "secrets", "steps", "inputs").WithHashFiles()
 	stepConditionAvailability       = expression.NewAvailability("github", "open_actions", "needs", "strategy", "matrix", "job", "runner", "env", "vars", "steps", "inputs").WithStatusFunctions().WithHashFiles()
 	jobOutputAvailability           = expression.NewAvailability("github", "open_actions", "needs", "strategy", "matrix", "job", "runner", "env", "vars", "secrets", "steps", "inputs")
@@ -281,8 +302,8 @@ func Parse(data []byte) (*Definition, error) {
 	if len(definition.Jobs) == 0 {
 		return nil, fmt.Errorf("workflow must define at least one job")
 	}
-	if len(definition.Jobs) > maxJobs {
-		return nil, fmt.Errorf("workflow defines %d jobs; maximum is %d", len(definition.Jobs), maxJobs)
+	if len(definition.Jobs) > MaxJobs {
+		return nil, fmt.Errorf("workflow defines %d jobs; maximum is %d", len(definition.Jobs), MaxJobs)
 	}
 	expandedJobs := 0
 	for id, job := range definition.Jobs {
@@ -290,13 +311,13 @@ func Parse(data []byte) (*Definition, error) {
 			return nil, err
 		}
 		combinations := MatrixCombinations(job.Strategy)
-		if len(combinations) == 0 {
+		if len(combinations) == 0 || MatrixRequiresEvaluation(job.Strategy) {
 			expandedJobs++
 		} else {
 			expandedJobs += len(combinations)
 		}
-		if expandedJobs > maxJobs {
-			return nil, fmt.Errorf("workflow expands to more than %d jobs", maxJobs)
+		if expandedJobs > MaxJobs {
+			return nil, fmt.Errorf("workflow expands to more than %d jobs", MaxJobs)
 		}
 		definition.Jobs[id] = job
 	}
@@ -367,6 +388,9 @@ func validateJob(id string, job *Job, workflowEnv map[string]any) error {
 	}
 	if err := job.TimeoutMinutes.validate(id); err != nil {
 		return err
+	}
+	if MatrixUsesNeeds(job.Strategy) && len(job.Needs) == 0 {
+		return fmt.Errorf("job %q matrix uses needs but the job declares no dependencies", id)
 	}
 	if job.If != "" {
 		if len(job.If) > MaxConditionBytes {
@@ -484,36 +508,111 @@ func validateStrategy(id string, strategy Strategy) error {
 	if !strategy.configured {
 		return nil
 	}
-	if len(strategy.Matrix) == 0 {
+	if strategy.Matrix.Expression == "" && len(strategy.Matrix.Axes) == 0 && len(strategy.Matrix.Include.Values) == 0 && strategy.Matrix.Include.Expression == "" {
 		return fmt.Errorf("job %q strategy must define a matrix", id)
 	}
-	if len(strategy.Matrix) > maxMapEntries {
-		return fmt.Errorf("job %q matrix defines %d axes; maximum is %d", id, len(strategy.Matrix), maxMapEntries)
+	if strategy.Matrix.Expression != "" {
+		if len(strategy.Matrix.Axes) > 0 || len(strategy.Matrix.Include.Values) > 0 || strategy.Matrix.Include.Expression != "" || len(strategy.Matrix.Exclude.Values) > 0 || strategy.Matrix.Exclude.Expression != "" {
+			return fmt.Errorf("job %q matrix expression cannot be combined with matrix fields", id)
+		}
+		if err := validateMatrixExpression(fmt.Sprintf("job %q matrix", id), strategy.Matrix.Expression); err != nil {
+			return err
+		}
+	} else if len(strategy.Matrix.Axes) > maxMapEntries {
+		return fmt.Errorf("job %q matrix defines %d axes; maximum is %d", id, len(strategy.Matrix.Axes), maxMapEntries)
 	}
-	combinations := 1
-	for name, values := range strategy.Matrix {
+	for name, axis := range strategy.Matrix.Axes {
 		if name == "" || utf8.RuneCountInString(name) > maxMapKeyLength {
 			return fmt.Errorf("job %q matrix axis %q must contain 1 to %d characters", id, name, maxMapKeyLength)
 		}
-		if len(values) == 0 {
+		if axis.Expression == "" && len(axis.Values) == 0 {
 			return fmt.Errorf("job %q matrix axis %q must define at least one value", id, name)
 		}
-		if len(values) > maxMatrixJobs || combinations > maxMatrixJobs/len(values) {
-			return fmt.Errorf("job %q matrix expands to more than %d jobs", id, maxMatrixJobs)
-		}
-		combinations *= len(values)
-		for _, value := range values {
-			scalar, ok := scalarString(value)
-			if !ok {
-				return fmt.Errorf("job %q matrix axis %q values must be scalars", id, name)
+		if axis.Expression != "" {
+			if len(axis.Values) > 0 {
+				return fmt.Errorf("job %q matrix axis %q expression cannot be combined with literal values", id, name)
 			}
-			if utf8.RuneCountInString(scalar) > maxMatrixValueLength {
-				return fmt.Errorf("job %q matrix axis %q value exceeds %d characters", id, name, maxMatrixValueLength)
+			if err := validateMatrixExpression(fmt.Sprintf("job %q matrix axis %q", id, name), axis.Expression); err != nil {
+				return err
+			}
+		}
+		if len(axis.Values) > maxMatrixJobs {
+			return fmt.Errorf("job %q matrix axis %q defines more than %d values", id, name, maxMatrixJobs)
+		}
+		for _, value := range axis.Values {
+			if err := validateMatrixValue(fmt.Sprintf("job %q matrix axis %q", id, name), value); err != nil {
+				return err
 			}
 		}
 	}
+	if err := validateMatrixEntries(id, "include", strategy.Matrix.Include); err != nil {
+		return err
+	}
+	if err := validateMatrixEntries(id, "exclude", strategy.Matrix.Exclude); err != nil {
+		return err
+	}
 	if strategy.maxParallelSet && strategy.MaxParallel < 1 {
 		return fmt.Errorf("job %q strategy max-parallel must be greater than zero", id)
+	}
+	if !MatrixRequiresEvaluation(strategy) {
+		if _, err := EvaluateMatrix(id, strategy, expression.Context{}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateMatrixExpression(field, input string) error {
+	if len(input) > MaxMapValueBytes {
+		return fmt.Errorf("%s expression exceeds %d bytes", field, MaxMapValueBytes)
+	}
+	if !containsExpression(input) {
+		return fmt.Errorf("%s must be an expression", field)
+	}
+	return validateTemplate(field, input, matrixAvailability)
+}
+
+func validateMatrixValue(field string, value any) error {
+	scalar, ok := scalarString(value)
+	if !ok {
+		return fmt.Errorf("%s values must be scalars", field)
+	}
+	if utf8.RuneCountInString(scalar) > maxMatrixValueLength {
+		return fmt.Errorf("%s value exceeds %d characters", field, maxMatrixValueLength)
+	}
+	if containsExpression(scalar) {
+		return validateTemplate(field+" value", scalar, matrixAvailability)
+	}
+	return nil
+}
+
+func validateMatrixEntries(jobID, name string, entries MatrixEntries) error {
+	field := fmt.Sprintf("job %q matrix %s", jobID, name)
+	if entries.Expression != "" {
+		if len(entries.Values) > 0 {
+			return fmt.Errorf("%s expression cannot be combined with literal entries", field)
+		}
+		return validateMatrixExpression(field, entries.Expression)
+	}
+	if len(entries.Values) > maxMatrixJobs {
+		return fmt.Errorf("%s defines more than %d entries", field, maxMatrixJobs)
+	}
+	for index, entry := range entries.Values {
+		entryField := fmt.Sprintf("%s entry %d", field, index+1)
+		if len(entry) == 0 {
+			return fmt.Errorf("%s must not be empty", entryField)
+		}
+		if len(entry) > maxMapEntries {
+			return fmt.Errorf("%s defines %d values; maximum is %d", entryField, len(entry), maxMapEntries)
+		}
+		for key, value := range entry {
+			if key == "" || utf8.RuneCountInString(key) > maxMapKeyLength {
+				return fmt.Errorf("%s key %q must contain 1 to %d characters", entryField, key, maxMapKeyLength)
+			}
+			if err := validateMatrixValue(entryField, value); err != nil {
+				return err
+			}
+		}
 	}
 	return nil
 }
@@ -567,33 +666,449 @@ func validateJobGraph(jobs map[string]Job) error {
 	return nil
 }
 
-// MatrixCombinations returns matrix values in stable axis and value order.
+// MatrixRequiresEvaluation reports whether expansion depends on expressions.
+func MatrixRequiresEvaluation(strategy Strategy) bool {
+	matrix := strategy.Matrix
+	if matrix.Expression != "" || matrix.Include.Expression != "" || matrix.Exclude.Expression != "" {
+		return true
+	}
+	for _, axis := range matrix.Axes {
+		if axis.Expression != "" || matrixValuesContainExpressions(axis.Values) {
+			return true
+		}
+	}
+	return matrixEntriesContainExpressions(matrix.Include.Values) || matrixEntriesContainExpressions(matrix.Exclude.Values)
+}
+
+// MatrixUsesNeeds reports whether matrix expansion reads the needs context.
+func MatrixUsesNeeds(strategy Strategy) bool {
+	for _, input := range matrixExpressions(strategy.Matrix) {
+		program, err := expression.Parse(input)
+		if err == nil && program.UsesContext("needs") {
+			return true
+		}
+	}
+	return false
+}
+
+func matrixExpressions(matrix MatrixDefinition) []string {
+	inputs := []string{matrix.Expression, matrix.Include.Expression, matrix.Exclude.Expression}
+	for _, axis := range matrix.Axes {
+		inputs = append(inputs, axis.Expression)
+		for _, value := range axis.Values {
+			if scalar, ok := scalarString(value); ok && containsExpression(scalar) {
+				inputs = append(inputs, scalar)
+			}
+		}
+	}
+	for _, entries := range [][]map[string]any{matrix.Include.Values, matrix.Exclude.Values} {
+		for _, entry := range entries {
+			for _, value := range entry {
+				if scalar, ok := scalarString(value); ok && containsExpression(scalar) {
+					inputs = append(inputs, scalar)
+				}
+			}
+		}
+	}
+	return inputs
+}
+
+func matrixValuesContainExpressions(values []any) bool {
+	for _, value := range values {
+		if scalar, ok := scalarString(value); ok && containsExpression(scalar) {
+			return true
+		}
+	}
+	return false
+}
+
+func matrixEntriesContainExpressions(entries []map[string]any) bool {
+	for _, entry := range entries {
+		for _, value := range entry {
+			if scalar, ok := scalarString(value); ok && containsExpression(scalar) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// MatrixCombinations returns literal matrix values in stable axis and value
+// order. Matrices containing expressions are expanded by EvaluateMatrix.
 func MatrixCombinations(strategy Strategy) []map[string]any {
-	if len(strategy.Matrix) == 0 {
+	if MatrixRequiresEvaluation(strategy) {
 		return nil
 	}
-	axisNames := make([]string, 0, len(strategy.Matrix))
-	for name := range strategy.Matrix {
+	combinations, _ := EvaluateMatrix("matrix", strategy, expression.Context{})
+	return combinations
+}
+
+// EvaluateMatrix evaluates and expands a matrix definition.
+func EvaluateMatrix(jobID string, strategy Strategy, context expression.Context) ([]map[string]any, error) {
+	if !strategy.configured && strategy.Matrix.Expression == "" && len(strategy.Matrix.Axes) == 0 && len(strategy.Matrix.Include.Values) == 0 && strategy.Matrix.Include.Expression == "" {
+		return nil, nil
+	}
+	context.Availability = matrixAvailability
+	matrix, err := resolveMatrixDefinition(jobID, strategy.Matrix, context)
+	if err != nil {
+		return nil, err
+	}
+	return expandMatrix(jobID, matrix)
+}
+
+type resolvedMatrix struct {
+	axes    map[string][]any
+	include []map[string]any
+	exclude []map[string]any
+}
+
+func resolveMatrixDefinition(jobID string, definition MatrixDefinition, context expression.Context) (resolvedMatrix, error) {
+	if definition.Expression != "" {
+		value, err := evaluateMatrixExpression(fmt.Sprintf("job %q matrix", jobID), definition.Expression, context)
+		if err != nil {
+			return resolvedMatrix{}, err
+		}
+		mapping, ok := value.(map[string]any)
+		if !ok {
+			return resolvedMatrix{}, fmt.Errorf("job %q matrix expression must evaluate to a mapping", jobID)
+		}
+		return resolvedMatrixFromMapping(jobID, mapping)
+	}
+
+	resolved := resolvedMatrix{axes: make(map[string][]any, len(definition.Axes))}
+	for name, axis := range definition.Axes {
+		values := axis.Values
+		evaluateValues := true
+		if axis.Expression != "" {
+			value, err := evaluateMatrixExpression(fmt.Sprintf("job %q matrix axis %q", jobID, name), axis.Expression, context)
+			if err != nil {
+				return resolvedMatrix{}, err
+			}
+			var ok bool
+			values, ok = value.([]any)
+			if !ok {
+				return resolvedMatrix{}, fmt.Errorf("job %q matrix axis %q expression must evaluate to an array", jobID, name)
+			}
+			evaluateValues = false
+		}
+		resolvedValues, err := resolveMatrixValues(fmt.Sprintf("job %q matrix axis %q", jobID, name), values, context, evaluateValues)
+		if err != nil {
+			return resolvedMatrix{}, err
+		}
+		resolved.axes[name] = resolvedValues
+	}
+	var err error
+	resolved.include, err = resolveMatrixEntries(jobID, "include", definition.Include, context)
+	if err != nil {
+		return resolvedMatrix{}, err
+	}
+	resolved.exclude, err = resolveMatrixEntries(jobID, "exclude", definition.Exclude, context)
+	if err != nil {
+		return resolvedMatrix{}, err
+	}
+	return resolved, nil
+}
+
+func resolvedMatrixFromMapping(jobID string, mapping map[string]any) (resolvedMatrix, error) {
+	if len(mapping) > maxMapEntries+2 {
+		return resolvedMatrix{}, fmt.Errorf("job %q matrix defines too many fields", jobID)
+	}
+	resolved := resolvedMatrix{axes: map[string][]any{}}
+	for name, value := range mapping {
+		switch name {
+		case "include", "exclude":
+			entries, err := matrixEntryList(fmt.Sprintf("job %q matrix %s", jobID, name), value)
+			if err != nil {
+				return resolvedMatrix{}, err
+			}
+			if name == "include" {
+				resolved.include = entries
+			} else {
+				resolved.exclude = entries
+			}
+		default:
+			if name == "" || utf8.RuneCountInString(name) > maxMapKeyLength {
+				return resolvedMatrix{}, fmt.Errorf("job %q matrix axis %q must contain 1 to %d characters", jobID, name, maxMapKeyLength)
+			}
+			values, ok := value.([]any)
+			if !ok {
+				return resolvedMatrix{}, fmt.Errorf("job %q matrix axis %q must be an array", jobID, name)
+			}
+			resolved.axes[name] = values
+		}
+	}
+	if len(resolved.axes) > maxMapEntries {
+		return resolvedMatrix{}, fmt.Errorf("job %q matrix defines %d axes; maximum is %d", jobID, len(resolved.axes), maxMapEntries)
+	}
+	for name, values := range resolved.axes {
+		if _, err := resolveMatrixValues(fmt.Sprintf("job %q matrix axis %q", jobID, name), values, expression.Context{}, false); err != nil {
+			return resolvedMatrix{}, err
+		}
+	}
+	return resolved, nil
+}
+
+func resolveMatrixEntries(jobID, name string, entries MatrixEntries, context expression.Context) ([]map[string]any, error) {
+	if entries.Expression == "" {
+		resolved := make([]map[string]any, 0, len(entries.Values))
+		for index, entry := range entries.Values {
+			values, err := resolveMatrixEntry(fmt.Sprintf("job %q matrix %s entry %d", jobID, name, index+1), entry, context, true)
+			if err != nil {
+				return nil, err
+			}
+			resolved = append(resolved, values)
+		}
+		return resolved, nil
+	}
+	value, err := evaluateMatrixExpression(fmt.Sprintf("job %q matrix %s", jobID, name), entries.Expression, context)
+	if err != nil {
+		return nil, err
+	}
+	return matrixEntryList(fmt.Sprintf("job %q matrix %s", jobID, name), value)
+}
+
+func matrixEntryList(field string, value any) ([]map[string]any, error) {
+	items, ok := value.([]any)
+	if !ok {
+		return nil, fmt.Errorf("%s must be an array of mappings", field)
+	}
+	if len(items) > maxMatrixJobs {
+		return nil, fmt.Errorf("%s defines more than %d entries", field, maxMatrixJobs)
+	}
+	entries := make([]map[string]any, 0, len(items))
+	for index, item := range items {
+		entry, ok := item.(map[string]any)
+		if !ok {
+			return nil, fmt.Errorf("%s entry %d must be a mapping", field, index+1)
+		}
+		resolved, err := resolveMatrixEntry(fmt.Sprintf("%s entry %d", field, index+1), entry, expression.Context{}, false)
+		if err != nil {
+			return nil, err
+		}
+		entries = append(entries, resolved)
+	}
+	return entries, nil
+}
+
+func resolveMatrixEntry(field string, entry map[string]any, context expression.Context, evaluateExpressions bool) (map[string]any, error) {
+	if len(entry) == 0 {
+		return nil, fmt.Errorf("%s must not be empty", field)
+	}
+	if len(entry) > maxMapEntries {
+		return nil, fmt.Errorf("%s defines %d values; maximum is %d", field, len(entry), maxMapEntries)
+	}
+	result := make(map[string]any, len(entry))
+	for name, value := range entry {
+		if name == "" || utf8.RuneCountInString(name) > maxMapKeyLength {
+			return nil, fmt.Errorf("%s key %q must contain 1 to %d characters", field, name, maxMapKeyLength)
+		}
+		resolved, err := resolveMatrixValue(field, value, context, evaluateExpressions)
+		if err != nil {
+			return nil, err
+		}
+		result[name] = resolved
+	}
+	return result, nil
+}
+
+func resolveMatrixValues(field string, values []any, context expression.Context, evaluateExpressions bool) ([]any, error) {
+	if len(values) == 0 {
+		return nil, fmt.Errorf("%s must define at least one value", field)
+	}
+	if len(values) > maxMatrixJobs {
+		return nil, fmt.Errorf("%s defines more than %d values", field, maxMatrixJobs)
+	}
+	result := make([]any, 0, len(values))
+	for _, value := range values {
+		resolved, err := resolveMatrixValue(field, value, context, evaluateExpressions)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, resolved)
+	}
+	return result, nil
+}
+
+func resolveMatrixValue(field string, value any, context expression.Context, evaluateExpressions bool) (any, error) {
+	if input, ok := value.(string); evaluateExpressions && ok && containsExpression(input) {
+		var err error
+		value, err = evaluateMatrixExpression(field+" value", input, context)
+		if err != nil {
+			return nil, err
+		}
+	}
+	scalar, ok := scalarString(value)
+	if !ok {
+		return nil, fmt.Errorf("%s values must be scalars", field)
+	}
+	if utf8.RuneCountInString(scalar) > maxMatrixValueLength {
+		return nil, fmt.Errorf("%s value exceeds %d characters", field, maxMatrixValueLength)
+	}
+	return value, nil
+}
+
+func evaluateMatrixExpression(field, input string, context expression.Context) (any, error) {
+	program, err := expression.Parse(input)
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", field, err)
+	}
+	result, err := program.Evaluate(context)
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", field, err)
+	}
+	return result.Value, nil
+}
+
+func expandMatrix(jobID string, matrix resolvedMatrix) ([]map[string]any, error) {
+	if len(matrix.axes) == 0 {
+		if len(matrix.include) == 0 {
+			return nil, fmt.Errorf("job %q matrix must define at least one axis or include entry", jobID)
+		}
+		if len(matrix.include) > maxMatrixJobs {
+			return nil, fmt.Errorf("job %q matrix expands to more than %d jobs", jobID, maxMatrixJobs)
+		}
+		return cloneMatrixEntries(matrix.include), nil
+	}
+
+	axisNames := make([]string, 0, len(matrix.axes))
+	for name := range matrix.axes {
 		axisNames = append(axisNames, name)
 	}
 	sort.Strings(axisNames)
-	combinations := []map[string]any{{}}
+	combinationCount := 1
 	for _, name := range axisNames {
-		values := strategy.Matrix[name]
-		next := make([]map[string]any, 0, len(combinations)*len(values))
-		for _, combination := range combinations {
-			for _, value := range values {
-				item := make(map[string]any, len(combination)+1)
-				for existingName, existingValue := range combination {
-					item[existingName] = existingValue
+		values := matrix.axes[name]
+		if combinationCount > maxMatrixJobs/len(values) {
+			return nil, fmt.Errorf("job %q matrix expands to more than %d jobs", jobID, maxMatrixJobs)
+		}
+		combinationCount *= len(values)
+	}
+	combinations := make([]map[string]any, 0, combinationCount)
+	var visit func(int, map[string]any) error
+	visit = func(axis int, values map[string]any) error {
+		if axis == len(axisNames) {
+			if matrixEntryMatchesAny(values, matrix.exclude) {
+				return nil
+			}
+			combinations = append(combinations, cloneMatrixEntry(values))
+			if len(combinations) > maxMatrixJobs {
+				return fmt.Errorf("job %q matrix expands to more than %d jobs", jobID, maxMatrixJobs)
+			}
+			return nil
+		}
+		name := axisNames[axis]
+		for _, value := range matrix.axes[name] {
+			values[name] = value
+			if !matrixPartialMatchAny(values, axisNames[:axis+1], matrix.exclude) {
+				if err := visit(axis+1, values); err != nil {
+					return err
 				}
-				item[name] = value
-				next = append(next, item)
 			}
 		}
-		combinations = next
+		delete(values, name)
+		return nil
 	}
-	return combinations
+	if err := visit(0, map[string]any{}); err != nil {
+		return nil, err
+	}
+
+	originals := cloneMatrixEntries(combinations)
+	for _, include := range matrix.include {
+		applied := false
+		for index, original := range originals {
+			if !matrixEntriesCompatible(original, include) {
+				continue
+			}
+			for name, value := range include {
+				combinations[index][name] = value
+			}
+			if len(combinations[index]) > maxMapEntries {
+				return nil, fmt.Errorf("job %q matrix combination defines more than %d values", jobID, maxMapEntries)
+			}
+			applied = true
+		}
+		if !applied {
+			combinations = append(combinations, cloneMatrixEntry(include))
+		}
+		if len(combinations) > maxMatrixJobs {
+			return nil, fmt.Errorf("job %q matrix expands to more than %d jobs", jobID, maxMatrixJobs)
+		}
+	}
+	if len(combinations) == 0 {
+		return nil, fmt.Errorf("job %q matrix expands to no jobs", jobID)
+	}
+	return combinations, nil
+}
+
+func matrixEntryMatchesAny(values map[string]any, entries []map[string]any) bool {
+	for _, entry := range entries {
+		matched := true
+		for name, value := range entry {
+			actual, found := values[name]
+			if !found || !matrixValuesEqual(actual, value) {
+				matched = false
+				break
+			}
+		}
+		if matched {
+			return true
+		}
+	}
+	return false
+}
+
+func matrixPartialMatchAny(values map[string]any, assigned []string, entries []map[string]any) bool {
+	assignedNames := make(map[string]struct{}, len(assigned))
+	for _, name := range assigned {
+		assignedNames[name] = struct{}{}
+	}
+	for _, entry := range entries {
+		if len(entry) > len(assignedNames) {
+			continue
+		}
+		matched := true
+		for name, value := range entry {
+			if _, assigned := assignedNames[name]; !assigned || !matrixValuesEqual(values[name], value) {
+				matched = false
+				break
+			}
+		}
+		if matched {
+			return true
+		}
+	}
+	return false
+}
+
+func matrixEntriesCompatible(original, include map[string]any) bool {
+	for name, value := range include {
+		if existing, found := original[name]; found && !matrixValuesEqual(existing, value) {
+			return false
+		}
+	}
+	return true
+}
+
+func matrixValuesEqual(left, right any) bool {
+	leftString, leftOK := scalarString(left)
+	rightString, rightOK := scalarString(right)
+	return leftOK && rightOK && leftString == rightString
+}
+
+func cloneMatrixEntries(entries []map[string]any) []map[string]any {
+	result := make([]map[string]any, 0, len(entries))
+	for _, entry := range entries {
+		result = append(result, cloneMatrixEntry(entry))
+	}
+	return result
+}
+
+func cloneMatrixEntry(entry map[string]any) map[string]any {
+	result := make(map[string]any, len(entry))
+	for name, value := range entry {
+		result[name] = value
+	}
+	return result
 }
 
 func validateJobOutputs(jobID string, outputs map[string]any) (int, error) {
@@ -683,6 +1198,8 @@ func scalarString(value any) (string, bool) {
 	switch typed := value.(type) {
 	case string:
 		return typed, true
+	case json.Number:
+		return typed.String(), true
 	case bool, int, int64, uint64, float64:
 		return fmt.Sprint(typed), true
 	default:
@@ -1251,13 +1768,7 @@ func (s *Strategy) UnmarshalYAML(node *yaml.Node) error {
 		value := node.Content[index+1]
 		switch name {
 		case "matrix":
-			if value.Kind != yaml.MappingNode {
-				return fmt.Errorf("job strategy matrix must be a mapping")
-			}
-			if err := rejectDuplicateMappingKeys(value, "job strategy matrix"); err != nil {
-				return err
-			}
-			if err := value.Decode(&s.Matrix); err != nil {
+			if err := decodeMatrixDefinition(value, &s.Matrix); err != nil {
 				return err
 			}
 		case "max-parallel":
@@ -1272,6 +1783,76 @@ func (s *Strategy) UnmarshalYAML(node *yaml.Node) error {
 		default:
 			return fmt.Errorf("unsupported job strategy field %q", name)
 		}
+	}
+	return nil
+}
+
+func decodeMatrixDefinition(node *yaml.Node, matrix *MatrixDefinition) error {
+	if node.Kind == yaml.ScalarNode {
+		if err := node.Decode(&matrix.Expression); err != nil {
+			return err
+		}
+		return nil
+	}
+	if node.Kind != yaml.MappingNode {
+		return fmt.Errorf("job strategy matrix must be a mapping or expression")
+	}
+	if err := rejectDuplicateMappingKeys(node, "job strategy matrix"); err != nil {
+		return err
+	}
+	matrix.Axes = map[string]MatrixAxis{}
+	for index := 0; index < len(node.Content); index += 2 {
+		name := node.Content[index].Value
+		value := node.Content[index+1]
+		switch name {
+		case "include", "exclude":
+			entries := &matrix.Include
+			if name == "exclude" {
+				entries = &matrix.Exclude
+			}
+			if err := decodeMatrixEntries(value, "job strategy matrix "+name, entries); err != nil {
+				return err
+			}
+		default:
+			axis := MatrixAxis{}
+			switch value.Kind {
+			case yaml.SequenceNode:
+				if err := value.Decode(&axis.Values); err != nil {
+					return err
+				}
+			case yaml.ScalarNode:
+				if err := value.Decode(&axis.Expression); err != nil {
+					return err
+				}
+			default:
+				return fmt.Errorf("job strategy matrix axis %q must be an array or expression", name)
+			}
+			matrix.Axes[name] = axis
+		}
+	}
+	return nil
+}
+
+func decodeMatrixEntries(node *yaml.Node, field string, entries *MatrixEntries) error {
+	if node.Kind == yaml.ScalarNode {
+		return node.Decode(&entries.Expression)
+	}
+	if node.Kind != yaml.SequenceNode {
+		return fmt.Errorf("%s must be an array or expression", field)
+	}
+	entries.Values = make([]map[string]any, 0, len(node.Content))
+	for index, item := range node.Content {
+		if item.Kind != yaml.MappingNode {
+			return fmt.Errorf("%s entry %d must be a mapping", field, index+1)
+		}
+		if err := rejectDuplicateMappingKeys(item, fmt.Sprintf("%s entry %d", field, index+1)); err != nil {
+			return err
+		}
+		entry := map[string]any{}
+		if err := item.Decode(&entry); err != nil {
+			return err
+		}
+		entries.Values = append(entries.Values, entry)
 	}
 	return nil
 }
