@@ -67,7 +67,7 @@ func TestJobPlanCoversSupportedSteps(t *testing.T) {
 		{Uses: "actions/setup-go@v5", With: map[string]any{"go-version-file": "go.mod"}},
 		{ID: "build", Name: "Build", Run: "make build"},
 	}}
-	plan, err := reconciler.jobPlan(run, "CI", "build", job, nil, map[string]any{"enabled": false, "retries": float64(2)})
+	plan, err := reconciler.jobPlan(run, "CI", "build", nil, job, nil, map[string]any{"enabled": false, "retries": float64(2)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -85,6 +85,73 @@ func TestJobPlanCoversSupportedSteps(t *testing.T) {
 	}
 	if plan.Steps[2].ID != "build" || plan.Outputs["artifact"] == "" {
 		t.Errorf("output plan = %#v", plan)
+	}
+}
+
+func TestPlanWorkflowJobsInheritsWorkflowEnvironment(t *testing.T) {
+	reconciler := &WorkflowRunReconciler{}
+	run := &actionsv1alpha1.WorkflowRun{Spec: actionsv1alpha1.WorkflowRunSpec{Source: actionsv1alpha1.WorkflowRunSource{
+		Type: actionsv1alpha1.SourceTypeGitHub,
+		GitHub: &actionsv1alpha1.GitHubWorkflowRunSource{
+			Repository: actionsv1alpha1.GitHubRepository{ID: 1, Owner: "acme", Name: "example"},
+			Event:      actionsv1alpha1.GitHubEvent{Name: "push", DeliveryID: "delivery"},
+			Revision:   actionsv1alpha1.GitRevision{SHA: strings.Repeat("a", 40), Ref: "refs/heads/main"},
+		},
+	}}}
+	definition := &workflow.Definition{
+		Name: "CI",
+		Env: map[string]any{
+			"GLOBAL":   "${{ vars.GLOBAL }}",
+			"OVERRIDE": "workflow",
+			"TOKEN":    "${{ secrets.TOKEN }}",
+		},
+		Jobs: map[string]workflow.Job{
+			"build": {
+				RunsOn: workflow.StringList{"ubuntu-latest"},
+				Env:    map[string]any{"OVERRIDE": "job"},
+				Steps: []workflow.Step{{
+					Uses: "actions/example@v1",
+					With: map[string]any{"message": "${{ env.GLOBAL }}-${{ env.OVERRIDE }}"},
+					Env:  map[string]any{"OVERRIDE": "step"},
+				}},
+			},
+			"lint": {
+				RunsOn: workflow.StringList{"ubuntu-latest"},
+				Steps:  []workflow.Step{{Run: "true"}},
+			},
+		},
+	}
+
+	planned, err := reconciler.planWorkflowJobs(run, definition, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(planned) != 2 {
+		t.Fatalf("planned jobs = %d, want 2", len(planned))
+	}
+	build := &runner.Plan{}
+	if err := json.Unmarshal([]byte(planned[0].plan), build); err != nil {
+		t.Fatal(err)
+	}
+	if build.Env["GLOBAL"] != "${{ vars.GLOBAL }}" || build.Env["OVERRIDE"] != "job" || build.Env["TOKEN"] != "${{ secrets.TOKEN }}" {
+		t.Fatalf("build environment = %#v", build.Env)
+	}
+	if build.Steps[0].Env["OVERRIDE"] != "step" || build.Steps[0].With["message"] != "${{ env.GLOBAL }}-${{ env.OVERRIDE }}" {
+		t.Fatalf("build step = %#v", build.Steps[0])
+	}
+	lint := &runner.Plan{}
+	if err := json.Unmarshal([]byte(planned[1].plan), lint); err != nil {
+		t.Fatal(err)
+	}
+	if lint.Env["GLOBAL"] != "${{ vars.GLOBAL }}" || lint.Env["OVERRIDE"] != "workflow" || lint.Env["TOKEN"] != "${{ secrets.TOKEN }}" {
+		t.Fatalf("lint environment = %#v", lint.Env)
+	}
+	replanned, err := reconciler.planWorkflowJobs(run, definition, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if replanned[0].plan != planned[0].plan || replanned[1].plan != planned[1].plan {
+		t.Fatal("workflow environment planning is not deterministic")
 	}
 }
 

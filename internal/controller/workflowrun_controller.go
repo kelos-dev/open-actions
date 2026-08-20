@@ -779,6 +779,10 @@ func (r *WorkflowRunReconciler) ensureWorkflowJobs(ctx context.Context, run *act
 }
 
 func (r *WorkflowRunReconciler) planWorkflowJobs(run *actionsv1alpha1.WorkflowRun, definition *workflow.Definition, inputValues map[string]any, variables any) ([]plannedWorkflowJob, error) {
+	workflowEnv, err := stringMap(definition.Env)
+	if err != nil {
+		return nil, fmt.Errorf("workflow env: %w", err)
+	}
 	jobIDs := make([]string, 0, len(definition.Jobs))
 	for id := range definition.Jobs {
 		jobIDs = append(jobIDs, id)
@@ -829,7 +833,7 @@ func (r *WorkflowRunReconciler) planWorkflowJobs(run *actionsv1alpha1.WorkflowRu
 			if matrix != nil {
 				displayName = matrixDisplayName(displayName, matrix, index)
 			}
-			plan, err := r.jobPlan(run, definition.Name, id, resolvedJob, matrix, inputValues)
+			plan, err := r.jobPlan(run, definition.Name, id, workflowEnv, resolvedJob, matrix, inputValues)
 			if err != nil {
 				return nil, err
 			}
@@ -1233,13 +1237,14 @@ func (r *WorkflowRunReconciler) ensurePlanConfigMap(ctx context.Context, workflo
 	return nil
 }
 
-func (r *WorkflowRunReconciler) jobPlan(run *actionsv1alpha1.WorkflowRun, workflowName, id string, job workflow.Job, matrix, inputValues map[string]any) (*runner.Plan, error) {
+func (r *WorkflowRunReconciler) jobPlan(run *actionsv1alpha1.WorkflowRun, workflowName, id string, workflowEnv map[string]string, job workflow.Job, matrix, inputValues map[string]any) (*runner.Plan, error) {
 	githubSource := run.Spec.Source.GitHub
 	headRef, baseRef := githubSourcePullRequestRefs(githubSource)
 	jobEnv, err := stringMap(job.Env)
 	if err != nil {
 		return nil, fmt.Errorf("job %q env: %w", id, err)
 	}
+	jobEnv = mergeStringMaps(workflowEnv, jobEnv)
 	outputs, err := stringMap(job.Outputs)
 	if err != nil {
 		return nil, fmt.Errorf("job %q outputs: %w", id, err)
@@ -2328,4 +2333,18 @@ func stringMap(values map[string]any) (map[string]string, error) {
 		}
 	}
 	return result, nil
+}
+
+func mergeStringMaps(base, override map[string]string) map[string]string {
+	if len(base) == 0 && len(override) == 0 {
+		return nil
+	}
+	result := make(map[string]string, len(base)+len(override))
+	for key, value := range base {
+		result[key] = value
+	}
+	for key, value := range override {
+		result[key] = value
+	}
+	return result
 }

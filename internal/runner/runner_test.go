@@ -31,7 +31,7 @@ import (
 func TestExecuteRunSteps(t *testing.T) {
 	workspace := t.TempDir()
 	plan := testPlan()
-	plan.Env = map[string]string{"JOB_ENV": "job"}
+	plan.Env = map[string]string{"JOB_ENV": "job", "SHARED": "job"}
 	binDirectory := filepath.Join(workspace, "bin")
 	if err := os.Mkdir(binDirectory, 0o755); err != nil {
 		t.Fatal(err)
@@ -43,8 +43,8 @@ func TestExecuteRunSteps(t *testing.T) {
 		},
 		{
 			Name: "write result",
-			Run:  `printf '%s/%s/%s/%s/%s' "$JOB_ENV" "$STEP_ENV" "$GITHUB_REF_NAME" "$EXPORTED" "${PATH%%:*}" > result`,
-			Env:  map[string]string{"STEP_ENV": "step"},
+			Run:  `printf '%s/%s/%s/%s/%s/%s/%s/%s' "$JOB_ENV" "$STEP_ENV" "$SHARED" "$JOB_ENV_CONTEXT" "$SHARED_CONTEXT" "$GITHUB_REF_NAME" "$EXPORTED" "${PATH%%:*}" > result`,
+			Env:  map[string]string{"STEP_ENV": "step", "SHARED": "step", "JOB_ENV_CONTEXT": "${{ env.JOB_ENV }}", "SHARED_CONTEXT": "${{ env.SHARED }}"},
 		},
 	}
 	executor := testExecutor(t, io.Discard, io.Discard)
@@ -55,7 +55,7 @@ func TestExecuteRunSteps(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(result) != "job/step/main/value/"+binDirectory {
+	if string(result) != "job/step/step/job/job/main/value/"+binDirectory {
 		t.Errorf("result = %q", result)
 	}
 }
@@ -970,7 +970,7 @@ fs.appendFileSync(process.env.GITHUB_STATE, 'pre_marker=saved\n');
 console.log('external pre ran');
 `,
 				"main.js": `const fs = require('fs');
-if (process.env.PRE_VALUE !== 'ready' || !process.env.PATH.startsWith('/external/bin:')) {
+if (process.env.PRE_VALUE !== 'ready' || !process.env.PATH.startsWith('/external/bin:') || process.env.ACTION_SCOPE !== 'workflow' || process.env.ACTION_STEP_SCOPE !== 'step') {
   throw new Error('pre command files were not applied');
 }
 fs.appendFileSync(process.env.GITHUB_ENV, 'ACTION_VALUE<<EOF\n' + process.env['INPUT_MESSAGE'] + '\nEOF\n');
@@ -988,10 +988,11 @@ console.log('external post ran');
 			})
 			plan := testPlan()
 			plan.Repository.ActionCloneBaseURL = "file://" + repositories
+			plan.Env = map[string]string{"ACTION_MESSAGE": "${{ vars.ACTION_MESSAGE }}", "ACTION_SCOPE": "workflow"}
 			plan.Outputs = map[string]string{"action": "${{ steps.external.outputs.modern }}"}
 			plan.Steps = []Step{
 				{Run: `printf '%s\n' "$RUNTIME_OVERRIDE" >> "$GITHUB_PATH"`, Env: map[string]string{"RUNTIME_OVERRIDE": overrideDirectory}},
-				{ID: "external", Uses: "actions/example@v1", With: map[string]string{"message": "external action ran"}},
+				{ID: "external", Uses: "actions/example@v1", With: map[string]string{"message": "${{ env.ACTION_MESSAGE }}"}, Env: map[string]string{"ACTION_STEP_SCOPE": "step"}},
 				{Run: `test "$ACTION_VALUE" = "external action ran" && case "$PATH" in /external/bin:*) ;; *) exit 1 ;; esac`},
 			}
 			var output bytes.Buffer
@@ -999,6 +1000,7 @@ console.log('external post ran');
 				Logger:      slog.New(slog.NewJSONHandler(&output, nil)),
 				GitHubToken: "installation-token",
 				ActionToken: "action-installation-token",
+				Variables:   map[string]string{"ACTION_MESSAGE": "external action ran"},
 				Environment: environment,
 				Stdout:      &output,
 				Stderr:      &output,
@@ -1197,6 +1199,8 @@ runs:
         test "$EXPECTED" = "composite value"
         test "$OUTER" = "workflow action env"
         test "$EXPECTED_OUTER" = "workflow action env"
+        test "$STEP_SCOPE" = "workflow action step env"
+        test "$EXPECTED_STEP_SCOPE" = "workflow action step env"
         test "$TOKEN" = "installation-token"
         test "${{ env.LOCAL }}" = "composite-local"
         printf 'COMPOSITE_VALUE=%s\n' "${{ steps.nested.outputs.value }}" >> "$GITHUB_ENV"
@@ -1204,6 +1208,7 @@ runs:
       env:
         EXPECTED: ${{ inputs.message }}
         EXPECTED_OUTER: ${{ env.OUTER }}
+        EXPECTED_STEP_SCOPE: ${{ env.STEP_SCOPE }}
         LOCAL: composite-local
         TOKEN: ${{ github.token }}
 `,
@@ -1227,8 +1232,9 @@ runs:
 	})
 	plan := testPlan()
 	plan.Repository.ActionCloneBaseURL = "file://" + repositories
+	plan.Env = map[string]string{"OUTER": "workflow action env"}
 	plan.Steps = []Step{
-		{Uses: "actions/parent@v1", With: map[string]string{"message": "composite value"}, Env: map[string]string{"OUTER": "workflow action env"}},
+		{Uses: "actions/parent@v1", With: map[string]string{"message": "composite value"}, Env: map[string]string{"STEP_SCOPE": "workflow action step env"}},
 		{Run: `test "$COMPOSITE_VALUE" = "composite value" && test "$PARENT_VALUE" = "composite value"`},
 	}
 	var output bytes.Buffer

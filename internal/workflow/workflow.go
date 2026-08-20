@@ -58,6 +58,7 @@ const (
 type Definition struct {
 	Name        string         `yaml:"name"`
 	On          Trigger        `yaml:"on"`
+	Env         map[string]any `yaml:"env"`
 	Concurrency Concurrency    `yaml:"concurrency"`
 	Jobs        map[string]Job `yaml:"jobs"`
 }
@@ -209,6 +210,7 @@ type Repository struct {
 
 var (
 	workflowConcurrencyAvailability = expression.NewAvailability("github", "inputs", "vars")
+	workflowEnvironmentAvailability = expression.NewAvailability("github", "secrets", "inputs", "vars")
 	jobNameAvailability             = expression.NewAvailability("github", "needs", "strategy", "matrix", "vars", "inputs")
 	jobEnvironmentAvailability      = expression.NewAvailability("github", "needs", "strategy", "matrix", "vars", "secrets", "inputs")
 	jobConditionAvailability        = expression.NewAvailability("github", "needs", "vars", "inputs").WithStatusFunctions()
@@ -250,6 +252,9 @@ func Parse(data []byte) (*Definition, error) {
 			return nil, err
 		}
 	}
+	if _, err := validateEnvironmentMap("workflow env", definition.Env, workflowEnvironmentAvailability); err != nil {
+		return nil, err
+	}
 	if err := validateTrigger(definition.On); err != nil {
 		return nil, err
 	}
@@ -261,7 +266,7 @@ func Parse(data []byte) (*Definition, error) {
 	}
 	expandedJobs := 0
 	for id, job := range definition.Jobs {
-		if err := validateJob(id, &job); err != nil {
+		if err := validateJob(id, &job, definition.Env); err != nil {
 			return nil, err
 		}
 		combinations := MatrixCombinations(job.Strategy)
@@ -281,7 +286,7 @@ func Parse(data []byte) (*Definition, error) {
 	return definition, nil
 }
 
-func validateJob(id string, job *Job) error {
+func validateJob(id string, job *Job, workflowEnv map[string]any) error {
 	if len(id) > maxJobIDLength {
 		return fmt.Errorf("workflow job ID %q exceeds %d characters", id, maxJobIDLength)
 	}
@@ -365,11 +370,10 @@ func validateJob(id string, job *Job) error {
 	for _, dependency := range job.Needs {
 		contentBytes += len(dependency)
 	}
-	envBytes, err := validateEnvironmentMap(fmt.Sprintf("job %q env", id), job.Env, jobEnvironmentAvailability)
-	if err != nil {
+	if _, err := validateEnvironmentMap(fmt.Sprintf("job %q env", id), job.Env, jobEnvironmentAvailability); err != nil {
 		return err
 	}
-	contentBytes += envBytes
+	contentBytes += mergedScalarMapBytes(workflowEnv, job.Env)
 	outputBytes, err := validateJobOutputs(id, job.Outputs)
 	if err != nil {
 		return err
@@ -590,6 +594,22 @@ func validateEnvironmentMap(field string, values map[string]any, availability ex
 		}
 	}
 	return validateScalarMap(field, values, availability)
+}
+
+func mergedScalarMapBytes(base, override map[string]any) int {
+	total := 0
+	for key, value := range base {
+		if _, found := override[key]; found {
+			continue
+		}
+		scalar, _ := scalarString(value)
+		total += len(key) + len(scalar)
+	}
+	for key, value := range override {
+		scalar, _ := scalarString(value)
+		total += len(key) + len(scalar)
+	}
+	return total
 }
 
 func reservedEnvironmentName(name string) bool {
