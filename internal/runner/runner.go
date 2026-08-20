@@ -44,6 +44,7 @@ type Plan struct {
 	WorkflowName          string            `json:"workflowName"`
 	JobID                 string            `json:"jobID"`
 	Matrix                map[string]any    `json:"matrix,omitempty"`
+	Needs                 Needs             `json:"-"`
 	Env                   map[string]string `json:"env,omitempty"`
 	Outputs               map[string]string `json:"outputs,omitempty"`
 	TimeoutSeconds        int64             `json:"timeoutSeconds,omitempty"`

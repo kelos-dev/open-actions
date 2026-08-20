@@ -63,7 +63,7 @@ jobs:
     if: always() && needs.test.result == 'success'
     runs-on: [ubuntu-latest, docker]
     steps:
-      - run: printf 'dependency graph e2e works\n'
+      - run: test "${{ needs.test.result }}" = success && printf 'dependency graph e2e works\n'
 `
 
 const preparationSteps = `      - name: Block action downloads

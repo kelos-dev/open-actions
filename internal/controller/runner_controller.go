@@ -35,6 +35,7 @@ var (
 
 const (
 	jobPlanVolume            = "open-actions-job"
+	jobNeedsVolume           = "open-actions-needs"
 	jobEventVolume           = "open-actions-event"
 	jobSecretsVolume         = "open-actions-secrets"
 	jobVariablesVolume       = "open-actions-variables"
@@ -42,6 +43,7 @@ const (
 	dockerSocketVolume       = "open-actions-docker-socket"
 	dockerStorageVolume      = "open-actions-docker-storage"
 	jobPlanMountPath         = "/var/run/open-actions"
+	jobNeedsMountPath        = "/var/run/open-actions/needs"
 	jobEventMountPath        = "/var/run/open-actions/event"
 	jobContextMountPath      = "/var/run/open-actions/context"
 	workspaceVolumeMountPath = "/workspace"
@@ -473,6 +475,25 @@ func (r *RunnerReconciler) executeWorkflowJob(ctx context.Context, runnerObject 
 	if !metav1.IsControlledBy(plan, workflowJob) {
 		return false, fmt.Errorf("job plan ConfigMap %q is not controlled by WorkflowJob %q", plan.Name, workflowJob.Name)
 	}
+	if len(workflowJob.Spec.Needs) > 0 {
+		needs := &corev1.ConfigMap{}
+		needsKey := client.ObjectKey{Namespace: workflowJob.Namespace, Name: childName(workflowJob.Name, "needs")}
+		if err := r.APIReader.Get(ctx, needsKey, needs); err != nil {
+			if apierrors.IsNotFound(err) {
+				return true, r.failAssignedWorkflowJob(ctx, workflowJob, "PlanUnavailable", fmt.Sprintf("Needs context ConfigMap %q is missing", needsKey.Name))
+			}
+			return false, fmt.Errorf("get needs context ConfigMap %q: %w", needsKey.Name, err)
+		}
+		if !metav1.IsControlledBy(needs, workflowJob) {
+			return false, fmt.Errorf("needs context ConfigMap %q is not controlled by WorkflowJob %q", needs.Name, workflowJob.Name)
+		}
+		if needs.Immutable == nil || !*needs.Immutable {
+			return true, r.failAssignedWorkflowJob(ctx, workflowJob, "PlanUnavailable", fmt.Sprintf("Needs context ConfigMap %q is not immutable", needs.Name))
+		}
+		if _, err := runner.DecodeNeedsContext([]byte(needs.Data[jobNeedsKey])); err != nil {
+			return true, r.failAssignedWorkflowJob(ctx, workflowJob, "PlanUnavailable", fmt.Sprintf("Needs context ConfigMap %q is invalid: %v", needs.Name, err))
+		}
+	}
 	if err := r.validateEventSnapshot(ctx, run); err != nil {
 		return false, err
 	}
@@ -865,6 +886,17 @@ func (r *RunnerReconciler) buildJob(workflowJob *actionsv1alpha1.WorkflowJob, ru
 		container := &podTemplate.Spec.Containers[0]
 		container.VolumeMounts = append(container.VolumeMounts, corev1.VolumeMount{Name: jobEventVolume, MountPath: jobEventMountPath, ReadOnly: true})
 		container.Args = append(container.Args, "--event-file="+jobEventMountPath+"/"+eventsnapshot.DataKey)
+	}
+	if len(workflowJob.Spec.Needs) > 0 {
+		podTemplate.Spec.Volumes = append(podTemplate.Spec.Volumes, corev1.Volume{
+			Name: jobNeedsVolume,
+			VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{
+				LocalObjectReference: corev1.LocalObjectReference{Name: childName(workflowJob.Name, "needs")},
+			}},
+		})
+		container := &podTemplate.Spec.Containers[0]
+		container.VolumeMounts = append(container.VolumeMounts, corev1.VolumeMount{Name: jobNeedsVolume, MountPath: jobNeedsMountPath, ReadOnly: true})
+		container.Args = append(container.Args, "--needs-file="+jobNeedsMountPath+"/"+jobNeedsKey)
 	}
 	configureProjectValues(&podTemplate.Spec, &podTemplate.Spec.Containers[0], project)
 	backoffLimit := int32(0)
