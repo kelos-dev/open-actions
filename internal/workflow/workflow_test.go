@@ -1089,6 +1089,34 @@ func TestParseAcceptsWorkflowExpressions(t *testing.T) {
 	}
 }
 
+func TestParseAcceptsWorkflowStepContinueOnError(t *testing.T) {
+	definition, err := Parse([]byte("name: CI\non: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: make test\n        continue-on-error: true\n      - run: make integration-test\n        continue-on-error: ${{ inputs.experimental && hashFiles('**/*.go') != '' }}\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	steps := definition.Jobs["build"].Steps
+	if steps[0].ContinueOnError != true || steps[1].ContinueOnError != "${{ inputs.experimental && hashFiles('**/*.go') != '' }}" {
+		t.Fatalf("continue-on-error values = %#v, %#v", steps[0].ContinueOnError, steps[1].ContinueOnError)
+	}
+}
+
+func TestParseRejectsInvalidWorkflowStepContinueOnError(t *testing.T) {
+	base := "name: CI\non: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: make test\n        continue-on-error: "
+	for name, value := range map[string]string{
+		"string":              "'true'",
+		"number":              "1",
+		"sequence":            "[true]",
+		"embedded expression": "'value-${{ inputs.experimental }}'",
+		"status function":     "${{ success() }}",
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := Parse([]byte(base + value + "\n")); err == nil {
+				t.Fatal("Parse() accepted an invalid continue-on-error value")
+			}
+		})
+	}
+}
+
 func TestParseRejectsInvalidOrUnavailableWorkflowExpressions(t *testing.T) {
 	tests := []struct {
 		name string
@@ -1225,6 +1253,7 @@ func TestParseEnforcesWorkflowConfigurationBounds(t *testing.T) {
 		{name: "working directory", data: base + "      - run: true\n        working-directory: " + strings.Repeat("x", MaxWorkingDirectoryLength+1) + "\n"},
 		{name: "step name", data: base + "      - name: " + strings.Repeat("x", MaxStepNameLength+1) + "\n        run: true\n"},
 		{name: "condition", data: base + "      - if: ${{ '" + strings.Repeat("x", MaxConditionBytes+1) + "' }}\n        run: true\n"},
+		{name: "continue-on-error", data: base + "      - continue-on-error: ${{ '" + strings.Repeat("x", MaxConditionBytes+1) + "' }}\n        run: true\n"},
 		{name: "aggregate job content", data: base + "      - run: " + strings.Repeat("x", 60_000) + "\n      - run: " + strings.Repeat("x", 60_000) + "\n"},
 		{name: "condition aggregate content", data: base + "      - if: ${{ '" + strings.Repeat("x", 50_000) + "' }}\n        run: " + strings.Repeat("x", 60_000) + "\n"},
 		{name: "workflow environment aggregate content", data: "name: CI\non: push\nenv:\n  VALUE: " + strings.Repeat("x", 50_000) + "\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: " + strings.Repeat("x", 60_000) + "\n"},

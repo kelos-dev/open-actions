@@ -143,7 +143,7 @@ func TestExecuteExposesRunStepOutputs(t *testing.T) {
 				"OVERWRITTEN": "${{ steps.producer.outputs.value }}",
 				"SKIPPED":     "${{ steps.skipped.outputs.value }}",
 			},
-			Run: `test -z "$MISSING" && test "$MULTILINE" = $'first line\nsecond line' && test "$OVERWRITTEN" = second && test -z "$SKIPPED"`,
+			Run: `test -z "$MISSING" && test "$MULTILINE" = $'first line\nsecond line' && test "$OVERWRITTEN" = second && test -z "$SKIPPED" && test '${{ steps.skipped.outcome }}' = skipped && test '${{ steps.skipped.conclusion }}' = skipped`,
 		},
 	}
 	result, err := testExecutor(t, io.Discard, io.Discard).ExecuteResult(context.Background(), plan, t.TempDir())
@@ -169,6 +169,103 @@ func TestExecuteKeepsOutputsFromFailedSteps(t *testing.T) {
 	}
 	if result.Outputs["value"] != "available" {
 		t.Fatalf("outputs = %#v", result.Outputs)
+	}
+}
+
+func TestExecuteContinuesAfterCoveredRunStepFailure(t *testing.T) {
+	workspace := t.TempDir()
+	plan := testPlan()
+	plan.Outputs = map[string]string{"value": "${{ steps.soft_failure.outputs.value }}"}
+	plan.Steps = []Step{
+		{ID: "soft_failure", Name: "Optional check", Run: `echo 'value=available' >> "$GITHUB_OUTPUT"; exit 1`, ContinueOnError: true},
+		{If: "steps.soft_failure.outcome == 'failure' && steps.soft_failure.conclusion == 'success'", Run: `test '${{ steps.soft_failure.outputs.value }}' = available; touch continued`},
+		{If: "failure()", Run: "touch failure"},
+	}
+	var logs bytes.Buffer
+	executor, err := NewExecutor(ExecutorConfig{
+		Logger:      slog.New(slog.NewJSONHandler(&logs, nil)),
+		GitHubToken: "installation-token",
+		ActionToken: "action-installation-token",
+		Environment: os.Environ(),
+		Stdout:      &logs,
+		Stderr:      &logs,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := executor.ExecuteResult(context.Background(), plan, workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Outputs["value"] != "available" {
+		t.Fatalf("outputs = %#v", result.Outputs)
+	}
+	if _, err := os.Stat(filepath.Join(workspace, "continued")); err != nil {
+		t.Fatalf("later step did not run: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(workspace, "failure")); !os.IsNotExist(err) {
+		t.Fatalf("failure condition matched a covered failure: %v", err)
+	}
+	warning := strings.Index(logs.String(), `"msg":"workflow step failed with continue-on-error"`)
+	completion := strings.Index(logs.String(), `"msg":"completed workflow step"`)
+	if warning < 0 || completion < warning || !strings.Contains(logs.String(), `"outcome":"failure","conclusion":"success"`) {
+		t.Fatalf("covered failure was not logged before its successful conclusion: %s", logs.String())
+	}
+}
+
+func TestExecuteResolvesWorkflowStepContinueOnErrorExpressions(t *testing.T) {
+	for _, tt := range []struct {
+		name          string
+		value         any
+		expression    string
+		wantContinued bool
+		wantError     string
+	}{
+		{name: "true", value: true, wantContinued: true},
+		{name: "whitespace", value: true, expression: " \t${{ matrix.continue }} \n", wantContinued: true},
+		{name: "false", value: false},
+		{name: "non-boolean", value: "not-boolean", wantError: "value must evaluate to a boolean"},
+		{name: "evaluation error", expression: "${{ fromJSON('invalid') }}", wantError: "parse JSON"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			workspace := t.TempDir()
+			plan := testPlan()
+			plan.Matrix = map[string]any{"continue": tt.value}
+			expression := tt.expression
+			if expression == "" {
+				expression = "${{ matrix.continue }}"
+			}
+			plan.Steps = []Step{
+				{Run: "touch started; exit 1", ContinueOnError: expression},
+				{Run: "touch continued"},
+				{If: "failure()", Run: "touch failed"},
+			}
+			err := testExecutor(t, io.Discard, io.Discard).Execute(context.Background(), plan, workspace)
+			if tt.wantContinued {
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, err := os.Stat(filepath.Join(workspace, "continued")); err != nil {
+					t.Fatalf("default later step did not run: %v", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatal("Execute() succeeded")
+			}
+			if tt.wantError != "" {
+				if !strings.Contains(err.Error(), tt.wantError) {
+					t.Fatalf("error = %v, want %q", err, tt.wantError)
+				}
+				if _, err := os.Stat(filepath.Join(workspace, "started")); !os.IsNotExist(err) {
+					t.Fatalf("step ran before continue-on-error evaluation failed: %v", err)
+				}
+				return
+			}
+			if _, err := os.Stat(filepath.Join(workspace, "failed")); err != nil {
+				t.Fatalf("failure condition did not run: %v", err)
+			}
+		})
 	}
 }
 
@@ -203,6 +300,35 @@ runs:
 	}
 	if result.Outputs["value"] != "available" {
 		t.Fatalf("outputs = %#v", result.Outputs)
+	}
+}
+
+func TestExecuteContinuesAfterCoveredCompositeActionFailure(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git is not installed")
+	}
+	repositories := t.TempDir()
+	createActionRepository(t, repositories, "actions", "optional-composite", "v1", map[string]string{
+		"action.yml": `name: Optional composite fixture
+outputs:
+  result:
+    value: ${{ steps.failed.outputs.value }}
+runs:
+  using: composite
+  steps:
+    - id: failed
+      run: echo 'value=available' >> "$GITHUB_OUTPUT"; exit 1
+      shell: bash
+`,
+	})
+	plan := testPlan()
+	plan.Repository.ActionCloneBaseURL = "file://" + repositories
+	plan.Steps = []Step{
+		{ID: "optional", Uses: "actions/optional-composite@v1", ContinueOnError: true},
+		{If: "steps.optional.outcome == 'failure' && steps.optional.conclusion == 'success'", Run: `test '${{ steps.optional.outputs.result }}' = available`},
+	}
+	if err := testExecutor(t, io.Discard, io.Discard).Execute(context.Background(), plan, t.TempDir()); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -564,6 +690,28 @@ func TestExecuteCancellationRunsPostActionWithinCleanupWindow(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(workspace, "post-ran")); err != nil {
 		t.Fatalf("post action did not run: %v", err)
+	}
+}
+
+func TestExecuteDoesNotCoverDeadline(t *testing.T) {
+	workspace := t.TempDir()
+	plan := testPlan()
+	plan.Steps = []Step{
+		{Run: "exec sleep 30", ContinueOnError: true},
+		{If: "cancelled()", Run: "touch deadline"},
+		{If: "failure()", Run: "touch failure"},
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	err := testExecutor(t, io.Discard, io.Discard).Execute(ctx, plan, workspace)
+	if err == nil || !strings.Contains(err.Error(), context.DeadlineExceeded.Error()) {
+		t.Fatalf("error = %v, want deadline exceeded", err)
+	}
+	if _, err := os.Stat(filepath.Join(workspace, "deadline")); err != nil {
+		t.Fatalf("deadline cleanup step did not run: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(workspace, "failure")); !os.IsNotExist(err) {
+		t.Fatalf("deadline was exposed as failure: %v", err)
 	}
 }
 
@@ -1246,6 +1394,50 @@ console.log('external post ran');
 				t.Errorf("output command was exposed: %s", output.String())
 			}
 		})
+	}
+}
+
+func TestExecuteContinuesAfterCoveredJavaScriptActionFailureAndRunsPost(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git is not installed")
+	}
+	if _, err := exec.LookPath("node"); err != nil {
+		t.Skip("node is not installed")
+	}
+	repositories := t.TempDir()
+	createActionRepository(t, repositories, "actions", "optional", "v1", map[string]string{
+		"action.yml": `name: Optional JavaScript fixture
+runs:
+  using: node20
+  main: main.js
+  post: post.js
+  post-if: success()
+`,
+		"main.js": `const fs = require('fs');
+fs.appendFileSync(process.env.GITHUB_OUTPUT, 'value=available\n');
+fs.appendFileSync(process.env.GITHUB_STATE, 'main=failed\n');
+process.exitCode = 1;
+`,
+		"post.js": `const fs = require('fs');
+if (process.env.STATE_main !== 'failed') {
+  throw new Error('action state was not preserved');
+}
+fs.writeFileSync(process.env.GITHUB_WORKSPACE + '/post-ran', '');
+`,
+	})
+	workspace := t.TempDir()
+	plan := testPlan()
+	plan.Repository.ActionCloneBaseURL = "file://" + repositories
+	plan.Matrix = map[string]any{"experimental": true}
+	plan.Steps = []Step{
+		{ID: "optional", Uses: "actions/optional@v1", ContinueOnError: "${{ matrix.experimental }}"},
+		{If: "steps.optional.outcome == 'failure' && steps.optional.conclusion == 'success'", Run: `test '${{ steps.optional.outputs.value }}' = available`},
+	}
+	if err := testExecutor(t, io.Discard, io.Discard).Execute(context.Background(), plan, workspace); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(workspace, "post-ran")); err != nil {
+		t.Fatalf("successful post hook did not run after a covered main failure: %v", err)
 	}
 }
 
@@ -2065,7 +2257,10 @@ func TestExecutorLogsCancelledWorkflowStep(t *testing.T) {
 		t.Fatal(err)
 	}
 	plan := testPlan()
-	plan.Steps = []Step{{Name: "Wait", Run: "touch started; exec sleep 30"}}
+	plan.Steps = []Step{
+		{ID: "wait", Name: "Wait", Run: "touch started; exec sleep 30", ContinueOnError: true},
+		{If: "cancelled() && steps.wait.outcome == 'cancelled' && steps.wait.conclusion == 'cancelled'", Run: "touch cancellation-recorded"},
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	result := make(chan error, 1)
 	go func() {
@@ -2083,6 +2278,12 @@ func TestExecutorLogsCancelledWorkflowStep(t *testing.T) {
 	}
 	if !strings.Contains(output.String(), `"msg":"cancelled workflow step","open_actions_runner":true,"job":"test","step":1,"name":"Wait"`) {
 		t.Fatalf("runner output has no cancelled step event: %s", output.String())
+	}
+	if strings.Contains(output.String(), "workflow step failed with continue-on-error") {
+		t.Fatalf("cancellation was softened: %s", output.String())
+	}
+	if _, err := os.Stat(filepath.Join(workspace, "cancellation-recorded")); err != nil {
+		t.Fatalf("cancelled outcome was not exposed to a cleanup step: %v", err)
 	}
 }
 

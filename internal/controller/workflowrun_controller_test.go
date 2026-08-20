@@ -75,7 +75,7 @@ func TestJobPlanCoversSupportedSteps(t *testing.T) {
 	job := workflow.Job{RunsOn: workflow.StringList{"ubuntu-latest"}, Outputs: map[string]any{"artifact": "${{ steps.build.outputs.value }}"}, Steps: []workflow.Step{
 		{Uses: "actions/checkout@v4"},
 		{Uses: "actions/setup-go@v5", With: map[string]any{"go-version-file": "go.mod"}},
-		{ID: "build", Name: "Build", Run: "make build"},
+		{ID: "build", Name: "Build", Run: "make build", ContinueOnError: "${{ inputs.enabled }}"},
 	}}
 	plan, err := reconciler.jobPlan(run, "CI", "build", nil, job, nil, map[string]any{"enabled": false, "retries": float64(2)}, 90*60)
 	if err != nil {
@@ -99,7 +99,7 @@ func TestJobPlanCoversSupportedSteps(t *testing.T) {
 	if len(plan.Steps) != 3 {
 		t.Errorf("steps = %d", len(plan.Steps))
 	}
-	if plan.Steps[2].ID != "build" || plan.Outputs["artifact"] == "" {
+	if plan.Steps[2].ID != "build" || plan.Steps[2].ContinueOnError != "${{ inputs.enabled }}" || plan.Outputs["artifact"] == "" {
 		t.Errorf("output plan = %#v", plan)
 	}
 }

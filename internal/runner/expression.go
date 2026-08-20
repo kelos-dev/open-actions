@@ -56,7 +56,40 @@ func resolveWorkflowStep(step Step, environment map[string]string, state *execut
 		return Step{}, fmt.Errorf("resolve with: %w", err)
 	}
 	resolved.Env = environment
+	continueOnError, err := resolveWorkflowStepContinueOnError(step.ContinueOnError, context)
+	if err != nil {
+		return Step{}, fmt.Errorf("resolve continue-on-error: %w", err)
+	}
+	if step.ContinueOnError != nil {
+		resolved.ContinueOnError = continueOnError
+	}
 	return resolved, nil
+}
+
+func resolveWorkflowStepContinueOnError(value any, context workflowexpression.Context) (bool, error) {
+	if value == nil {
+		return false, nil
+	}
+	if boolean, ok := value.(bool); ok {
+		return boolean, nil
+	}
+	input, ok := value.(string)
+	if !ok {
+		return false, fmt.Errorf("value must be a boolean or expression")
+	}
+	program, err := workflowexpression.Parse(strings.TrimSpace(input))
+	if err != nil {
+		return false, err
+	}
+	result, err := program.Evaluate(context)
+	if err != nil {
+		return false, err
+	}
+	boolean, ok := result.Value.(bool)
+	if !ok {
+		return false, fmt.Errorf("value must evaluate to a boolean")
+	}
+	return boolean, nil
 }
 
 func workflowStepCondition(input string, environment map[string]string, status workflowexpression.Status, state *executionState) (bool, error) {
@@ -304,7 +337,15 @@ func resolvedStepBytes(step Step) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	return len(step.Name) + len(step.Uses) + len(step.Run) + len(step.WorkingDirectory) + len(step.If) + withBytes + environmentBytes, nil
+	continueOnErrorBytes := 0
+	if step.ContinueOnError != nil {
+		value, ok := step.ContinueOnError.(bool)
+		if !ok {
+			return 0, fmt.Errorf("evaluated continue-on-error must be a boolean")
+		}
+		continueOnErrorBytes = len(strconv.FormatBool(value))
+	}
+	return len(step.Name) + len(step.Uses) + len(step.Run) + len(step.WorkingDirectory) + len(step.If) + continueOnErrorBytes + withBytes + environmentBytes, nil
 }
 
 func resolveExpressionString(input string, context workflowexpression.Context) (string, error) {
