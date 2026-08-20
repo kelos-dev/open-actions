@@ -36,7 +36,8 @@ GitHub Enterprise API path such as `/api/v3`. `--github-server-url` defaults to
 `https://github.com` and supplies `github.server_url`. `--action-clone-base-url`
 defaults to the GitHub server URL and is used only to fetch external action
 repositories. Set it explicitly when actions are hosted on another server. The
-controller's optional `--console-url` adds Console links to GitHub Check Runs.
+controller's optional `--console-url` adds Console links to GitHub Check Runs
+and supplies workflow run and stale-query URLs to job contexts.
 `--max-job-timeout` is the cluster-wide upper bound for workflow job execution
 and defaults to `6h`. It must be a positive whole number of minutes. The Helm
 chart configures it through `controller.maxJobTimeout`.
@@ -157,7 +158,9 @@ ID and the last report accepted by GitHub. For locally integrated pull requests,
 commit used for execution. `baseSHA`, `headSHA`, and `mergeBaseSHA` pin its two
 parents and merge base; `headSHA` is also used for check reporting. Pull request
 runs without these integration inputs use the remote revision identified by
-`sha`. Set
+`sha`. `status.identity` records the stable numeric run ID, per-workflow run
+number, attempt, and configured Console URL before jobs are planned. The
+immutable `spec.source.github.actor` records the source actor. Set
 `spec.cancelRequested` to gracefully cancel ordinary jobs while
 allowing cancellation-aware reporting and cleanup jobs to finish. Deleting a
 WorkflowRun force-cancels and removes its child resources. A Runner's
@@ -475,16 +478,16 @@ evaluation when the corresponding execution feature has not supplied it.
 | Phase | Allowed contexts and functions | Currently supplied |
 | --- | --- | --- |
 | Workflow concurrency | `github`, `inputs`, `vars` | All listed contexts |
-| Workflow environment | `github`, `secrets`, `inputs`, `vars` | All listed contexts |
-| Workflow job condition | `github`, `needs`, `vars`, `inputs`, and status functions | `github`, direct dependency results and outputs, `vars`, `inputs`, and status functions |
-| Job name, timeout, and runner labels | `github`, `needs`, `strategy`, `matrix`, `vars`, `inputs` | `github`, `inputs`, `vars`, and `matrix` for matrix jobs |
-| Job environment | `github`, `needs`, `strategy`, `matrix`, `vars`, `secrets`, `inputs` | `github`, `inputs`, `vars`, `secrets`, and `matrix` for matrix jobs |
-| Workflow step name, run script, working directory, environment, and inputs | `github`, `needs`, `strategy`, `matrix`, `job`, `runner`, `env`, `vars`, `secrets`, `steps`, `inputs`, and `hashFiles` | `github`, `matrix`, `runner`, `env`, `vars`, `secrets`, `inputs`, `steps`, and `hashFiles` |
-| Workflow step condition | Step contexts except `secrets`, plus status functions and `hashFiles` | `github`, `matrix`, `runner`, `env`, `vars`, `inputs`, `steps`, status functions, and `hashFiles` |
-| Job outputs | Workflow step contexts without `hashFiles` | `github`, `matrix`, `runner`, `env`, `vars`, `secrets`, `inputs`, `steps` |
-| Composite step fields and outputs | `github`, `runner`, `env`, `inputs`, `steps`, and `hashFiles` | All listed contexts and functions |
+| Workflow environment | `github`, `open_actions`, `secrets`, `inputs`, `vars` | All listed contexts |
+| Workflow job condition | `github`, `open_actions`, `needs`, `vars`, `inputs`, and status functions | `github`, `open_actions`, direct dependency results and outputs, `vars`, `inputs`, and status functions |
+| Job name, timeout, and runner labels | `github`, `open_actions`, `needs`, `strategy`, `matrix`, `vars`, `inputs` | `github`, `open_actions`, `inputs`, `vars`, and `matrix` for matrix jobs |
+| Job environment | `github`, `open_actions`, `needs`, `strategy`, `matrix`, `vars`, `secrets`, `inputs` | `github`, `open_actions`, `inputs`, `vars`, `secrets`, and `matrix` for matrix jobs |
+| Workflow step name, run script, working directory, environment, and inputs | `github`, `open_actions`, `needs`, `strategy`, `matrix`, `job`, `runner`, `env`, `vars`, `secrets`, `steps`, `inputs`, and `hashFiles` | `github`, `open_actions`, `matrix`, `runner`, `env`, `vars`, `secrets`, `inputs`, `steps`, and `hashFiles` |
+| Workflow step condition | Step contexts except `secrets`, plus status functions and `hashFiles` | `github`, `open_actions`, `matrix`, `runner`, `env`, `vars`, `inputs`, `steps`, status functions, and `hashFiles` |
+| Job outputs | Workflow step contexts without `hashFiles` | `github`, `open_actions`, `matrix`, `runner`, `env`, `vars`, `secrets`, `inputs`, `steps` |
+| Composite step fields and outputs | `github`, `open_actions`, `runner`, `env`, `inputs`, `steps`, and `hashFiles` | All listed contexts and functions |
 | Composite step condition | Composite contexts, status functions, and `hashFiles` | All listed contexts and functions |
-| Action input default | `github` | `github` |
+| Action input default | `github`, `open_actions` | All listed contexts |
 
 Values derived from `github.token` or the `secrets` context are marked sensitive
 through interpolation and function calls, and evaluation diagnostics do not
@@ -492,6 +495,71 @@ include resolved values. The runner maps interrupt and termination signals to
 cancelled status, separately from failure and timeout, so eligible workflow and
 composite cleanup steps can run during Pod termination. A single five-minute
 cleanup deadline is shared by those steps and action post hooks.
+
+### Run identity and stale-run queries
+
+Each first attempt receives a numeric `run_id` that is unique within the
+namespace and Project name, and a one-based `run_number` for its repository and
+workflow path. The counters persist independently of retained WorkflowRuns and
+Project recreation. They are stored in namespace-scoped ConfigMaps whose names
+start with `open-actions-run-sequence-`; preserve those ConfigMaps in backups
+and while retaining WorkflowRuns to prevent reused IDs and numbers. A GitHub
+Check Run rerequest creates a new immutable WorkflowRun resource in the same
+lineage, reuses both values, and increments only `run_attempt`. Ordinary
+webhook deliveries, manual dispatches, schedules,
+reusable-workflow calls, and concurrency replacements create new lineages and
+therefore receive new IDs and numbers. Controller retries and restarts do not
+increment an identity already recorded in `status.identity`.
+
+Webhook runs use the signed payload's `sender.login` as `actor`. Direct
+`workflow_dispatch` and `workflow_call` resources use
+`spec.source.github.actor`; it defaults to `open-actions` when the caller does
+not supply an identity. Scheduled runs use `open-actions`. Reruns preserve the
+first attempt's actor, matching GitHub's `github.actor` behavior.
+
+The values are available during planning and runner execution:
+
+| Expression | Default runner environment |
+| --- | --- |
+| `github.run_id` | `GITHUB_RUN_ID` |
+| `github.run_number` | `GITHUB_RUN_NUMBER` |
+| `github.run_attempt` | `GITHUB_RUN_ATTEMPT` |
+| `github.actor` | `GITHUB_ACTOR` |
+| `open_actions.run_url` | `OPEN_ACTIONS_RUN_URL` |
+
+`open_actions.run_url` links to the current attempt in the Open Actions Console. It
+is empty when the controller has no `--console-url`. Open Actions does not
+construct a `github.server_url/<owner>/<repository>/actions/runs/<run_id>` URL,
+because that page identifies a GitHub Actions workflow run that does not exist.
+
+When a Console URL is configured, `open_actions.run_query_url` and
+`OPEN_ACTIONS_RUN_QUERY_URL` identify a read-only JSON endpoint for detecting a
+newer Open Actions run of the same Project, repository, workflow path, and
+revision SHA. The endpoint has the same read access as Console workflow pages.
+Query it immediately before writing a shared external status:
+
+```bash
+response=$(curl --fail --silent --show-error "$OPEN_ACTIONS_RUN_QUERY_URL")
+if [ "$(jq -r '.newer' <<<"$response")" = true ]; then
+  echo "Skipping status update from a stale Open Actions run"
+  exit 0
+fi
+```
+
+The response contains `current` and, when `newer` is `true`, `superseding`
+objects with string-valued `id`, `number`, and `attempt` fields plus `actor`,
+`namespace`, `name`, and the Console `url`. A higher run ID supersedes the
+current lineage; for the same ID, only a higher attempt supersedes it. The query
+is live rather than captured in the job plan, so it detects concurrency
+replacements and reruns that begin after the job starts.
+The endpoint returns HTTP 503 until the current run identity is available.
+
+GitHub's Actions REST endpoints under
+`/repos/{owner}/{repo}/actions/runs`, including workflow-specific listings,
+jobs, logs, cancellation, and rerun endpoints, contain only GitHub Actions
+workflow-run records. They never contain Open Actions WorkflowRuns. GitHub's
+Checks endpoints can return the Check Runs reported by Open Actions, but the
+Console query above is the supported stale-run contract.
 
 ### Step and job outputs
 
@@ -681,7 +749,8 @@ remains within its 1,024-character limit.
 
 `workflow_dispatch` accepts up to 25 typed, bounded inputs. Initiate a manual
 run by creating a `WorkflowRun` through the Kubernetes API with the selected
-workflow path, pinned commit and branch or tag ref, and any supplied inputs.
+workflow path, pinned commit and branch or tag ref, initiating `actor`, and any
+supplied inputs.
 Use a deterministic `metadata.name` as the invocation's idempotency key; a
 retry of the same request must reuse that name. `deliveryID` is reserved for
 the `X-GitHub-Delivery` value on webhook-backed events. The controller verifies
@@ -791,12 +860,12 @@ same immutable snapshot. Synthetic `workflow_dispatch`, `schedule`, and
 `workflow_call` runs use a bounded generated document containing their inputs,
 schedule, repository identity, and supported event metadata.
 
-The controller emits job-plan version 6, and the runner accepts versions 1
-through 6. When a release changes the job-plan version, update every Runner
+The controller emits job-plan version 7, and the runner accepts versions 1
+through 7. When a release changes the job-plan version, update every Runner
 `spec.execution.image` to an image that accepts both the installed and target
 controller versions before upgrading the controller. The received job-plan
 version also determines the runner result version: plan versions 1 through 5
-use result version 1, and plan version 6 uses result version 2. A runner that accepts more
+use result version 1, and plan versions 6 and 7 use result version 2. A runner that accepts more
 than one plan version must emit the result version assigned to that plan, not
 always the latest result version supported by the runner binary. Integration
 commit construction is part of this versioned contract; changing its merge

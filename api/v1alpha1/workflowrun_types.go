@@ -168,6 +168,15 @@ type WorkflowRunSource struct {
 // +kubebuilder:validation:XValidation:rule="self.event.name != 'pull_request' || !has(self.event.pullRequest) || (self.event.pullRequest.headRef == self.revision.headRef && self.event.pullRequest.baseRef == self.revision.baseRef && has(self.revision.headSHA) && self.event.pullRequest.headSHA == self.revision.headSHA)",message="pull request event metadata must match duplicated revision fields"
 // +kubebuilder:validation:XValidation:rule="self.event.name != 'pull_request' || !has(self.event.pullRequest) || !self.revision.ref.startsWith('refs/pull/') || int(self.revision.ref.split('/')[2]) == self.event.pullRequest.number",message="pull request revision.ref must identify event.pullRequest.number"
 type GitHubWorkflowRunSource struct {
+	// Actor is the GitHub login or Open Actions identity that initiated the
+	// first attempt. Reruns retain the original actor.
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=100
+	// +kubebuilder:validation:Pattern=`^[A-Za-z0-9][A-Za-z0-9_-]*(\[bot\])?$`
+	// +kubebuilder:default=open-actions
+	// +optional
+	Actor string `json:"actor,omitempty"`
+
 	// Repository identifies the GitHub repository at the time of the event.
 	// +required
 	Repository GitHubRepository `json:"repository"`
@@ -543,12 +552,47 @@ type WorkflowRunSourceStatus struct {
 	GitHub *GitHubWorkflowRunStatus `json:"github,omitempty"`
 }
 
+// WorkflowRunIdentityStatus contains the GitHub-compatible identity allocated
+// to a workflow run lineage.
+type WorkflowRunIdentityStatus struct {
+	// ID uniquely identifies this run lineage within its Project. It is reused
+	// by every rerun attempt.
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=9007199254740991
+	// +required
+	ID int64 `json:"id"`
+
+	// Number is the one-based sequence number for this repository and workflow
+	// path. It is reused by every rerun attempt.
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=9007199254740991
+	// +required
+	Number int64 `json:"number"`
+
+	// Attempt is the one-based attempt number for this run lineage.
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=2147483647
+	// +required
+	Attempt int32 `json:"attempt"`
+
+	// URL is the Open Actions Console page for this attempt when a Console URL
+	// is configured.
+	// +kubebuilder:validation:MaxLength=2048
+	// +optional
+	URL string `json:"url,omitempty"`
+}
+
 // WorkflowRunStatus contains observations made while executing a workflow.
 type WorkflowRunStatus struct {
 	// ObservedGeneration is the most recent generation observed by the
 	// controller.
 	// +optional
 	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
+
+	// Identity is the stable run lineage and attempt identity allocated before
+	// workflow jobs are planned.
+	// +optional
+	Identity *WorkflowRunIdentityStatus `json:"identity,omitempty"`
 
 	// WorkflowName is the display name read from the selected workflow file.
 	// +kubebuilder:validation:MaxLength=256

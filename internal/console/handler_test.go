@@ -257,6 +257,67 @@ func TestConsoleMainPageListsWorkflowRunsNewestFirst(t *testing.T) {
 	}
 }
 
+func TestNewerRunQueryDetectsConcurrencyReplacementAndRerun(t *testing.T) {
+	handler := newTestHandler(t, false)
+	clusterClient := handler.client.(client.Client)
+	current := &actionsv1alpha1.WorkflowRun{}
+	if err := clusterClient.Get(context.Background(), client.ObjectKey{Namespace: "default", Name: "ci"}, current); err != nil {
+		t.Fatal(err)
+	}
+
+	query := func(name string) newerRunResponse {
+		t.Helper()
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/v1/runs/default/"+name+"/newer", nil))
+		if response.Code != http.StatusOK {
+			t.Fatalf("newer run query = %d, %q", response.Code, response.Body.String())
+		}
+		result := newerRunResponse{}
+		if err := json.Unmarshal(response.Body.Bytes(), &result); err != nil {
+			t.Fatal(err)
+		}
+		return result
+	}
+	if response := query(current.Name); response.Newer || response.Superseding != nil ||
+		response.Current.ID != "1" || response.Current.Actor != "octocat" {
+		t.Fatalf("initial query = %#v", response)
+	}
+
+	replacement := current.DeepCopy()
+	replacement.ResourceVersion = ""
+	replacement.Name = "ci-replacement"
+	replacement.UID = "replacement-uid"
+	replacement.Status.Identity = &actionsv1alpha1.WorkflowRunIdentityStatus{
+		ID: 2, Number: 2, Attempt: 1, URL: "https://actions.example/runs/default/ci-replacement",
+	}
+	replacement.Status.ConcurrencyGroup = "ci-main"
+	if err := clusterClient.Create(context.Background(), replacement); err != nil {
+		t.Fatal(err)
+	}
+	if response := query(current.Name); !response.Newer || response.Superseding == nil || response.Superseding.ID != "2" || response.Superseding.Attempt != "1" {
+		t.Fatalf("replacement query = %#v", response)
+	}
+
+	rerun := replacement.DeepCopy()
+	rerun.ResourceVersion = ""
+	rerun.Name = "ci-replacement-attempt-2"
+	rerun.UID = "rerun-uid"
+	rerun.Spec.Rerun = &actionsv1alpha1.WorkflowRunRerun{
+		OriginalRunRef: actionsv1alpha1.WorkflowRunReference{Name: replacement.Name, UID: replacement.UID},
+		PreviousRunRef: actionsv1alpha1.WorkflowRunReference{Name: replacement.Name, UID: replacement.UID},
+		Attempt:        2,
+	}
+	rerun.Status.Identity = &actionsv1alpha1.WorkflowRunIdentityStatus{
+		ID: 2, Number: 2, Attempt: 2, URL: "https://actions.example/runs/default/ci-replacement-attempt-2",
+	}
+	if err := clusterClient.Create(context.Background(), rerun); err != nil {
+		t.Fatal(err)
+	}
+	if response := query(replacement.Name); !response.Newer || response.Superseding == nil || response.Superseding.ID != "2" || response.Superseding.Attempt != "2" {
+		t.Fatalf("rerun query = %#v", response)
+	}
+}
+
 func TestConsoleMainPageLimitsWorkflowRuns(t *testing.T) {
 	handler := newTestHandler(t, false)
 	clusterClient, ok := handler.client.(client.Client)
@@ -1095,12 +1156,18 @@ func newTestHandler(t *testing.T, secureCookie bool) *Handler {
 		Spec: actionsv1alpha1.WorkflowRunSpec{
 			ProjectRef: corev1.LocalObjectReference{Name: "project"}, WorkflowPath: ".open-actions/workflows/ci.yaml",
 			Source: actionsv1alpha1.WorkflowRunSource{Type: actionsv1alpha1.SourceTypeGitHub, GitHub: &actionsv1alpha1.GitHubWorkflowRunSource{
+				Actor:      "octocat",
 				Repository: actionsv1alpha1.GitHubRepository{ID: 123, Owner: "acme", Name: "example"},
 				Event:      actionsv1alpha1.GitHubEvent{Name: actionsv1alpha1.GitHubEventNamePush, DeliveryID: "delivery-id"},
 				Revision:   actionsv1alpha1.GitRevision{SHA: strings.Repeat("a", 40), Ref: "refs/heads/main"},
 			}},
 		},
-		Status: actionsv1alpha1.WorkflowRunStatus{WorkflowName: "CI"},
+		Status: actionsv1alpha1.WorkflowRunStatus{
+			WorkflowName: "CI",
+			Identity: &actionsv1alpha1.WorkflowRunIdentityStatus{
+				ID: 1, Number: 1, Attempt: 1, URL: "https://actions.example/runs/default/ci",
+			},
+		},
 	}
 	job := &actionsv1alpha1.WorkflowJob{
 		TypeMeta:   metav1.TypeMeta{APIVersion: actionsv1alpha1.GroupVersion.String(), Kind: "WorkflowJob"},

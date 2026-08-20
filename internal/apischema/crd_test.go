@@ -156,6 +156,23 @@ func TestWorkflowRunRerunContract(t *testing.T) {
 	}
 }
 
+func TestWorkflowRunIdentityContract(t *testing.T) {
+	crd, _ := loadCRD(t, "actions.kelos.dev_workflowruns.yaml")
+	object := loadSample(t, "actions_v1alpha1_workflowrun.yaml")
+	object["status"] = map[string]any{"identity": map[string]any{
+		"id": int64(101), "number": int64(7), "attempt": int64(2),
+		"url": "https://actions.example/runs/default/ci-attempt-2",
+	}}
+	if errs := validateObject(t, crd, object, nil); len(errs) > 0 {
+		t.Fatalf("valid WorkflowRun identity was rejected: %v", errs.ToAggregate())
+	}
+
+	object["status"].(map[string]any)["identity"].(map[string]any)["id"] = int64(0)
+	if errs := validateObject(t, crd, object, nil); len(errs) == 0 {
+		t.Fatal("zero WorkflowRun identity passed schema validation")
+	}
+}
+
 func normalizeWorkflowRunCELIntegers(object map[string]any) {
 	repository := workflowRunGitHub(object)["repository"].(map[string]any)
 	if id, ok := repository["id"].(float64); ok {

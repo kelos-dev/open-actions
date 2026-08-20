@@ -175,6 +175,15 @@ spec:
                     description: GitHub records the GitHub trigger, repository, and
                       revision for this run.
                     properties:
+                      actor:
+                        default: open-actions
+                        description: |-
+                          Actor is the GitHub login or Open Actions identity that initiated the
+                          first attempt. Reruns retain the original actor.
+                        maxLength: 100
+                        minLength: 1
+                        pattern: ^[A-Za-z0-9][A-Za-z0-9_-]*(\[bot\])?$
+                        type: string
                       event:
                         description: Event identifies the GitHub-compatible trigger
                           that requested this run.
@@ -811,6 +820,45 @@ spec:
                 x-kubernetes-list-map-keys:
                 - type
                 x-kubernetes-list-type: map
+              identity:
+                description: |-
+                  Identity is the stable run lineage and attempt identity allocated before
+                  workflow jobs are planned.
+                properties:
+                  attempt:
+                    description: Attempt is the one-based attempt number for this
+                      run lineage.
+                    format: int32
+                    maximum: 2147483647
+                    minimum: 1
+                    type: integer
+                  id:
+                    description: |-
+                      ID uniquely identifies this run lineage within its Project. It is reused
+                      by every rerun attempt.
+                    format: int64
+                    maximum: 9007199254740991
+                    minimum: 1
+                    type: integer
+                  number:
+                    description: |-
+                      Number is the one-based sequence number for this repository and workflow
+                      path. It is reused by every rerun attempt.
+                    format: int64
+                    maximum: 9007199254740991
+                    minimum: 1
+                    type: integer
+                  url:
+                    description: |-
+                      URL is the Open Actions Console page for this attempt when a Console URL
+                      is configured.
+                    maxLength: 2048
+                    type: string
+                required:
+                - attempt
+                - id
+                - number
+                type: object
               jobs:
                 description: Jobs summarizes WorkflowJobs owned by this run.
                 properties:

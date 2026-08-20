@@ -46,6 +46,12 @@ type countingReader struct {
 	getCount int
 }
 
+func setTestWorkflowRunIdentity(run *actionsv1alpha1.WorkflowRun) {
+	run.Status.Identity = &actionsv1alpha1.WorkflowRunIdentityStatus{
+		ID: 1, Number: 1, Attempt: 1, URL: "https://actions.example/runs/default/ci",
+	}
+}
+
 func (r *countingReader) Get(ctx context.Context, key client.ObjectKey, object client.Object, options ...client.GetOption) error {
 	r.getCount++
 	return r.Reader.Get(ctx, key, object, options...)
@@ -57,12 +63,15 @@ func TestJobPlanCoversSupportedSteps(t *testing.T) {
 		Source: actionsv1alpha1.WorkflowRunSource{
 			Type: actionsv1alpha1.SourceTypeGitHub,
 			GitHub: &actionsv1alpha1.GitHubWorkflowRunSource{
+				Actor:      "octocat",
 				Repository: actionsv1alpha1.GitHubRepository{ID: 1, Owner: "example", Name: "project"},
 				Event:      actionsv1alpha1.GitHubEvent{Name: "push", DeliveryID: "delivery"},
 				Revision:   actionsv1alpha1.GitRevision{SHA: strings.Repeat("a", 40), Ref: "refs/heads/main", BaseRef: "target"},
 			},
 		},
-	}}
+	}, Status: actionsv1alpha1.WorkflowRunStatus{Identity: &actionsv1alpha1.WorkflowRunIdentityStatus{
+		ID: 101, Number: 7, Attempt: 1, URL: "https://actions.example/runs/default/ci",
+	}}}
 	job := workflow.Job{RunsOn: workflow.StringList{"ubuntu-latest"}, Outputs: map[string]any{"artifact": "${{ steps.build.outputs.value }}"}, Steps: []workflow.Step{
 		{Uses: "actions/checkout@v4"},
 		{Uses: "actions/setup-go@v5", With: map[string]any{"go-version-file": "go.mod"}},
@@ -80,6 +89,9 @@ func TestJobPlanCoversSupportedSteps(t *testing.T) {
 	}
 	if plan.TimeoutSeconds != 90*60 || plan.CleanupTimeoutSeconds != int64(runner.CleanupTimeout/time.Second) {
 		t.Errorf("plan timeouts = execution %d, cleanup %d", plan.TimeoutSeconds, plan.CleanupTimeoutSeconds)
+	}
+	if plan.Run.ID != 101 || plan.Run.Number != 7 || plan.Run.Attempt != 1 || plan.Run.Actor != "octocat" || plan.Run.URL != "https://actions.example/runs/default/ci" {
+		t.Errorf("run identity = %#v", plan.Run)
 	}
 	if plan.Inputs["enabled"] != false || plan.Inputs["retries"] != float64(2) {
 		t.Errorf("plan inputs = %#v", plan.Inputs)
@@ -102,6 +114,7 @@ func TestPlanWorkflowJobsInheritsWorkflowEnvironment(t *testing.T) {
 			Revision:   actionsv1alpha1.GitRevision{SHA: strings.Repeat("a", 40), Ref: "refs/heads/main"},
 		},
 	}}}
+	setTestWorkflowRunIdentity(run)
 	definition := &workflow.Definition{
 		Name: "CI",
 		Env: map[string]any{
@@ -239,6 +252,7 @@ func TestWorkflowRunPlansFromLocalPullRequestIntegration(t *testing.T) {
 		Client: clusterClient, APIReader: clusterClient, GitHub: github, GitRepository: gitRepository,
 		GitHubAPIBase: server.URL, GitHubServerURL: "https://github.example", ActionCloneBaseURL: "https://github.example",
 	}
+	setTestWorkflowRunIdentity(run)
 	if _, err := reconciler.reconcileWorkflowRun(context.Background(), run); err != nil {
 		t.Fatal(err)
 	}
@@ -287,6 +301,7 @@ func TestPlanWorkflowJobsSetsDisplayNames(t *testing.T) {
 		"lint":  {RunsOn: workflow.StringList{"ubuntu-latest"}, Needs: workflow.StringList{"build"}, If: "always()"},
 	}}
 
+	setTestWorkflowRunIdentity(run)
 	planned, err := reconciler.planWorkflowJobs(run, definition, map[string]any{"environment": "staging"}, nil, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -325,6 +340,7 @@ func TestPlanWorkflowJobsCapsTimeout(t *testing.T) {
 			Revision:   actionsv1alpha1.GitRevision{SHA: strings.Repeat("a", 40), Ref: "refs/heads/main"},
 		},
 	}}}
+	setTestWorkflowRunIdentity(run)
 	reconciler := &WorkflowRunReconciler{MaxJobTimeout: 90 * time.Minute}
 	planned, err := reconciler.planWorkflowJobs(run, definition, nil, nil, nil)
 	if err != nil {
@@ -711,6 +727,7 @@ func TestPlanWorkflowJobsResolvesOnlyPlanningVariables(t *testing.T) {
 		},
 	}}
 	variablesContext := reconciler.projectVariableContext(context.Background(), project)
+	setTestWorkflowRunIdentity(run)
 	planned, err := reconciler.planWorkflowJobs(run, definition, nil, variablesContext, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -758,6 +775,7 @@ func TestJobExpressionsUseCanonicalEventInputs(t *testing.T) {
 	definition := &workflow.Definition{Name: "Manual", Jobs: map[string]workflow.Job{
 		"check": {Name: "${{ inputs.retries }}-${{ github.event.inputs.retries }}", RunsOn: workflow.StringList{"ubuntu-latest"}},
 	}}
+	setTestWorkflowRunIdentity(run)
 	planned, err := reconciler.planWorkflowJobs(run, definition, map[string]any{"retries": float64(1.1)}, nil, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -788,6 +806,7 @@ func TestJobPlanFitsBoundedEncodedContexts(t *testing.T) {
 				Revision: actionsv1alpha1.GitRevision{SHA: strings.Repeat("b", 40), Ref: "refs/heads/main"},
 			},
 		}}}
+		setTestWorkflowRunIdentity(run)
 		planned, err := reconciler.planWorkflowJobs(run, &workflow.Definition{Name: "Review", Jobs: map[string]workflow.Job{"check": job}}, nil, nil, nil)
 		if err != nil {
 			t.Fatal(err)
@@ -809,6 +828,7 @@ func TestJobPlanFitsBoundedEncodedContexts(t *testing.T) {
 				Revision:   actionsv1alpha1.GitRevision{SHA: strings.Repeat("b", 40), Ref: "refs/heads/main"},
 			},
 		}}}
+		setTestWorkflowRunIdentity(run)
 		planned, err := reconciler.planWorkflowJobs(run, &workflow.Definition{Name: "Manual", Jobs: map[string]workflow.Job{"check": job}}, map[string]any{"a": value}, nil, nil)
 		if err != nil {
 			t.Fatal(err)
@@ -936,6 +956,36 @@ func TestWorkflowRunReadsOwnedImmutableEventSnapshot(t *testing.T) {
 	}
 }
 
+func TestJobExpressionsIncludeRunIdentity(t *testing.T) {
+	reconciler := &WorkflowRunReconciler{
+		GitHubServerURL: "https://github.com", GitHubAPIBase: "https://api.github.com", ConsoleURL: "https://actions.example",
+	}
+	run := &actionsv1alpha1.WorkflowRun{
+		ObjectMeta: metav1.ObjectMeta{Name: "ci", Namespace: "default"},
+		Spec: actionsv1alpha1.WorkflowRunSpec{Source: actionsv1alpha1.WorkflowRunSource{
+			Type: actionsv1alpha1.SourceTypeGitHub,
+			GitHub: &actionsv1alpha1.GitHubWorkflowRunSource{
+				Actor: "octocat", Event: actionsv1alpha1.GitHubEvent{Name: "push", DeliveryID: "delivery"},
+				Revision: actionsv1alpha1.GitRevision{SHA: strings.Repeat("a", 40), Ref: "refs/heads/main"},
+			},
+		}},
+		Status: actionsv1alpha1.WorkflowRunStatus{Identity: &actionsv1alpha1.WorkflowRunIdentityStatus{
+			ID: 101, Number: 7, Attempt: 2, URL: "https://actions.example/runs/default/ci",
+		}},
+	}
+	job, err := workflow.EvaluateJob("test", workflow.Job{
+		Name:   "${{ github.run_id }}-${{ github.run_number }}-${{ github.run_attempt }}-${{ github.actor }}-${{ open_actions.run_url }}-${{ open_actions.run_query_url }}",
+		RunsOn: workflow.StringList{"ubuntu-latest"},
+	}, reconciler.jobExpressionContext(run, "CI", nil, nil, nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "101-7-2-octocat-https://actions.example/runs/default/ci-https://actions.example/api/v1/runs/default/ci/newer"
+	if job.Name != want {
+		t.Fatalf("job name = %q, want %q", job.Name, want)
+	}
+}
+
 func TestPlanWorkflowJobsExpandsArchitectureMatrix(t *testing.T) {
 	reconciler := &WorkflowRunReconciler{}
 	run := &actionsv1alpha1.WorkflowRun{Spec: actionsv1alpha1.WorkflowRunSpec{Source: actionsv1alpha1.WorkflowRunSource{
@@ -951,6 +1001,7 @@ func TestPlanWorkflowJobsExpandsArchitectureMatrix(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	setTestWorkflowRunIdentity(run)
 	planned, err := reconciler.planWorkflowJobs(run, definition, nil, nil, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -994,6 +1045,7 @@ func TestPlanWorkflowJobsPreservesDisabledMatrixFailFast(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	setTestWorkflowRunIdentity(run)
 	planned, err := reconciler.planWorkflowJobs(run, definition, nil, nil, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -1386,6 +1438,9 @@ func TestValidateWorkflowRunRerun(t *testing.T) {
 		{name: "previous still running", mutate: func(previous, _ *actionsv1alpha1.WorkflowRun) {
 			previous.Status.Conditions = nil
 		}, wantError: "is not complete"},
+		{name: "previous without identity", mutate: func(previous, _ *actionsv1alpha1.WorkflowRun) {
+			previous.Status.Identity = nil
+		}, wantError: "has no run identity"},
 		{name: "spec mismatch", mutate: func(_ *actionsv1alpha1.WorkflowRun, run *actionsv1alpha1.WorkflowRun) {
 			run.Spec.WorkflowPath = ".open-actions/workflows/other.yaml"
 		}, wantError: "does not match previous"},
@@ -1415,7 +1470,10 @@ func TestValidateWorkflowRunRerun(t *testing.T) {
 				Spec: actionsv1alpha1.WorkflowRunSpec{
 					ProjectRef: corev1.LocalObjectReference{Name: "project"}, WorkflowPath: ".open-actions/workflows/ci.yaml",
 				},
-				Status: actionsv1alpha1.WorkflowRunStatus{Conditions: append([]metav1.Condition(nil), terminalConditions...)},
+				Status: actionsv1alpha1.WorkflowRunStatus{
+					Identity:   &actionsv1alpha1.WorkflowRunIdentityStatus{ID: 1, Number: 1, Attempt: 1},
+					Conditions: append([]metav1.Condition(nil), terminalConditions...),
+				},
 			}
 			run := &actionsv1alpha1.WorkflowRun{
 				ObjectMeta: metav1.ObjectMeta{Name: "ci-attempt-2", Namespace: previous.Namespace, UID: "attempt-uid"},
@@ -1436,7 +1494,7 @@ func TestValidateWorkflowRunRerun(t *testing.T) {
 			clusterClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objects...).Build()
 			reconciler := &WorkflowRunReconciler{Client: clusterClient, APIReader: clusterClient}
 
-			err := reconciler.validateWorkflowRunRerun(context.Background(), run)
+			_, err := reconciler.validateWorkflowRunRerun(context.Background(), run)
 			if test.wantError == "" && err != nil {
 				t.Fatalf("valid rerun rejected: %v", err)
 			}
@@ -1447,21 +1505,174 @@ func TestValidateWorkflowRunRerun(t *testing.T) {
 	}
 }
 
+func TestWorkflowRunIdentityPersistsAcrossRerunsAndControllerRestarts(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := actionsv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	project := &actionsv1alpha1.Project{
+		TypeMeta:   metav1.TypeMeta{APIVersion: actionsv1alpha1.GroupVersion.String(), Kind: "Project"},
+		ObjectMeta: metav1.ObjectMeta{Name: "project", Namespace: "default", UID: "project-uid"},
+	}
+	root := &actionsv1alpha1.WorkflowRun{
+		ObjectMeta: metav1.ObjectMeta{Name: "ci", Namespace: "default", UID: "root-uid"},
+		Spec: actionsv1alpha1.WorkflowRunSpec{
+			ProjectRef:   corev1.LocalObjectReference{Name: project.Name},
+			WorkflowPath: ".open-actions/workflows/ci.yaml",
+			Source: actionsv1alpha1.WorkflowRunSource{Type: actionsv1alpha1.SourceTypeGitHub, GitHub: &actionsv1alpha1.GitHubWorkflowRunSource{
+				Actor:      "octocat",
+				Repository: actionsv1alpha1.GitHubRepository{ID: 1, Owner: "acme", Name: "example"},
+				Event:      actionsv1alpha1.GitHubEvent{Name: actionsv1alpha1.GitHubEventNamePush, DeliveryID: "delivery"},
+				Revision:   actionsv1alpha1.GitRevision{SHA: strings.Repeat("a", 40), Ref: "refs/heads/main"},
+			}},
+		},
+	}
+	clusterClient := fake.NewClientBuilder().WithScheme(scheme).
+		WithStatusSubresource(&actionsv1alpha1.WorkflowRun{}).
+		WithObjects(project, root).Build()
+	reconciler := &WorkflowRunReconciler{
+		Client: clusterClient, APIReader: clusterClient, ConsoleURL: "https://actions.example",
+	}
+	if err := reconciler.ensureWorkflowRunIdentity(context.Background(), root, project, nil); err != nil {
+		t.Fatal(err)
+	}
+	if root.Status.Identity == nil || root.Status.Identity.ID != 1 || root.Status.Identity.Number != 1 || root.Status.Identity.Attempt != 1 || root.Status.Identity.URL != "https://actions.example/runs/default/ci" {
+		t.Fatalf("root identity = %#v", root.Status.Identity)
+	}
+
+	reloadedRoot := &actionsv1alpha1.WorkflowRun{}
+	if err := clusterClient.Get(context.Background(), client.ObjectKeyFromObject(root), reloadedRoot); err != nil {
+		t.Fatal(err)
+	}
+	restarted := &WorkflowRunReconciler{Client: clusterClient, APIReader: clusterClient, ConsoleURL: "https://actions.example"}
+	if err := restarted.ensureWorkflowRunIdentity(context.Background(), reloadedRoot, project, nil); err != nil {
+		t.Fatal(err)
+	}
+	if reloadedRoot.Status.Identity.ID != root.Status.Identity.ID || reloadedRoot.Status.Identity.Number != root.Status.Identity.Number {
+		t.Fatalf("reloaded root identity = %#v", reloadedRoot.Status.Identity)
+	}
+
+	rerun := root.DeepCopy()
+	rerun.ResourceVersion = ""
+	rerun.Name = "ci-attempt-2"
+	rerun.UID = "rerun-uid"
+	rerun.Status = actionsv1alpha1.WorkflowRunStatus{}
+	rerun.Spec.Rerun = &actionsv1alpha1.WorkflowRunRerun{
+		OriginalRunRef: actionsv1alpha1.WorkflowRunReference{Name: root.Name, UID: root.UID},
+		PreviousRunRef: actionsv1alpha1.WorkflowRunReference{Name: root.Name, UID: root.UID},
+		Attempt:        2,
+	}
+	if err := clusterClient.Create(context.Background(), rerun); err != nil {
+		t.Fatal(err)
+	}
+	if err := restarted.ensureWorkflowRunIdentity(context.Background(), rerun, project, root); err != nil {
+		t.Fatal(err)
+	}
+	if rerun.Status.Identity == nil || rerun.Status.Identity.ID != root.Status.Identity.ID || rerun.Status.Identity.Number != root.Status.Identity.Number || rerun.Status.Identity.Attempt != 2 || rerun.Status.Identity.URL != "https://actions.example/runs/default/ci-attempt-2" {
+		t.Fatalf("rerun identity = %#v", rerun.Status.Identity)
+	}
+
+	recreatedProject := project.DeepCopy()
+	recreatedProject.UID = "recreated-project-uid"
+	nextRun := root.DeepCopy()
+	nextRun.ResourceVersion = ""
+	nextRun.Name = "ci-next"
+	nextRun.UID = "next-run-uid"
+	nextRun.Status = actionsv1alpha1.WorkflowRunStatus{}
+	if err := clusterClient.Create(context.Background(), nextRun); err != nil {
+		t.Fatal(err)
+	}
+	if err := restarted.ensureWorkflowRunIdentity(context.Background(), nextRun, recreatedProject, nil); err != nil {
+		t.Fatal(err)
+	}
+	if nextRun.Status.Identity == nil || nextRun.Status.Identity.ID != 2 || nextRun.Status.Identity.Number != 2 || nextRun.Status.Identity.Attempt != 1 {
+		t.Fatalf("identity after Project recreation = %#v", nextRun.Status.Identity)
+	}
+
+	otherWorkflow := root.DeepCopy()
+	otherWorkflow.ResourceVersion = ""
+	otherWorkflow.Name = "release"
+	otherWorkflow.UID = "release-uid"
+	otherWorkflow.Spec.WorkflowPath = ".open-actions/workflows/release.yaml"
+	otherWorkflow.Status = actionsv1alpha1.WorkflowRunStatus{}
+	if err := clusterClient.Create(context.Background(), otherWorkflow); err != nil {
+		t.Fatal(err)
+	}
+	if err := restarted.ensureWorkflowRunIdentity(context.Background(), otherWorkflow, recreatedProject, nil); err != nil {
+		t.Fatal(err)
+	}
+	if otherWorkflow.Status.Identity == nil || otherWorkflow.Status.Identity.ID != 3 || otherWorkflow.Status.Identity.Number != 1 {
+		t.Fatalf("identity for second workflow path = %#v", otherWorkflow.Status.Identity)
+	}
+
+	meta.SetStatusCondition(&rerun.Status.Conditions, metav1.Condition{
+		Type: actionsv1alpha1.WorkflowRunConditionSucceeded, Status: metav1.ConditionTrue, Reason: "JobsSucceeded",
+	})
+	if err := clusterClient.Status().Update(context.Background(), rerun); err != nil {
+		t.Fatal(err)
+	}
+	attemptThree := rerun.DeepCopy()
+	attemptThree.ResourceVersion = ""
+	attemptThree.Name = "ci-attempt-3"
+	attemptThree.UID = "third-attempt-uid"
+	attemptThree.Status = actionsv1alpha1.WorkflowRunStatus{}
+	attemptThree.Spec.Rerun = &actionsv1alpha1.WorkflowRunRerun{
+		OriginalRunRef: actionsv1alpha1.WorkflowRunReference{Name: root.Name, UID: root.UID},
+		PreviousRunRef: actionsv1alpha1.WorkflowRunReference{Name: rerun.Name, UID: rerun.UID},
+		Attempt:        3,
+	}
+	if err := clusterClient.Create(context.Background(), attemptThree); err != nil {
+		t.Fatal(err)
+	}
+	if err := clusterClient.Delete(context.Background(), root); err != nil {
+		t.Fatal(err)
+	}
+	previous, err := restarted.validateWorkflowRunRerun(context.Background(), attemptThree)
+	if err != nil {
+		t.Fatalf("validate third attempt after root deletion: %v", err)
+	}
+	if err := restarted.ensureWorkflowRunIdentity(context.Background(), attemptThree, recreatedProject, previous); err != nil {
+		t.Fatal(err)
+	}
+	if attemptThree.Status.Identity == nil || attemptThree.Status.Identity.ID != 1 || attemptThree.Status.Identity.Number != 1 || attemptThree.Status.Identity.Attempt != 3 {
+		t.Fatalf("third attempt identity after root deletion = %#v", attemptThree.Status.Identity)
+	}
+}
+
 func TestInvalidWorkflowRunRerunBecomesTerminal(t *testing.T) {
 	scheme := runtime.NewScheme()
 	if err := actionsv1alpha1.AddToScheme(scheme); err != nil {
 		t.Fatal(err)
 	}
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	project := &actionsv1alpha1.Project{ObjectMeta: metav1.ObjectMeta{Name: "project", Namespace: "default"}}
 	run := &actionsv1alpha1.WorkflowRun{
 		ObjectMeta: metav1.ObjectMeta{Name: "ci-attempt-2", Namespace: "default", UID: "attempt-uid"},
-		Spec: actionsv1alpha1.WorkflowRunSpec{Rerun: &actionsv1alpha1.WorkflowRunRerun{
-			OriginalRunRef: actionsv1alpha1.WorkflowRunReference{Name: "ci", UID: "root-uid"},
-			PreviousRunRef: actionsv1alpha1.WorkflowRunReference{Name: "ci", UID: "root-uid"},
-			Attempt:        2,
-		}},
+		Spec: actionsv1alpha1.WorkflowRunSpec{
+			ProjectRef: corev1.LocalObjectReference{Name: project.Name},
+			Source: actionsv1alpha1.WorkflowRunSource{Type: actionsv1alpha1.SourceTypeGitHub, GitHub: &actionsv1alpha1.GitHubWorkflowRunSource{
+				Actor:      "octocat",
+				Repository: actionsv1alpha1.GitHubRepository{ID: 1, Owner: "acme", Name: "example"},
+				Event:      actionsv1alpha1.GitHubEvent{Name: actionsv1alpha1.GitHubEventNameWorkflowDispatch},
+				Revision:   actionsv1alpha1.GitRevision{SHA: strings.Repeat("a", 40), Ref: "refs/heads/main"},
+			}},
+			Rerun: &actionsv1alpha1.WorkflowRunRerun{
+				OriginalRunRef: actionsv1alpha1.WorkflowRunReference{Name: "ci", UID: "root-uid"},
+				PreviousRunRef: actionsv1alpha1.WorkflowRunReference{Name: "ci", UID: "root-uid"},
+				Attempt:        2,
+			},
+		},
 	}
-	clusterClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&actionsv1alpha1.WorkflowRun{}).WithObjects(run).Build()
+	clusterClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&actionsv1alpha1.WorkflowRun{}).WithObjects(project, run).Build()
 	reconciler := &WorkflowRunReconciler{Client: clusterClient, APIReader: clusterClient}
+	if _, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(run)}); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(run)}); err != nil {
 		t.Fatal(err)
 	}
@@ -1473,6 +1684,16 @@ func TestInvalidWorkflowRunRerunBecomesTerminal(t *testing.T) {
 	succeeded := meta.FindStatusCondition(stored.Status.Conditions, actionsv1alpha1.WorkflowRunConditionSucceeded)
 	if planned == nil || planned.Status != metav1.ConditionFalse || planned.Reason != "RerunInvalid" || succeeded == nil || succeeded.Status != metav1.ConditionFalse || succeeded.Reason != "RerunInvalid" {
 		t.Fatalf("invalid rerun conditions = %#v", stored.Status.Conditions)
+	}
+	if stored.Status.Identity != nil {
+		t.Fatalf("invalid rerun identity = %#v", stored.Status.Identity)
+	}
+	sequences := &corev1.ConfigMapList{}
+	if err := clusterClient.List(context.Background(), sequences); err != nil {
+		t.Fatal(err)
+	}
+	if len(sequences.Items) != 0 {
+		t.Fatalf("invalid rerun created %d run sequence ConfigMaps", len(sequences.Items))
 	}
 }
 
@@ -2140,6 +2361,65 @@ func TestWorkflowJobIdentityRequiresOwnerSpecAndLabels(t *testing.T) {
 	existing.OwnerReferences = nil
 	if workflowJobIdentityMatches(existing, desired, run) {
 		t.Fatal("unowned WorkflowJob was accepted")
+	}
+}
+
+func TestReconcileAllocatesWorkflowRunIdentityBeforeObservingJobs(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := actionsv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	project := &actionsv1alpha1.Project{ObjectMeta: metav1.ObjectMeta{Name: "project", Namespace: "default"}}
+	run := &actionsv1alpha1.WorkflowRun{
+		ObjectMeta: metav1.ObjectMeta{Name: "ci", Namespace: "default", UID: types.UID("run-uid")},
+		Spec: actionsv1alpha1.WorkflowRunSpec{
+			ProjectRef:   corev1.LocalObjectReference{Name: project.Name},
+			WorkflowPath: ".open-actions/workflows/ci.yaml",
+			Source: actionsv1alpha1.WorkflowRunSource{Type: actionsv1alpha1.SourceTypeGitHub, GitHub: &actionsv1alpha1.GitHubWorkflowRunSource{
+				Actor:      "octocat",
+				Repository: actionsv1alpha1.GitHubRepository{ID: 1, Owner: "acme", Name: "example"},
+				Event:      actionsv1alpha1.GitHubEvent{Name: actionsv1alpha1.GitHubEventNamePush, DeliveryID: "delivery"},
+				Revision:   actionsv1alpha1.GitRevision{SHA: strings.Repeat("a", 40), Ref: "refs/heads/main"},
+			}},
+		},
+		Status: actionsv1alpha1.WorkflowRunStatus{
+			WorkflowName: "CI",
+			Jobs:         &actionsv1alpha1.WorkflowRunJobStatus{Total: 1},
+			Conditions:   []metav1.Condition{plannedCondition(metav1.ConditionTrue, "JobsPlanned")},
+		},
+	}
+	job := &actionsv1alpha1.WorkflowJob{
+		TypeMeta: metav1.TypeMeta{APIVersion: actionsv1alpha1.GroupVersion.String(), Kind: "WorkflowJob"},
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "build", Namespace: run.Namespace, UID: types.UID("job-uid"),
+			Labels: map[string]string{actionsv1alpha1.LabelWorkflowRunUID: string(run.UID)},
+		},
+	}
+	plan := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: childName(job.Name, "plan"), Namespace: job.Namespace}}
+	if err := controllerutil.SetControllerReference(job, plan, scheme); err != nil {
+		t.Fatal(err)
+	}
+	clusterClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&actionsv1alpha1.WorkflowRun{}, &actionsv1alpha1.WorkflowJob{}).
+		WithObjects(project, run, job, plan).
+		Build()
+	reconciler := &WorkflowRunReconciler{Client: clusterClient, APIReader: clusterClient}
+	if _, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(run)}); err != nil {
+		t.Fatal(err)
+	}
+	stored := &actionsv1alpha1.WorkflowRun{}
+	if err := clusterClient.Get(context.Background(), client.ObjectKeyFromObject(run), stored); err != nil {
+		t.Fatal(err)
+	}
+	if stored.Status.Identity == nil || stored.Status.Identity.ID != 1 || stored.Status.Identity.Number != 1 || stored.Status.Identity.Attempt != 1 {
+		t.Fatalf("reconciled identity = %#v", stored.Status.Identity)
+	}
+	if stored.Status.Jobs == nil || stored.Status.Jobs.Queued != 1 {
+		t.Fatalf("job summary = %#v", stored.Status.Jobs)
 	}
 }
 

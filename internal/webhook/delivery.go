@@ -756,6 +756,7 @@ func (r *DeliveryReconciler) createWorkflowRun(ctx context.Context, project *act
 			Source: actionsv1alpha1.WorkflowRunSource{
 				Type: actionsv1alpha1.SourceTypeGitHub,
 				GitHub: &actionsv1alpha1.GitHubWorkflowRunSource{
+					Actor:      selection.Event.Actor,
 					Repository: actionsv1alpha1.GitHubRepository{ID: delivery.Repository.ID, Owner: delivery.Repository.Owner, Name: delivery.Repository.Name},
 					Event:      workflowRunEvent(selection.Event, delivery.DeliveryID),
 					Revision:   workflowRunRevision(selection.Event),

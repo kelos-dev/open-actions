@@ -230,13 +230,13 @@ type Repository struct {
 
 var (
 	workflowConcurrencyAvailability = expression.NewAvailability("github", "inputs", "vars")
-	workflowEnvironmentAvailability = expression.NewAvailability("github", "secrets", "inputs", "vars")
-	jobNameAvailability             = expression.NewAvailability("github", "needs", "strategy", "matrix", "vars", "inputs")
-	jobEnvironmentAvailability      = expression.NewAvailability("github", "needs", "strategy", "matrix", "vars", "secrets", "inputs")
-	jobConditionAvailability        = expression.NewAvailability("github", "needs", "vars", "inputs").WithStatusFunctions()
-	stepAvailability                = expression.NewAvailability("github", "needs", "strategy", "matrix", "job", "runner", "env", "vars", "secrets", "steps", "inputs").WithHashFiles()
-	stepConditionAvailability       = expression.NewAvailability("github", "needs", "strategy", "matrix", "job", "runner", "env", "vars", "steps", "inputs").WithStatusFunctions().WithHashFiles()
-	jobOutputAvailability           = expression.NewAvailability("github", "needs", "strategy", "matrix", "job", "runner", "env", "vars", "secrets", "steps", "inputs")
+	workflowEnvironmentAvailability = expression.NewAvailability("github", "open_actions", "secrets", "inputs", "vars")
+	jobNameAvailability             = expression.NewAvailability("github", "open_actions", "needs", "strategy", "matrix", "vars", "inputs")
+	jobEnvironmentAvailability      = expression.NewAvailability("github", "open_actions", "needs", "strategy", "matrix", "vars", "secrets", "inputs")
+	jobConditionAvailability        = expression.NewAvailability("github", "open_actions", "needs", "vars", "inputs").WithStatusFunctions()
+	stepAvailability                = expression.NewAvailability("github", "open_actions", "needs", "strategy", "matrix", "job", "runner", "env", "vars", "secrets", "steps", "inputs").WithHashFiles()
+	stepConditionAvailability       = expression.NewAvailability("github", "open_actions", "needs", "strategy", "matrix", "job", "runner", "env", "vars", "steps", "inputs").WithStatusFunctions().WithHashFiles()
+	jobOutputAvailability           = expression.NewAvailability("github", "open_actions", "needs", "strategy", "matrix", "job", "runner", "env", "vars", "secrets", "steps", "inputs")
 )
 
 func Parse(data []byte) (*Definition, error) {

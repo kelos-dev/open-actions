@@ -219,7 +219,12 @@ func TestExecuteEvaluatesWorkflowExpressions(t *testing.T) {
 	workspace := t.TempDir()
 	plan := testPlan()
 	plan.Matrix = map[string]any{"arch": "arm64"}
-	plan.Env = map[string]string{"ARCH": "${{ matrix.arch }}", "BRANCH": "${{ github.ref_name }}", "JOB_TOKEN": "${{ github.token }}"}
+	plan.Env = map[string]string{
+		"ARCH": "${{ matrix.arch }}", "BRANCH": "${{ github.ref_name }}", "JOB_TOKEN": "${{ github.token }}",
+		"RUN_ID_CONTEXT": "${{ github.run_id }}", "RUN_NUMBER_CONTEXT": "${{ github.run_number }}",
+		"RUN_ATTEMPT_CONTEXT": "${{ github.run_attempt }}", "ACTOR_CONTEXT": "${{ github.actor }}",
+		"RUN_URL_CONTEXT": "${{ open_actions.run_url }}", "RUN_QUERY_URL_CONTEXT": "${{ open_actions.run_query_url }}",
+	}
 	plan.Outputs = map[string]string{"image": "${{ matrix.arch }}-${{ steps.build.outputs.image }}"}
 	plan.Steps = []Step{
 		{
@@ -237,7 +242,7 @@ func TestExecuteEvaluatesWorkflowExpressions(t *testing.T) {
 				"STEP_TOKEN": "${{ github.token }}",
 				"TARGET":     "main",
 			},
-			Run: "test \"$JOB_TOKEN\" = installation-token && test \"$STEP_TOKEN\" = installation-token && printf '%s/%s/${{ github.sha }}/${{ env.TARGET }}/${{ matrix.arch }}' \"$BRANCH\" \"$REPOSITORY\" > result && echo 'image=ready' >> \"$GITHUB_OUTPUT\"",
+			Run: "test \"$JOB_TOKEN\" = installation-token && test \"$STEP_TOKEN\" = installation-token && test \"$RUN_ID_CONTEXT\" = \"$GITHUB_RUN_ID\" && test \"$RUN_NUMBER_CONTEXT\" = \"$GITHUB_RUN_NUMBER\" && test \"$RUN_ATTEMPT_CONTEXT\" = \"$GITHUB_RUN_ATTEMPT\" && test \"$ACTOR_CONTEXT\" = \"$GITHUB_ACTOR\" && test \"$RUN_URL_CONTEXT\" = \"$OPEN_ACTIONS_RUN_URL\" && test \"$RUN_QUERY_URL_CONTEXT\" = \"$OPEN_ACTIONS_RUN_QUERY_URL\" && printf '%s/%s/${{ github.sha }}/${{ env.TARGET }}/${{ matrix.arch }}' \"$BRANCH\" \"$REPOSITORY\" > result && echo 'image=ready' >> \"$GITHUB_OUTPUT\"",
 		},
 	}
 	executor := testExecutor(t, io.Discard, io.Discard)
@@ -647,7 +652,15 @@ func TestLoadPlanSupportsCompatibleVersions(t *testing.T) {
 	for version := minimumPlanVersion; version <= PlanVersion; version++ {
 		t.Run(fmt.Sprintf("version %d", version), func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "job.json")
-			data := fmt.Sprintf(`{"version":%d,"repository":{"id":1,"owner":"acme","name":"example","serverURL":"https://github.com","apiURL":"https://api.github.com","actionCloneBaseURL":"https://github.com"},"event":{"name":"push","deliveryID":"delivery"},"revision":{"sha":"abc","ref":"refs/heads/main","refName":"main"},"workflowName":"CI","jobID":"build","timeoutSeconds":21600,"cleanupTimeoutSeconds":300,"steps":[{"run":"true"}]}`, version)
+			run := ""
+			if version >= 7 {
+				run = `,"run":{"id":101,"number":7,"attempt":1,"actor":"octocat"}`
+			}
+			timeouts := ""
+			if version >= 6 {
+				timeouts = `,"timeoutSeconds":21600,"cleanupTimeoutSeconds":300`
+			}
+			data := fmt.Sprintf(`{"version":%d%s,"repository":{"id":1,"owner":"acme","name":"example","serverURL":"https://github.com","apiURL":"https://api.github.com","actionCloneBaseURL":"https://github.com"},"event":{"name":"push","deliveryID":"delivery"},"revision":{"sha":"abc","ref":"refs/heads/main","refName":"main"},"workflowName":"CI","jobID":"build"%s,"steps":[{"run":"true"}]}`, version, run, timeouts)
 			if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
 				t.Fatal(err)
 			}
@@ -703,6 +716,22 @@ func TestLoadPlanValidatesVersionFivePullRequestRevision(t *testing.T) {
 				t.Fatalf("LoadPlan() error = %v", err)
 			}
 		})
+	}
+}
+
+func TestLoadPlanRequiresVersionSevenRunIdentity(t *testing.T) {
+	plan := testPlan()
+	plan.Run = Run{}
+	path := filepath.Join(t.TempDir(), "job.json")
+	data, err := json.Marshal(plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadPlan(path); err == nil || !strings.Contains(err.Error(), "run identity is incomplete") {
+		t.Fatalf("LoadPlan() error = %v", err)
 	}
 }
 
@@ -2236,6 +2265,7 @@ func waitForFile(t *testing.T, path, timeoutMessage string) {
 func testPlan() *Plan {
 	return &Plan{
 		Version:               PlanVersion,
+		Run:                   Run{ID: 101, Number: 7, Attempt: 1, Actor: "octocat", URL: "https://actions.example/runs/default/ci", QueryURL: "https://actions.example/api/v1/runs/default/ci/newer"},
 		Repository:            Repository{ID: 1, Owner: "acme", Name: "example", ServerURL: "https://github.com", APIURL: "https://api.github.com", ActionCloneBaseURL: "https://github.com"},
 		Event:                 Event{Name: "push", DeliveryID: "delivery"},
 		Revision:              Revision{SHA: strings.Repeat("a", 40), Ref: "refs/heads/main", RefName: "main"},

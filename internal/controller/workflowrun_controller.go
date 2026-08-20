@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net/url"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -28,6 +29,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/client-go/tools/events"
+	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -45,6 +47,10 @@ const (
 	workflowRunScheduleFinalizer     = "actions.kelos.dev/schedule-idempotency"
 	defaultJobTimeout                = time.Duration(workflow.DefaultJobTimeoutMinutes) * time.Minute
 	defaultMaxJobTimeout             = 6 * time.Hour
+	workflowRunSequencePrefix        = "open-actions-run-sequence-"
+	workflowRunSequenceScopeKey      = "scope"
+	workflowRunSequenceNextKey       = "next"
+	maxGitHubCompatibleNumber        = int64(9_007_199_254_740_991)
 )
 
 var digestEncoding = base32.StdEncoding.WithPadding(base32.NoPadding)
@@ -99,8 +105,11 @@ func (r *WorkflowRunReconciler) Reconcile(ctx context.Context, request ctrl.Requ
 	if err := r.Get(ctx, request.NamespacedName, run); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
+	var rerunPrevious *actionsv1alpha1.WorkflowRun
 	if run.Spec.Rerun != nil && !terminalRun(run) {
-		if err := r.validateWorkflowRunRerun(ctx, run); err != nil {
+		var err error
+		rerunPrevious, err = r.validateWorkflowRunRerun(ctx, run)
+		if err != nil {
 			terminal := &terminalPlanningError{}
 			if !errors.As(err, &terminal) {
 				return ctrl.Result{}, err
@@ -111,6 +120,17 @@ func (r *WorkflowRunReconciler) Reconcile(ctx context.Context, request ctrl.Requ
 	if run.DeletionTimestamp.IsZero() {
 		if err := r.ensureWorkflowRunLineageLabel(ctx, run); err != nil {
 			return ctrl.Result{}, err
+		}
+		if !terminalRun(run) {
+			project := &actionsv1alpha1.Project{}
+			projectKey := client.ObjectKey{Namespace: run.Namespace, Name: run.Spec.ProjectRef.Name}
+			if err := r.APIReader.Get(ctx, projectKey, project); err == nil {
+				if err := r.ensureWorkflowRunIdentity(ctx, run, project, rerunPrevious); err != nil {
+					return ctrl.Result{}, err
+				}
+			} else if !apierrors.IsNotFound(err) {
+				return ctrl.Result{}, err
+			}
 		}
 	}
 	if r.githubCheckEnabled(run) && run.DeletionTimestamp.IsZero() && !controllerutil.ContainsFinalizer(run, workflowRunCheckFinalizer) {
@@ -138,6 +158,99 @@ func (r *WorkflowRunReconciler) Reconcile(ctx context.Context, request ctrl.Requ
 	return result, nil
 }
 
+func (r *WorkflowRunReconciler) ensureWorkflowRunIdentity(ctx context.Context, run *actionsv1alpha1.WorkflowRun, project *actionsv1alpha1.Project, rerunPrevious *actionsv1alpha1.WorkflowRun) error {
+	if run.Status.Identity != nil {
+		return nil
+	}
+	attempt := int32(1)
+	var id, number int64
+	if run.Spec.Rerun == nil {
+		var err error
+		id, err = r.allocateWorkflowRunSequence(ctx, project, "id")
+		if err != nil {
+			return fmt.Errorf("allocate ID for WorkflowRun %q: %w", run.Name, err)
+		}
+		numberScope := strings.Join([]string{
+			"number",
+			strconv.FormatInt(run.Spec.Source.GitHub.Repository.ID, 10),
+			run.Spec.WorkflowPath,
+		}, "\x00")
+		number, err = r.allocateWorkflowRunSequence(ctx, project, numberScope)
+		if err != nil {
+			return fmt.Errorf("allocate number for WorkflowRun %q: %w", run.Name, err)
+		}
+	} else {
+		attempt = run.Spec.Rerun.Attempt
+		previousRef := run.Spec.Rerun.PreviousRunRef
+		if rerunPrevious == nil {
+			return fmt.Errorf("previous WorkflowRun %q is required to allocate identity for WorkflowRun %q", previousRef.Name, run.Name)
+		}
+		if rerunPrevious.Name != previousRef.Name || rerunPrevious.UID != previousRef.UID {
+			return fmt.Errorf("previous WorkflowRun %q does not match the rerun reference for WorkflowRun %q", rerunPrevious.Name, run.Name)
+		}
+		if rerunPrevious.Status.Identity == nil {
+			return fmt.Errorf("previous WorkflowRun %q has no run identity for WorkflowRun %q", rerunPrevious.Name, run.Name)
+		}
+		id = rerunPrevious.Status.Identity.ID
+		number = rerunPrevious.Status.Identity.Number
+	}
+	before := run.DeepCopy()
+	run.Status.Identity = &actionsv1alpha1.WorkflowRunIdentityStatus{
+		ID: id, Number: number, Attempt: attempt,
+	}
+	if r.ConsoleURL != "" {
+		run.Status.Identity.URL = workflowRunConsoleURL(r.ConsoleURL, run)
+	}
+	return r.Status().Patch(ctx, run, client.MergeFrom(before))
+}
+
+func (r *WorkflowRunReconciler) allocateWorkflowRunSequence(ctx context.Context, project *actionsv1alpha1.Project, scope string) (int64, error) {
+	identity := project.Name + "\x00" + scope
+	digest := sha256.Sum256([]byte(identity))
+	name := workflowRunSequencePrefix + strings.ToLower(digestEncoding.EncodeToString(digest[:]))[:20]
+	var allocated int64
+	err := retry.OnError(retry.DefaultRetry, func(err error) bool {
+		return apierrors.IsAlreadyExists(err) || apierrors.IsConflict(err)
+	}, func() error {
+		sequence := &corev1.ConfigMap{}
+		key := client.ObjectKey{Namespace: project.Namespace, Name: name}
+		if err := r.APIReader.Get(ctx, key, sequence); err != nil {
+			if !apierrors.IsNotFound(err) {
+				return err
+			}
+			sequence = &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: project.Namespace},
+				Data: map[string]string{
+					workflowRunSequenceScopeKey: identity,
+					workflowRunSequenceNextKey:  "2",
+				},
+			}
+			if err := r.Create(ctx, sequence); err != nil {
+				return err
+			}
+			allocated = 1
+			return nil
+		}
+		if sequence.Data[workflowRunSequenceScopeKey] != identity {
+			return fmt.Errorf("run sequence ConfigMap %q does not belong to Project %q", sequence.Name, project.Name)
+		}
+		next, err := strconv.ParseInt(sequence.Data[workflowRunSequenceNextKey], 10, 64)
+		if err != nil || next < 1 || next > maxGitHubCompatibleNumber {
+			return fmt.Errorf("run sequence ConfigMap %q contains an invalid next value", sequence.Name)
+		}
+		if next == maxGitHubCompatibleNumber {
+			return fmt.Errorf("run sequence ConfigMap %q exhausted its numeric range", sequence.Name)
+		}
+		sequence.Data[workflowRunSequenceNextKey] = strconv.FormatInt(next+1, 10)
+		if err := r.Update(ctx, sequence); err != nil {
+			return err
+		}
+		allocated = next
+		return nil
+	})
+	return allocated, err
+}
+
 func (r *WorkflowRunReconciler) ensureWorkflowRunLineageLabel(ctx context.Context, run *actionsv1alpha1.WorkflowRun) error {
 	rootUID := run.UID
 	if run.Spec.Rerun != nil {
@@ -162,42 +275,45 @@ func (r *WorkflowRunReconciler) githubCheckEnabled(run *actionsv1alpha1.Workflow
 	return r.GitHub != nil && run.Spec.Source.Type == actionsv1alpha1.SourceTypeGitHub && run.Spec.Source.GitHub != nil && run.UID != ""
 }
 
-func (r *WorkflowRunReconciler) validateWorkflowRunRerun(ctx context.Context, run *actionsv1alpha1.WorkflowRun) error {
+func (r *WorkflowRunReconciler) validateWorkflowRunRerun(ctx context.Context, run *actionsv1alpha1.WorkflowRun) (*actionsv1alpha1.WorkflowRun, error) {
 	rerun := run.Spec.Rerun
 	previous := &actionsv1alpha1.WorkflowRun{}
 	key := client.ObjectKey{Namespace: run.Namespace, Name: rerun.PreviousRunRef.Name}
 	if err := r.APIReader.Get(ctx, key, previous); err != nil {
 		if apierrors.IsNotFound(err) {
-			return &terminalPlanningError{cause: fmt.Errorf("previous WorkflowRun %q does not exist", key.Name)}
+			return nil, &terminalPlanningError{cause: fmt.Errorf("previous WorkflowRun %q does not exist", key.Name)}
 		}
-		return err
+		return nil, err
 	}
 	if previous.UID != rerun.PreviousRunRef.UID {
-		return &terminalPlanningError{cause: fmt.Errorf("previous WorkflowRun %q has a different UID", previous.Name)}
+		return nil, &terminalPlanningError{cause: fmt.Errorf("previous WorkflowRun %q has a different UID", previous.Name)}
 	}
 	if !terminalRun(previous) {
-		return &terminalPlanningError{cause: fmt.Errorf("previous WorkflowRun %q is not complete", previous.Name)}
+		return nil, &terminalPlanningError{cause: fmt.Errorf("previous WorkflowRun %q is not complete", previous.Name)}
+	}
+	if previous.Status.Identity == nil {
+		return nil, &terminalPlanningError{cause: fmt.Errorf("previous WorkflowRun %q has no run identity", previous.Name)}
 	}
 	if !apiEquality.Semantic.DeepEqual(run.Spec.ProjectRef, previous.Spec.ProjectRef) ||
 		!apiEquality.Semantic.DeepEqual(run.Spec.Source, previous.Spec.Source) || run.Spec.WorkflowPath != previous.Spec.WorkflowPath {
-		return &terminalPlanningError{cause: fmt.Errorf("WorkflowRun %q does not match previous WorkflowRun %q", run.Name, previous.Name)}
+		return nil, &terminalPlanningError{cause: fmt.Errorf("WorkflowRun %q does not match previous WorkflowRun %q", run.Name, previous.Name)}
 	}
 
 	previousAttempt := int32(1)
 	if previous.Spec.Rerun == nil {
 		if rerun.OriginalRunRef.Name != previous.Name || rerun.OriginalRunRef.UID != previous.UID {
-			return &terminalPlanningError{cause: fmt.Errorf("original WorkflowRun reference does not identify previous WorkflowRun %q", previous.Name)}
+			return nil, &terminalPlanningError{cause: fmt.Errorf("original WorkflowRun reference does not identify previous WorkflowRun %q", previous.Name)}
 		}
 	} else {
 		previousAttempt = previous.Spec.Rerun.Attempt
 		if rerun.OriginalRunRef != previous.Spec.Rerun.OriginalRunRef {
-			return &terminalPlanningError{cause: fmt.Errorf("original WorkflowRun reference does not match previous WorkflowRun %q", previous.Name)}
+			return nil, &terminalPlanningError{cause: fmt.Errorf("original WorkflowRun reference does not match previous WorkflowRun %q", previous.Name)}
 		}
 	}
 	if rerun.Attempt != previousAttempt+1 {
-		return &terminalPlanningError{cause: fmt.Errorf("rerun attempt %d must follow attempt %d", rerun.Attempt, previousAttempt)}
+		return nil, &terminalPlanningError{cause: fmt.Errorf("rerun attempt %d must follow attempt %d", rerun.Attempt, previousAttempt)}
 	}
-	return nil
+	return previous, nil
 }
 
 func (r *WorkflowRunReconciler) reconcileWorkflowRun(ctx context.Context, run *actionsv1alpha1.WorkflowRun) (ctrl.Result, error) {
@@ -659,6 +775,18 @@ func workflowRunConsoleURL(baseURL string, run *actionsv1alpha1.WorkflowRun) str
 	return parsed.String()
 }
 
+func workflowRunQueryURL(baseURL string, run *actionsv1alpha1.WorkflowRun) string {
+	if baseURL == "" {
+		return ""
+	}
+	parsed, err := url.Parse(baseURL)
+	if err != nil {
+		return ""
+	}
+	parsed.Path = strings.TrimRight(parsed.Path, "/") + "/api/v1/runs/" + url.PathEscape(run.Namespace) + "/" + url.PathEscape(run.Name) + "/newer"
+	return parsed.String()
+}
+
 type plannedWorkflowJob struct {
 	id             string
 	displayName    string
@@ -838,7 +966,7 @@ func (r *WorkflowRunReconciler) planWorkflowJobs(run *actionsv1alpha1.WorkflowRu
 
 			expressionContext := r.jobExpressionContext(run, definition.Name, inputValues, variables, eventPayload)
 			if matrix != nil {
-				expressionContext.Availability = workflowexpression.NewAvailability("github", "matrix", "inputs", "vars")
+				expressionContext.Availability = workflowexpression.NewAvailability("github", "open_actions", "matrix", "inputs", "vars")
 				expressionContext.Values["matrix"] = matrix
 			}
 			resolvedJob, err := workflow.EvaluateJob(id, definitionJob, expressionContext)
@@ -1025,27 +1153,53 @@ func githubSourcePullRequestRefs(source *actionsv1alpha1.GitHubWorkflowRunSource
 	return source.Revision.HeadRef, source.Revision.BaseRef
 }
 
+func githubSourceActor(source *actionsv1alpha1.GitHubWorkflowRunSource) string {
+	if source.Actor == "" {
+		return "open-actions"
+	}
+	return source.Actor
+}
+
 func (r *WorkflowRunReconciler) jobExpressionContext(run *actionsv1alpha1.WorkflowRun, workflowName string, inputValues map[string]any, variables any, eventPayload map[string]any) workflowexpression.Context {
 	githubSource := run.Spec.Source.GitHub
 	headRef, baseRef := githubSourcePullRequestRefs(githubSource)
 	eventValues := githubEventExpressionValue(githubSource, inputValues, eventPayload)
+	identity := run.Status.Identity
+	runID, runNumber, runAttempt, runURL, runQueryURL := "", "", "", "", ""
+	if identity != nil {
+		runID = strconv.FormatInt(identity.ID, 10)
+		runNumber = strconv.FormatInt(identity.Number, 10)
+		runAttempt = strconv.FormatInt(int64(identity.Attempt), 10)
+		runURL = identity.URL
+		if r.ConsoleURL != "" {
+			runQueryURL = workflowRunQueryURL(r.ConsoleURL, run)
+		}
+	}
 	return workflowexpression.Context{
-		Availability: workflowexpression.NewAvailability("github", "inputs", "vars"),
+		Availability: workflowexpression.NewAvailability("github", "open_actions", "inputs", "vars"),
 		Values: map[string]any{
 			"inputs": inputValues,
 			"vars":   variables,
 			"github": map[string]any{
-				"workflow":   workflowName,
-				"event_name": string(githubSource.Event.Name),
-				"event":      eventValues,
-				"repository": githubSource.Repository.Owner + "/" + githubSource.Repository.Name,
-				"sha":        githubSource.Revision.SHA,
-				"ref":        githubSource.Revision.Ref,
-				"ref_name":   githubclient.RefName(githubSource.Revision.Ref),
-				"head_ref":   headRef,
-				"base_ref":   baseRef,
-				"server_url": strings.TrimSuffix(r.GitHubServerURL, "/"),
-				"api_url":    strings.TrimSuffix(r.GitHubAPIBase, "/"),
+				"actor":       githubSourceActor(githubSource),
+				"workflow":    workflowName,
+				"event_name":  string(githubSource.Event.Name),
+				"event":       eventValues,
+				"repository":  githubSource.Repository.Owner + "/" + githubSource.Repository.Name,
+				"sha":         githubSource.Revision.SHA,
+				"ref":         githubSource.Revision.Ref,
+				"ref_name":    githubclient.RefName(githubSource.Revision.Ref),
+				"head_ref":    headRef,
+				"base_ref":    baseRef,
+				"server_url":  strings.TrimSuffix(r.GitHubServerURL, "/"),
+				"api_url":     strings.TrimSuffix(r.GitHubAPIBase, "/"),
+				"run_id":      runID,
+				"run_number":  runNumber,
+				"run_attempt": runAttempt,
+			},
+			"open_actions": map[string]any{
+				"run_url":       runURL,
+				"run_query_url": runQueryURL,
 			},
 		},
 	}
@@ -1305,6 +1459,10 @@ func (r *WorkflowRunReconciler) ensurePlanConfigMap(ctx context.Context, workflo
 
 func (r *WorkflowRunReconciler) jobPlan(run *actionsv1alpha1.WorkflowRun, workflowName, id string, workflowEnv map[string]string, job workflow.Job, matrix, inputValues map[string]any, timeoutSeconds int64) (*runner.Plan, error) {
 	githubSource := run.Spec.Source.GitHub
+	identity := run.Status.Identity
+	if identity == nil {
+		return nil, fmt.Errorf("WorkflowRun %q has no run identity", run.Name)
+	}
 	headRef, baseRef := githubSourcePullRequestRefs(githubSource)
 	jobEnv, err := stringMap(job.Env)
 	if err != nil {
@@ -1339,6 +1497,11 @@ func (r *WorkflowRunReconciler) jobPlan(run *actionsv1alpha1.WorkflowRun, workfl
 	return &runner.Plan{
 		Version: runner.PlanVersion,
 		Inputs:  inputValues,
+		Run: runner.Run{
+			ID: identity.ID, Number: identity.Number, Attempt: identity.Attempt,
+			Actor: githubSourceActor(githubSource), URL: identity.URL,
+			QueryURL: workflowRunQueryURL(r.ConsoleURL, run),
+		},
 		Repository: runner.Repository{
 			ID:                 githubSource.Repository.ID,
 			Owner:              githubSource.Repository.Owner,
