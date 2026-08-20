@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -24,7 +25,7 @@ import (
 
 const (
 	minimumPlanVersion = 1
-	PlanVersion        = 6
+	PlanVersion        = 7
 	ContainerName      = "runner"
 	GitHubTokenEnvVar  = "OPEN_ACTIONS_GITHUB_TOKEN"
 	ActionTokenEnvVar  = "OPEN_ACTIONS_ACTION_TOKEN"
@@ -35,6 +36,7 @@ const runnerLogMarker = "open_actions_runner"
 
 type Plan struct {
 	Version               int               `json:"version"`
+	Run                   Run               `json:"run"`
 	Repository            Repository        `json:"repository"`
 	Event                 Event             `json:"event"`
 	Revision              Revision          `json:"revision"`
@@ -49,6 +51,15 @@ type Plan struct {
 	Steps                 []Step            `json:"steps"`
 	eventPath             string
 	eventPayload          map[string]any
+}
+
+type Run struct {
+	ID       int64  `json:"id"`
+	Number   int64  `json:"number"`
+	Attempt  int32  `json:"attempt"`
+	Actor    string `json:"actor"`
+	URL      string `json:"url,omitempty"`
+	QueryURL string `json:"queryURL,omitempty"`
 }
 
 type Repository struct {
@@ -277,6 +288,9 @@ func LoadPlan(path string) (*Plan, error) {
 	if plan.Version >= 6 && (plan.TimeoutSeconds < 1 || plan.TimeoutSeconds > maxDurationSeconds || plan.CleanupTimeoutSeconds < 1 || plan.CleanupTimeoutSeconds > maxDurationSeconds) {
 		return nil, errors.New("job plan timeout configuration is incomplete")
 	}
+	if plan.Version >= 7 && (plan.Run.ID < 1 || plan.Run.Number < 1 || plan.Run.Attempt < 1 || plan.Run.Actor == "") {
+		return nil, errors.New("job plan run identity is incomplete")
+	}
 	return plan, nil
 }
 
@@ -382,6 +396,7 @@ func (e *Executor) executePlan(ctx context.Context, plan *Plan, workspace string
 		"CI=true",
 		"GITHUB_ACTIONS=true",
 		"GITHUB_API_URL="+strings.TrimSuffix(plan.Repository.APIURL, "/"),
+		"GITHUB_ACTOR="+plan.Run.Actor,
 		"GITHUB_BASE_REF="+planPullRequestRefs(plan).base,
 		"GITHUB_EVENT_ACTION="+plan.Event.Action,
 		"GITHUB_EVENT_NAME="+plan.Event.Name,
@@ -391,10 +406,15 @@ func (e *Executor) executePlan(ctx context.Context, plan *Plan, workspace string
 		"GITHUB_REF="+plan.Revision.Ref,
 		"GITHUB_REF_NAME="+plan.Revision.RefName,
 		"GITHUB_REPOSITORY="+plan.Repository.Owner+"/"+plan.Repository.Name,
+		"GITHUB_RUN_ATTEMPT="+strconv.FormatInt(int64(plan.Run.Attempt), 10),
+		"GITHUB_RUN_ID="+strconv.FormatInt(plan.Run.ID, 10),
+		"GITHUB_RUN_NUMBER="+strconv.FormatInt(plan.Run.Number, 10),
 		"GITHUB_SERVER_URL="+strings.TrimSuffix(plan.Repository.ServerURL, "/"),
 		"GITHUB_SHA="+plan.Revision.SHA,
 		"GITHUB_WORKFLOW="+plan.WorkflowName,
 		"GITHUB_WORKSPACE="+workspace,
+		"OPEN_ACTIONS_RUN_QUERY_URL="+plan.Run.QueryURL,
+		"OPEN_ACTIONS_RUN_URL="+plan.Run.URL,
 		"RUNNER_ARCH="+runnerArchitecture(),
 		"RUNNER_OS=Linux",
 		"RUNNER_TEMP="+filepath.Join(temporaryDirectory, "temp"),

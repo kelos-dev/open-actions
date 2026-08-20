@@ -790,11 +790,11 @@ func TestParseAcceptsStepIDsAndJobOutputs(t *testing.T) {
 }
 
 func TestParseAcceptsWorkflowEnvironment(t *testing.T) {
-	definition, err := Parse([]byte("name: CI\non: workflow_dispatch\nenv:\n  REPOSITORY: '${{ github.repository }}'\n  TOKEN: '${{ secrets.TOKEN }}'\n  TARGET: '${{ inputs.target }}'\n  REGION: '${{ vars.REGION }}'\n  ENABLED: true\n" + minimalJob))
+	definition, err := Parse([]byte("name: CI\non: workflow_dispatch\nenv:\n  REPOSITORY: '${{ github.repository }}'\n  RUN_URL: '${{ open_actions.run_url }}'\n  TOKEN: '${{ secrets.TOKEN }}'\n  TARGET: '${{ inputs.target }}'\n  REGION: '${{ vars.REGION }}'\n  ENABLED: true\n" + minimalJob))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if definition.Env["REPOSITORY"] != "${{ github.repository }}" || definition.Env["ENABLED"] != true {
+	if definition.Env["REPOSITORY"] != "${{ github.repository }}" || definition.Env["RUN_URL"] != "${{ open_actions.run_url }}" || definition.Env["ENABLED"] != true {
 		t.Fatalf("workflow environment = %#v", definition.Env)
 	}
 }
@@ -929,6 +929,7 @@ func TestParseAcceptsWorkflowExpressions(t *testing.T) {
 		{name: "step environment", job: "    steps:\n      - run: echo test\n        env:\n          VALUE: '${{ github.sha }}'\n"},
 		{name: "action input", job: "    steps:\n      - uses: actions/example@v1\n        with:\n          value: '${{ github.sha }}'\n"},
 		{name: "run script", job: "    steps:\n      - run: 'echo ${{ github.sha }}'\n"},
+		{name: "Open Actions context", job: "    steps:\n      - run: 'echo ${{ open_actions.run_url }}'\n"},
 		{name: "working directory", job: "    steps:\n      - run: echo test\n        working-directory: '${{ github.workspace }}'\n"},
 		{name: "step condition", job: "    steps:\n      - run: echo test\n        if: github.ref_name == 'main'\n"},
 		{name: "hash files", job: "    steps:\n      - run: \"echo ${{ hashFiles('**/*.go') }}\"\n"},

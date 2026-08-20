@@ -213,6 +213,22 @@ type runPageData struct {
 	Jobs           []jobPageData
 }
 
+type runIdentityResponse struct {
+	ID        string `json:"id"`
+	Number    string `json:"number"`
+	Attempt   string `json:"attempt"`
+	Actor     string `json:"actor"`
+	URL       string `json:"url,omitempty"`
+	Namespace string `json:"namespace"`
+	Name      string `json:"name"`
+}
+
+type newerRunResponse struct {
+	Newer       bool                 `json:"newer"`
+	Current     runIdentityResponse  `json:"current"`
+	Superseding *runIdentityResponse `json:"superseding,omitempty"`
+}
+
 type jobPageData struct {
 	ID          string
 	DisplayName string
@@ -370,6 +386,15 @@ func (h *Handler) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 		h.projects(writer, request)
 		return
 	}
+	if len(parts) == 6 && parts[0] == "api" && parts[1] == "v1" && parts[2] == "runs" && parts[5] == "newer" {
+		run, err := h.resolveRun(request.Context(), parts[3], parts[4])
+		if err != nil {
+			h.writeResolutionError(writer, request, err)
+			return
+		}
+		h.newerRun(writer, request, run)
+		return
+	}
 	if len(parts) == 3 && parts[0] == "projects" {
 		h.projectDetails(writer, request, parts[1], parts[2])
 		return
@@ -397,6 +422,67 @@ func (h *Handler) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 
 func (h *Handler) redirectToLogin(writer http.ResponseWriter, request *http.Request) {
 	http.Redirect(writer, request, "/login?next="+url.QueryEscape(request.URL.RequestURI()), http.StatusFound)
+}
+
+func (h *Handler) newerRun(writer http.ResponseWriter, request *http.Request, run *actionsv1alpha1.WorkflowRun) {
+	if run.Status.Identity == nil {
+		http.Error(writer, "WorkflowRun identity is not available", http.StatusServiceUnavailable)
+		return
+	}
+	runs := &actionsv1alpha1.WorkflowRunList{}
+	if err := h.client.List(request.Context(), runs, client.InNamespace(run.Namespace)); err != nil {
+		h.writeResolutionError(writer, request, fmt.Errorf("list workflow runs: %w", err))
+		return
+	}
+	var superseding *actionsv1alpha1.WorkflowRun
+	for index := range runs.Items {
+		candidate := &runs.Items[index]
+		if !matchingRunRevisionAndWorkflow(run, candidate) || !newerRunIdentity(candidate.Status.Identity, run.Status.Identity) {
+			continue
+		}
+		if superseding == nil || newerRunIdentity(candidate.Status.Identity, superseding.Status.Identity) {
+			superseding = candidate
+		}
+	}
+	response := newerRunResponse{Current: workflowRunIdentityResponse(run)}
+	if superseding != nil {
+		identity := workflowRunIdentityResponse(superseding)
+		response.Newer = true
+		response.Superseding = &identity
+	}
+	writer.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(writer).Encode(response); err != nil {
+		h.logger.Error("failed to encode newer workflow run response", "error", err)
+	}
+}
+
+func matchingRunRevisionAndWorkflow(current, candidate *actionsv1alpha1.WorkflowRun) bool {
+	if candidate.Status.Identity == nil || current.Spec.ProjectRef != candidate.Spec.ProjectRef || current.Spec.WorkflowPath != candidate.Spec.WorkflowPath {
+		return false
+	}
+	currentSource := current.Spec.Source.GitHub
+	candidateSource := candidate.Spec.Source.GitHub
+	return currentSource != nil && candidateSource != nil &&
+		currentSource.Repository.ID == candidateSource.Repository.ID &&
+		currentSource.Revision.SHA == candidateSource.Revision.SHA
+}
+
+func newerRunIdentity(candidate, current *actionsv1alpha1.WorkflowRunIdentityStatus) bool {
+	return candidate != nil && current != nil &&
+		(candidate.ID > current.ID || candidate.ID == current.ID && candidate.Attempt > current.Attempt)
+}
+
+func workflowRunIdentityResponse(run *actionsv1alpha1.WorkflowRun) runIdentityResponse {
+	identity := run.Status.Identity
+	actor := "open-actions"
+	if source := run.Spec.Source.GitHub; source != nil && source.Actor != "" {
+		actor = source.Actor
+	}
+	return runIdentityResponse{
+		ID: strconv.FormatInt(identity.ID, 10), Number: strconv.FormatInt(identity.Number, 10),
+		Attempt: strconv.FormatInt(int64(identity.Attempt), 10), Actor: actor, URL: identity.URL,
+		Namespace: run.Namespace, Name: run.Name,
+	}
 }
 
 func (h *Handler) resolveRun(ctx context.Context, namespace, name string) (*actionsv1alpha1.WorkflowRun, error) {

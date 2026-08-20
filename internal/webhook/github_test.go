@@ -50,6 +50,18 @@ func TestGitHubHandlerRejectsOversizedSnapshot(t *testing.T) {
 	}
 }
 
+func TestNormalizePreservesWebhookActor(t *testing.T) {
+	event := &payload{Ref: "refs/heads/main", After: strings.Repeat("a", 40)}
+	event.Sender.Login = "octocat"
+	normalized, supported, err := normalize("push", event)
+	if err != nil || !supported {
+		t.Fatalf("normalize() = %#v, supported %t, error %v", normalized, supported, err)
+	}
+	if normalized.Actor != "octocat" {
+		t.Fatalf("actor = %q, want octocat", normalized.Actor)
+	}
+}
+
 func TestProjectForInstallationUsesConfiguredOwner(t *testing.T) {
 	scheme := runtime.NewScheme()
 	if err := actionsv1alpha1.AddToScheme(scheme); err != nil {

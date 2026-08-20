@@ -51,8 +51,11 @@ type payloadRepository struct {
 }
 
 type payload struct {
-	Action       string `json:"action"`
-	Ref          string `json:"ref"`
+	Action string `json:"action"`
+	Ref    string `json:"ref"`
+	Sender struct {
+		Login string `json:"login"`
+	} `json:"sender"`
 	Installation struct {
 		ID int64 `json:"id"`
 	} `json:"installation"`
@@ -150,6 +153,7 @@ type normalizedReview struct {
 type normalizedEvent struct {
 	Name          string                 `json:"name"`
 	Action        string                 `json:"action,omitempty"`
+	Actor         string                 `json:"actor,omitempty"`
 	SHA           string                 `json:"sha,omitempty"`
 	Ref           string                 `json:"ref"`
 	HeadRef       string                 `json:"headRef,omitempty"`
@@ -295,7 +299,7 @@ func (h *GitHubHandler) projectForInstallation(ctx context.Context, installation
 }
 
 func normalize(eventName string, event *payload) (normalizedEvent, bool, error) {
-	result := normalizedEvent{Name: eventName, Action: event.Action}
+	result := normalizedEvent{Name: eventName, Action: event.Action, Actor: event.Sender.Login}
 	if !workflow.SupportsEventAction(eventName, event.Action) {
 		return result, false, nil
 	}

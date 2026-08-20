@@ -17,6 +17,7 @@ func TestRunWritesWorkflowJobResult(t *testing.T) {
 	directory := t.TempDir()
 	plan := runner.Plan{
 		Version: runner.PlanVersion,
+		Run:     runner.Run{ID: 1, Number: 1, Attempt: 1, Actor: "octocat"},
 		Repository: runner.Repository{
 			ID: 1, Owner: "acme", Name: "example", ServerURL: "https://github.com", APIURL: "https://api.github.com", ActionCloneBaseURL: "https://github.com",
 		},

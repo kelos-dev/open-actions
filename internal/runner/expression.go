@@ -2,6 +2,7 @@ package runner
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 	"unicode/utf8"
 
@@ -10,12 +11,12 @@ import (
 )
 
 var (
-	runnerJobAvailability          = workflowexpression.NewAvailability("github", "matrix", "vars", "secrets", "inputs")
-	actionDefaultAvailability      = workflowexpression.NewAvailability("github")
-	runnerStepAvailability         = workflowexpression.NewAvailability("github", "matrix", "runner", "env", "vars", "secrets", "inputs", "steps").WithHashFiles()
-	runnerConditionAvailability    = workflowexpression.NewAvailability("github", "matrix", "runner", "env", "vars", "inputs", "steps").WithStatusFunctions().WithHashFiles()
-	compositeAvailability          = workflowexpression.NewAvailability("github", "runner", "env", "inputs", "steps").WithHashFiles()
-	compositeConditionAvailability = workflowexpression.NewAvailability("github", "runner", "env", "inputs", "steps").WithStatusFunctions().WithHashFiles()
+	runnerJobAvailability          = workflowexpression.NewAvailability("github", "open_actions", "matrix", "vars", "secrets", "inputs")
+	actionDefaultAvailability      = workflowexpression.NewAvailability("github", "open_actions")
+	runnerStepAvailability         = workflowexpression.NewAvailability("github", "open_actions", "matrix", "runner", "env", "vars", "secrets", "inputs", "steps").WithHashFiles()
+	runnerConditionAvailability    = workflowexpression.NewAvailability("github", "open_actions", "matrix", "runner", "env", "vars", "inputs", "steps").WithStatusFunctions().WithHashFiles()
+	compositeAvailability          = workflowexpression.NewAvailability("github", "open_actions", "runner", "env", "inputs", "steps").WithHashFiles()
+	compositeConditionAvailability = workflowexpression.NewAvailability("github", "open_actions", "runner", "env", "inputs", "steps").WithStatusFunctions().WithHashFiles()
 )
 
 func resolveJobEnvironment(values map[string]string, plan *Plan, environment []string, token string, secrets, variables map[string]string) (map[string]string, error) {
@@ -112,25 +113,33 @@ func compositeExpressionContext(compositeContext *compositeContext, availability
 func expressionContext(plan *Plan, environment []string, actionPath string, extra map[string]any, availability workflowexpression.Availability, status *workflowexpression.Status, token string, secrets, variables map[string]string) workflowexpression.Context {
 	pullRequestRefs := planPullRequestRefs(plan)
 	github := map[string]any{
-		"workflow":   plan.WorkflowName,
-		"event_name": plan.Event.Name,
-		"event":      githubExpressionEvent(plan),
-		"repository": plan.Repository.Owner + "/" + plan.Repository.Name,
-		"sha":        plan.Revision.SHA,
-		"ref":        plan.Revision.Ref,
-		"ref_name":   plan.Revision.RefName,
-		"head_ref":   pullRequestRefs.head,
-		"base_ref":   pullRequestRefs.base,
-		"workspace":  environmentValue(environment, "GITHUB_WORKSPACE"),
-		"server_url": strings.TrimSuffix(plan.Repository.ServerURL, "/"),
-		"api_url":    strings.TrimSuffix(plan.Repository.APIURL, "/"),
-		"token":      workflowexpression.Secret(token),
+		"actor":       plan.Run.Actor,
+		"workflow":    plan.WorkflowName,
+		"event_name":  plan.Event.Name,
+		"event":       githubExpressionEvent(plan),
+		"repository":  plan.Repository.Owner + "/" + plan.Repository.Name,
+		"sha":         plan.Revision.SHA,
+		"ref":         plan.Revision.Ref,
+		"ref_name":    plan.Revision.RefName,
+		"head_ref":    pullRequestRefs.head,
+		"base_ref":    pullRequestRefs.base,
+		"workspace":   environmentValue(environment, "GITHUB_WORKSPACE"),
+		"server_url":  strings.TrimSuffix(plan.Repository.ServerURL, "/"),
+		"api_url":     strings.TrimSuffix(plan.Repository.APIURL, "/"),
+		"run_id":      strconv.FormatInt(plan.Run.ID, 10),
+		"run_number":  strconv.FormatInt(plan.Run.Number, 10),
+		"run_attempt": strconv.FormatInt(int64(plan.Run.Attempt), 10),
+		"token":       workflowexpression.Secret(token),
 	}
 	if actionPath != "" {
 		github["action_path"] = actionPath
 	}
 	values := map[string]any{
-		"github":  github,
+		"github": github,
+		"open_actions": map[string]any{
+			"run_url":       plan.Run.URL,
+			"run_query_url": plan.Run.QueryURL,
+		},
 		"inputs":  plan.Inputs,
 		"matrix":  plan.Matrix,
 		"secrets": secretContext(token, secrets),

@@ -9,6 +9,7 @@ spec:
   source:
     type: GitHub
     github:
+      actor: open-actions
       repository:
         id: 123456789
         owner: example

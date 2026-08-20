@@ -328,6 +328,7 @@ func (r *ScheduleReconciler) createWorkflowRun(ctx context.Context, project *act
 			ProjectRef:              corev1.LocalObjectReference{Name: project.Name},
 			TTLSecondsAfterFinished: r.WorkflowRunTTLSecondsAfterFinished,
 			Source: actionsv1alpha1.WorkflowRunSource{Type: actionsv1alpha1.SourceTypeGitHub, GitHub: &actionsv1alpha1.GitHubWorkflowRunSource{
+				Actor:      "open-actions",
 				Repository: actionsv1alpha1.GitHubRepository{ID: repository.ID, Owner: repository.Owner.Login, Name: repository.Name},
 				Event:      actionsv1alpha1.GitHubEvent{Name: actionsv1alpha1.GitHubEventNameSchedule, Schedule: schedule},
 				Revision:   actionsv1alpha1.GitRevision{SHA: revision, Ref: "refs/heads/" + repository.DefaultBranch},
