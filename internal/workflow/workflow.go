@@ -129,6 +129,7 @@ type Job struct {
 	Outputs        map[string]any `yaml:"outputs"`
 	Steps          []Step         `yaml:"steps"`
 	Strategy       Strategy       `yaml:"strategy"`
+	Concurrency    Concurrency    `yaml:"concurrency"`
 	Container      yaml.Node      `yaml:"container"`
 	Services       yaml.Node      `yaml:"services"`
 	If             string         `yaml:"if"`
@@ -234,6 +235,7 @@ var (
 	jobNameAvailability             = expression.NewAvailability("github", "needs", "strategy", "matrix", "vars", "inputs")
 	jobEnvironmentAvailability      = expression.NewAvailability("github", "needs", "strategy", "matrix", "vars", "secrets", "inputs")
 	jobConditionAvailability        = expression.NewAvailability("github", "needs", "vars", "inputs").WithStatusFunctions()
+	jobConcurrencyAvailability      = expression.NewAvailability("github", "needs", "strategy", "matrix", "vars", "inputs")
 	stepAvailability                = expression.NewAvailability("github", "needs", "strategy", "matrix", "job", "runner", "env", "vars", "secrets", "steps", "inputs").WithHashFiles()
 	stepConditionAvailability       = expression.NewAvailability("github", "needs", "strategy", "matrix", "job", "runner", "env", "vars", "steps", "inputs").WithStatusFunctions().WithHashFiles()
 	jobOutputAvailability           = expression.NewAvailability("github", "needs", "strategy", "matrix", "job", "runner", "env", "vars", "secrets", "steps", "inputs")
@@ -380,6 +382,17 @@ func validateJob(id string, job *Job, workflowEnv map[string]any) error {
 			return fmt.Errorf("job %q if: %w", id, err)
 		}
 	}
+	if utf8.RuneCountInString(job.Concurrency.Group) > maxConcurrencyGroupLength {
+		return fmt.Errorf("job %q concurrency group exceeds %d characters", id, maxConcurrencyGroupLength)
+	}
+	if job.Concurrency.configured && job.Concurrency.Group == "" {
+		return fmt.Errorf("job %q concurrency group must not be empty", id)
+	}
+	if job.Concurrency.Group != "" {
+		if err := validateTemplate(fmt.Sprintf("job %q concurrency group", id), job.Concurrency.Group, jobConcurrencyAvailability); err != nil {
+			return err
+		}
+	}
 	if job.Container.Kind != 0 || job.Services.Kind != 0 {
 		return fmt.Errorf("job %q uses an unsupported job feature", id)
 	}
@@ -389,7 +402,7 @@ func validateJob(id string, job *Job, workflowEnv map[string]any) error {
 	if len(job.Steps) > maxSteps {
 		return fmt.Errorf("job %q defines %d steps; maximum is %d", id, len(job.Steps), maxSteps)
 	}
-	contentBytes := len(job.Name) + len(job.If) + len(job.TimeoutMinutes.expression)
+	contentBytes := len(job.Name) + len(job.If) + len(job.Concurrency.Group) + len(job.TimeoutMinutes.expression)
 	for _, dependency := range job.Needs {
 		contentBytes += len(dependency)
 	}
@@ -764,6 +777,34 @@ func EvaluateJobCondition(id, input string, context expression.Context) (bool, e
 		return false, fmt.Errorf("job %q if: %w", id, err)
 	}
 	return result.Bool(), nil
+}
+
+// EvaluateJobConcurrency evaluates a job concurrency group after its
+// dependencies and matrix combination are available.
+func EvaluateJobConcurrency(id string, concurrency Concurrency, context expression.Context) (string, bool, error) {
+	if concurrency.Group == "" {
+		return "", false, nil
+	}
+	program, err := expression.Parse(concurrency.Group)
+	if err != nil {
+		return "", false, fmt.Errorf("job %q concurrency group: %w", id, err)
+	}
+	context.Availability = jobConcurrencyAvailability
+	result, err := program.Evaluate(context)
+	if err != nil {
+		return "", false, fmt.Errorf("job %q concurrency group: %w", id, err)
+	}
+	group, err := result.String()
+	if err != nil {
+		return "", false, fmt.Errorf("job %q concurrency group: %w", id, err)
+	}
+	if group == "" {
+		return "", false, fmt.Errorf("job %q evaluated concurrency group must not be empty", id)
+	}
+	if utf8.RuneCountInString(group) > maxConcurrencyGroupLength {
+		return "", false, fmt.Errorf("job %q evaluated concurrency group exceeds %d characters", id, maxConcurrencyGroupLength)
+	}
+	return group, concurrency.CancelInProgress, nil
 }
 
 func EvaluateConcurrency(definition *Definition, event Event, variables any) (string, bool, error) {
@@ -1286,9 +1327,9 @@ func (c *Concurrency) UnmarshalYAML(node *yaml.Node) error {
 		return nil
 	}
 	if node.Kind != yaml.MappingNode {
-		return fmt.Errorf("workflow concurrency must be a string or mapping")
+		return fmt.Errorf("concurrency must be a string or mapping")
 	}
-	if err := rejectDuplicateMappingKeys(node, "workflow concurrency"); err != nil {
+	if err := rejectDuplicateMappingKeys(node, "concurrency"); err != nil {
 		return err
 	}
 	for index := 0; index < len(node.Content); index += 2 {

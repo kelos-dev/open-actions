@@ -453,6 +453,57 @@ func TestParseRejectsConcurrencyWithoutGroup(t *testing.T) {
 	}
 }
 
+func TestParseJobConcurrency(t *testing.T) {
+	for _, test := range []struct {
+		name               string
+		value              string
+		wantGroup          string
+		wantCancelProgress bool
+	}{
+		{name: "scalar", value: "deploy-${{ matrix.arch }}", wantGroup: "deploy-${{ matrix.arch }}"},
+		{name: "mapping", value: "{group: 'deploy-${{ needs.build.result }}', cancel-in-progress: true}", wantGroup: "deploy-${{ needs.build.result }}", wantCancelProgress: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			data := []byte("name: CI\non: push\njobs:\n  build:\n    concurrency: " + test.value + "\n    runs-on: ubuntu-latest\n    steps:\n      - run: make test\n")
+			definition, err := Parse(data)
+			if err != nil {
+				t.Fatal(err)
+			}
+			concurrency := definition.Jobs["build"].Concurrency
+			if concurrency.Group != test.wantGroup || concurrency.CancelInProgress != test.wantCancelProgress {
+				t.Fatalf("job concurrency = %#v", concurrency)
+			}
+		})
+	}
+}
+
+func TestParseRejectsInvalidJobConcurrency(t *testing.T) {
+	for _, concurrency := range []string{"''", "{}", "{cancel-in-progress: true}", "${{ secrets.TOKEN }}", "{group: deploy, cancel-in-progress: '${{ github.ref }}'}"} {
+		data := []byte("name: CI\non: push\njobs:\n  build:\n    concurrency: " + concurrency + "\n    runs-on: ubuntu-latest\n    steps:\n      - run: make test\n")
+		if _, err := Parse(data); err == nil {
+			t.Fatalf("Parse() accepted job concurrency %q", concurrency)
+		}
+	}
+}
+
+func TestEvaluateJobConcurrencyUsesDeferredContexts(t *testing.T) {
+	concurrency := Concurrency{Group: "${{ github.ref_name }}-${{ needs.build.result }}-${{ strategy['job-index'] }}-${{ matrix.arch }}-${{ inputs.target }}-${{ vars.stage }}", CancelInProgress: true}
+	group, cancelInProgress, err := EvaluateJobConcurrency("deploy", concurrency, workflowexpression.Context{Values: map[string]any{
+		"github":   map[string]any{"ref_name": "main"},
+		"needs":    map[string]any{"build": map[string]any{"result": "success"}},
+		"strategy": map[string]any{"job-index": int32(1)},
+		"matrix":   map[string]any{"arch": "arm64"},
+		"inputs":   map[string]any{"target": "production"},
+		"vars":     map[string]any{"stage": "release"},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if group != "main-success-1-arm64-production-release" || !cancelInProgress {
+		t.Fatalf("EvaluateJobConcurrency() = %q, %t", group, cancelInProgress)
+	}
+}
+
 func TestEvaluateConcurrency(t *testing.T) {
 	data, err := os.ReadFile("testdata/ci.yaml")
 	if err != nil {

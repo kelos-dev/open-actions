@@ -42,6 +42,7 @@ func TestJob(t *testing.T) {
 		{name: "waiting", job: &actionsv1alpha1.WorkflowJob{}, want: "Queued"},
 		{name: "dependency waiting", job: &actionsv1alpha1.WorkflowJob{Spec: actionsv1alpha1.WorkflowJobSpec{Needs: []string{"build"}}, Status: actionsv1alpha1.WorkflowJobStatus{Conditions: []metav1.Condition{{Type: actionsv1alpha1.WorkflowJobConditionReady, Status: metav1.ConditionUnknown}}}}, want: "Waiting"},
 		{name: "running", job: &actionsv1alpha1.WorkflowJob{Status: actionsv1alpha1.WorkflowJobStatus{RunnerRef: &corev1.LocalObjectReference{Name: "runner"}}}, want: "Running"},
+		{name: "cancelling", job: &actionsv1alpha1.WorkflowJob{Status: actionsv1alpha1.WorkflowJobStatus{RunnerRef: &corev1.LocalObjectReference{Name: "runner"}, Conditions: []metav1.Condition{{Type: actionsv1alpha1.WorkflowJobConditionCancellationRequested, Status: metav1.ConditionTrue}}}}, want: "Cancelling"},
 		{name: "succeeded", job: workflowJobWithCondition(metav1.ConditionTrue), want: "Succeeded"},
 		{name: "failed", job: workflowJobWithCondition(metav1.ConditionFalse), want: "Failed"},
 		{name: "skipped", job: &actionsv1alpha1.WorkflowJob{Status: actionsv1alpha1.WorkflowJobStatus{Result: actionsv1alpha1.WorkflowJobResultSkipped}}, want: "Skipped"},
