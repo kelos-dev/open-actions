@@ -23,6 +23,7 @@ func TestRun(t *testing.T) {
 		{name: "succeeded after cancellation", run: &actionsv1alpha1.WorkflowRun{Spec: actionsv1alpha1.WorkflowRunSpec{CancelRequested: true}, Status: actionsv1alpha1.WorkflowRunStatus{Conditions: []metav1.Condition{{Type: actionsv1alpha1.WorkflowRunConditionSucceeded, Status: metav1.ConditionTrue}}}}, want: "Succeeded"},
 		{name: "failed", run: workflowRunWithCondition(metav1.ConditionFalse, &started), want: "Failed"},
 		{name: "cancelled", run: &actionsv1alpha1.WorkflowRun{Status: actionsv1alpha1.WorkflowRunStatus{Conditions: []metav1.Condition{{Type: actionsv1alpha1.WorkflowRunConditionSucceeded, Status: metav1.ConditionFalse, Reason: "JobCancelled"}}}}, want: "Cancelled"},
+		{name: "timed out", run: &actionsv1alpha1.WorkflowRun{Status: actionsv1alpha1.WorkflowRunStatus{Conditions: []metav1.Condition{{Type: actionsv1alpha1.WorkflowRunConditionSucceeded, Status: metav1.ConditionFalse, Reason: "JobTimedOut"}}}}, want: "Timed out"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			if got := Run(test.run); got != test.want {
@@ -45,6 +46,7 @@ func TestJob(t *testing.T) {
 		{name: "failed", job: workflowJobWithCondition(metav1.ConditionFalse), want: "Failed"},
 		{name: "skipped", job: &actionsv1alpha1.WorkflowJob{Status: actionsv1alpha1.WorkflowJobStatus{Result: actionsv1alpha1.WorkflowJobResultSkipped}}, want: "Skipped"},
 		{name: "cancelled", job: &actionsv1alpha1.WorkflowJob{Status: actionsv1alpha1.WorkflowJobStatus{Result: actionsv1alpha1.WorkflowJobResultCancelled}}, want: "Cancelled"},
+		{name: "timed out", job: &actionsv1alpha1.WorkflowJob{Status: actionsv1alpha1.WorkflowJobStatus{Result: actionsv1alpha1.WorkflowJobResultFailure, Conditions: []metav1.Condition{{Type: actionsv1alpha1.WorkflowJobConditionSucceeded, Status: metav1.ConditionFalse, Reason: "JobTimedOut"}}}}, want: "Timed out"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			if got := Job(test.job); got != test.want {

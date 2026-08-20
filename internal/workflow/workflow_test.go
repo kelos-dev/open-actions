@@ -865,9 +865,58 @@ func TestParseRejectsInvalidActionReference(t *testing.T) {
 }
 
 func TestParseRejectsUnknownField(t *testing.T) {
-	_, err := Parse([]byte("name: CI\non: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    timeout-minutes: 10\n    steps:\n      - run: true\n"))
+	_, err := Parse([]byte("name: CI\non: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    unsupported-field: true\n    steps:\n      - run: true\n"))
 	if err == nil {
 		t.Fatal("Parse() accepted an unsupported field")
+	}
+}
+
+func TestParseJobTimeoutMinutes(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		field   string
+		want    int64
+		wantErr bool
+	}{
+		{name: "default", want: DefaultJobTimeoutMinutes},
+		{name: "explicit", field: "    timeout-minutes: 90\n", want: 90},
+		{name: "zero", field: "    timeout-minutes: 0\n", wantErr: true},
+		{name: "negative", field: "    timeout-minutes: -1\n", wantErr: true},
+		{name: "fractional", field: "    timeout-minutes: 1.5\n", wantErr: true},
+		{name: "quoted", field: "    timeout-minutes: '10'\n", wantErr: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			definition, err := Parse([]byte("name: CI\non: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n" + test.field + "    steps:\n      - run: true\n"))
+			if test.wantErr {
+				if err == nil {
+					t.Fatal("Parse() accepted invalid timeout-minutes")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := definition.Jobs["build"].TimeoutMinutes.Minutes(); got != test.want {
+				t.Fatalf("timeout-minutes = %d, want %d", got, test.want)
+			}
+		})
+	}
+}
+
+func TestEvaluateJobTimeoutMinutesExpression(t *testing.T) {
+	definition, err := Parse([]byte("name: CI\non: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    timeout-minutes: ${{ matrix.timeout }}\n    steps:\n      - run: true\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	job, err := EvaluateJob("build", definition.Jobs["build"], workflowexpression.Context{
+		Availability: workflowexpression.NewAvailability("matrix"),
+		Values:       map[string]any{"matrix": map[string]any{"timeout": float64(75)}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := job.TimeoutMinutes.Minutes(); got != 75 {
+		t.Fatalf("timeout-minutes = %d, want 75", got)
 	}
 }
 

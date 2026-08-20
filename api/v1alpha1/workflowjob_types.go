@@ -79,6 +79,17 @@ type WorkflowJobSpec struct {
 	// Matrix describes the matrix combination represented by this job.
 	// +optional
 	Matrix *WorkflowJobMatrix `json:"matrix,omitempty"`
+
+	// TimeoutSeconds is the effective execution timeout after applying the
+	// controller maximum. Cleanup may continue during the Pod termination grace
+	// period after this timeout expires. Omit it to apply the default 360-minute
+	// timeout, capped by the controller maximum.
+	// +kubebuilder:validation:Minimum=60
+	// The maximum is 9223372036 seconds, the largest timeout the controller can
+	// represent.
+	// +kubebuilder:validation:Maximum=9223372036
+	// +optional
+	TimeoutSeconds int64 `json:"timeoutSeconds,omitempty"`
 }
 
 // WorkflowJobMatrix identifies one expanded combination of a logical workflow

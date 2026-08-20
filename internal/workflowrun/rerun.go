@@ -51,10 +51,10 @@ func Terminal(run *actionsv1alpha1.WorkflowRun) bool {
 	return condition != nil && (condition.Status == metav1.ConditionTrue || condition.Status == metav1.ConditionFalse)
 }
 
-// Failed reports whether a WorkflowRun completed because one or more jobs failed.
+// Failed reports whether a WorkflowRun completed because one or more jobs failed or timed out.
 func Failed(run *actionsv1alpha1.WorkflowRun) bool {
 	condition := meta.FindStatusCondition(run.Status.Conditions, actionsv1alpha1.WorkflowRunConditionSucceeded)
-	return condition != nil && condition.Status == metav1.ConditionFalse && condition.Reason == "JobFailed"
+	return condition != nil && condition.Status == metav1.ConditionFalse && (condition.Reason == "JobFailed" || condition.Reason == "JobTimedOut")
 }
 
 // FailedJobIDs selects failed expanded jobs and their transitive dependents.

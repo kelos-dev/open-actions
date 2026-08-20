@@ -128,7 +128,7 @@ func (e *Executor) runComposite(ctx context.Context, state *executionState, invo
 		e.logger.Info("starting composite step", "action", invocation.step.Uses, "step", index+1, "name", name)
 		var outputs map[string]string
 		cancelledBeforeCommand := ctx.Err() != nil
-		commandContext := executionContext(ctx)
+		commandContext := state.commandContext(ctx)
 		if step.Uses != "" {
 			outputs, err = e.executeAction(commandContext, state, step, cancelled)
 		} else {

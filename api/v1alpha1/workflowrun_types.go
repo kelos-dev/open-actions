@@ -473,11 +473,20 @@ type WorkflowRunJobStatus struct {
 	// +optional
 	Succeeded int32 `json:"succeeded,omitempty"`
 
-	// Failed is the number of jobs with a failed terminal condition.
+	// Failed is the number of jobs with a failed terminal condition, excluding
+	// timed-out jobs.
 	// +kubebuilder:validation:Minimum=0
 	// +kubebuilder:validation:Maximum=100000
 	// +optional
 	Failed int32 `json:"failed,omitempty"`
+
+	// TimedOut is the number of jobs that exceeded their effective execution
+	// timeout. These jobs are counted separately from Failed but expose failure
+	// through the needs context.
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=100000
+	// +optional
+	TimedOut int32 `json:"timedOut,omitempty"`
 
 	// Skipped is the number of jobs whose condition evaluated to false.
 	// +kubebuilder:validation:Minimum=0
@@ -509,7 +518,7 @@ type GitHubCheckRunStatus struct {
 	Status string `json:"status"`
 
 	// Conclusion is the terminal result accepted by GitHub.
-	// +kubebuilder:validation:Enum=success;failure;cancelled
+	// +kubebuilder:validation:Enum=success;failure;cancelled;timed_out
 	// +optional
 	Conclusion string `json:"conclusion,omitempty"`
 

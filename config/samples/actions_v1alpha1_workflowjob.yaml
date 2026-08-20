@@ -11,3 +11,4 @@ spec:
   displayName: Build and test
   runsOn:
     - ubuntu-latest
+  timeoutSeconds: 21600

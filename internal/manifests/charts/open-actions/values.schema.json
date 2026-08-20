@@ -7,7 +7,7 @@
     "controller": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["image", "githubAPIURL", "githubServerURL", "actionCloneBaseURL", "workflowRunTTLSecondsAfterFinished"],
+      "required": ["image", "githubAPIURL", "githubServerURL", "actionCloneBaseURL", "maxJobTimeout", "workflowRunTTLSecondsAfterFinished"],
       "properties": {
         "image": {
           "type": "object",
@@ -25,6 +25,7 @@
         "githubAPIURL": {"type": "string", "minLength": 1, "maxLength": 2048},
         "githubServerURL": {"type": "string", "minLength": 1, "maxLength": 2048},
         "actionCloneBaseURL": {"type": "string", "maxLength": 2048},
+        "maxJobTimeout": {"type": "string", "minLength": 2, "maxLength": 32, "pattern": "^([1-9][0-9]*h([0-9]+m)?|(0h)?[1-9][0-9]*m)$"},
         "workflowRunTTLSecondsAfterFinished": {"type": ["integer", "null"], "minimum": 0, "maximum": 2147483647}
       }
     },

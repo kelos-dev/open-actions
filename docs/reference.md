@@ -37,6 +37,9 @@ GitHub Enterprise API path such as `/api/v3`. `--github-server-url` defaults to
 defaults to the GitHub server URL and is used only to fetch external action
 repositories. Set it explicitly when actions are hosted on another server. The
 controller's optional `--console-url` adds Console links to GitHub Check Runs.
+`--max-job-timeout` is the cluster-wide upper bound for workflow job execution
+and defaults to `6h`. It must be a positive whole number of minutes. The Helm
+chart configures it through `controller.maxJobTimeout`.
 The Console serves HTTP on `--bind-address` (default
 `:8080`) and serves its read-only views without authentication. Anyone who can
 reach the Console can read Project and workflow metadata and runner logs. The
@@ -125,6 +128,7 @@ open-actions-controller \
   --github-api-url=https://github.example/api/v3 \
   --github-server-url=https://github.example \
   --action-clone-base-url=https://github.example \
+  --max-job-timeout=6h \
   --console-url=https://actions.example
 
 open-actions-console \
@@ -161,12 +165,15 @@ WorkflowRun force-cancels and removes its child resources. A Runner's
 immutable, and changes to `spec.execution` apply only to Kubernetes Jobs created
 afterward. A `WorkflowJob` spec is immutable, and `status.runnerRef` identifies
 its one-time Runner assignment. `spec.needs` records direct workflow
-dependencies, `spec.if` records its scheduling condition, and `status.result`
+dependencies, `spec.if` records its scheduling condition,
+`spec.timeoutSeconds` records its effective execution timeout, and `status.result`
 contains `success`, `failure`, `skipped`, or `cancelled` after completion. After
 execution, `status.outputs` contains the non-secret outputs declared by that
 workflow job. The controller copies these values from the completed runner Pod
 before allowing native Job cleanup, so they remain available after controller
-restarts and Pod deletion.
+restarts and Pod deletion. `WorkflowRun.status.jobs.timedOut` counts jobs whose
+`Succeeded` condition has reason `JobTimedOut`; those jobs retain `failure` as
+their `status.result` for dependency evaluation.
 
 ### Project secrets and variables
 
@@ -306,6 +313,29 @@ start another queued combination, including when `max-parallel` is set.
 Independent jobs and other logical matrix jobs continue normally. Set
 `fail-fast: false` to let every combination reach its normal terminal result.
 
+### Job timeouts
+
+`jobs.<id>.timeout-minutes` accepts a positive integer or an expression that
+resolves to a positive whole number. It defaults to 360 minutes. The controller
+caps both explicit and default values at `--max-job-timeout` and persists the
+effective value in `WorkflowJob.spec.timeoutSeconds`.
+
+The effective timeout is applied to both the runner execution context and the
+native Kubernetes Job's `activeDeadlineSeconds`. When it expires, the active
+command is cancelled and eligible `cancelled()` and `always()` workflow and
+composite steps run before action post hooks. All timeout and cancellation
+cleanup shares one five-minute window. The Pod's
+`terminationGracePeriodSeconds` enforces the same cleanup bound if the native
+Job deadline expires or a cancellation deletes the Job.
+
+A timed-out WorkflowJob has `status.result: failure` and a false `Succeeded`
+condition with reason `JobTimedOut`, while user cancellation has
+`status.result: cancelled`. A WorkflowRun containing a timed-out job uses
+reason `JobTimedOut` and reports the GitHub Check Run conclusion `timed_out`;
+ordinary failures use `JobFailed` and `failure`, and cancellations use
+`JobCancelled` and `cancelled`. When a run contains both timed-out and ordinarily
+failed jobs, `JobTimedOut` and `timed_out` take precedence in its summary.
+
 ### Conditions
 
 The resources expose these condition contracts:
@@ -323,7 +353,7 @@ The resources expose these condition contracts:
 | `WorkflowRun` | `Planned` | `False` | `ProjectUnavailable`, `WorkflowFetchFailed`, `WorkflowInvalid`, `TriggerInvalid`, `RerunInvalid`, `ChildCreationFailed`, `ExecutionStateLost` |
 | `WorkflowRun` | `Succeeded` | `Unknown` | `JobsWaiting`, `JobsQueued`, `JobsRunning` |
 | `WorkflowRun` | `Succeeded` | `True` | `JobsSucceeded` |
-| `WorkflowRun` | `Succeeded` | `False` | `ProjectUnavailable`, `WorkflowFetchFailed`, `WorkflowInvalid`, `TriggerInvalid`, `RerunInvalid`, `ChildCreationFailed`, `JobFailed`, `JobCancelled`, `ExecutionStateLost` |
+| `WorkflowRun` | `Succeeded` | `False` | `ProjectUnavailable`, `WorkflowFetchFailed`, `WorkflowInvalid`, `TriggerInvalid`, `RerunInvalid`, `ChildCreationFailed`, `JobFailed`, `JobTimedOut`, `JobCancelled`, `ExecutionStateLost` |
 | `WorkflowJob` | `Ready` | `Unknown` | `DependenciesPending` |
 | `WorkflowJob` | `Ready` | `True` | `ConditionPassed` |
 | `WorkflowJob` | `Ready` | `False` | `ConditionFalse`, `ConditionEvaluationFailed`, `CancellationRequested`, `MatrixFailFast` |
@@ -331,7 +361,7 @@ The resources expose these condition contracts:
 | `WorkflowJob` | `Scheduled` | `False` | `ConditionFalse`, `ConditionEvaluationFailed`, `CancellationRequested`, `MatrixFailFast`, `ProjectRecreated` |
 | `WorkflowJob` | `Succeeded` | `Unknown` | `JobRunning` |
 | `WorkflowJob` | `Succeeded` | `True` | `JobSucceeded` |
-| `WorkflowJob` | `Succeeded` | `False` | `JobFailed`, `JobResultInvalid`, `ConditionEvaluationFailed`, `PlanUnavailable`, `JobStartFailed`, `ExecutionStateLost`, `CancellationRequested`, `MatrixFailFast`, `ProjectRecreated` |
+| `WorkflowJob` | `Succeeded` | `False` | `JobFailed`, `JobTimedOut`, `JobCancelled`, `JobResultInvalid`, `ConditionEvaluationFailed`, `PlanUnavailable`, `JobStartFailed`, `ExecutionStateLost`, `CancellationRequested`, `MatrixFailFast`, `ProjectRecreated` |
 | `WorkflowJob` | `CancellationRequested` | `True` | `CancellationRequested`, `ConditionEvaluationFailed`, `MatrixFailFast` |
 | `WorkflowJob` | `CancellationRequested` | `False` | `ConditionPassed` |
 
@@ -361,8 +391,8 @@ and assigned runner name remain available through
 the user-facing `jobs.<id>.name` value, or the job ID when no name is
 configured. Queued jobs record their project name in the
 `actions.kelos.dev/project-name` annotation so a recreated project can be
-distinguished from the original object. Workflow jobs that declare outputs,
-and their native Jobs and Pods, carry the
+distinguished from the original object. Workflow jobs, their native Jobs, and
+their Pods carry the
 `actions.kelos.dev/runner-result-version` annotation. Its value identifies the
 runner result format required to complete that job.
 
@@ -447,7 +477,7 @@ evaluation when the corresponding execution feature has not supplied it.
 | Workflow concurrency | `github`, `inputs`, `vars` | All listed contexts |
 | Workflow environment | `github`, `secrets`, `inputs`, `vars` | All listed contexts |
 | Workflow job condition | `github`, `needs`, `vars`, `inputs`, and status functions | `github`, direct dependency results and outputs, `vars`, `inputs`, and status functions |
-| Job name and runner labels | `github`, `needs`, `strategy`, `matrix`, `vars`, `inputs` | `github`, `inputs`, `vars`, and `matrix` for matrix jobs |
+| Job name, timeout, and runner labels | `github`, `needs`, `strategy`, `matrix`, `vars`, `inputs` | `github`, `inputs`, `vars`, and `matrix` for matrix jobs |
 | Job environment | `github`, `needs`, `strategy`, `matrix`, `vars`, `secrets`, `inputs` | `github`, `inputs`, `vars`, `secrets`, and `matrix` for matrix jobs |
 | Workflow step name, run script, working directory, environment, and inputs | `github`, `needs`, `strategy`, `matrix`, `job`, `runner`, `env`, `vars`, `secrets`, `steps`, `inputs`, and `hashFiles` | `github`, `matrix`, `runner`, `env`, `vars`, `secrets`, `inputs`, `steps`, and `hashFiles` |
 | Workflow step condition | Step contexts except `secrets`, plus status functions and `hashFiles` | `github`, `matrix`, `runner`, `env`, `vars`, `inputs`, `steps`, status functions, and `hashFiles` |
@@ -459,8 +489,9 @@ evaluation when the corresponding execution feature has not supplied it.
 Values derived from `github.token` or the `secrets` context are marked sensitive
 through interpolation and function calls, and evaluation diagnostics do not
 include resolved values. The runner maps interrupt and termination signals to
-cancelled status, separately from failure, so eligible workflow and composite
-cleanup steps can run during pod termination.
+cancelled status, separately from failure and timeout, so eligible workflow and
+composite cleanup steps can run during Pod termination. A single five-minute
+cleanup deadline is shared by those steps and action post hooks.
 
 ### Step and job outputs
 
@@ -477,11 +508,10 @@ empty string.
 including when a step failed. Output names use the same identifier syntax.
 Values that are derived from an expression secret or contain a registered mask
 are omitted from runner logs, the result document, and `WorkflowJob.status`.
-The complete versioned job result is limited to 4 KiB and 100 outputs. Exceeding
-that bound fails the job without persisting a partial result. A successful job
-that declares outputs finishes with reason `JobResultInvalid` when its runner
-result is missing or malformed. Jobs without declared outputs do not require
-runner result metadata.
+The complete versioned job result, including its conclusion, is limited to 4
+KiB and 100 outputs. Exceeding that bound fails the job without persisting a
+partial result. A successful job finishes with reason `JobResultInvalid` when
+its runner result is missing or malformed.
 
 ### Job dependencies and conditions
 
@@ -765,7 +795,8 @@ The controller emits job-plan version 6, and the runner accepts versions 1
 through 6. When a release changes the job-plan version, update every Runner
 `spec.execution.image` to an image that accepts both the installed and target
 controller versions before upgrading the controller. The received job-plan
-version also determines the runner result version. A runner that accepts more
+version also determines the runner result version: plan versions 1 through 5
+use result version 1, and plan version 6 uses result version 2. A runner that accepts more
 than one plan version must emit the result version assigned to that plan, not
 always the latest result version supported by the runner binary. Integration
 commit construction is part of this versioned contract; changing its merge

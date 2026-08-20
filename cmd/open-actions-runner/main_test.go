@@ -8,6 +8,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/kelos-dev/open-actions/internal/runner"
 )
@@ -19,11 +20,13 @@ func TestRunWritesWorkflowJobResult(t *testing.T) {
 		Repository: runner.Repository{
 			ID: 1, Owner: "acme", Name: "example", ServerURL: "https://github.com", APIURL: "https://api.github.com", ActionCloneBaseURL: "https://github.com",
 		},
-		Event:        runner.Event{Name: "push", DeliveryID: "delivery"},
-		Revision:     runner.Revision{SHA: strings.Repeat("a", 40), Ref: "refs/heads/main", RefName: "main"},
-		WorkflowName: "CI",
-		JobID:        "build",
-		Outputs:      map[string]string{"value": "${{ steps.producer.outputs.value }}"},
+		Event:                 runner.Event{Name: "push", DeliveryID: "delivery"},
+		Revision:              runner.Revision{SHA: strings.Repeat("a", 40), Ref: "refs/heads/main", RefName: "main"},
+		WorkflowName:          "CI",
+		JobID:                 "build",
+		TimeoutSeconds:        int64((6 * time.Hour) / time.Second),
+		CleanupTimeoutSeconds: int64(runner.CleanupTimeout / time.Second),
+		Outputs:               map[string]string{"value": "${{ steps.producer.outputs.value }}"},
 		Steps: []runner.Step{{
 			ID: "producer", Run: `test -z "$OPEN_ACTIONS_GITHUB_TOKEN"
 test -z "$OPEN_ACTIONS_ACTION_TOKEN"
@@ -52,8 +55,8 @@ echo 'value=ready' >> "$GITHUB_OUTPUT"`,
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.Outputs["value"] != "ready" {
-		t.Fatalf("outputs = %#v", result.Outputs)
+	if result.Conclusion != runner.ResultConclusionSuccess || result.Outputs["value"] != "ready" {
+		t.Fatalf("result = %#v", result)
 	}
 }
 

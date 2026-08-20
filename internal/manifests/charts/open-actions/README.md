@@ -42,6 +42,7 @@ resources.
 | `controller.githubAPIURL` | `https://api.github.com/` | Base URL for the GitHub API |
 | `controller.githubServerURL` | `https://github.com` | GitHub web-server URL exposed to workflows |
 | `controller.actionCloneBaseURL` | `""` | Base URL used to clone external action repositories; defaults to `controller.githubServerURL` when empty |
+| `controller.maxJobTimeout` | `6h` | Maximum execution timeout available to workflow jobs, expressed in whole hours and minutes such as `1h30m`; longer `timeout-minutes` values are capped |
 | `controller.workflowRunTTLSecondsAfterFinished` | `null` | Default `spec.ttlSecondsAfterFinished` for generated WorkflowRuns; `null` retains them indefinitely |
 | `console.enabled` | `true` | Deploy the Open Actions Console |
 | `console.replicas` | `1` | Console replica count |

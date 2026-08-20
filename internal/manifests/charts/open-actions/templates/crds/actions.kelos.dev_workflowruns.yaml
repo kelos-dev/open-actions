@@ -830,8 +830,9 @@ spec:
                     minimum: 0
                     type: integer
                   failed:
-                    description: Failed is the number of jobs with a failed terminal
-                      condition.
+                    description: |-
+                      Failed is the number of jobs with a failed terminal condition, excluding
+                      timed-out jobs.
                     format: int32
                     maximum: 100000
                     minimum: 0
@@ -853,6 +854,15 @@ spec:
                   succeeded:
                     description: Succeeded is the number of jobs with a successful
                       terminal condition.
+                    format: int32
+                    maximum: 100000
+                    minimum: 0
+                    type: integer
+                  timedOut:
+                    description: |-
+                      TimedOut is the number of jobs that exceeded their effective execution
+                      timeout. These jobs are counted separately from Failed but expose failure
+                      through the needs context.
                     format: int32
                     maximum: 100000
                     minimum: 0
@@ -896,6 +906,7 @@ spec:
                             - success
                             - failure
                             - cancelled
+                            - timed_out
                             type: string
                           id:
                             description: ID is GitHub's check-run identifier.
