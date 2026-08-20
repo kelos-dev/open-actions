@@ -38,6 +38,9 @@ const (
 	sessionCookieName  = "open_actions_console_session"
 	sessionLifetime    = 7 * 24 * time.Hour
 	streamHeartbeat    = 15 * time.Second
+	logBatchInterval   = 50 * time.Millisecond
+	logBatchEntryLimit = 200
+	logBatchByteLimit  = 64 << 10
 	maxLogLineBytes    = 256 << 10
 	truncatedLogMarker = " … [log line truncated]"
 	mainPageRunLimit   = 100
@@ -721,30 +724,59 @@ func (h *Handler) streamJobLogs(writer http.ResponseWriter, request *http.Reques
 	reads := readLogStream(request.Context(), stream)
 	heartbeat := time.NewTicker(streamHeartbeat)
 	defer heartbeat.Stop()
+	batchTicker := time.NewTicker(logBatchInterval)
+	defer batchTicker.Stop()
 	// Log IDs are positions in the currently retained Pod log, not durable offsets across log rotation.
 	var logID uint64
+	batch := make([]json.RawMessage, 0, logBatchEntryLimit)
+	batchBytes := 0
+	var batchLastLogID uint64
+	flushBatch := func() {
+		if len(batch) == 0 {
+			return
+		}
+		writeLogEvent(writer, flusher, batchLastLogID, batch)
+		clear(batch)
+		batch = batch[:0]
+		batchBytes = 0
+	}
 	for {
 		select {
 		case result, ok := <-reads:
 			if !ok {
+				flushBatch()
 				return
 			}
 			if result.entry != nil {
 				logID++
 				if logID > lastLogID {
-					writeLogEvent(writer, flusher, logID, result.entry)
+					encoded, _ := json.Marshal(result.entry)
+					entryBytes := len(encoded) + 1
+					if len(batch) > 0 && (len(batch) == logBatchEntryLimit || batchBytes+entryBytes > logBatchByteLimit) {
+						flushBatch()
+					}
+					batch = append(batch, encoded)
+					batchBytes += entryBytes
+					batchLastLogID = logID
+					if len(batch) == logBatchEntryLimit || batchBytes >= logBatchByteLimit {
+						flushBatch()
+					}
 				}
 			}
 			if result.err == nil {
 				continue
 			}
+			flushBatch()
 			if result.err == io.EOF {
 				writeEvent(writer, flusher, "end", "Log stream ended.")
 			} else if request.Context().Err() == nil {
 				writeEvent(writer, flusher, "error", "Runner log stream failed.")
 			}
 			return
+		case <-batchTicker.C:
+			flushBatch()
 		case <-heartbeat.C:
+			flushBatch()
 			writeSSEComment(writer, flusher, "keepalive")
 		case <-request.Context().Done():
 			return

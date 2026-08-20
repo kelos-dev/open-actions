@@ -2,12 +2,14 @@ package console
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -144,6 +146,97 @@ func TestConsoleResumesReconnectedLogStream(t *testing.T) {
 	if response.Code != http.StatusOK || strings.Contains(body, `"text":"first"`) || strings.Contains(body, `"text":"second"`) || !strings.Contains(body, "id: 3\nevent: log") || !strings.Contains(body, `"text":"third"`) {
 		t.Fatalf("resumed log stream = %d, %q", response.Code, body)
 	}
+}
+
+func TestConsoleBatchesLogStream(t *testing.T) {
+	tests := []struct {
+		name               string
+		logs               string
+		entryCount         int
+		maxEntriesPerBatch int
+	}{
+		{
+			name:               "entry limit",
+			logs:               strings.Repeat("output\n", logBatchEntryLimit+1),
+			entryCount:         logBatchEntryLimit + 1,
+			maxEntriesPerBatch: logBatchEntryLimit,
+		},
+		{
+			name:               "byte limit",
+			logs:               strings.Repeat("a", 40<<10) + "\n" + strings.Repeat("b", 40<<10) + "\n",
+			entryCount:         2,
+			maxEntriesPerBatch: 1,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			handler := newTestHandler(t, false)
+			handler.logs.(*testLogSource).logs = test.logs
+			request := httptest.NewRequest(http.MethodGet, "/runs/default/ci/jobs/build/stream", nil)
+			request.Header.Set("Authorization", "Bearer "+testConsoleToken)
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, request)
+			body := response.Body.String()
+
+			if response.Code != http.StatusOK {
+				t.Fatalf("log stream status = %d, body %q", response.Code, body)
+			}
+			batches := parseTestLogBatches(t, body)
+			if len(batches) < 2 {
+				t.Fatalf("log stream contains %d batches, want at least 2: %q", len(batches), body)
+			}
+			entries := 0
+			for _, batch := range batches {
+				entries += len(batch.entries)
+				if len(batch.entries) > test.maxEntriesPerBatch {
+					t.Fatalf("batch contains %d entries, want at most %d", len(batch.entries), test.maxEntriesPerBatch)
+				}
+				if batch.id != uint64(entries) {
+					t.Fatalf("batch ID = %d, want %d", batch.id, entries)
+				}
+				if batch.encodedBytes > logBatchByteLimit+1 {
+					t.Fatalf("batch contains %d encoded bytes, want at most %d", batch.encodedBytes, logBatchByteLimit+1)
+				}
+			}
+			if entries != test.entryCount {
+				t.Fatalf("log stream contains %d entries, want %d", entries, test.entryCount)
+			}
+		})
+	}
+}
+
+type testLogBatch struct {
+	id           uint64
+	entries      []logEntry
+	encodedBytes int
+}
+
+func parseTestLogBatches(t *testing.T, body string) []testLogBatch {
+	t.Helper()
+	var batches []testLogBatch
+	for _, event := range strings.Split(body, "\n\n") {
+		if !strings.Contains(event, "event: log\n") {
+			continue
+		}
+		batch := testLogBatch{}
+		for _, line := range strings.Split(event, "\n") {
+			if value, found := strings.CutPrefix(line, "id: "); found {
+				id, err := strconv.ParseUint(value, 10, 64)
+				if err != nil {
+					t.Fatalf("parse batch ID %q: %v", value, err)
+				}
+				batch.id = id
+			}
+			if value, found := strings.CutPrefix(line, "data: "); found {
+				batch.encodedBytes = len(value)
+				if err := json.Unmarshal([]byte(value), &batch.entries); err != nil {
+					t.Fatalf("parse log batch: %v", err)
+				}
+			}
+		}
+		batches = append(batches, batch)
+	}
+	return batches
 }
 
 func TestConsoleMainPageListsWorkflowRunsNewestFirst(t *testing.T) {
