@@ -61,10 +61,11 @@ jobs:
         with:
           cluster_name: kind
       - name: Build images
-        run: make image WHAT="cmd/open-actions-controller cmd/open-actions-console cmd/open-actions-runner test/fixture/github" VERSION=e2e
+        run: make image WHAT="cmd/open-actions-controller cmd/open-actions-artifact-server cmd/open-actions-console cmd/open-actions-runner test/fixture/github" VERSION=e2e
       - name: Load images
         run: |
           kind load docker-image ghcr.io/kelos-dev/open-actions-controller:e2e
+          kind load docker-image ghcr.io/kelos-dev/open-actions-artifact-server:e2e
           kind load docker-image ghcr.io/kelos-dev/open-actions-console:e2e
           kind load docker-image ghcr.io/kelos-dev/open-actions-runner:e2e
           kind load docker-image ghcr.io/kelos-dev/open-actions-fixture:e2e
@@ -81,6 +82,9 @@ jobs:
             deployment/open-actions-controller \
             deployment/open-actions-console \
             deployment/github-fixture
+          kubectl rollout status statefulset/open-actions-artifacts \
+            --namespace open-actions-system \
+            --timeout=180s
       - name: End-to-end test
         env:
           E2E_PROCS: "4"

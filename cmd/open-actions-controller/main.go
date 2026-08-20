@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -13,6 +14,7 @@ import (
 	"time"
 
 	actionsv1alpha1 "github.com/kelos-dev/open-actions/api/v1alpha1"
+	"github.com/kelos-dev/open-actions/internal/artifact"
 	"github.com/kelos-dev/open-actions/internal/controller"
 	"github.com/kelos-dev/open-actions/internal/endpointurl"
 	githubclient "github.com/kelos-dev/open-actions/internal/github"
@@ -77,6 +79,9 @@ func runManager(arguments []string) error {
 	metricsAddress := flags.String("metrics-bind-address", ":8082", "Address used by the metrics endpoint")
 	healthAddress := flags.String("health-probe-bind-address", ":8081", "Address used by health probes")
 	webhookAddress := flags.String("webhook-bind-address", ":8080", "Address used by the GitHub webhook endpoint")
+	artifactServiceURL := flags.String("artifact-service-url", "", "Artifact service origin exposed to workflow jobs; omit to disable artifacts")
+	artifactSigningKeyFile := flags.String("artifact-signing-key-file", "", "File containing the artifact credential signing key; required with artifact-service-url")
+	artifactMaxRetentionDays := flags.Int("artifact-max-retention-days", 30, "Maximum artifact retention in days")
 	githubAPIURL := flags.String("github-api-url", "https://api.github.com/", "Base URL for the GitHub API")
 	githubServerURL := flags.String("github-server-url", "https://github.com", "GitHub web-server URL exposed to workflows")
 	actionCloneBaseURL := flags.String("action-clone-base-url", "", "Base URL used to clone external action repositories; defaults to the GitHub server URL")
@@ -114,6 +119,28 @@ func runManager(arguments []string) error {
 	normalizedConsoleURL := ""
 	if *consoleURL != "" {
 		normalizedConsoleURL, err = endpointurl.NormalizeOrigin(*consoleURL, "Console URL")
+		if err != nil {
+			return err
+		}
+	}
+	normalizedArtifactServiceURL := ""
+	var artifactTokens *artifact.TokenCodec
+	if (*artifactServiceURL == "") != (*artifactSigningKeyFile == "") {
+		return errors.New("artifact-service-url and artifact-signing-key-file must be specified together")
+	}
+	if *artifactServiceURL != "" {
+		normalizedArtifactServiceURL, err = endpointurl.NormalizeOrigin(*artifactServiceURL, "Artifact service URL")
+		if err != nil {
+			return err
+		}
+		if *artifactMaxRetentionDays < 1 || *artifactMaxRetentionDays > 3650 {
+			return errors.New("artifact maximum retention must be between 1 and 3650 days")
+		}
+		signingKey, err := os.ReadFile(*artifactSigningKeyFile)
+		if err != nil {
+			return fmt.Errorf("read artifact signing key: %w", err)
+		}
+		artifactTokens, err = artifact.NewTokenCodec(signingKey)
 		if err != nil {
 			return err
 		}
@@ -180,11 +207,14 @@ func runManager(arguments []string) error {
 		return fmt.Errorf("configure WorkflowRun controller: %w", err)
 	}
 	if err := (&controller.RunnerReconciler{
-		Client:        controllerManager.GetClient(),
-		APIReader:     controllerManager.GetAPIReader(),
-		GitHub:        github,
-		MaxJobTimeout: *maxJobTimeout,
-		Recorder:      controllerManager.GetEventRecorder("runner-controller"),
+		Client:                   controllerManager.GetClient(),
+		APIReader:                controllerManager.GetAPIReader(),
+		GitHub:                   github,
+		MaxJobTimeout:            *maxJobTimeout,
+		Recorder:                 controllerManager.GetEventRecorder("runner-controller"),
+		ArtifactResultsURL:       normalizedArtifactServiceURL,
+		ArtifactMaxRetentionDays: *artifactMaxRetentionDays,
+		ArtifactTokens:           artifactTokens,
 	}).SetupWithManager(controllerManager); err != nil {
 		return fmt.Errorf("configure Runner controller: %w", err)
 	}

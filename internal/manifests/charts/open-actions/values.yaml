@@ -9,6 +9,26 @@ controller:
   maxJobTimeout: 6h
   workflowRunTTLSecondsAfterFinished: null
 
+artifacts:
+  enabled: true
+  image:
+    repository: ghcr.io/kelos-dev/open-actions-artifact-server
+    tag: latest
+    pullPolicy: IfNotPresent
+  signingKeySecretName: ""
+  signingKeyKey: signing-key
+  defaultRetentionDays: 7
+  maxRetentionDays: 30
+  maxFileBytes: 1073741824
+  maxArtifactBytes: 2147483648
+  maxRunBytes: 10737418240
+  persistence:
+    enabled: true
+    existingClaim: ""
+    storageClass: null
+    accessModes: [ReadWriteOnce]
+    size: 20Gi
+
 console:
   enabled: true
   replicas: 1

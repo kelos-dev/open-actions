@@ -275,6 +275,96 @@ var _ = Describe("Runner", func() {
 		Expect(matrixValues).To(Equal(map[string]bool{"first": true, "second": true}))
 	})
 
+	It("uploads artifacts from parallel matrix jobs and aggregates them in a dependent job", func() {
+		ctx := context.Background()
+		runnerOne := &actionsv1alpha1.Runner{}
+		Expect(clusterClient.Get(ctx, client.ObjectKey{Namespace: e2eNamespace, Name: "runner-1"}, runnerOne)).To(Succeed())
+		runnerTwo := &actionsv1alpha1.Runner{
+			ObjectMeta: metav1.ObjectMeta{Name: "runner-2", Namespace: e2eNamespace},
+			Spec:       *runnerOne.Spec.DeepCopy(),
+		}
+		Expect(clusterClient.Create(ctx, runnerTwo)).To(Succeed())
+		Eventually(func(g Gomega) {
+			stored := &actionsv1alpha1.Runner{}
+			g.Expect(clusterClient.Get(ctx, client.ObjectKeyFromObject(runnerTwo), stored)).To(Succeed())
+			g.Expect(meta.IsStatusConditionTrue(stored.Status.Conditions, actionsv1alpha1.RunnerConditionReady)).To(BeTrue())
+		}, 60*time.Second, time.Second).Should(Succeed())
+
+		run := &actionsv1alpha1.WorkflowRun{
+			ObjectMeta: metav1.ObjectMeta{Name: "runner-artifacts", Namespace: e2eNamespace},
+			Spec: actionsv1alpha1.WorkflowRunSpec{
+				ProjectRef: corev1.LocalObjectReference{Name: "default"},
+				Source: actionsv1alpha1.WorkflowRunSource{
+					Type: actionsv1alpha1.SourceTypeGitHub,
+					GitHub: &actionsv1alpha1.GitHubWorkflowRunSource{
+						Repository: actionsv1alpha1.GitHubRepository{ID: 123456789, Owner: "acme", Name: "example"},
+						Event:      actionsv1alpha1.GitHubEvent{Name: "push", DeliveryID: "71111111-2222-3333-4444-555555555555"},
+						Revision:   actionsv1alpha1.GitRevision{SHA: fixtureRevision, Ref: "refs/heads/main"},
+					},
+				},
+				WorkflowPath: artifactWorkflowPath,
+			},
+		}
+		Expect(clusterClient.Create(ctx, run)).To(Succeed())
+		Eventually(func(g Gomega) {
+			stored := &actionsv1alpha1.WorkflowRun{}
+			g.Expect(clusterClient.Get(ctx, client.ObjectKeyFromObject(run), stored)).To(Succeed())
+			condition := meta.FindStatusCondition(stored.Status.Conditions, actionsv1alpha1.WorkflowRunConditionSucceeded)
+			g.Expect(condition).NotTo(BeNil())
+			if condition != nil {
+				g.Expect(condition.Status).To(Equal(metav1.ConditionTrue), condition.Message)
+			}
+		}, 180*time.Second, time.Second).Should(Succeed())
+
+		workflowJobs := &actionsv1alpha1.WorkflowJobList{}
+		Expect(clusterClient.List(ctx, workflowJobs, client.InNamespace(e2eNamespace), client.MatchingLabels{
+			actionsv1alpha1.LabelWorkflowRunUID: string(run.UID),
+		})).To(Succeed())
+		Expect(workflowJobs.Items).To(HaveLen(3))
+		matrixJobs := make([]actionsv1alpha1.WorkflowJob, 0, 2)
+		var aggregate *actionsv1alpha1.WorkflowJob
+		for index := range workflowJobs.Items {
+			job := &workflowJobs.Items[index]
+			if job.Spec.Matrix != nil {
+				matrixJobs = append(matrixJobs, *job)
+			} else if job.Spec.JobID == "aggregate" {
+				aggregate = job
+			}
+		}
+		Expect(matrixJobs).To(HaveLen(2))
+		Expect(aggregate).NotTo(BeNil())
+		if len(matrixJobs) == 2 {
+			Expect(matrixJobs[0].Status.StartTime).NotTo(BeNil())
+			Expect(matrixJobs[1].Status.StartTime).NotTo(BeNil())
+			Expect(matrixJobs[0].Status.CompletionTime).NotTo(BeNil())
+			Expect(matrixJobs[1].Status.CompletionTime).NotTo(BeNil())
+			if matrixJobs[0].Status.StartTime != nil && matrixJobs[1].Status.StartTime != nil &&
+				matrixJobs[0].Status.CompletionTime != nil && matrixJobs[1].Status.CompletionTime != nil {
+				latestStart := matrixJobs[0].Status.StartTime.Time
+				if matrixJobs[1].Status.StartTime.Time.After(latestStart) {
+					latestStart = matrixJobs[1].Status.StartTime.Time
+				}
+				earliestCompletion := matrixJobs[0].Status.CompletionTime.Time
+				if matrixJobs[1].Status.CompletionTime.Time.Before(earliestCompletion) {
+					earliestCompletion = matrixJobs[1].Status.CompletionTime.Time
+				}
+				Expect(latestStart.Before(earliestCompletion)).To(BeTrue(), "matrix artifact jobs did not overlap")
+			}
+		}
+		if aggregate != nil {
+			pods, err := clientset.CoreV1().Pods(e2eNamespace).List(ctx, metav1.ListOptions{
+				LabelSelector: labels.Set{batchv1.JobNameLabel: aggregate.Name}.String(),
+			})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(pods.Items).To(HaveLen(1))
+			if len(pods.Items) == 1 {
+				logs, err := clientset.CoreV1().Pods(e2eNamespace).GetLogs(pods.Items[0].Name, &corev1.PodLogOptions{}).DoRaw(ctx)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(string(logs)).To(ContainSubstring("artifact aggregation e2e works"))
+			}
+		}
+	})
+
 	It("executes a pull request checkout with persisted credentials", func() {
 		ctx := context.Background()
 		run := &actionsv1alpha1.WorkflowRun{

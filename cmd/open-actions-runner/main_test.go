@@ -124,6 +124,7 @@ func TestRunLoadsNeedsContext(t *testing.T) {
 func TestWithoutEnvironmentVariables(t *testing.T) {
 	environment := withoutEnvironmentVariables([]string{
 		"PATH=/usr/bin",
+		"ACTIONS_RUNTIME_TOKEN=artifact-token",
 		"OPEN_ACTIONS_GITHUB_TOKEN=secret",
 		"OPEN_ACTIONS_GITHUB_TOKEN_BACKUP=preserved",
 		"OPEN_ACTIONS_ACTION_TOKEN=secret",
@@ -135,7 +136,7 @@ func TestWithoutEnvironmentVariables(t *testing.T) {
 	if slices.Contains(environment, "OPEN_ACTIONS_ACTION_TOKEN=secret") {
 		t.Fatal("filtered environment contains the action token")
 	}
-	if !slices.Contains(environment, "PATH=/usr/bin") || !slices.Contains(environment, "OPEN_ACTIONS_GITHUB_TOKEN_BACKUP=preserved") || !slices.Contains(environment, "OPEN_ACTIONS_ACTION_TOKEN_BACKUP=preserved") {
+	if !slices.Contains(environment, "PATH=/usr/bin") || !slices.Contains(environment, "ACTIONS_RUNTIME_TOKEN=artifact-token") || !slices.Contains(environment, "OPEN_ACTIONS_GITHUB_TOKEN_BACKUP=preserved") || !slices.Contains(environment, "OPEN_ACTIONS_ACTION_TOKEN_BACKUP=preserved") {
 		t.Fatalf("filtered environment = %#v", environment)
 	}
 }

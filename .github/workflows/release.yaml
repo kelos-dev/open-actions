@@ -65,7 +65,7 @@ jobs:
           ARCH: ${{ matrix.arch }}
           REVISION: ${{ needs.determine-version.outputs.revision }}
         run: |
-          for image in open-actions-controller open-actions-console open-actions-runner; do
+          for image in open-actions-controller open-actions-artifact-server open-actions-console open-actions-runner; do
             docker push "ghcr.io/kelos-dev/${image}:${REVISION}-${ARCH}"
           done
 
@@ -87,7 +87,7 @@ jobs:
         env:
           REVISION: ${{ needs.determine-version.outputs.revision }}
         run: |
-          for image in open-actions-controller open-actions-console open-actions-runner; do
+          for image in open-actions-controller open-actions-artifact-server open-actions-console open-actions-runner; do
             docker buildx imagetools create \
               -t "ghcr.io/kelos-dev/${image}:${REVISION}" \
               "ghcr.io/kelos-dev/${image}:${REVISION}-amd64" \
@@ -116,7 +116,7 @@ jobs:
             exit 0
           fi
 
-          for image in open-actions-controller open-actions-console open-actions-runner; do
+          for image in open-actions-controller open-actions-artifact-server open-actions-console open-actions-runner; do
             docker buildx imagetools create \
               -t "ghcr.io/kelos-dev/${image}:${VERSION}" \
               "ghcr.io/kelos-dev/${image}:${REVISION}-amd64" \
@@ -152,7 +152,7 @@ jobs:
             exit 0
           fi
 
-          for image in open-actions-controller open-actions-console open-actions-runner; do
+          for image in open-actions-controller open-actions-artifact-server open-actions-console open-actions-runner; do
             docker buildx imagetools create \
               -t "ghcr.io/kelos-dev/${image}:latest" \
               "ghcr.io/kelos-dev/${image}:${REVISION}-amd64" \

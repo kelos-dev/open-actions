@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft-07/schema#",
   "type": "object",
   "additionalProperties": false,
-  "required": ["controller", "console", "service"],
+  "required": ["controller", "artifacts", "console", "service"],
   "properties": {
     "controller": {
       "type": "object",
@@ -27,6 +27,65 @@
         "actionCloneBaseURL": {"type": "string", "maxLength": 2048},
         "maxJobTimeout": {"type": "string", "minLength": 2, "maxLength": 32, "pattern": "^([1-9][0-9]*h([0-9]+m)?|(0h)?[1-9][0-9]*m)$"},
         "workflowRunTTLSecondsAfterFinished": {"type": ["integer", "null"], "minimum": 0, "maximum": 2147483647}
+      }
+    },
+    "artifacts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled", "image", "signingKeySecretName", "signingKeyKey", "defaultRetentionDays", "maxRetentionDays", "maxFileBytes", "maxArtifactBytes", "maxRunBytes", "persistence"],
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "image": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["repository", "tag", "pullPolicy"],
+          "properties": {
+            "repository": {"type": "string", "minLength": 1, "maxLength": 512},
+            "tag": {"type": "string", "minLength": 1, "maxLength": 128},
+            "pullPolicy": {
+              "type": "string",
+              "enum": ["Always", "IfNotPresent", "Never"]
+            }
+          }
+        },
+        "signingKeySecretName": {
+          "type": "string",
+          "maxLength": 253,
+          "pattern": "^$|^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?)*$"
+        },
+        "signingKeyKey": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 253,
+          "pattern": "^[-._A-Za-z0-9]+$"
+        },
+        "defaultRetentionDays": {"type": "integer", "minimum": 1, "maximum": 3650},
+        "maxRetentionDays": {"type": "integer", "minimum": 1, "maximum": 3650},
+        "maxFileBytes": {"type": "integer", "minimum": 1},
+        "maxArtifactBytes": {"type": "integer", "minimum": 1},
+        "maxRunBytes": {"type": "integer", "minimum": 1},
+        "persistence": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["enabled", "existingClaim", "storageClass", "accessModes", "size"],
+          "properties": {
+            "enabled": {"type": "boolean"},
+            "existingClaim": {
+              "type": "string",
+              "maxLength": 253,
+              "pattern": "^$|^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?([.][a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?)*$"
+            },
+            "storageClass": {"type": ["string", "null"], "minLength": 1, "maxLength": 253},
+            "accessModes": {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 3,
+              "uniqueItems": true,
+              "items": {"type": "string", "enum": ["ReadWriteOnce", "ReadWriteMany"]}
+            },
+            "size": {"type": "string", "minLength": 1, "maxLength": 64}
+          }
+        }
       }
     },
     "console": {

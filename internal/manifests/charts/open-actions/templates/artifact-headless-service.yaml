@@ -1,0 +1,19 @@
+{{- if .Values.artifacts.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: open-actions-artifacts-headless
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: open-actions
+    app.kubernetes.io/component: artifacts
+spec:
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: open-actions
+    app.kubernetes.io/component: artifacts
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+{{- end }}

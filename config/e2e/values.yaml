@@ -4,6 +4,13 @@ controller:
   githubAPIURL: http://github-fixture.open-actions-system.svc.cluster.local:8080/
   githubServerURL: http://github-fixture.open-actions-system.svc.cluster.local:8080
 
+artifacts:
+  image:
+    tag: e2e
+    pullPolicy: Never
+  persistence:
+    enabled: false
+
 console:
   publicURL: http://127.0.0.1:18082
   image:

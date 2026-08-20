@@ -20,6 +20,7 @@ import (
 const workflowPath = ".open-actions/workflows/ci.yaml"
 const preparationWorkflowPath = ".open-actions/workflows/preparation.yaml"
 const dynamicMatrixWorkflowPath = ".open-actions/workflows/dynamic-matrix.yaml"
+const artifactWorkflowPath = ".open-actions/workflows/artifacts.yaml"
 const fixtureJobToken = "fixture-job-token"
 const fixtureActionToken = "fixture-action-token"
 
@@ -102,6 +103,39 @@ jobs:
     runs-on: [ubuntu-latest, docker]
     steps:
       - run: test "${{ matrix.target }}" = first || test "${{ matrix.target }}" = second
+`
+
+const artifactWorkflowData = `name: Artifact exchange
+on: push
+jobs:
+  generate:
+    strategy:
+      matrix:
+        shard: [one, two]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create shard result
+        run: |
+          sleep 5
+          printf '%s\n' '${{ matrix.shard }}' > 'result-${{ matrix.shard }}.txt'
+      - uses: actions/upload-artifact@v7
+        with:
+          name: result-${{ matrix.shard }}
+          path: result-${{ matrix.shard }}.txt
+  aggregate:
+    needs: generate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: result-*
+          merge-multiple: true
+          path: artifacts
+      - name: Verify aggregation
+        run: |
+          test "$(cat artifacts/result-one.txt)" = one
+          test "$(cat artifacts/result-two.txt)" = two
+          printf 'artifact aggregation e2e works\n'
 `
 
 const pullRequestWorkflowPath = ".open-actions/workflows/pull-request.yaml"
@@ -373,6 +407,153 @@ fs.appendFileSync(process.env.GITHUB_OUTPUT, 'value=' + process.env['INPUT_MESSA
 fs.appendFileSync(process.env.GITHUB_STATE, 'marker=true\n');
 `
 
+const uploadArtifactMetadata = `name: Upload artifact fixture
+inputs:
+  name:
+    default: artifact
+  path:
+    required: true
+runs:
+  using: node24
+  main: dist/index.js
+`
+
+const uploadArtifactScript = `const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
+
+function backendIDs() {
+  const payload = JSON.parse(Buffer.from(process.env.ACTIONS_RUNTIME_TOKEN.split('.')[1], 'base64url').toString());
+  const scope = payload.scp.split(' ').find(value => value.startsWith('Actions.Results:')).split(':');
+  return {run: scope[1], job: scope[2]};
+}
+
+async function rpc(method, body) {
+  const response = await fetch(new URL('/twirp/github.actions.results.api.v1.ArtifactService/' + method, process.env.ACTIONS_RESULTS_URL), {
+    method: 'POST', headers: {'Authorization': 'Bearer ' + process.env.ACTIONS_RUNTIME_TOKEN, 'Content-Type': 'application/json'}, body: JSON.stringify(body)
+  });
+  const result = await response.json();
+  if (!response.ok) throw new Error(method + ': ' + result.msg);
+  return result;
+}
+
+function crc32(data) {
+  let crc = 0xffffffff;
+  for (const byte of data) {
+    crc ^= byte;
+    for (let bit = 0; bit < 8; bit++) crc = (crc >>> 1) ^ (crc & 1 ? 0xedb88320 : 0);
+  }
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+function zip(name, data) {
+  const fileName = Buffer.from(name);
+  const crc = crc32(data);
+  const local = Buffer.alloc(30);
+  local.writeUInt32LE(0x04034b50, 0); local.writeUInt16LE(20, 4); local.writeUInt16LE(0, 6); local.writeUInt16LE(0, 8);
+  local.writeUInt32LE(crc, 14); local.writeUInt32LE(data.length, 18); local.writeUInt32LE(data.length, 22); local.writeUInt16LE(fileName.length, 26);
+  const central = Buffer.alloc(46);
+  central.writeUInt32LE(0x02014b50, 0); central.writeUInt16LE(20, 4); central.writeUInt16LE(20, 6); central.writeUInt16LE(0, 8); central.writeUInt16LE(0, 10);
+  central.writeUInt32LE(crc, 16); central.writeUInt32LE(data.length, 20); central.writeUInt32LE(data.length, 24); central.writeUInt16LE(fileName.length, 28);
+  const end = Buffer.alloc(22);
+  end.writeUInt32LE(0x06054b50, 0); end.writeUInt16LE(1, 8); end.writeUInt16LE(1, 10);
+  end.writeUInt32LE(central.length + fileName.length, 12); end.writeUInt32LE(local.length + fileName.length + data.length, 16);
+  return Buffer.concat([local, fileName, data, central, fileName, end]);
+}
+
+async function run() {
+  const name = process.env.INPUT_NAME || 'artifact';
+  const source = path.resolve(process.env.GITHUB_WORKSPACE, process.env.INPUT_PATH);
+  const content = zip(path.basename(source), fs.readFileSync(source));
+  const ids = backendIDs();
+  const created = await rpc('CreateArtifact', {workflow_run_backend_id: ids.run, workflow_job_run_backend_id: ids.job, name, version: 7, mime_type: 'application/zip'});
+  const blockID = Buffer.from('block-0001').toString('base64');
+  const upload = new URL(created.signed_upload_url);
+  upload.searchParams.set('comp', 'block'); upload.searchParams.set('blockid', blockID);
+  let response = await fetch(upload, {method: 'PUT', body: content, headers: {'Content-Type': 'application/octet-stream', 'x-ms-version': '2021-12-02'}});
+  if (!response.ok) throw new Error('stage block: ' + response.status);
+  upload.searchParams.set('comp', 'blocklist'); upload.searchParams.delete('blockid');
+  response = await fetch(upload, {method: 'PUT', body: '<BlockList><Latest>' + blockID + '</Latest></BlockList>', headers: {'Content-Type': 'application/xml', 'x-ms-version': '2021-12-02'}});
+  if (!response.ok) throw new Error('commit block list: ' + response.status);
+  const digest = 'sha256:' + crypto.createHash('sha256').update(content).digest('hex');
+  const finalized = await rpc('FinalizeArtifact', {workflow_run_backend_id: ids.run, workflow_job_run_backend_id: ids.job, name, size: String(content.length), hash: digest});
+  fs.appendFileSync(process.env.GITHUB_OUTPUT, 'artifact-id=' + finalized.artifact_id + '\nartifact-digest=' + digest + '\n');
+  console.log('artifact ' + name + ' uploaded');
+}
+
+run().catch(error => { console.error(error); process.exitCode = 1; });
+`
+
+const downloadArtifactMetadata = `name: Download artifact fixture
+inputs:
+  name:
+    required: false
+  pattern:
+    required: false
+  path:
+    required: false
+  merge-multiple:
+    default: "false"
+runs:
+  using: node24
+  main: dist/index.js
+`
+
+const downloadArtifactScript = `const fs = require('fs');
+const path = require('path');
+
+function backendIDs() {
+  const payload = JSON.parse(Buffer.from(process.env.ACTIONS_RUNTIME_TOKEN.split('.')[1], 'base64url').toString());
+  const scope = payload.scp.split(' ').find(value => value.startsWith('Actions.Results:')).split(':');
+  return {run: scope[1], job: scope[2]};
+}
+
+async function rpc(method, body) {
+  const response = await fetch(new URL('/twirp/github.actions.results.api.v1.ArtifactService/' + method, process.env.ACTIONS_RESULTS_URL), {
+    method: 'POST', headers: {'Authorization': 'Bearer ' + process.env.ACTIONS_RUNTIME_TOKEN, 'Content-Type': 'application/json'}, body: JSON.stringify(body)
+  });
+  const result = await response.json();
+  if (!response.ok) throw new Error(method + ': ' + result.msg);
+  return result;
+}
+
+function extract(archive, destination) {
+  let offset = 0;
+  while (archive.readUInt32LE(offset) === 0x04034b50) {
+    const size = archive.readUInt32LE(offset + 18);
+    const nameLength = archive.readUInt16LE(offset + 26);
+    const extraLength = archive.readUInt16LE(offset + 28);
+    const name = archive.subarray(offset + 30, offset + 30 + nameLength).toString();
+    if (path.basename(name) !== name) throw new Error('unsafe artifact path');
+    const start = offset + 30 + nameLength + extraLength;
+    fs.mkdirSync(destination, {recursive: true});
+    fs.writeFileSync(path.join(destination, name), archive.subarray(start, start + size));
+    offset = start + size;
+  }
+}
+
+async function run() {
+  const ids = backendIDs();
+  const listed = await rpc('ListArtifacts', {workflow_run_backend_id: ids.run, workflow_job_run_backend_id: ids.job});
+  const name = process.env.INPUT_NAME || '';
+  const pattern = process.env.INPUT_PATTERN || '';
+  const expression = pattern ? new RegExp('^' + pattern.replace(/[.+?^${}()|[\]\\]/g, '\\$&').replaceAll('*', '.*') + '$') : null;
+  const artifacts = listed.artifacts.filter(artifact => name ? artifact.name === name : !expression || expression.test(artifact.name));
+  const root = path.resolve(process.env.GITHUB_WORKSPACE, process.env.INPUT_PATH || '.');
+  for (const artifact of artifacts) {
+    const signed = await rpc('GetSignedArtifactURL', {workflow_run_backend_id: ids.run, workflow_job_run_backend_id: artifact.workflow_job_run_backend_id, name: artifact.name});
+    const response = await fetch(signed.signed_url);
+    if (!response.ok) throw new Error('download artifact: ' + response.status);
+    const destination = process.env['INPUT_MERGE-MULTIPLE'] === 'true' || artifacts.length === 1 ? root : path.join(root, artifact.name);
+    extract(Buffer.from(await response.arrayBuffer()), destination);
+  }
+  fs.appendFileSync(process.env.GITHUB_OUTPUT, 'download-path=' + root + '\n');
+  console.log('downloaded ' + artifacts.length + ' artifacts');
+}
+
+run().catch(error => { console.error(error); process.exitCode = 1; });
+`
+
 const compositeMetadata = `name: Composite fixture
 inputs:
   message:
@@ -521,6 +702,9 @@ func main() {
 	mux.HandleFunc("/repos/acme/example/contents/"+dynamicMatrixWorkflowPath, func(writer http.ResponseWriter, _ *http.Request) {
 		writeJSON(writer, map[string]string{"encoding": "base64", "content": base64.StdEncoding.EncodeToString([]byte(dynamicMatrixWorkflowData))})
 	})
+	mux.HandleFunc("/repos/acme/example/contents/"+artifactWorkflowPath, func(writer http.ResponseWriter, _ *http.Request) {
+		writeJSON(writer, map[string]string{"encoding": "base64", "content": base64.StdEncoding.EncodeToString([]byte(artifactWorkflowData))})
+	})
 	checkRunMutex := sync.RWMutex{}
 	checkRuns := map[string]map[string]any{}
 	recordCheckRun := func(writer http.ResponseWriter, request *http.Request) {
@@ -651,6 +835,16 @@ func createRepositories(dataDirectory string) (fixtureRevisions, error) {
 	}
 	if _, err := createRepository(dataDirectory, "actions", "composite", "v1", map[string]string{
 		"action.yml": compositeMetadata,
+	}); err != nil {
+		return fixtureRevisions{}, err
+	}
+	if _, err := createRepository(dataDirectory, "actions", "upload-artifact", "v7", map[string]string{
+		"action.yml": uploadArtifactMetadata, "dist/index.js": uploadArtifactScript,
+	}); err != nil {
+		return fixtureRevisions{}, err
+	}
+	if _, err := createRepository(dataDirectory, "actions", "download-artifact", "v8", map[string]string{
+		"action.yml": downloadArtifactMetadata, "dist/index.js": downloadArtifactScript,
 	}); err != nil {
 		return fixtureRevisions{}, err
 	}

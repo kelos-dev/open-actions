@@ -130,7 +130,14 @@ open-actions-controller \
   --github-server-url=https://github.example \
   --action-clone-base-url=https://github.example \
   --max-job-timeout=6h \
-  --console-url=https://actions.example
+  --console-url=https://actions.example \
+  --artifact-service-url=http://open-actions-artifacts.open-actions-system.svc \
+  --artifact-signing-key-file=/var/run/secrets/open-actions-artifacts/signing-key
+
+open-actions-artifact-server \
+  --public-url=http://open-actions-artifacts.open-actions-system.svc \
+  --storage-directory=/var/lib/open-actions/artifacts \
+  --signing-key-file=/var/run/secrets/open-actions-artifacts/signing-key
 
 open-actions-console \
   --token-file=/var/run/secrets/open-actions-console/token \
@@ -910,6 +917,93 @@ Names, branch patterns, action references, paths, map keys, and values are also
 bounded during workflow validation. Field and aggregate content limits are
 reapplied after expression evaluation before a step executes.
 
+### Workflow artifacts
+
+Open Actions supports the Results Service protocol used by pinned
+`actions/upload-artifact` majors 4 through 7 and
+`actions/download-artifact` majors 4 through 8. Artifact operations without a
+`github-token` are scoped to the current WorkflowRun attempt. Cross-repository
+and cross-run downloads through GitHub's artifact REST API are not supported.
+
+Each job receives `ACTIONS_RESULTS_URL` and an `ACTIONS_RUNTIME_TOKEN`. The
+controller mints the token immediately before creating the native Job and sets
+its lifetime to the job's effective, capped execution timeout plus five-minute
+startup and cleanup allowances. The token is held in the job's owned
+authentication Secret and is removed after the job finishes. The signed token
+remains valid until its expiry, including if the authentication Secret is
+deleted.
+Its scope includes the Project UID, GitHub repository ID, WorkflowRun lineage
+and attempt, WorkflowRun UID, and WorkflowJob UID.
+Jobs in one attempt may list and download artifacts finalized by other jobs in
+that attempt; requests cannot use it to cross Projects, repositories, lineages,
+or attempts. Anyone who can read a job authentication Secret can impersonate
+that job until the token expires. Signed upload and
+download URLs grant access only to one artifact and operation, expire with the
+job credential, and do not contain the runtime token. Artifact bytes and
+metadata are stored on the artifact volume, not in Kubernetes API objects.
+The chart exposes the service only through a cluster-internal `ClusterIP` and
+uses HTTP inside the cluster. Treat the job network as trusted or apply network
+policies that restrict access to the artifact service; do not expose that
+Service externally without a TLS-terminating, access-controlled ingress.
+
+Artifact names are immutable and unique within an attempt. A second upload
+with the same name receives a conflict. `overwrite: true` uses the action's
+delete-then-create behavior and assigns a new artifact ID. Concurrent matrix
+jobs should therefore include a matrix value in each artifact name. Downloads
+by name select that unique finalized artifact; omitted names and `pattern`
+inputs can aggregate multiple finalized artifacts in a dependent job. Missing
+names fail through the action's normal `ArtifactNotFound` behavior.
+The `artifact-id` and `artifact-digest` outputs are supported. The
+GitHub-shaped `artifact-url` output is informational only because Open Actions
+does not provide GitHub's web or REST artifact-download route.
+
+File globbing, hidden-file selection, and `if-no-files-found` behavior are
+implemented by the pinned upload action. Archive creation and extraction are
+implemented by the pinned upload and download actions. Before accepting a ZIP,
+the service fully reads every entry and rejects absolute or parent-relative
+paths, backslashes, duplicate or conflicting paths, links, non-regular entries,
+invalid archives, and content over the configured limits. Raw uploads are
+stored under the validated artifact name. The official uploader dereferences a
+selected symbolic link before creating its archive; workflows must not select
+a link whose target should not be published.
+
+The default limits are 1 GiB for one uncompressed file, 2 GiB for one stored or
+uncompressed artifact, 10 GiB of stored artifacts for one run attempt, and 500
+artifacts created by one job. Limits are enforced while blocks are staged and
+again when an archive is committed. Artifact IDs, sizes, and SHA-256 digests
+are verified during idempotent finalization. The defaults retain artifacts for
+7 days and cap `retention-days` at 30 days. Expired artifacts and unfinished
+uploads older than one hour are removed on access and by an hourly idempotent
+cleanup pass; cleanup resumes after artifact service restarts. Deleting a
+WorkflowRun does not delete its artifacts before their artifact retention
+expires.
+
+The Helm chart enables a standalone artifact service as a one-replica
+StatefulSet. Its volume claim template provisions a 20 GiB `ReadWriteOnce`
+PersistentVolumeClaim by default and retains that claim when the StatefulSet is
+deleted or scaled down. The StatefulSet replaces its only Pod sequentially;
+its headless Service governs Pod identity, while workflow jobs use the separate
+`open-actions-artifacts` ClusterIP Service. Controller rollouts do not interrupt
+uploads or cleanup. The artifact service does not use the Kubernetes API and
+its service account token is not mounted.
+
+The controller and artifact service share a credential signing key. By default,
+the chart generates that key in the
+`open-actions-artifact-auth` Secret. Set `artifacts.signingKeySecretName` and
+`artifacts.signingKeyKey` to use an externally managed key of at least 32 bytes.
+Anyone who can read the key can mint artifact credentials. After rotating an
+external key, restart the `open-actions-controller` Deployment and
+`open-actions-artifacts` StatefulSet; tokens and signed URLs issued with the
+previous key stop working.
+
+Set
+`artifacts.persistence.existingClaim` to use a provisioned claim, or configure
+its storage class, access modes, and size through the chart. The PVC must have
+capacity for all retained attempts, not just the per-attempt limit. Disabling
+artifact persistence uses an `emptyDir` and is intended only for disposable
+test clusters because Pod replacement loses stored artifacts. Set
+`artifacts.enabled=false` to omit the service and runtime credentials.
+
 ### Execution constraints
 
 External actions must use the `node20`, `node24`, or composite runtime and be
@@ -947,8 +1041,8 @@ always the latest result version supported by the runner binary. Integration
 commit construction is part of this versioned contract; changing its merge
 behavior or commit metadata requires a job-plan version transition.
 
-Docker and local actions, service containers, caches, and artifacts are not
-supported. Expressions outside the documented
+Docker and local actions, matrix `include` and `exclude`, service containers,
+and caches are not supported. Expressions outside the documented
 fields and runtime contexts are rejected during planning or execution and are
 never interpreted as literal values.
 `WorkflowJob` resources are not retried or reassigned when a Runner is removed.

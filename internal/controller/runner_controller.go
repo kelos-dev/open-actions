@@ -11,6 +11,7 @@ import (
 	"time"
 
 	actionsv1alpha1 "github.com/kelos-dev/open-actions/api/v1alpha1"
+	"github.com/kelos-dev/open-actions/internal/artifact"
 	"github.com/kelos-dev/open-actions/internal/eventsnapshot"
 	githubclient "github.com/kelos-dev/open-actions/internal/github"
 	"github.com/kelos-dev/open-actions/internal/runner"
@@ -73,10 +74,13 @@ type workflowJobCancellation struct {
 
 type RunnerReconciler struct {
 	client.Client
-	APIReader     client.Reader
-	GitHub        *githubclient.Client
-	MaxJobTimeout time.Duration
-	Recorder      events.EventRecorder
+	APIReader                client.Reader
+	GitHub                   *githubclient.Client
+	MaxJobTimeout            time.Duration
+	Recorder                 events.EventRecorder
+	ArtifactResultsURL       string
+	ArtifactMaxRetentionDays int
+	ArtifactTokens           *artifact.TokenCodec
 }
 
 func (r *RunnerReconciler) Reconcile(ctx context.Context, request ctrl.Request) (ctrl.Result, error) {
@@ -522,7 +526,31 @@ func (r *RunnerReconciler) executeWorkflowJob(ctx context.Context, runnerObject 
 	} else if cancellation != nil {
 		return true, r.cancelWorkflowJob(ctx, workflowJob, cancellation)
 	}
-	if err := r.ensureAuthSecret(ctx, workflowJob, jobInstallation.Token(), actionInstallation.Token()); err != nil {
+	artifactToken := ""
+	if r.ArtifactResultsURL != "" {
+		if r.ArtifactTokens == nil {
+			return false, errors.New("artifact token codec is not configured")
+		}
+		attempt := int32(1)
+		if run.Spec.Rerun != nil {
+			attempt = run.Spec.Rerun.Attempt
+		}
+		rootRunUID := run.Labels[actionsv1alpha1.LabelWorkflowRunRootUID]
+		if rootRunUID == "" {
+			rootRunUID = string(run.UID)
+		}
+		artifactToken, err = r.ArtifactTokens.NewRuntimeToken(time.Now(), r.artifactTokenLifetime(workflowJob), artifact.TokenClaims{
+			Scope: artifact.Scope{
+				ProjectUID: string(project.UID), RepositoryID: githubSource.Repository.ID,
+				RootRunUID: rootRunUID, RunUID: string(run.UID), Attempt: attempt,
+			},
+			WorkflowRunBackendID: string(run.UID), WorkflowJobBackendID: string(workflowJob.UID),
+		})
+		if err != nil {
+			return false, fmt.Errorf("create artifact token for WorkflowJob %q: %w", workflowJob.Name, err)
+		}
+	}
+	if err := r.ensureAuthSecret(ctx, workflowJob, jobInstallation.Token(), actionInstallation.Token(), artifactToken); err != nil {
 		return false, err
 	}
 	nativeJob, err := r.buildJob(workflowJob, run, project, runnerObject)
@@ -756,7 +784,7 @@ func (r *RunnerReconciler) cleanupAuthSecret(ctx context.Context, workflowJob *a
 	return nil
 }
 
-func (r *RunnerReconciler) ensureAuthSecret(ctx context.Context, workflowJob *actionsv1alpha1.WorkflowJob, jobToken, actionToken string) error {
+func (r *RunnerReconciler) ensureAuthSecret(ctx context.Context, workflowJob *actionsv1alpha1.WorkflowJob, jobToken, actionToken, artifactToken string) error {
 	secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{
 		Name:      childName(workflowJob.Name, "auth"),
 		Namespace: workflowJob.Namespace,
@@ -765,6 +793,9 @@ func (r *RunnerReconciler) ensureAuthSecret(ctx context.Context, workflowJob *ac
 			actionsv1alpha1.LabelWorkflowJobUID: string(workflowJob.UID),
 		},
 	}, Data: map[string][]byte{jobTokenSecretKey: []byte(jobToken), actionTokenSecretKey: []byte(actionToken)}}
+	if artifactToken != "" {
+		secret.Data[artifact.TokenSecretKey] = []byte(artifactToken)
+	}
 	if err := controllerutil.SetControllerReference(workflowJob, secret, r.Scheme()); err != nil {
 		return err
 	}
@@ -793,10 +824,30 @@ func (r *RunnerReconciler) ensureAuthSecret(ctx context.Context, workflowJob *ac
 	}
 	existing.Data[jobTokenSecretKey] = []byte(jobToken)
 	existing.Data[actionTokenSecretKey] = []byte(actionToken)
+	if artifactToken != "" {
+		existing.Data[artifact.TokenSecretKey] = []byte(artifactToken)
+	} else {
+		delete(existing.Data, artifact.TokenSecretKey)
+	}
 	if apiEquality.Semantic.DeepEqual(before, existing) {
 		return nil
 	}
 	return r.Patch(ctx, existing, client.MergeFrom(before))
+}
+
+func (r *RunnerReconciler) effectiveJobTimeout(workflowJob *actionsv1alpha1.WorkflowJob) time.Duration {
+	timeout := time.Duration(workflowJob.Spec.TimeoutSeconds) * time.Second
+	if timeout == 0 {
+		timeout = defaultJobTimeout
+	}
+	if maximum := configuredMaxJobTimeout(r.MaxJobTimeout); timeout > maximum {
+		timeout = maximum
+	}
+	return timeout
+}
+
+func (r *RunnerReconciler) artifactTokenLifetime(workflowJob *actionsv1alpha1.WorkflowJob) time.Duration {
+	return r.effectiveJobTimeout(workflowJob) + jobStartTimeout + runner.CleanupTimeout
 }
 
 func (r *RunnerReconciler) buildJob(workflowJob *actionsv1alpha1.WorkflowJob, run *actionsv1alpha1.WorkflowRun, project *actionsv1alpha1.Project, runnerObject *actionsv1alpha1.Runner) (*batchv1.Job, error) {
@@ -811,13 +862,7 @@ func (r *RunnerReconciler) buildJob(workflowJob *actionsv1alpha1.WorkflowJob, ru
 	if workflowJob.Spec.DisplayName != "" {
 		annotations[actionsv1alpha1.AnnotationWorkflowJobDisplayName] = workflowJob.Spec.DisplayName
 	}
-	timeoutSeconds := workflowJob.Spec.TimeoutSeconds
-	if timeoutSeconds == 0 {
-		timeoutSeconds = int64(defaultJobTimeout / time.Second)
-	}
-	if maximumSeconds := int64(configuredMaxJobTimeout(r.MaxJobTimeout) / time.Second); timeoutSeconds > maximumSeconds {
-		timeoutSeconds = maximumSeconds
-	}
+	timeoutSeconds := int64(r.effectiveJobTimeout(workflowJob) / time.Second)
 	cleanupTimeoutSeconds := int64(runner.CleanupTimeout / time.Second)
 	podTemplate := corev1.PodTemplateSpec{
 		ObjectMeta: metav1.ObjectMeta{Labels: labels, Annotations: annotations},
@@ -899,6 +944,16 @@ func (r *RunnerReconciler) buildJob(workflowJob *actionsv1alpha1.WorkflowJob, ru
 		container.Args = append(container.Args, "--needs-file="+jobNeedsMountPath+"/"+jobNeedsKey)
 	}
 	configureProjectValues(&podTemplate.Spec, &podTemplate.Spec.Containers[0], project)
+	if r.ArtifactResultsURL != "" {
+		container := &podTemplate.Spec.Containers[0]
+		container.Env = append(container.Env,
+			corev1.EnvVar{Name: runner.ArtifactTokenEnvVar, ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
+				LocalObjectReference: corev1.LocalObjectReference{Name: childName(workflowJob.Name, "auth")}, Key: artifact.TokenSecretKey,
+			}}},
+			corev1.EnvVar{Name: runner.ArtifactResultsURLEnvVar, Value: r.ArtifactResultsURL},
+			corev1.EnvVar{Name: "GITHUB_RETENTION_DAYS", Value: strconv.Itoa(r.ArtifactMaxRetentionDays)},
+		)
+	}
 	backoffLimit := int32(0)
 	job := &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
@@ -1409,6 +1464,13 @@ func nativeJobLabels(workflowJob *actionsv1alpha1.WorkflowJob, run *actionsv1alp
 		actionsv1alpha1.LabelWorkflowJobUID: string(workflowJob.UID),
 		actionsv1alpha1.LabelWorkflowJob:    workflowJob.Labels[actionsv1alpha1.LabelWorkflowJob],
 	}
+}
+
+func workflowRunAttempt(run *actionsv1alpha1.WorkflowRun) int {
+	if run.Spec.Rerun != nil {
+		return int(run.Spec.Rerun.Attempt)
+	}
+	return 1
 }
 
 func jobResult(job *batchv1.Job) metav1.ConditionStatus {

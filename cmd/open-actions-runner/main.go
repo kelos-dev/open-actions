@@ -60,16 +60,18 @@ func run(ctx context.Context, arguments []string) error {
 	}
 	githubToken := os.Getenv(runner.GitHubTokenEnvVar)
 	actionToken := os.Getenv(runner.ActionTokenEnvVar)
+	artifactToken := os.Getenv(runner.ArtifactTokenEnvVar)
 	environment := withoutEnvironmentVariables(os.Environ(), runner.GitHubTokenEnvVar, runner.ActionTokenEnvVar)
 	executor, err := runner.NewExecutor(runner.ExecutorConfig{
-		Logger:      slog.New(slog.NewJSONHandler(os.Stdout, nil)),
-		GitHubToken: githubToken,
-		ActionToken: actionToken,
-		Secrets:     secrets,
-		Variables:   variables,
-		Environment: environment,
-		Stdout:      os.Stdout,
-		Stderr:      os.Stderr,
+		Logger:        slog.New(slog.NewJSONHandler(os.Stdout, nil)),
+		GitHubToken:   githubToken,
+		ActionToken:   actionToken,
+		ArtifactToken: artifactToken,
+		Secrets:       secrets,
+		Variables:     variables,
+		Environment:   environment,
+		Stdout:        os.Stdout,
+		Stderr:        os.Stderr,
 	})
 	if err != nil {
 		return err

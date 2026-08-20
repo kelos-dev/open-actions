@@ -10,6 +10,7 @@ import (
 	"time"
 
 	actionsv1alpha1 "github.com/kelos-dev/open-actions/api/v1alpha1"
+	"github.com/kelos-dev/open-actions/internal/artifact"
 	"github.com/kelos-dev/open-actions/internal/eventsnapshot"
 	"github.com/kelos-dev/open-actions/internal/runner"
 	batchv1 "k8s.io/api/batch/v1"
@@ -204,6 +205,15 @@ func TestRunnerUsesDefaultDeadlineWhenWorkflowJobOmitsTimeout(t *testing.T) {
 	}
 }
 
+func TestArtifactTokenLifetimeCoversEffectiveJobLifetime(t *testing.T) {
+	reconciler := &RunnerReconciler{MaxJobTimeout: 2 * time.Hour}
+	workflowJob := &actionsv1alpha1.WorkflowJob{Spec: actionsv1alpha1.WorkflowJobSpec{TimeoutSeconds: 3 * 60 * 60}}
+	want := 2*time.Hour + jobStartTimeout + runner.CleanupTimeout
+	if got := reconciler.artifactTokenLifetime(workflowJob); got != want {
+		t.Fatalf("artifact token lifetime = %s, want %s", got, want)
+	}
+}
+
 func TestRunnerMountsNeedsContextForDependentJob(t *testing.T) {
 	scheme := runnerTestScheme(t)
 	reconciler := &RunnerReconciler{Client: fake.NewClientBuilder().WithScheme(scheme).Build()}
@@ -268,6 +278,38 @@ func TestRunnerBuildsJobWithProjectValues(t *testing.T) {
 	}
 	if variables == nil || variables.Name != "project-variables" {
 		t.Fatalf("variable volume = %#v", variables)
+	}
+}
+
+func TestRunnerBuildsJobWithArtifactCredential(t *testing.T) {
+	scheme := runnerTestScheme(t)
+	reconciler := &RunnerReconciler{
+		Client:                   fake.NewClientBuilder().WithScheme(scheme).Build(),
+		ArtifactResultsURL:       "http://open-actions-artifacts.open-actions-system.svc",
+		ArtifactMaxRetentionDays: 30,
+	}
+	run := &actionsv1alpha1.WorkflowRun{}
+	workflowJob := &actionsv1alpha1.WorkflowJob{ObjectMeta: metav1.ObjectMeta{Name: "build", Namespace: "default", UID: types.UID("job-uid")}}
+	runnerObject := &actionsv1alpha1.Runner{Spec: actionsv1alpha1.RunnerSpec{Execution: actionsv1alpha1.RunnerExecutionSpec{Image: "runner:test"}}}
+	job, err := reconciler.buildJob(workflowJob, run, &actionsv1alpha1.Project{}, runnerObject)
+	if err != nil {
+		t.Fatal(err)
+	}
+	environment := map[string]corev1.EnvVar{}
+	for _, variable := range job.Spec.Template.Spec.Containers[0].Env {
+		environment[variable.Name] = variable
+	}
+	if environment[runner.ArtifactResultsURLEnvVar].Value != reconciler.ArtifactResultsURL || environment["GITHUB_RETENTION_DAYS"].Value != "30" {
+		t.Fatalf("artifact environment = %#v", environment)
+	}
+	for _, name := range []string{"GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT"} {
+		if _, found := environment[name]; found {
+			t.Fatalf("artifact environment contains runner-owned variable %q", name)
+		}
+	}
+	token := environment[runner.ArtifactTokenEnvVar].ValueFrom
+	if token == nil || token.SecretKeyRef == nil || token.SecretKeyRef.Name != childName(workflowJob.Name, "auth") || token.SecretKeyRef.Key != artifact.TokenSecretKey {
+		t.Fatalf("artifact token source = %#v", token)
 	}
 }
 
@@ -1634,7 +1676,7 @@ func TestEnsureAuthSecretStoresRunnerTokens(t *testing.T) {
 	}
 	clusterClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(workflowJob).Build()
 	reconciler := &RunnerReconciler{Client: clusterClient, APIReader: clusterClient}
-	if err := reconciler.ensureAuthSecret(context.Background(), workflowJob, "job-token", "action-token"); err != nil {
+	if err := reconciler.ensureAuthSecret(context.Background(), workflowJob, "job-token", "action-token", "artifact-token"); err != nil {
 		t.Fatal(err)
 	}
 	secret := &corev1.Secret{}
@@ -1643,6 +1685,9 @@ func TestEnsureAuthSecretStoresRunnerTokens(t *testing.T) {
 	}
 	if string(secret.Data[jobTokenSecretKey]) != "job-token" || string(secret.Data[actionTokenSecretKey]) != "action-token" {
 		t.Fatalf("authentication Secret data = %#v", secret.Data)
+	}
+	if string(secret.Data[artifact.TokenSecretKey]) != "artifact-token" {
+		t.Fatalf("artifact token = %q", secret.Data[artifact.TokenSecretKey])
 	}
 }
 
@@ -1658,7 +1703,7 @@ func TestEnsureAuthSecretRejectsUnownedCollision(t *testing.T) {
 	}
 	clusterClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(workflowJob, secret).Build()
 	reconciler := &RunnerReconciler{Client: clusterClient, APIReader: clusterClient}
-	if err := reconciler.ensureAuthSecret(context.Background(), workflowJob, "replacement", "action-replacement"); err == nil {
+	if err := reconciler.ensureAuthSecret(context.Background(), workflowJob, "replacement", "action-replacement", "artifact-replacement"); err == nil {
 		t.Fatal("unowned authentication Secret was accepted")
 	}
 	stored := &corev1.Secret{}
