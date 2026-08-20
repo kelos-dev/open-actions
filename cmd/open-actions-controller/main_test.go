@@ -33,6 +33,28 @@ func TestRunManagerRejectsInvalidEndpointURLs(t *testing.T) {
 	}
 }
 
+func TestNormalizeActionCloneBaseURL(t *testing.T) {
+	for _, tt := range []struct {
+		name            string
+		value           string
+		githubServerURL string
+		want            string
+	}{
+		{name: "GitHub server URL", githubServerURL: "https://github.example", want: "https://github.example"},
+		{name: "explicit URL", value: "https://actions.example/git/", githubServerURL: "https://github.example", want: "https://actions.example/git"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := normalizeActionCloneBaseURL(tt.value, tt.githubServerURL)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != tt.want {
+				t.Fatalf("normalizeActionCloneBaseURL() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestWebhookServerRunsWithoutLeaderElectionAndTracksReadiness(t *testing.T) {
 	runnable := &webhookServer{
 		server: &http.Server{Addr: "127.0.0.1:0", Handler: http.NotFoundHandler()},

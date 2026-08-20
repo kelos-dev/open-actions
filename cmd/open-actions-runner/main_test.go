@@ -25,7 +25,9 @@ func TestRunWritesWorkflowJobResult(t *testing.T) {
 		JobID:        "build",
 		Outputs:      map[string]string{"value": "${{ steps.producer.outputs.value }}"},
 		Steps: []runner.Step{{
-			ID: "producer", Run: `echo 'value=ready' >> "$GITHUB_OUTPUT"`,
+			ID: "producer", Run: `test -z "$OPEN_ACTIONS_GITHUB_TOKEN"
+test -z "$OPEN_ACTIONS_ACTION_TOKEN"
+echo 'value=ready' >> "$GITHUB_OUTPUT"`,
 		}},
 	}
 	planData, err := json.Marshal(plan)
@@ -37,7 +39,8 @@ func TestRunWritesWorkflowJobResult(t *testing.T) {
 		t.Fatal(err)
 	}
 	resultPath := filepath.Join(directory, "result.json")
-	t.Setenv("OPEN_ACTIONS_GITHUB_TOKEN", "installation-token")
+	t.Setenv(runner.GitHubTokenEnvVar, "installation-token")
+	t.Setenv(runner.ActionTokenEnvVar, "action-installation-token")
 	if err := run(context.Background(), []string{"--job-file=" + planPath, "--result-file=" + resultPath, "--workspace=" + filepath.Join(directory, "workspace")}); err != nil {
 		t.Fatal(err)
 	}
@@ -54,16 +57,21 @@ func TestRunWritesWorkflowJobResult(t *testing.T) {
 	}
 }
 
-func TestWithoutEnvironmentVariable(t *testing.T) {
-	environment := withoutEnvironmentVariable([]string{
+func TestWithoutEnvironmentVariables(t *testing.T) {
+	environment := withoutEnvironmentVariables([]string{
 		"PATH=/usr/bin",
 		"OPEN_ACTIONS_GITHUB_TOKEN=secret",
 		"OPEN_ACTIONS_GITHUB_TOKEN_BACKUP=preserved",
-	}, "OPEN_ACTIONS_GITHUB_TOKEN")
+		"OPEN_ACTIONS_ACTION_TOKEN=secret",
+		"OPEN_ACTIONS_ACTION_TOKEN_BACKUP=preserved",
+	}, runner.GitHubTokenEnvVar, runner.ActionTokenEnvVar)
 	if slices.Contains(environment, "OPEN_ACTIONS_GITHUB_TOKEN=secret") {
 		t.Fatal("filtered environment contains the GitHub token")
 	}
-	if !slices.Contains(environment, "PATH=/usr/bin") || !slices.Contains(environment, "OPEN_ACTIONS_GITHUB_TOKEN_BACKUP=preserved") {
+	if slices.Contains(environment, "OPEN_ACTIONS_ACTION_TOKEN=secret") {
+		t.Fatal("filtered environment contains the action token")
+	}
+	if !slices.Contains(environment, "PATH=/usr/bin") || !slices.Contains(environment, "OPEN_ACTIONS_GITHUB_TOKEN_BACKUP=preserved") || !slices.Contains(environment, "OPEN_ACTIONS_ACTION_TOKEN_BACKUP=preserved") {
 		t.Fatalf("filtered environment = %#v", environment)
 	}
 }

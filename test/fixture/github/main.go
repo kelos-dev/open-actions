@@ -18,6 +18,9 @@ import (
 )
 
 const workflowPath = ".open-actions/workflows/ci.yaml"
+const preparationWorkflowPath = ".open-actions/workflows/preparation.yaml"
+const fixtureJobToken = "fixture-job-token"
+const fixtureActionToken = "fixture-action-token"
 
 const workflowData = `name: Fixture CI
 on:
@@ -62,6 +65,21 @@ jobs:
     steps:
       - run: printf 'dependency graph e2e works\n'
 `
+
+const preparationSteps = `      - name: Block action downloads
+        run: |
+          curl --silent --show-error --fail --request POST "$GITHUB_SERVER_URL/fixture/block-preparation-actions"
+          printf 'action downloads blocked after preparation\n'
+      - uses: preparation-actions/composite@v1
+        with:
+          message: prepared before steps
+      - name: Verify prepared actions
+        run: |
+          test "$PREPARATION_VALUE" = "prepared before steps"
+          printf 'prepared action graph e2e works\n'
+`
+
+var preparationWorkflowData = strings.Replace(workflowData, "    steps:\n", "    steps:\n"+preparationSteps, 1)
 
 const pullRequestWorkflowPath = ".open-actions/workflows/pull-request.yaml"
 
@@ -354,6 +372,24 @@ runs:
       shell: bash
 `
 
+const preparationCompositeMetadata = `name: Preparation composite fixture
+inputs:
+  message:
+    required: true
+runs:
+  using: composite
+  steps:
+    - id: marker
+      uses: preparation-actions/marker@v1
+      with:
+        message: ${{ inputs.message }}
+    - name: Export preparation result
+      run: |
+        printf 'PREPARATION_VALUE=%s\n' "${{ steps.marker.outputs.value }}" >> "$GITHUB_ENV"
+        printf 'external preparation composite run\n'
+      shell: bash
+`
+
 func main() {
 	dataDirectory := flag.String("data-dir", "/data", "Directory used for fixture Git repositories")
 	listenAddress := flag.String("listen-address", ":8080", "HTTP listen address")
@@ -375,15 +411,49 @@ func main() {
 			"GIT_PROJECT_ROOT=" + filepath.Join(*dataDirectory, "git"),
 		},
 	}
-	mux.Handle("/acme/", http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-		if count := len(request.Header.Values("Authorization")); count != 1 {
-			http.Error(writer, fmt.Sprintf("expected one Authorization header, got %d", count), http.StatusBadRequest)
+	authenticatedGitBackend := func(token string) http.Handler {
+		return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+			authorizations := request.Header.Values("Authorization")
+			expected := "basic " + base64.StdEncoding.EncodeToString([]byte("x-access-token:"+token))
+			if len(authorizations) != 1 || authorizations[0] != expected {
+				http.Error(writer, fmt.Sprintf("unexpected Authorization headers: %d", len(authorizations)), http.StatusUnauthorized)
+				return
+			}
+			gitBackend.ServeHTTP(writer, request)
+		})
+	}
+	jobGitBackend := authenticatedGitBackend(fixtureJobToken)
+	actionGitBackend := authenticatedGitBackend(fixtureActionToken)
+	mux.Handle("/acme/", jobGitBackend)
+	mux.Handle("/actions/", actionGitBackend)
+	mux.Handle("/helm/", actionGitBackend)
+	preparationActionsMutex := sync.RWMutex{}
+	preparationActionsBlocked := false
+	mux.Handle("/preparation-actions/", http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		preparationActionsMutex.RLock()
+		blocked := preparationActionsBlocked
+		preparationActionsMutex.RUnlock()
+		if blocked {
+			http.Error(writer, "preparation action downloads are blocked", http.StatusServiceUnavailable)
 			return
 		}
-		gitBackend.ServeHTTP(writer, request)
+		actionGitBackend.ServeHTTP(writer, request)
 	}))
-	mux.Handle("/actions/", gitBackend)
-	mux.Handle("/helm/", gitBackend)
+	mux.HandleFunc("/fixture/block-preparation-actions", func(writer http.ResponseWriter, request *http.Request) {
+		blocked := false
+		switch request.Method {
+		case http.MethodPost:
+			blocked = true
+		case http.MethodDelete:
+		default:
+			http.Error(writer, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		preparationActionsMutex.Lock()
+		preparationActionsBlocked = blocked
+		preparationActionsMutex.Unlock()
+		writer.WriteHeader(http.StatusNoContent)
+	})
 	mux.HandleFunc("/app/installations/", func(writer http.ResponseWriter, request *http.Request) {
 		if request.Method != http.MethodPost {
 			http.Error(writer, "method not allowed", http.StatusMethodNotAllowed)
@@ -393,7 +463,21 @@ func main() {
 			http.NotFound(writer, request)
 			return
 		}
-		writeJSON(writer, map[string]string{"token": "fixture-installation-token"})
+		body := struct {
+			Repositories []string `json:"repositories"`
+		}{}
+		if err := json.NewDecoder(request.Body).Decode(&body); err != nil {
+			http.Error(writer, "invalid token request", http.StatusBadRequest)
+			return
+		}
+		switch {
+		case len(body.Repositories) == 0:
+			writeJSON(writer, map[string]string{"token": fixtureActionToken})
+		case len(body.Repositories) == 1 && body.Repositories[0] != "":
+			writeJSON(writer, map[string]string{"token": fixtureJobToken})
+		default:
+			http.Error(writer, "unexpected repository scope", http.StatusBadRequest)
+		}
 	})
 	mux.HandleFunc("/installation/repositories", func(writer http.ResponseWriter, request *http.Request) {
 		if request.Method != http.MethodGet {
@@ -407,6 +491,9 @@ func main() {
 	})
 	mux.HandleFunc("/repos/acme/example/contents/"+workflowPath, func(writer http.ResponseWriter, _ *http.Request) {
 		writeJSON(writer, map[string]string{"encoding": "base64", "content": base64.StdEncoding.EncodeToString([]byte(workflowData))})
+	})
+	mux.HandleFunc("/repos/acme/example/contents/"+preparationWorkflowPath, func(writer http.ResponseWriter, _ *http.Request) {
+		writeJSON(writer, map[string]string{"encoding": "base64", "content": base64.StdEncoding.EncodeToString([]byte(preparationWorkflowData))})
 	})
 	checkRunMutex := sync.RWMutex{}
 	checkRuns := map[string]map[string]any{}
@@ -538,6 +625,17 @@ func createRepositories(dataDirectory string) (fixtureRevisions, error) {
 	}
 	if _, err := createRepository(dataDirectory, "actions", "composite", "v1", map[string]string{
 		"action.yml": compositeMetadata,
+	}); err != nil {
+		return fixtureRevisions{}, err
+	}
+	if _, err := createRepository(dataDirectory, "preparation-actions", "marker", "v1", map[string]string{
+		"action.yml":    markerMetadata,
+		"dist/index.js": markerScript,
+	}); err != nil {
+		return fixtureRevisions{}, err
+	}
+	if _, err := createRepository(dataDirectory, "preparation-actions", "composite", "v1", map[string]string{
+		"action.yml": preparationCompositeMetadata,
 	}); err != nil {
 		return fixtureRevisions{}, err
 	}

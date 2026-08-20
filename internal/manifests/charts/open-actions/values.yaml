@@ -5,7 +5,7 @@ controller:
     pullPolicy: IfNotPresent
   githubAPIURL: https://api.github.com/
   githubServerURL: https://github.com
-  actionCloneBaseURL: https://github.com
+  actionCloneBaseURL: ""
   workflowRunTTLSecondsAfterFinished: null
 
 console:

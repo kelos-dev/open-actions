@@ -11,11 +11,15 @@ import (
 	"io"
 	"log/slog"
 	"maps"
+	"net/http"
+	"net/http/cgi"
+	"net/http/httptest"
 	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -269,7 +273,7 @@ func TestExecuteResolvesAndMasksRepositoryValues(t *testing.T) {
 	plan.Steps = []Step{{
 		ID: "value",
 		Run: fmt.Sprintf(
-			`test "$BUILTIN_TOKEN" = installation-token && test "$REPOSITORY_TOKEN" = %q && test "$NAMESPACE" = production && printf 'secret=%%s\n' "$REPOSITORY_TOKEN" >> "$GITHUB_OUTPUT" && printf '%%s\n%%s\n%%s\n' "$REPOSITORY_TOKEN" %q "$NAMESPACE"`,
+			`test "$BUILTIN_TOKEN" = installation-token && test "$REPOSITORY_TOKEN" = %q && test "$NAMESPACE" = production && printf 'secret=%%s\n' "$REPOSITORY_TOKEN" >> "$GITHUB_OUTPUT" && printf '%%s\n%%s\n%%s\naction-installation-token\n' "$REPOSITORY_TOKEN" %q "$NAMESPACE"`,
 			secret,
 			encodedSecret,
 		),
@@ -278,6 +282,7 @@ func TestExecuteResolvesAndMasksRepositoryValues(t *testing.T) {
 	executor, err := NewExecutor(ExecutorConfig{
 		Logger:      slog.New(slog.NewTextHandler(&output, nil)),
 		GitHubToken: "installation-token",
+		ActionToken: "action-installation-token",
 		Secrets:     map[string]string{"REPOSITORY_TOKEN": secret},
 		Variables:   map[string]string{"DEPLOYMENT_NAMESPACE": "production"},
 		Environment: os.Environ(),
@@ -294,8 +299,8 @@ func TestExecuteResolvesAndMasksRepositoryValues(t *testing.T) {
 	if _, found := result.Outputs["secret"]; found {
 		t.Fatalf("secret-derived output was persisted: %#v", result.Outputs)
 	}
-	if strings.Contains(output.String(), secret) || strings.Contains(output.String(), encodedSecret) {
-		t.Fatalf("runner output exposed a Project secret: %s", output.String())
+	if strings.Contains(output.String(), secret) || strings.Contains(output.String(), encodedSecret) || strings.Contains(output.String(), "action-installation-token") {
+		t.Fatalf("runner output exposed a credential: %s", output.String())
 	}
 	if !strings.Contains(output.String(), "production") || !strings.Contains(output.String(), "***") {
 		t.Fatalf("runner output = %q", output.String())
@@ -698,52 +703,73 @@ func TestLoadPlanRejectsIncompatibleSchemas(t *testing.T) {
 	}
 }
 
-func TestNewExecutorRequiresGitHubToken(t *testing.T) {
-	_, err := NewExecutor(ExecutorConfig{
-		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
-		Environment: os.Environ(),
-		Stdout:      io.Discard,
-		Stderr:      io.Discard,
-	})
-	if err == nil {
-		t.Fatal("NewExecutor() accepted an empty GitHub token")
+func TestNewExecutorRequiresTokens(t *testing.T) {
+	for name, tokens := range map[string]struct {
+		github string
+		action string
+	}{
+		"GitHub": {action: "action-installation-token"},
+		"action": {github: "installation-token"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := NewExecutor(ExecutorConfig{
+				Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+				GitHubToken: tokens.github,
+				ActionToken: tokens.action,
+				Environment: os.Environ(),
+				Stdout:      io.Discard,
+				Stderr:      io.Discard,
+			})
+			if err == nil {
+				t.Fatalf("NewExecutor() accepted an empty %s token", name)
+			}
+		})
 	}
 }
 
-func TestActionCloneTokenIsLimitedToWorkflowRepository(t *testing.T) {
+func TestActionTokenForClone(t *testing.T) {
 	plan := testPlan()
-	plan.Event = Event{
-		Name: "pull_request_target",
-		PullRequest: &PullRequest{
-			HeadRepository: EventRepository{ID: 2, Owner: "contributor", Name: "example"},
-		},
+	plan.Repository.ServerURL = "https://github.example"
+	plan.Repository.ActionCloneBaseURL = "https://github.example"
+	if got := actionTokenForClone(plan, "action-installation-token"); got != "action-installation-token" {
+		t.Fatalf("same-origin action clone token = %q", got)
 	}
-	sameRepository := actionref.Reference{Owner: "ACME", Repository: "Example"}
-	otherRepository := actionref.Reference{Owner: "actions", Repository: "checkout"}
-	headRepository := actionref.Reference{Owner: "contributor", Repository: "example"}
-	if got := actionCloneToken(sameRepository, plan, "installation-token"); got != "installation-token" {
-		t.Fatalf("same-repository clone token = %q", got)
+	plan.Repository.ActionCloneBaseURL = "https://actions.example"
+	if got := actionTokenForClone(plan, "action-installation-token"); got != "" {
+		t.Fatalf("different-origin action clone token = %q", got)
 	}
-	if got := actionCloneToken(otherRepository, plan, "installation-token"); got != "" {
-		t.Fatalf("cross-repository clone token = %q", got)
-	}
-	if got := actionCloneToken(headRepository, plan, "installation-token"); got != "" {
-		t.Fatalf("fork repository clone token = %q", got)
-	}
+}
 
-	environment := actionDownloadEnvironment([]string{"PATH=/usr/bin"}, "https://github.example/acme/example", "installation-token")
+func TestActionDownloadEnvironment(t *testing.T) {
+	environment := actionDownloadEnvironment([]string{"PATH=/usr/bin"}, "https://github.example/acme/example", "action-installation-token")
 	for _, name := range []string{"GIT_CONFIG_COUNT", "GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0"} {
 		if environmentValue(environment, name) == "" {
 			t.Fatalf("%s was not configured", name)
 		}
 	}
 	for _, entry := range environment {
-		if strings.Contains(entry, "installation-token") {
+		if strings.Contains(entry, "action-installation-token") {
 			t.Fatalf("download environment contains the raw token: %q", entry)
 		}
 	}
-	if got := actionDownloadEnvironment([]string{"PATH=/usr/bin"}, "https://github.example/actions/checkout", ""); len(got) != 1 {
+	if got := actionDownloadEnvironment([]string{"PATH=/usr/bin"}, "https://github.example/actions/checkout", ""); len(got) != 2 || environmentValue(got, "GIT_TERMINAL_PROMPT") != "0" {
 		t.Fatalf("unauthenticated download environment = %#v", got)
+	}
+}
+
+func TestCredentialMasksIncludeGitAuthorizationEncoding(t *testing.T) {
+	token := "repository-access-token"
+	masker := newOutputMasker()
+	addCredentialMasks(masker, token)
+	for _, value := range []string{
+		token,
+		base64.StdEncoding.EncodeToString([]byte(token)),
+		base64.StdEncoding.EncodeToString([]byte("x-access-token:" + token)),
+		base64.RawStdEncoding.EncodeToString([]byte("x-access-token:" + token)),
+	} {
+		if masked := masker.mask(value); masked != "***" {
+			t.Errorf("credential form was not masked: %q", masked)
+		}
 	}
 }
 
@@ -756,7 +782,7 @@ func TestConfigurePullRequestCheckoutUsesPinnedHead(t *testing.T) {
 		Ref: "refs/pull/42/merge", RefName: "42/merge", HeadRef: "feature", BaseRef: "main",
 	}
 	invocation := &actionInvocation{
-		reference: actionref.Reference{Owner: "actions", Repository: "checkout", Ref: "v4"},
+		reference: actionref.Reference{Owner: "installed-actions", Repository: "checkout", Ref: "v4"},
 		inputs:    map[string]string{"repository": "acme/example", "path": "source", "ref": ""},
 	}
 	directory, integrate, err := configurePullRequestCheckout(invocation, plan, workspace)
@@ -972,6 +998,7 @@ console.log('external post ran');
 			executor, err := NewExecutor(ExecutorConfig{
 				Logger:      slog.New(slog.NewJSONHandler(&output, nil)),
 				GitHubToken: "installation-token",
+				ActionToken: "action-installation-token",
 				Environment: environment,
 				Stdout:      &output,
 				Stderr:      &output,
@@ -1006,6 +1033,35 @@ console.log('external post ran');
 				t.Errorf("output command was exposed: %s", output.String())
 			}
 		})
+	}
+}
+
+func TestExecutePreparesNestedActionsBeforeSteps(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git is not installed")
+	}
+	repositories := t.TempDir()
+	createActionRepository(t, repositories, "actions", "parent", "v1", map[string]string{
+		"action.yml": `name: Parent composite fixture
+runs:
+  using: composite
+  steps:
+    - uses: actions/missing@v1
+`,
+	})
+	plan := testPlan()
+	plan.Repository.ActionCloneBaseURL = "file://" + repositories
+	plan.Steps = []Step{
+		{Run: `touch ran`},
+		{Uses: "actions/parent@v1"},
+	}
+	workspace := t.TempDir()
+	err := testExecutor(t, io.Discard, io.Discard).Execute(context.Background(), plan, workspace)
+	if err == nil || !strings.Contains(err.Error(), "download action actions/missing@v1") {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(workspace, "ran")); !os.IsNotExist(err) {
+		t.Fatalf("workflow step ran before action preparation failed: %v", err)
 	}
 }
 
@@ -1185,6 +1241,31 @@ runs:
 	}
 }
 
+func TestActionDownloadUsesActionTokenOnGitHubOrigin(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git is not installed")
+	}
+	repositories := t.TempDir()
+	createActionRepository(t, repositories, "installed-actions", "example", "v1", map[string]string{
+		"action.yml": "name: Installed action fixture\nruns:\n  using: node20\n  main: index.js\n",
+		"index.js":   "",
+	})
+	server := newAuthenticatedGitServer(t, repositories, map[string]string{"installed-actions/example": "action-installation-token"})
+	plan := testPlan()
+	plan.Repository.ServerURL = server.URL
+	plan.Repository.APIURL = server.URL
+	plan.Repository.ActionCloneBaseURL = server.URL
+	plan.Steps = []Step{{Uses: "installed-actions/example@v1"}}
+	if err := testExecutor(t, io.Discard, io.Discard).Execute(context.Background(), plan, t.TempDir()); err != nil {
+		t.Fatalf("authenticated action download: %v", err)
+	}
+	for _, authorization := range server.authorizations("installed-actions/example") {
+		if authorization != basicAuthorization("action-installation-token") {
+			t.Fatalf("external action authorization = %q", authorization)
+		}
+	}
+}
+
 func TestCompositeActionRejectsCycles(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git is not installed")
@@ -1204,6 +1285,51 @@ runs:
 	err := testExecutor(t, io.Discard, io.Discard).Execute(context.Background(), plan, t.TempDir())
 	if err == nil || !strings.Contains(err.Error(), "cycle detected") {
 		t.Fatalf("execute cyclic composite action error = %v", err)
+	}
+}
+
+func TestResolveCompositeStepKeepsUsesLiteral(t *testing.T) {
+	state := &executionState{plan: testPlan(), environment: os.Environ()}
+	context := &compositeContext{
+		inputs:     map[string]string{"name": "resolved name", "version": "v2"},
+		stepOutput: map[string]map[string]string{},
+		state:      state,
+	}
+	step, _, err := resolveCompositeStep(compositeStep{
+		Name: "${{ inputs.name }}",
+		Uses: "actions/example@${{ inputs.version }}",
+	}, nil, context)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if step.Name != "resolved name" {
+		t.Fatalf("step name = %q", step.Name)
+	}
+	if step.Uses != "actions/example@${{ inputs.version }}" {
+		t.Fatalf("step uses = %q", step.Uses)
+	}
+}
+
+func TestCompositeActionRejectsExcessiveNesting(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git is not installed")
+	}
+	repositories := t.TempDir()
+	files := map[string]string{}
+	for depth := 1; depth <= maxCompositeDepth+1; depth++ {
+		step := "    - run: \"true\"\n      shell: bash\n"
+		if depth <= maxCompositeDepth {
+			step = fmt.Sprintf("    - uses: actions/deep/%d@v1\n", depth+1)
+		}
+		files[fmt.Sprintf("%d/action.yml", depth)] = "name: Nested composite fixture\nruns:\n  using: composite\n  steps:\n" + step
+	}
+	createActionRepository(t, repositories, "actions", "deep", "v1", files)
+	plan := testPlan()
+	plan.Repository.ActionCloneBaseURL = "file://" + repositories
+	plan.Steps = []Step{{Uses: "actions/deep/1@v1"}}
+	err := testExecutor(t, io.Discard, io.Discard).Execute(context.Background(), plan, t.TempDir())
+	if err == nil || !strings.Contains(err.Error(), fmt.Sprintf("nesting exceeds %d levels", maxCompositeDepth)) {
+		t.Fatalf("Execute() error = %v", err)
 	}
 }
 
@@ -1297,7 +1423,7 @@ func TestReadKeyValueFile(t *testing.T) {
 func TestFailedActionDownloadUsesFreshDirectory(t *testing.T) {
 	directory := t.TempDir()
 	downloadDirectories := []string{}
-	resolver := newActionResolver("https://github.example", directory, []string{"PATH=/usr/bin"}, func(_ context.Context, command string, arguments []string, _ string, _ []string) error {
+	resolver := newActionResolver("https://github.example", directory, []string{"PATH=/usr/bin"}, "action-token", func(_ context.Context, command string, arguments []string, _ string, _ []string) error {
 		if command == "git" && len(arguments) >= 3 && arguments[0] == "init" {
 			downloadDirectories = append(downloadDirectories, arguments[2])
 			if err := os.MkdirAll(arguments[2], 0o755); err != nil {
@@ -1306,10 +1432,9 @@ func TestFailedActionDownloadUsesFreshDirectory(t *testing.T) {
 		}
 		return errors.New("download failed")
 	})
-	step := Step{Uses: "actions/example@v1"}
 	for range 2 {
-		if _, err := resolver.prepare(context.Background(), step, testPlan(), "token"); err == nil {
-			t.Fatal("prepare() succeeded after a failed action download")
+		if _, err := resolver.resolve(context.Background(), "actions/example@v1"); err == nil {
+			t.Fatal("resolve() succeeded after a failed action download")
 		}
 	}
 	if len(downloadDirectories) != 2 || downloadDirectories[0] == downloadDirectories[1] {
@@ -1632,6 +1757,7 @@ func TestExecutorSeparatesUnterminatedChildOutputFromRunnerRecords(t *testing.T)
 	executor, err := NewExecutor(ExecutorConfig{
 		Logger:      slog.New(slog.NewJSONHandler(&output, nil)),
 		GitHubToken: "installation-token",
+		ActionToken: "action-installation-token",
 		Environment: os.Environ(),
 		Stdout:      &output,
 		Stderr:      io.Discard,
@@ -1667,6 +1793,7 @@ func TestExecutorLogsFailedWorkflowStep(t *testing.T) {
 	executor, err := NewExecutor(ExecutorConfig{
 		Logger:      slog.New(slog.NewJSONHandler(&output, nil)),
 		GitHubToken: "installation-token",
+		ActionToken: "action-installation-token",
 		Environment: os.Environ(),
 		Stdout:      &output,
 		Stderr:      &output,
@@ -1690,6 +1817,7 @@ func TestExecutorLogsCancelledWorkflowStep(t *testing.T) {
 	executor, err := NewExecutor(ExecutorConfig{
 		Logger:      slog.New(slog.NewJSONHandler(&output, nil)),
 		GitHubToken: "installation-token",
+		ActionToken: "action-installation-token",
 		Environment: os.Environ(),
 		Stdout:      &output,
 		Stderr:      &output,
@@ -1822,6 +1950,7 @@ func TestExecutorDoesNotLogCommandValues(t *testing.T) {
 	executor, err := NewExecutor(ExecutorConfig{
 		Logger:      slog.New(slog.NewJSONHandler(&logs, nil)),
 		GitHubToken: "installation-token",
+		ActionToken: "action-installation-token",
 		Environment: os.Environ(),
 		Stdout:      io.Discard,
 		Stderr:      io.Discard,
@@ -1840,6 +1969,7 @@ func TestExecutorMasksContinueOnErrorWarnings(t *testing.T) {
 	executor, err := NewExecutor(ExecutorConfig{
 		Logger:      slog.New(slog.NewJSONHandler(&logs, nil)),
 		GitHubToken: "installation-token",
+		ActionToken: "action-installation-token",
 		Environment: os.Environ(),
 		Stdout:      io.Discard,
 		Stderr:      io.Discard,
@@ -1852,7 +1982,6 @@ func TestExecutorMasksContinueOnErrorWarnings(t *testing.T) {
 		workspace:          t.TempDir(),
 		temporaryDirectory: t.TempDir(),
 		environment:        os.Environ(),
-		compositeStack:     map[string]bool{},
 	}
 	invocation := &actionInvocation{
 		step: Step{Uses: "actions/composite@v1"},
@@ -1861,7 +1990,7 @@ func TestExecutorMasksContinueOnErrorWarnings(t *testing.T) {
 		}}}},
 		inputs: map[string]string{},
 	}
-	if _, err := executor.runComposite(context.Background(), state, invocation, 1, false); err != nil {
+	if _, err := executor.runComposite(context.Background(), state, invocation, false); err != nil {
 		t.Fatal(err)
 	}
 	if strings.Contains(logs.String(), "installation-token") || !strings.Contains(logs.String(), "***") {
@@ -1881,7 +2010,6 @@ func TestCompositeRunsCancelledStepWithCleanupContext(t *testing.T) {
 		workspace:          workspace,
 		temporaryDirectory: t.TempDir(),
 		environment:        os.Environ(),
-		compositeStack:     map[string]bool{},
 	}
 	invocation := &actionInvocation{
 		step: Step{Uses: "actions/composite@v1"},
@@ -1894,7 +2022,7 @@ func TestCompositeRunsCancelledStepWithCleanupContext(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if _, err := testExecutor(t, io.Discard, io.Discard).runComposite(ctx, state, invocation, 1, false); err != nil {
+	if _, err := testExecutor(t, io.Discard, io.Discard).runComposite(ctx, state, invocation, false); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(filepath.Join(workspace, "composite-cancelled")); err != nil {
@@ -1914,7 +2042,6 @@ func TestCompositeStepsCountTowardEvaluatedContentLimit(t *testing.T) {
 		workspace:          t.TempDir(),
 		temporaryDirectory: t.TempDir(),
 		environment:        os.Environ(),
-		compositeStack:     map[string]bool{},
 		resolvedContent:    workflow.MaxJobContentBytes - 7,
 	}
 	invocation := &actionInvocation{
@@ -1926,7 +2053,7 @@ func TestCompositeStepsCountTowardEvaluatedContentLimit(t *testing.T) {
 		inputs: map[string]string{},
 	}
 
-	_, err := testExecutor(t, io.Discard, io.Discard).runComposite(context.Background(), state, invocation, 1, false)
+	_, err := testExecutor(t, io.Discard, io.Discard).runComposite(context.Background(), state, invocation, false)
 	if err == nil || !strings.Contains(err.Error(), "composite step 2: evaluated job configuration exceeds") {
 		t.Fatalf("error = %v, want aggregate evaluated job configuration limit", err)
 	}
@@ -1981,6 +2108,7 @@ func testExecutorWithEnvironment(t *testing.T, environment []string, stdout, std
 	executor, err := NewExecutor(ExecutorConfig{
 		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
 		GitHubToken: "installation-token",
+		ActionToken: "action-installation-token",
 		Environment: environment,
 		Stdout:      stdout,
 		Stderr:      stderr,
@@ -2026,6 +2154,65 @@ func createActionRepository(t *testing.T, root, owner, name, tag string, files m
 		t.Fatal(err)
 	}
 	runGit(t, "clone", "--quiet", "--bare", source, bare)
+}
+
+type authenticatedGitServer struct {
+	*httptest.Server
+	mutex          sync.Mutex
+	requestsByRepo map[string][]string
+}
+
+func newAuthenticatedGitServer(t *testing.T, root string, requiredTokens map[string]string) *authenticatedGitServer {
+	t.Helper()
+	gitPath, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	backend := &cgi.Handler{
+		Path: gitPath,
+		Args: []string{"http-backend"},
+		Env: []string{
+			"GIT_HTTP_EXPORT_ALL=1",
+			"GIT_PROJECT_ROOT=" + root,
+		},
+	}
+	result := &authenticatedGitServer{requestsByRepo: map[string][]string{}}
+	handler := http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		parts := strings.Split(strings.TrimPrefix(request.URL.Path, "/"), "/")
+		if len(parts) < 2 {
+			http.NotFound(writer, request)
+			return
+		}
+		repository := parts[0] + "/" + parts[1]
+		authorization := request.Header.Get("Authorization")
+		result.mutex.Lock()
+		result.requestsByRepo[repository] = append(result.requestsByRepo[repository], authorization)
+		result.mutex.Unlock()
+		if token, required := requiredTokens[repository]; required {
+			if authorization != basicAuthorization(token) {
+				writer.Header().Set("WWW-Authenticate", `Basic realm="private"`)
+				http.Error(writer, "authorization required", http.StatusUnauthorized)
+				return
+			}
+		} else if authorization != "" {
+			http.Error(writer, "authorization does not match repository origin", http.StatusBadRequest)
+			return
+		}
+		backend.ServeHTTP(writer, request)
+	})
+	result.Server = httptest.NewServer(handler)
+	t.Cleanup(result.Close)
+	return result
+}
+
+func (s *authenticatedGitServer) authorizations(repository string) []string {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+	return append([]string(nil), s.requestsByRepo[repository]...)
+}
+
+func basicAuthorization(token string) string {
+	return "basic " + base64.StdEncoding.EncodeToString([]byte("x-access-token:"+token))
 }
 
 func runGit(t *testing.T, arguments ...string) string {

@@ -3,7 +3,6 @@ package runner
 import (
 	"bytes"
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -25,6 +24,8 @@ const (
 	minimumPlanVersion = 1
 	PlanVersion        = 5
 	ContainerName      = "runner"
+	GitHubTokenEnvVar  = "OPEN_ACTIONS_GITHUB_TOKEN"
+	ActionTokenEnvVar  = "OPEN_ACTIONS_ACTION_TOKEN"
 )
 
 const runnerLogMarker = "open_actions_runner"
@@ -123,6 +124,7 @@ type Step struct {
 type ExecutorConfig struct {
 	Logger      *slog.Logger
 	GitHubToken string
+	ActionToken string
 	Secrets     map[string]string
 	Variables   map[string]string
 	Environment []string
@@ -133,6 +135,7 @@ type ExecutorConfig struct {
 type Executor struct {
 	logger      *slog.Logger
 	githubToken string
+	actionToken string
 	secrets     map[string]string
 	variables   map[string]string
 	environment []string
@@ -153,24 +156,24 @@ type executionState struct {
 	variables          map[string]string
 	resolver           *actionResolver
 	posts              []*actionInvocation
-	compositeStack     map[string]bool
 	stepOutputs        map[string]map[string]any
 	resolvedContent    int
 }
 
 func NewExecutor(config ExecutorConfig) (*Executor, error) {
-	if config.Logger == nil || config.GitHubToken == "" || config.Environment == nil || config.Stdout == nil || config.Stderr == nil {
+	if config.Logger == nil || config.GitHubToken == "" || config.ActionToken == "" || config.Environment == nil || config.Stdout == nil || config.Stderr == nil {
 		return nil, errors.New("runner executor configuration is incomplete")
 	}
 	masker := newOutputMasker()
-	masker.addSecret(config.GitHubToken)
-	masker.add(base64.StdEncoding.EncodeToString([]byte("x-access-token:" + config.GitHubToken)))
+	addCredentialMasks(masker, config.GitHubToken)
+	addCredentialMasks(masker, config.ActionToken)
 	for _, secret := range config.Secrets {
 		masker.addSecret(secret)
 	}
 	return &Executor{
 		logger:      config.Logger.With(runnerLogMarker, true),
 		githubToken: config.GitHubToken,
+		actionToken: config.ActionToken,
 		secrets:     cloneStringMap(config.Secrets),
 		variables:   cloneStringMap(config.Variables),
 		environment: append([]string(nil), config.Environment...),
@@ -190,6 +193,11 @@ func cloneStringMap(values map[string]string) map[string]string {
 		result[name] = value
 	}
 	return result
+}
+
+func addCredentialMasks(masker *outputMasker, token string) {
+	masker.addSecret(token)
+	masker.addSecret("x-access-token:" + token)
 }
 
 func LoadPlan(path string) (*Plan, error) {
@@ -330,10 +338,12 @@ func (e *Executor) executePlan(ctx context.Context, plan *Plan, workspace string
 		githubToken:        e.githubToken,
 		secrets:            e.secrets,
 		variables:          e.variables,
-		resolver:           newActionResolver(plan.Repository.ActionCloneBaseURL, filepath.Join(temporaryDirectory, "actions"), environment, e.executeCommand),
-		compositeStack:     map[string]bool{},
+		resolver:           newActionResolver(plan.Repository.ActionCloneBaseURL, filepath.Join(temporaryDirectory, "actions"), environment, actionTokenForClone(plan, e.actionToken), e.executeCommand),
 		stepOutputs:        map[string]map[string]any{},
 		resolvedContent:    jobContentBytes,
+	}
+	if err := state.resolver.prepareAll(executionContext(ctx), plan.Steps); err != nil {
+		return emptyResult, fmt.Errorf("prepare job actions: %w", err)
 	}
 
 	failed := false
@@ -386,7 +396,7 @@ func (e *Executor) executePlan(ctx context.Context, plan *Plan, workspace string
 		if step.Uses == "" {
 			outputs, stepError = e.runScript(stepContext, state, step)
 		} else {
-			outputs, stepError = e.executeAction(stepContext, state, step, 0, cancelledBeforeCommand)
+			outputs, stepError = e.executeAction(stepContext, state, step, cancelledBeforeCommand)
 		}
 		if rawStep.ID != "" {
 			e.recordWorkflowStepOutputs(state, rawStep.ID, outputs)

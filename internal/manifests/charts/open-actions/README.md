@@ -40,7 +40,7 @@ resources.
 | `controller.image.pullPolicy` | `IfNotPresent` | Kubernetes image pull policy |
 | `controller.githubAPIURL` | `https://api.github.com/` | Base URL for the GitHub API |
 | `controller.githubServerURL` | `https://github.com` | GitHub web-server URL exposed to workflows |
-| `controller.actionCloneBaseURL` | `https://github.com` | Base URL used to clone external action repositories |
+| `controller.actionCloneBaseURL` | `""` | Base URL used to clone external action repositories; defaults to `controller.githubServerURL` when empty |
 | `controller.workflowRunTTLSecondsAfterFinished` | `null` | Default `spec.ttlSecondsAfterFinished` for generated WorkflowRuns; `null` retains them indefinitely |
 | `console.enabled` | `true` | Deploy the Open Actions Console |
 | `console.replicas` | `1` | Console replica count |
