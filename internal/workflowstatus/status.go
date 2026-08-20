@@ -7,18 +7,22 @@ import (
 )
 
 const (
-	queued    = "Queued"
-	running   = "Running"
-	succeeded = "Succeeded"
-	failed    = "Failed"
-	skipped   = "Skipped"
-	cancelled = "Cancelled"
-	waiting   = "Waiting"
+	queued     = "Queued"
+	running    = "Running"
+	cancelling = "Cancelling"
+	succeeded  = "Succeeded"
+	failed     = "Failed"
+	skipped    = "Skipped"
+	cancelled  = "Cancelled"
+	waiting    = "Waiting"
 )
 
 // Run returns the user-facing status derived from a WorkflowRun's conditions.
 func Run(run *actionsv1alpha1.WorkflowRun) string {
 	condition := meta.FindStatusCondition(run.Status.Conditions, actionsv1alpha1.WorkflowRunConditionSucceeded)
+	if run.Spec.CancelRequested && (condition == nil || condition.Status == metav1.ConditionUnknown) {
+		return cancelling
+	}
 	if condition == nil {
 		return queued
 	}

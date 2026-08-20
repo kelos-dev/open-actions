@@ -18,7 +18,9 @@ func TestRun(t *testing.T) {
 		{name: "no condition", run: &actionsv1alpha1.WorkflowRun{}, want: "Queued"},
 		{name: "waiting", run: workflowRunWithCondition(metav1.ConditionUnknown, nil), want: "Queued"},
 		{name: "running", run: workflowRunWithCondition(metav1.ConditionUnknown, &started), want: "Running"},
+		{name: "cancelling", run: &actionsv1alpha1.WorkflowRun{Spec: actionsv1alpha1.WorkflowRunSpec{CancelRequested: true}}, want: "Cancelling"},
 		{name: "succeeded", run: workflowRunWithCondition(metav1.ConditionTrue, &started), want: "Succeeded"},
+		{name: "succeeded after cancellation", run: &actionsv1alpha1.WorkflowRun{Spec: actionsv1alpha1.WorkflowRunSpec{CancelRequested: true}, Status: actionsv1alpha1.WorkflowRunStatus{Conditions: []metav1.Condition{{Type: actionsv1alpha1.WorkflowRunConditionSucceeded, Status: metav1.ConditionTrue}}}}, want: "Succeeded"},
 		{name: "failed", run: workflowRunWithCondition(metav1.ConditionFalse, &started), want: "Failed"},
 		{name: "cancelled", run: &actionsv1alpha1.WorkflowRun{Status: actionsv1alpha1.WorkflowRunStatus{Conditions: []metav1.Condition{{Type: actionsv1alpha1.WorkflowRunConditionSucceeded, Status: metav1.ConditionFalse, Reason: "JobCancelled"}}}}, want: "Cancelled"},
 	} {

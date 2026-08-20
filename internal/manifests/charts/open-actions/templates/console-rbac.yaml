@@ -9,7 +9,7 @@ rules:
     verbs: [get, list]
   - apiGroups: [actions.kelos.dev]
     resources: [workflowruns]
-    verbs: [get, list, create]
+    verbs: [get, list, create, update]
   - apiGroups: [""]
     resources: [pods]
     verbs: [get, list]
