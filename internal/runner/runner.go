@@ -26,7 +26,7 @@ import (
 
 const (
 	minimumPlanVersion       = 1
-	PlanVersion              = 7
+	PlanVersion              = 8
 	ContainerName            = "runner"
 	GitHubTokenEnvVar        = "OPEN_ACTIONS_GITHUB_TOKEN"
 	ActionTokenEnvVar        = "OPEN_ACTIONS_ACTION_TOKEN"
@@ -141,6 +141,7 @@ type Step struct {
 	With             map[string]string `json:"with,omitempty"`
 	Env              map[string]string `json:"env,omitempty"`
 	If               string            `json:"if,omitempty"`
+	ContinueOnError  any               `json:"continueOnError,omitempty"`
 }
 
 type ExecutorConfig struct {
@@ -469,6 +470,9 @@ func (e *Executor) executePlan(ctx context.Context, plan *Plan, workspace string
 		}
 		if !runStep {
 			e.logger.Info("skipping workflow step", "job", plan.JobID, "step", index+1, "name", rawStep.Name)
+			if rawStep.ID != "" {
+				e.recordWorkflowStep(state, rawStep.ID, nil, "skipped", "skipped")
+			}
 			continue
 		}
 		stepEnvironment, err := resolveWorkflowStepEnvironment(rawStep, state)
@@ -483,6 +487,7 @@ func (e *Executor) executePlan(ctx context.Context, plan *Plan, workspace string
 			failed = true
 			continue
 		}
+		continueOnError, _ := step.ContinueOnError.(bool)
 		stepBytes, err := resolvedStepBytes(step)
 		if err != nil {
 			executionErrors = errors.Join(executionErrors, fmt.Errorf("step %d: %w", index+1, err))
@@ -509,20 +514,33 @@ func (e *Executor) executePlan(ctx context.Context, plan *Plan, workspace string
 		} else {
 			outputs, stepError = e.executeAction(stepContext, state, step, cancelledBeforeCommand)
 		}
-		if rawStep.ID != "" {
-			e.recordWorkflowStepOutputs(state, rawStep.ID, outputs)
-		}
 		if stepError != nil {
 			stepError = fmt.Errorf("step %d (%s): %w", index+1, name, stepError)
-			executionErrors = errors.Join(executionErrors, stepError)
 			cancelledDuringCommand := !cancelledBeforeCommand && ctx.Err() != nil
 			if cancelledDuringCommand {
+				if rawStep.ID != "" {
+					e.recordWorkflowStep(state, rawStep.ID, outputs, "cancelled", "cancelled")
+				}
+				executionErrors = errors.Join(executionErrors, stepError)
 				e.logger.Info("cancelled workflow step", "job", plan.JobID, "step", index+1, "name", name)
+			} else if continueOnError {
+				if rawStep.ID != "" {
+					e.recordWorkflowStep(state, rawStep.ID, outputs, "failure", "success")
+				}
+				e.logger.Warn("workflow step failed with continue-on-error", "job", plan.JobID, "step", index+1, "name", name, "outcome", "failure", "conclusion", "success", "error", e.masker.mask(stepError.Error()))
+				e.logger.Info("completed workflow step", "job", plan.JobID, "step", index+1, "name", name)
 			} else {
+				if rawStep.ID != "" {
+					e.recordWorkflowStep(state, rawStep.ID, outputs, "failure", "failure")
+				}
+				executionErrors = errors.Join(executionErrors, stepError)
 				failed = true
 				e.logger.Info("failed workflow step", "job", plan.JobID, "step", index+1, "name", name)
 			}
 			continue
+		}
+		if rawStep.ID != "" {
+			e.recordWorkflowStep(state, rawStep.ID, outputs, "success", "success")
 		}
 		e.logger.Info("completed workflow step", "job", plan.JobID, "step", index+1, "name", name)
 	}
@@ -742,7 +760,7 @@ func (e *Executor) runScript(ctx context.Context, state *executionState, step St
 	return updates.outputs, executionError
 }
 
-func (e *Executor) recordWorkflowStepOutputs(state *executionState, id string, outputs map[string]string) {
+func (e *Executor) recordWorkflowStep(state *executionState, id string, outputs map[string]string, outcome, conclusion string) {
 	values := make(map[string]any, len(outputs))
 	for name, value := range outputs {
 		if e.masker.contains(value) {
@@ -751,7 +769,7 @@ func (e *Executor) recordWorkflowStepOutputs(state *executionState, id string, o
 			values[name] = value
 		}
 	}
-	state.stepOutputs[id] = map[string]any{"outputs": values}
+	state.stepOutputs[id] = map[string]any{"outputs": values, "outcome": outcome, "conclusion": conclusion}
 }
 
 func (e *Executor) resolveJobOutputs(state *executionState) (map[string]string, error) {

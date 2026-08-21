@@ -119,6 +119,10 @@ func TestActionLogParserStructuresRunnerMessages(t *testing.T) {
 	if !visible || entry.Kind != "endgroup" || entry.Conclusion != "success" {
 		t.Fatalf("completion entry = %#v, %t", entry, visible)
 	}
+	entry, visible = parser.parse(`{"time":"2026-08-10T12:34:57Z","level":"WARN","msg":"workflow step failed with continue-on-error","open_actions_runner":true,"job":"build","step":2,"name":"Test","outcome":"failure","conclusion":"success","error":"exit status 1"}`)
+	if !visible || entry.Kind != "warning" || entry.Text != "workflow step failed with continue-on-error: exit status 1" {
+		t.Fatalf("continue-on-error warning = %#v, %t", entry, visible)
+	}
 	entry, visible = parser.parse(`{"time":"2026-08-10T12:34:57Z","level":"INFO","msg":"failed workflow step","open_actions_runner":true,"job":"build","step":2,"name":"Test"}`)
 	if !visible || entry.Kind != "endgroup" || entry.Conclusion != "failure" {
 		t.Fatalf("failure entry = %#v, %t", entry, visible)

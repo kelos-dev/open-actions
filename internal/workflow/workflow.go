@@ -191,6 +191,7 @@ type Step struct {
 	With             map[string]any `yaml:"with"`
 	Env              map[string]any `yaml:"env"`
 	If               string         `yaml:"if"`
+	ContinueOnError  any            `yaml:"continue-on-error"`
 }
 
 type Event struct {
@@ -488,6 +489,10 @@ func validateJob(id string, job *Job, workflowEnv map[string]any) error {
 				return fmt.Errorf("job %q step %d if: %w", id, i+1, err)
 			}
 		}
+		continueOnErrorBytes, err := validateStepContinueOnError(fmt.Sprintf("job %q step %d continue-on-error", id, i+1), step.ContinueOnError)
+		if err != nil {
+			return err
+		}
 		withBytes, err := validateScalarMap(fmt.Sprintf("job %q step %d with", id, i+1), step.With, stepAvailability)
 		if err != nil {
 			return err
@@ -496,12 +501,39 @@ func validateJob(id string, job *Job, workflowEnv map[string]any) error {
 		if err != nil {
 			return err
 		}
-		contentBytes += len(step.ID) + len(step.Name) + len(step.Uses) + len(step.Run) + len(step.WorkingDirectory) + len(step.If) + withBytes + stepEnvBytes
+		contentBytes += len(step.ID) + len(step.Name) + len(step.Uses) + len(step.Run) + len(step.WorkingDirectory) + len(step.If) + continueOnErrorBytes + withBytes + stepEnvBytes
 	}
 	if contentBytes > MaxJobContentBytes {
 		return fmt.Errorf("job %q configuration exceeds %d bytes", id, MaxJobContentBytes)
 	}
 	return nil
+}
+
+func validateStepContinueOnError(field string, value any) (int, error) {
+	switch typed := value.(type) {
+	case nil:
+		return 0, nil
+	case bool:
+		return len(strconv.FormatBool(typed)), nil
+	case string:
+		if len(typed) > MaxConditionBytes {
+			return 0, fmt.Errorf("%s exceeds %d bytes", field, MaxConditionBytes)
+		}
+		trimmed := strings.TrimSpace(typed)
+		if !strings.HasPrefix(trimmed, "${{") {
+			return 0, fmt.Errorf("%s must be a boolean or expression", field)
+		}
+		program, err := expression.ParseCondition(trimmed)
+		if err != nil {
+			return 0, fmt.Errorf("%s: %w", field, err)
+		}
+		if err := program.Validate(stepAvailability); err != nil {
+			return 0, fmt.Errorf("%s: %w", field, err)
+		}
+		return len(typed), nil
+	default:
+		return 0, fmt.Errorf("%s must be a boolean or expression", field)
+	}
 }
 
 func validateStrategy(id string, strategy Strategy) error {

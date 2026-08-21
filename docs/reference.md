@@ -543,6 +543,7 @@ evaluation when the corresponding execution feature has not supplied it.
 | Job name, timeout, and runner labels | `github`, `open_actions`, `needs`, `strategy`, `matrix`, `vars`, `inputs` | `github`, `open_actions`, `inputs`, `vars`, and `matrix` for matrix jobs; deferred matrix jobs also receive `needs` |
 | Job environment | `github`, `open_actions`, `needs`, `strategy`, `matrix`, `vars`, `secrets`, `inputs` | `github`, `open_actions`, direct dependency results and outputs, `inputs`, `vars`, `secrets`, and `matrix` for matrix jobs |
 | Workflow step name, run script, working directory, environment, and inputs | `github`, `open_actions`, `needs`, `strategy`, `matrix`, `job`, `runner`, `env`, `vars`, `secrets`, `steps`, `inputs`, and `hashFiles` | `github`, `open_actions`, direct dependency results and outputs, `matrix`, `runner`, `env`, `vars`, `secrets`, `inputs`, `steps`, and `hashFiles` |
+| Workflow step `continue-on-error` | `github`, `open_actions`, `needs`, `strategy`, `matrix`, `job`, `runner`, `env`, `vars`, `secrets`, `steps`, `inputs`, and `hashFiles` | `github`, `open_actions`, direct dependency results and outputs, `matrix`, `runner`, `env`, `vars`, `secrets`, `inputs`, `steps`, and `hashFiles` |
 | Workflow step condition | Step contexts except `secrets`, plus status functions and `hashFiles` | `github`, `open_actions`, direct dependency results and outputs, `matrix`, `runner`, `env`, `vars`, `inputs`, `steps`, status functions, and `hashFiles` |
 | Job outputs | Workflow step contexts without `hashFiles` | `github`, `open_actions`, direct dependency results and outputs, `matrix`, `runner`, `env`, `vars`, `secrets`, `inputs`, `steps` |
 | Composite step fields and outputs | `github`, `open_actions`, `runner`, `env`, `inputs`, `steps`, and `hashFiles` | All listed contexts and functions |
@@ -630,7 +631,22 @@ write single-line or heredoc-style multiline values to `GITHUB_OUTPUT`.
 Each step's output command file is limited to 1 MiB. Repeated names use the last
 value. Once the step finishes, later steps can read those values through
 `steps.<id>.outputs.<name>`; missing and skipped-step outputs evaluate to an
-empty string.
+empty string. After an identified step runs or is skipped,
+`steps.<id>.outcome` and `steps.<id>.conclusion` are each `success`, `failure`,
+`cancelled`, or `skipped`. `outcome` records the execution result before
+`continue-on-error` is applied, while `conclusion` records the result afterward.
+
+A run step or external action may set `continue-on-error` to a Boolean or to a
+single expression that evaluates to a Boolean. When such a step exits
+unsuccessfully and the resolved value is `true`, later steps continue under a
+successful job status. The step remains observable as
+`steps.<id>.outcome == 'failure'`, while
+`steps.<id>.conclusion == 'success'`; outputs emitted before the failure remain
+available. A false value preserves ordinary failure behavior. Cancellation
+remains terminal and is never converted to success. Runner logs retain the
+underlying error, and the Console shows a successful step conclusion with the
+failure warning inside the step group. Action post hooks still run and can fail
+the job independently.
 
 `jobs.<id>.outputs` is evaluated after workflow steps and post actions finish,
 including when a step failed. Output names use the same identifier syntax.
@@ -910,6 +926,7 @@ Workflow definitions must satisfy these limits:
   output metadata.
 - A run script may contain at most 65,536 bytes.
 - A step condition may contain at most 65,536 bytes.
+- A step `continue-on-error` expression may contain at most 65,536 bytes.
 - Each workflow, job, or step `env` map and each `with` map may contain at most
   100 entries.
 
@@ -1030,14 +1047,15 @@ same immutable snapshot. Synthetic `workflow_dispatch`, `schedule`, and
 `workflow_call` runs use a bounded generated document containing their inputs,
 schedule, repository identity, and supported event metadata.
 
-The controller emits job-plan version 7, and the runner accepts versions 1
-through 7. When a release changes the job-plan version, update every Runner
+The controller emits job-plan version 8, and the runner accepts versions 1
+through 8. When a release changes the job-plan version, update every Runner
 `spec.execution.image` to an image that accepts both the installed and target
 controller versions before upgrading the controller. The received job-plan
 version also determines the runner result version: plan versions 1 through 5
-use result version 1, and plan versions 6 and 7 use result version 2. A runner that accepts more
-than one plan version must emit the result version assigned to that plan, not
-always the latest result version supported by the runner binary. Integration
+use result version 1, and plan versions 6 through 8 use result version 2. A
+runner that accepts more than one plan version must emit the result version
+assigned to that plan, not always the latest result version supported by the
+runner binary. Integration
 commit construction is part of this versioned contract; changing its merge
 behavior or commit metadata requires a job-plan version transition.
 

@@ -1737,6 +1737,7 @@ func (r *WorkflowRunReconciler) jobPlan(run *actionsv1alpha1.WorkflowRun, workfl
 			With:             with,
 			Env:              environment,
 			If:               step.If,
+			ContinueOnError:  step.ContinueOnError,
 		})
 	}
 	return &runner.Plan{
