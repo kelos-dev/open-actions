@@ -379,7 +379,7 @@ func (r *WorkflowRunReconciler) reconcileWorkflowRun(ctx context.Context, run *a
 	if err != nil {
 		return r.planningFailed(ctx, run, "CredentialsUnavailable", err, planningFailureRetry)
 	}
-	installation, err := r.GitHub.Installation(ctx, githubConfig.AppID, githubConfig.InstallationID, privateKey, githubSource.Repository.Name, githubclient.InstallationPermissions{ContentsRead: true})
+	installation, err := r.GitHub.Installation(ctx, githubConfig.AppID, githubConfig.InstallationID, privateKey, githubSource.Repository.Name, githubclient.InstallationPermissions{"contents": "read"})
 	if err != nil {
 		return r.planningFailed(ctx, run, "GitHubAuthenticationFailed", err, planningFailureRetry)
 	}
@@ -605,7 +605,7 @@ func (r *WorkflowRunReconciler) reconcileGitHubCheck(ctx context.Context, run *a
 	if err != nil {
 		return fmt.Errorf("read credentials for GitHub check: %w", err)
 	}
-	installation, err := r.GitHub.Installation(ctx, githubConfig.AppID, githubConfig.InstallationID, privateKey, githubSource.Repository.Name, githubclient.InstallationPermissions{ChecksWrite: true})
+	installation, err := r.GitHub.Installation(ctx, githubConfig.AppID, githubConfig.InstallationID, privateKey, githubSource.Repository.Name, githubclient.InstallationPermissions{"checks": "write"})
 	if err != nil {
 		return fmt.Errorf("authenticate GitHub check reporter: %w", err)
 	}
@@ -987,6 +987,7 @@ func (r *WorkflowRunReconciler) planWorkflowJobs(run *actionsv1alpha1.WorkflowRu
 	}
 	for _, id := range jobIDs {
 		definitionJob := definition.Jobs[id]
+		definitionJob.Permissions = workflow.EffectivePermissions(definition.Permissions, definitionJob.Permissions)
 		if workflow.MatrixUsesNeeds(definitionJob.Strategy) {
 			if !variablesSnapshotted {
 				variableSnapshot, err = snapshotExpressionVariables(variables)
@@ -1778,14 +1779,31 @@ func (r *WorkflowRunReconciler) jobPlan(run *actionsv1alpha1.WorkflowRun, workfl
 			HeadRef:      headRef,
 			BaseRef:      baseRef,
 		},
-		JobID:                 id,
-		Matrix:                matrix,
-		Env:                   jobEnv,
-		Outputs:               outputs,
-		TimeoutSeconds:        timeoutSeconds,
-		CleanupTimeoutSeconds: int64(runner.CleanupTimeout / time.Second),
-		Steps:                 steps,
+		JobID:                  id,
+		Matrix:                 matrix,
+		Env:                    jobEnv,
+		Outputs:                outputs,
+		GitHubTokenPermissions: githubTokenPermissions(run, workflow.EffectivePermissions(nil, job.Permissions)),
+		TimeoutSeconds:         timeoutSeconds,
+		CleanupTimeoutSeconds:  int64(runner.CleanupTimeout / time.Second),
+		Steps:                  steps,
 	}, nil
+}
+
+func githubTokenPermissions(run *actionsv1alpha1.WorkflowRun, permissions workflow.Permissions) map[string]string {
+	restrictWrites := false
+	githubSource := run.Spec.Source.GitHub
+	if pullRequest := githubSource.Event.PullRequest; pullRequest != nil && githubSource.Event.Name != actionsv1alpha1.GitHubEventNamePullRequestTarget {
+		restrictWrites = pullRequest.HeadRepository.ID != githubSource.Repository.ID
+	}
+	result := make(map[string]string, len(permissions))
+	for name, level := range permissions {
+		if restrictWrites && level == "write" {
+			level = "read"
+		}
+		result[strings.ReplaceAll(name, "-", "_")] = level
+	}
+	return result
 }
 
 func runnerPullRequest(pullRequest *actionsv1alpha1.GitHubPullRequest) *runner.PullRequest {

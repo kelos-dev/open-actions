@@ -2,8 +2,16 @@ package controller
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
+	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
+	"maps"
+	"net/http"
+	"net/http/httptest"
 	"slices"
 	"strings"
 	"testing"
@@ -12,6 +20,7 @@ import (
 	actionsv1alpha1 "github.com/kelos-dev/open-actions/api/v1alpha1"
 	"github.com/kelos-dev/open-actions/internal/artifact"
 	"github.com/kelos-dev/open-actions/internal/eventsnapshot"
+	githubclient "github.com/kelos-dev/open-actions/internal/github"
 	"github.com/kelos-dev/open-actions/internal/runner"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -1239,6 +1248,56 @@ func TestExpiredPreStartFailureTerminatesJobAndCleansCredentials(t *testing.T) {
 	}
 }
 
+func TestHandleJobTokenCreationError(t *testing.T) {
+	tests := []struct {
+		name       string
+		statusCode int
+		terminal   bool
+	}{
+		{name: "permission rejection", statusCode: http.StatusUnprocessableEntity, terminal: true},
+		{name: "server failure", statusCode: http.StatusInternalServerError},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			scheme := runnerTestScheme(t)
+			workflowJob := &actionsv1alpha1.WorkflowJob{
+				ObjectMeta: metav1.ObjectMeta{Name: "build", Namespace: "default"},
+				Status:     actionsv1alpha1.WorkflowJobStatus{RunnerRef: &corev1.LocalObjectReference{Name: "runner"}},
+			}
+			clusterClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&actionsv1alpha1.WorkflowJob{}).WithObjects(workflowJob).Build()
+			reconciler := &RunnerReconciler{Client: clusterClient, APIReader: clusterClient}
+			permissions := githubclient.InstallationPermissions{"issues": "write"}
+			terminal, err := reconciler.handleJobTokenCreationError(context.Background(), workflowJob, permissions, &githubclient.APIError{
+				StatusCode: test.statusCode,
+				Status:     fmt.Sprintf("%d %s", test.statusCode, http.StatusText(test.statusCode)),
+				Message:    "token request failed",
+			})
+			if terminal != test.terminal {
+				t.Fatalf("terminal = %t, want %t", terminal, test.terminal)
+			}
+			if !test.terminal {
+				if err == nil || !strings.Contains(err.Error(), `WorkflowJob "build"`) || !strings.Contains(err.Error(), "issues:write") {
+					t.Fatalf("error = %v", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			stored := &actionsv1alpha1.WorkflowJob{}
+			if err := clusterClient.Get(context.Background(), client.ObjectKeyFromObject(workflowJob), stored); err != nil {
+				t.Fatal(err)
+			}
+			condition := meta.FindStatusCondition(stored.Status.Conditions, actionsv1alpha1.WorkflowJobConditionSucceeded)
+			if condition == nil || condition.Status != metav1.ConditionFalse || condition.Reason != "GitHubTokenPermissionsRejected" ||
+				!strings.HasPrefix(condition.Message, "Creating the GitHub token") ||
+				!strings.Contains(condition.Message, `WorkflowJob "build"`) || !strings.Contains(condition.Message, "issues:write") {
+				t.Fatalf("succeeded condition = %#v", condition)
+			}
+		})
+	}
+}
+
 func TestMissingPlanFailsAssignedWorkflowJob(t *testing.T) {
 	scheme := runnerTestScheme(t)
 	run := &actionsv1alpha1.WorkflowRun{
@@ -1289,6 +1348,111 @@ func TestMissingPlanFailsAssignedWorkflowJob(t *testing.T) {
 	}
 }
 
+func TestExecuteWorkflowJobMintsPlannedTokenPermissions(t *testing.T) {
+	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	privateKeyData := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(privateKey)})
+	requests := []struct {
+		Repositories []string
+		Permissions  map[string]string
+	}{}
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodPost || request.URL.Path != "/app/installations/2/access_tokens" {
+			http.NotFound(writer, request)
+			return
+		}
+		body := struct {
+			Repositories []string          `json:"repositories"`
+			Permissions  map[string]string `json:"permissions"`
+		}{}
+		if err := json.NewDecoder(request.Body).Decode(&body); err != nil {
+			http.Error(writer, "invalid request", http.StatusBadRequest)
+			return
+		}
+		requests = append(requests, struct {
+			Repositories []string
+			Permissions  map[string]string
+		}{Repositories: body.Repositories, Permissions: body.Permissions})
+		if len(body.Repositories) == 0 {
+			fmt.Fprint(writer, `{"token":"action-token"}`)
+			return
+		}
+		fmt.Fprint(writer, `{"token":"job-token"}`)
+	}))
+	defer server.Close()
+	github, err := githubclient.NewClient(server.URL, server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	scheme := runnerTestScheme(t)
+	project := &actionsv1alpha1.Project{
+		ObjectMeta: metav1.ObjectMeta{Name: "project", Namespace: "default", UID: types.UID("project-uid")},
+		Spec: actionsv1alpha1.ProjectSpec{Source: actionsv1alpha1.ProjectSource{Type: actionsv1alpha1.SourceTypeGitHub, GitHub: &actionsv1alpha1.GitHubAppConfiguration{
+			AppID: 1, InstallationID: 2,
+			PrivateKeySecretRef: corev1.SecretKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: "github"}, Key: "private-key"},
+		}}},
+	}
+	run := &actionsv1alpha1.WorkflowRun{
+		TypeMeta:   metav1.TypeMeta{APIVersion: actionsv1alpha1.GroupVersion.String(), Kind: "WorkflowRun"},
+		ObjectMeta: metav1.ObjectMeta{Name: "ci", Namespace: "default", UID: types.UID("run-uid")},
+		Spec: actionsv1alpha1.WorkflowRunSpec{
+			ProjectRef: corev1.LocalObjectReference{Name: project.Name},
+			Source: actionsv1alpha1.WorkflowRunSource{Type: actionsv1alpha1.SourceTypeGitHub, GitHub: &actionsv1alpha1.GitHubWorkflowRunSource{
+				Repository: actionsv1alpha1.GitHubRepository{ID: 1, Owner: "acme", Name: "example"},
+				Event:      actionsv1alpha1.GitHubEvent{Name: actionsv1alpha1.GitHubEventNamePush, DeliveryID: "delivery"},
+				Revision:   actionsv1alpha1.GitRevision{SHA: strings.Repeat("a", 40), Ref: "refs/heads/main"},
+			}},
+		},
+	}
+	workflowJob := &actionsv1alpha1.WorkflowJob{
+		TypeMeta: metav1.TypeMeta{APIVersion: actionsv1alpha1.GroupVersion.String(), Kind: "WorkflowJob"},
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "build", Namespace: "default", UID: types.UID("job-uid"),
+			Labels: map[string]string{actionsv1alpha1.LabelProjectUID: string(project.UID), actionsv1alpha1.LabelWorkflowRunUID: string(run.UID)},
+		},
+		Spec:   actionsv1alpha1.WorkflowJobSpec{WorkflowRunRef: corev1.LocalObjectReference{Name: run.Name}, JobID: "build"},
+		Status: actionsv1alpha1.WorkflowJobStatus{RunnerRef: &corev1.LocalObjectReference{Name: "runner"}},
+	}
+	if err := controllerutil.SetControllerReference(run, workflowJob, scheme); err != nil {
+		t.Fatal(err)
+	}
+	plan := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: childName(workflowJob.Name, "plan"), Namespace: workflowJob.Namespace},
+		Data:       map[string]string{jobPlanKey: runnerControllerPlanData(t, map[string]string{"issues": "write", "statuses": "read"})},
+	}
+	if err := controllerutil.SetControllerReference(workflowJob, plan, scheme); err != nil {
+		t.Fatal(err)
+	}
+	credentials := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "github", Namespace: "default"}, Data: map[string][]byte{"private-key": privateKeyData}}
+	runnerObject := &actionsv1alpha1.Runner{
+		ObjectMeta: metav1.ObjectMeta{Name: "runner", Namespace: "default", UID: types.UID("runner-uid")},
+		Spec:       actionsv1alpha1.RunnerSpec{Execution: actionsv1alpha1.RunnerExecutionSpec{Image: "runner:test"}},
+	}
+	clusterClient := fake.NewClientBuilder().WithScheme(scheme).
+		WithStatusSubresource(&actionsv1alpha1.WorkflowJob{}, &batchv1.Job{}).
+		WithObjects(project, run, workflowJob, plan, credentials, runnerObject).Build()
+	reconciler := &RunnerReconciler{Client: clusterClient, APIReader: clusterClient, GitHub: github}
+	terminal, err := reconciler.executeWorkflowJob(context.Background(), runnerObject, workflowJob, project)
+	if err != nil || terminal {
+		t.Fatalf("executeWorkflowJob() = terminal %v, error %v", terminal, err)
+	}
+	if len(requests) != 2 || !slices.Equal(requests[0].Repositories, []string{"example"}) ||
+		len(requests[1].Repositories) != 0 || !maps.Equal(requests[0].Permissions, map[string]string{"issues": "write", "statuses": "read"}) ||
+		!maps.Equal(requests[1].Permissions, map[string]string{"contents": "read"}) {
+		t.Fatalf("installation token requests = %#v", requests)
+	}
+	auth := &corev1.Secret{}
+	if err := clusterClient.Get(context.Background(), client.ObjectKey{Namespace: "default", Name: childName(workflowJob.Name, "auth")}, auth); err != nil {
+		t.Fatal(err)
+	}
+	if string(auth.Data[jobTokenSecretKey]) != "job-token" || string(auth.Data[actionTokenSecretKey]) != "action-token" {
+		t.Fatalf("authentication Secret data = %#v", auth.Data)
+	}
+}
+
 func TestMissingNeedsContextFailsAssignedWorkflowJob(t *testing.T) {
 	scheme := runnerTestScheme(t)
 	run := &actionsv1alpha1.WorkflowRun{
@@ -1310,7 +1474,10 @@ func TestMissingNeedsContextFailsAssignedWorkflowJob(t *testing.T) {
 	if err := controllerutil.SetControllerReference(run, workflowJob, scheme); err != nil {
 		t.Fatal(err)
 	}
-	plan := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: childName(workflowJob.Name, "plan"), Namespace: workflowJob.Namespace}}
+	plan := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: childName(workflowJob.Name, "plan"), Namespace: workflowJob.Namespace},
+		Data:       map[string]string{jobPlanKey: runnerControllerPlanData(t, map[string]string{"issues": "write"})},
+	}
 	if err := controllerutil.SetControllerReference(workflowJob, plan, scheme); err != nil {
 		t.Fatal(err)
 	}
@@ -1362,7 +1529,10 @@ func TestPlanReadUsesLiveReader(t *testing.T) {
 	if err := controllerutil.SetControllerReference(run, workflowJob, scheme); err != nil {
 		t.Fatal(err)
 	}
-	plan := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: childName(workflowJob.Name, "plan"), Namespace: workflowJob.Namespace}}
+	plan := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: childName(workflowJob.Name, "plan"), Namespace: workflowJob.Namespace},
+		Data:       map[string]string{jobPlanKey: runnerControllerPlanData(t, map[string]string{"issues": "write"})},
+	}
 	if err := controllerutil.SetControllerReference(workflowJob, plan, scheme); err != nil {
 		t.Fatal(err)
 	}
@@ -1691,6 +1861,50 @@ func TestEnsureAuthSecretStoresRunnerTokens(t *testing.T) {
 	}
 }
 
+func TestCleanupAuthSecretRevokesRunnerTokens(t *testing.T) {
+	scheme := runnerTestScheme(t)
+	workflowJob := &actionsv1alpha1.WorkflowJob{
+		TypeMeta:   metav1.TypeMeta{APIVersion: actionsv1alpha1.GroupVersion.String(), Kind: "WorkflowJob"},
+		ObjectMeta: metav1.ObjectMeta{Name: "build", Namespace: "default", UID: types.UID("job-uid")},
+	}
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: childName(workflowJob.Name, "auth"), Namespace: workflowJob.Namespace},
+		Data: map[string][]byte{
+			jobTokenSecretKey:    []byte("job-token"),
+			actionTokenSecretKey: []byte("action-token"),
+		},
+	}
+	if err := controllerutil.SetControllerReference(workflowJob, secret, scheme); err != nil {
+		t.Fatal(err)
+	}
+	revoked := []string{}
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodDelete || request.URL.Path != "/installation/token" {
+			http.NotFound(writer, request)
+			return
+		}
+		revoked = append(revoked, strings.TrimPrefix(request.Header.Get("Authorization"), "Bearer "))
+		writer.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+	github, err := githubclient.NewClient(server.URL, server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	clusterClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(workflowJob, secret).Build()
+	reconciler := &RunnerReconciler{Client: clusterClient, APIReader: clusterClient, GitHub: github}
+	if err := reconciler.cleanupAuthSecret(context.Background(), workflowJob); err != nil {
+		t.Fatal(err)
+	}
+	slices.Sort(revoked)
+	if !slices.Equal(revoked, []string{"action-token", "job-token"}) {
+		t.Fatalf("revoked tokens = %#v", revoked)
+	}
+	if err := clusterClient.Get(context.Background(), client.ObjectKeyFromObject(secret), &corev1.Secret{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("authentication Secret still exists: %v", err)
+	}
+}
+
 func TestEnsureAuthSecretRejectsUnownedCollision(t *testing.T) {
 	scheme := runnerTestScheme(t)
 	workflowJob := &actionsv1alpha1.WorkflowJob{
@@ -1713,6 +1927,28 @@ func TestEnsureAuthSecretRejectsUnownedCollision(t *testing.T) {
 	if string(stored.Data[jobTokenSecretKey]) != "existing" {
 		t.Fatalf("unowned Secret token = %q", stored.Data[jobTokenSecretKey])
 	}
+}
+
+func runnerControllerPlanData(t *testing.T, permissions map[string]string) string {
+	t.Helper()
+	plan := runner.Plan{
+		Version:                runner.PlanVersion,
+		Run:                    runner.Run{ID: 1, Number: 1, Attempt: 1, Actor: "octocat"},
+		Repository:             runner.Repository{ID: 1, Owner: "acme", Name: "example", ServerURL: "https://github.com", APIURL: "https://api.github.com", ActionCloneBaseURL: "https://github.com"},
+		Event:                  runner.Event{Name: "push", DeliveryID: "delivery"},
+		Revision:               runner.Revision{SHA: strings.Repeat("a", 40), Ref: "refs/heads/main", RefName: "main"},
+		WorkflowName:           "CI",
+		JobID:                  "build",
+		GitHubTokenPermissions: permissions,
+		TimeoutSeconds:         int64((6 * time.Hour) / time.Second),
+		CleanupTimeoutSeconds:  int64(runner.CleanupTimeout / time.Second),
+		Steps:                  []runner.Step{{Run: "true"}},
+	}
+	data, err := json.Marshal(plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(data)
 }
 
 func TestDeletingBusyRunnerFinalizesItsWorkflowJob(t *testing.T) {

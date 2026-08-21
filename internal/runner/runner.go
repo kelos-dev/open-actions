@@ -38,23 +38,24 @@ const (
 const runnerLogMarker = "open_actions_runner"
 
 type Plan struct {
-	Version               int               `json:"version"`
-	Run                   Run               `json:"run"`
-	Repository            Repository        `json:"repository"`
-	Event                 Event             `json:"event"`
-	Revision              Revision          `json:"revision"`
-	Inputs                map[string]any    `json:"inputs,omitempty"`
-	WorkflowName          string            `json:"workflowName"`
-	JobID                 string            `json:"jobID"`
-	Matrix                map[string]any    `json:"matrix,omitempty"`
-	Needs                 Needs             `json:"-"`
-	Env                   map[string]string `json:"env,omitempty"`
-	Outputs               map[string]string `json:"outputs,omitempty"`
-	TimeoutSeconds        int64             `json:"timeoutSeconds,omitempty"`
-	CleanupTimeoutSeconds int64             `json:"cleanupTimeoutSeconds,omitempty"`
-	Steps                 []Step            `json:"steps"`
-	eventPath             string
-	eventPayload          map[string]any
+	Version                int               `json:"version"`
+	Run                    Run               `json:"run"`
+	Repository             Repository        `json:"repository"`
+	Event                  Event             `json:"event"`
+	Revision               Revision          `json:"revision"`
+	Inputs                 map[string]any    `json:"inputs,omitempty"`
+	WorkflowName           string            `json:"workflowName"`
+	JobID                  string            `json:"jobID"`
+	Matrix                 map[string]any    `json:"matrix,omitempty"`
+	Needs                  Needs             `json:"-"`
+	Env                    map[string]string `json:"env,omitempty"`
+	Outputs                map[string]string `json:"outputs,omitempty"`
+	GitHubTokenPermissions map[string]string `json:"githubTokenPermissions"`
+	TimeoutSeconds         int64             `json:"timeoutSeconds,omitempty"`
+	CleanupTimeoutSeconds  int64             `json:"cleanupTimeoutSeconds,omitempty"`
+	Steps                  []Step            `json:"steps"`
+	eventPath              string
+	eventPayload           map[string]any
 }
 
 type Run struct {
@@ -270,6 +271,11 @@ func LoadPlan(path string) (*Plan, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read job plan: %w", err)
 	}
+	return DecodePlan(data)
+}
+
+// DecodePlan validates and decodes an immutable job plan.
+func DecodePlan(data []byte) (*Plan, error) {
 	plan := &Plan{}
 	decoder := json.NewDecoder(bytes.NewReader(data))
 	decoder.DisallowUnknownFields()
@@ -300,7 +306,27 @@ func LoadPlan(path string) (*Plan, error) {
 	if plan.Version >= 7 && (plan.Run.ID < 1 || plan.Run.Number < 1 || plan.Run.Attempt < 1 || plan.Run.Actor == "") {
 		return nil, errors.New("job plan run identity is incomplete")
 	}
+	if plan.Version >= 8 && !validGitHubTokenPermissions(plan.GitHubTokenPermissions) {
+		return nil, errors.New("job plan GitHub token permissions are incomplete")
+	}
 	return plan, nil
+}
+
+func validGitHubTokenPermissions(permissions map[string]string) bool {
+	if permissions == nil {
+		return false
+	}
+	for name, level := range permissions {
+		switch name {
+		case "actions", "checks", "contents", "issues", "packages", "pull_requests", "statuses":
+		default:
+			return false
+		}
+		if level != "read" && level != "write" {
+			return false
+		}
+	}
+	return true
 }
 
 func LoadEventSnapshot(plan *Plan, path string) error {

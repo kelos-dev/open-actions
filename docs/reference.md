@@ -233,6 +233,60 @@ environment unless the workflow assigns one of those expressions to an
 environment variable or action input. Token permission selection is described
 separately from Project value sources.
 
+### Job token permissions
+
+Open Actions accepts `permissions` at the workflow and job levels for
+`actions`, `checks`, `contents`, `issues`, `packages`, `pull-requests`, and
+`statuses`. Each value may be `read`, `write`, or `none`; `write` includes
+read access. `read-all`, `write-all`, and `{}` are also supported. A permission
+map sets every omitted permission to `none`. For `{}`, Open Actions explicitly
+requests only GitHub's repository Metadata read permission instead of omitting
+the token permission restriction.
+
+When a job omits `permissions`, it inherits the workflow-level value. When
+both levels omit it, the default is `contents: read`. A job-level value replaces
+the workflow-level value rather than merging with it:
+
+```yaml
+permissions:
+  contents: read
+
+jobs:
+  label:
+    permissions:
+      issues: write
+    runs-on: ubuntu-latest
+    steps:
+      - run: gh issue edit 42 --add-label triage
+        env:
+          GH_TOKEN: ${{ github.token }}
+```
+
+The `label` job receives only `issues: write`; it does not inherit
+`contents: read`. Release API operations use the `contents` permission, so
+there is no separate `releases` permission. Open Actions rejects unsupported
+permission names, including `id-token`, because it does not provide GitHub's
+Actions OIDC token service.
+
+Immediately before creating a job Pod, the controller requests a GitHub App
+installation token selected to the Project repository and narrowed to the
+effective permissions. A request that exceeds the permissions granted to the
+configured App immediately fails the WorkflowJob before the Pod starts and
+reports the requested permission set. For pull request events from a fork,
+requested writes are reduced to reads;
+`pull_request_target` keeps the permissions declared by its trusted base
+workflow.
+
+The controller stores the job token and the separate action-download token in
+an owned Kubernetes Secret, revokes both after the job finishes, and then
+deletes the Secret. GitHub App installation tokens also expire one hour after
+creation, so a token used by a job running longer than one hour can expire
+before the job completes.
+
+Because this token belongs to the Project's GitHub App, GitHub treats events it
+creates as ordinary App events. It does not receive the special recursive-run
+suppression that GitHub applies to its native Actions `GITHUB_TOKEN`.
+
 ### External actions
 
 External action repositories on the configured GitHub server are downloaded
@@ -410,7 +464,7 @@ The resources expose these condition contracts:
 | `WorkflowJob` | `Scheduled` | `False` | `ConditionFalse`, `ConditionEvaluationFailed`, `MatrixEvaluationFailed`, `CancellationRequested`, `MatrixFailFast`, `ProjectRecreated` |
 | `WorkflowJob` | `Succeeded` | `Unknown` | `JobRunning` |
 | `WorkflowJob` | `Succeeded` | `True` | `JobSucceeded` |
-| `WorkflowJob` | `Succeeded` | `False` | `JobFailed`, `JobTimedOut`, `JobCancelled`, `JobResultInvalid`, `ConditionEvaluationFailed`, `MatrixEvaluationFailed`, `PlanUnavailable`, `JobStartFailed`, `ExecutionStateLost`, `CancellationRequested`, `MatrixFailFast`, `ProjectRecreated` |
+| `WorkflowJob` | `Succeeded` | `False` | `JobFailed`, `JobTimedOut`, `JobCancelled`, `JobResultInvalid`, `ConditionEvaluationFailed`, `MatrixEvaluationFailed`, `PlanUnavailable`, `JobStartFailed`, `GitHubTokenPermissionsRejected`, `ExecutionStateLost`, `CancellationRequested`, `MatrixFailFast`, `ProjectRecreated` |
 | `WorkflowJob` | `CancellationRequested` | `True` | `CancellationRequested`, `ConditionEvaluationFailed`, `MatrixFailFast` |
 | `WorkflowJob` | `CancellationRequested` | `False` | `ConditionPassed` |
 

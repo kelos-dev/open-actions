@@ -18,6 +18,7 @@ import (
 	"net/http"
 	"net/url"
 	"path"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -63,9 +64,41 @@ type repositoryCommit struct {
 
 // InstallationPermissions selects the repository permissions for a scoped
 // installation token.
-type InstallationPermissions struct {
-	ContentsRead bool
-	ChecksWrite  bool
+type InstallationPermissions map[string]string
+
+var installationPermissionLevels = map[string]map[string]struct{}{
+	"actions":       {"read": {}, "write": {}},
+	"checks":        {"read": {}, "write": {}},
+	"contents":      {"read": {}, "write": {}},
+	"issues":        {"read": {}, "write": {}},
+	"packages":      {"read": {}, "write": {}},
+	"pull_requests": {"read": {}, "write": {}},
+	"statuses":      {"read": {}, "write": {}},
+}
+
+func (p InstallationPermissions) String() string {
+	if len(p) == 0 {
+		return "none"
+	}
+	values := make([]string, 0, len(p))
+	for name, level := range p {
+		values = append(values, name+":"+level)
+	}
+	sort.Strings(values)
+	return strings.Join(values, ", ")
+}
+
+func (p InstallationPermissions) validate() error {
+	if p == nil {
+		return errors.New("installation token permissions must be specified")
+	}
+	for name, level := range p {
+		levels := installationPermissionLevels[name]
+		if _, found := levels[level]; !found {
+			return fmt.Errorf("unsupported installation token permission %s:%s", name, level)
+		}
+	}
+	return nil
 }
 
 // CheckRun is the GitHub representation needed to reconcile a workflow check.
@@ -181,15 +214,8 @@ func (c *Client) InstallationForAllRepositories(ctx context.Context, appID, inst
 }
 
 func (c *Client) installation(ctx context.Context, appID, installationID int64, privateKey []byte, repositories []string, permissions InstallationPermissions) (*InstallationClient, error) {
-	tokenPermissions := map[string]string{}
-	if permissions.ContentsRead {
-		tokenPermissions["contents"] = "read"
-	}
-	if permissions.ChecksWrite {
-		tokenPermissions["checks"] = "write"
-	}
-	if len(tokenPermissions) == 0 {
-		return nil, errors.New("installation token permissions must be specified")
+	if err := permissions.validate(); err != nil {
+		return nil, err
 	}
 	key, err := parsePrivateKey(privateKey)
 	if err != nil {
@@ -203,6 +229,10 @@ func (c *Client) installation(ctx context.Context, appID, installationID int64, 
 	response := struct {
 		Token string `json:"token"`
 	}{}
+	tokenPermissions := permissions
+	if len(tokenPermissions) == 0 {
+		tokenPermissions = InstallationPermissions{"metadata": "read"}
+	}
 	tokenRequest := map[string]any{"permissions": tokenPermissions}
 	if len(repositories) > 0 {
 		tokenRequest["repositories"] = repositories
@@ -218,6 +248,25 @@ func (c *Client) installation(ctx context.Context, appID, installationID int64, 
 
 func (c *InstallationClient) Token() string {
 	return c.token
+}
+
+// Revoke invalidates this installation access token.
+func (c *InstallationClient) Revoke(ctx context.Context) error {
+	return c.client.RevokeInstallationToken(ctx, c.token)
+}
+
+// RevokeInstallationToken invalidates an installation access token. An already
+// expired or revoked token is considered successfully revoked.
+func (c *Client) RevokeInstallationToken(ctx context.Context, token string) error {
+	if token == "" {
+		return errors.New("installation token is required")
+	}
+	err := c.doJSONWithBody(ctx, http.MethodDelete, "installation/token", token, nil, nil)
+	apiError := &APIError{}
+	if errors.As(err, &apiError) && apiError.StatusCode == http.StatusUnauthorized {
+		return nil
+	}
+	return err
 }
 
 func (c *InstallationClient) ListRepositories(ctx context.Context, limit int) ([]Repository, error) {
@@ -427,6 +476,9 @@ func (c *Client) doJSONWithBodyAndQuery(ctx context.Context, method, requestPath
 			apiError.Message = strings.TrimSpace(string(responseBody))
 		}
 		return apiError
+	}
+	if destination == nil {
+		return nil
 	}
 	if err := json.Unmarshal(responseBody, destination); err != nil {
 		return fmt.Errorf("decode GitHub response: %w", err)

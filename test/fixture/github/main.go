@@ -21,8 +21,14 @@ const workflowPath = ".open-actions/workflows/ci.yaml"
 const preparationWorkflowPath = ".open-actions/workflows/preparation.yaml"
 const dynamicMatrixWorkflowPath = ".open-actions/workflows/dynamic-matrix.yaml"
 const artifactWorkflowPath = ".open-actions/workflows/artifacts.yaml"
+const tokenPermissionsWorkflowPath = ".open-actions/workflows/token-permissions.yaml"
 const fixtureJobToken = "fixture-job-token"
 const fixtureActionToken = "fixture-action-token"
+
+type installationTokenRequest struct {
+	Repositories []string          `json:"repositories,omitempty"`
+	Permissions  map[string]string `json:"permissions"`
+}
 
 const workflowData = `name: Fixture CI
 on:
@@ -136,6 +142,40 @@ jobs:
           test "$(cat artifacts/result-one.txt)" = one
           test "$(cat artifacts/result-two.txt)" = two
           printf 'artifact aggregation e2e works\n'
+`
+
+const tokenPermissionsWorkflowData = `name: Token permissions
+on: push
+permissions:
+  issues: write
+jobs:
+  inherited:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify inherited token
+        run: test -n "$CONTEXT_TOKEN" && test "$CONTEXT_TOKEN" = "$SECRET_TOKEN"
+        env:
+          CONTEXT_TOKEN: ${{ github.token }}
+          SECRET_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  overridden:
+    permissions:
+      statuses: read
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify overridden token
+        run: test -n "$CONTEXT_TOKEN" && test "$CONTEXT_TOKEN" = "$SECRET_TOKEN"
+        env:
+          CONTEXT_TOKEN: ${{ github.token }}
+          SECRET_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  disabled:
+    permissions: {}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify metadata-only token
+        run: test -n "$CONTEXT_TOKEN" && test "$CONTEXT_TOKEN" = "$SECRET_TOKEN"
+        env:
+          CONTEXT_TOKEN: ${{ github.token }}
+          SECRET_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 `
 
 const pullRequestWorkflowPath = ".open-actions/workflows/pull-request.yaml"
@@ -633,6 +673,8 @@ func main() {
 	mux.Handle("/helm/", actionGitBackend)
 	preparationActionsMutex := sync.RWMutex{}
 	preparationActionsBlocked := false
+	installationTokenRequestsMutex := sync.RWMutex{}
+	installationTokenRequests := map[string][]installationTokenRequest{}
 	mux.Handle("/preparation-actions/", http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		preparationActionsMutex.RLock()
 		blocked := preparationActionsBlocked
@@ -667,21 +709,30 @@ func main() {
 			http.NotFound(writer, request)
 			return
 		}
-		body := struct {
-			Repositories []string `json:"repositories"`
-		}{}
+		installationID := strings.TrimSuffix(strings.TrimPrefix(request.URL.Path, "/app/installations/"), "/access_tokens")
+		if installationID == "" || strings.Contains(installationID, "/") {
+			http.NotFound(writer, request)
+			return
+		}
+		body := installationTokenRequest{}
 		if err := json.NewDecoder(request.Body).Decode(&body); err != nil {
 			http.Error(writer, "invalid token request", http.StatusBadRequest)
 			return
 		}
+		var token string
 		switch {
 		case len(body.Repositories) == 0:
-			writeJSON(writer, map[string]string{"token": fixtureActionToken})
+			token = fixtureActionToken
 		case len(body.Repositories) == 1 && body.Repositories[0] != "":
-			writeJSON(writer, map[string]string{"token": fixtureJobToken})
+			token = fixtureJobToken
 		default:
 			http.Error(writer, "unexpected repository scope", http.StatusBadRequest)
+			return
 		}
+		installationTokenRequestsMutex.Lock()
+		installationTokenRequests[installationID] = append(installationTokenRequests[installationID], body)
+		installationTokenRequestsMutex.Unlock()
+		writeJSON(writer, map[string]string{"token": token})
 	})
 	mux.HandleFunc("/installation/repositories", func(writer http.ResponseWriter, request *http.Request) {
 		if request.Method != http.MethodGet {
@@ -689,6 +740,18 @@ func main() {
 			return
 		}
 		writeJSON(writer, map[string]any{"total_count": 0, "repositories": []any{}})
+	})
+	mux.HandleFunc("/installation/token", func(writer http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodDelete {
+			http.Error(writer, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		authorization := request.Header.Get("Authorization")
+		if authorization != "Bearer "+fixtureJobToken && authorization != "Bearer "+fixtureActionToken {
+			http.Error(writer, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		writer.WriteHeader(http.StatusNoContent)
 	})
 	mux.HandleFunc("/repos/acme/example/contents/.open-actions/workflows", func(writer http.ResponseWriter, _ *http.Request) {
 		writeJSON(writer, []map[string]string{{"name": "ci.yaml", "path": workflowPath, "type": "file"}})
@@ -704,6 +767,9 @@ func main() {
 	})
 	mux.HandleFunc("/repos/acme/example/contents/"+artifactWorkflowPath, func(writer http.ResponseWriter, _ *http.Request) {
 		writeJSON(writer, map[string]string{"encoding": "base64", "content": base64.StdEncoding.EncodeToString([]byte(artifactWorkflowData))})
+	})
+	mux.HandleFunc("/repos/acme/example/contents/"+tokenPermissionsWorkflowPath, func(writer http.ResponseWriter, _ *http.Request) {
+		writeJSON(writer, map[string]string{"encoding": "base64", "content": base64.StdEncoding.EncodeToString([]byte(tokenPermissionsWorkflowData))})
 	})
 	checkRunMutex := sync.RWMutex{}
 	checkRuns := map[string]map[string]any{}
@@ -763,6 +829,27 @@ func main() {
 	}
 	mux.HandleFunc("/fixture/revisions", func(writer http.ResponseWriter, _ *http.Request) {
 		writeJSON(writer, revisions)
+	})
+	mux.HandleFunc("/fixture/installation-token-requests/", func(writer http.ResponseWriter, request *http.Request) {
+		installationID := strings.TrimPrefix(request.URL.Path, "/fixture/installation-token-requests/")
+		if installationID == "" || strings.Contains(installationID, "/") {
+			http.NotFound(writer, request)
+			return
+		}
+		switch request.Method {
+		case http.MethodGet:
+			installationTokenRequestsMutex.RLock()
+			requests := append([]installationTokenRequest{}, installationTokenRequests[installationID]...)
+			installationTokenRequestsMutex.RUnlock()
+			writeJSON(writer, requests)
+		case http.MethodDelete:
+			installationTokenRequestsMutex.Lock()
+			delete(installationTokenRequests, installationID)
+			installationTokenRequestsMutex.Unlock()
+			writer.WriteHeader(http.StatusNoContent)
+		default:
+			http.Error(writer, "method not allowed", http.StatusMethodNotAllowed)
+		}
 	})
 	mux.HandleFunc("/fixture/check-runs/", func(writer http.ResponseWriter, request *http.Request) {
 		if request.Method != http.MethodGet {

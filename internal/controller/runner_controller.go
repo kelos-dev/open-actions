@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"net/http"
 	"sort"
 	"strconv"
 	"time"
@@ -498,6 +499,10 @@ func (r *RunnerReconciler) executeWorkflowJob(ctx context.Context, runnerObject 
 			return true, r.failAssignedWorkflowJob(ctx, workflowJob, "PlanUnavailable", fmt.Sprintf("Needs context ConfigMap %q is invalid: %v", needs.Name, err))
 		}
 	}
+	decodedPlan, err := runner.DecodePlan([]byte(plan.Data[jobPlanKey]))
+	if err != nil {
+		return true, r.failAssignedWorkflowJob(ctx, workflowJob, "PlanUnavailable", fmt.Sprintf("Job plan ConfigMap %q is invalid: %v", plan.Name, err))
+	}
 	if err := r.validateEventSnapshot(ctx, run); err != nil {
 		return false, err
 	}
@@ -513,22 +518,33 @@ func (r *RunnerReconciler) executeWorkflowJob(ctx context.Context, runnerObject 
 	if err != nil {
 		return false, err
 	}
-	jobInstallation, err := r.GitHub.Installation(ctx, githubConfig.AppID, githubConfig.InstallationID, privateKey, githubSource.Repository.Name, githubclient.InstallationPermissions{ContentsRead: true})
-	if err != nil {
-		return false, err
+	jobPermissions := githubclient.InstallationPermissions(decodedPlan.GitHubTokenPermissions)
+	if jobPermissions == nil {
+		jobPermissions = githubclient.InstallationPermissions{"contents": "read"}
 	}
-	actionInstallation, err := r.GitHub.InstallationForAllRepositories(ctx, githubConfig.AppID, githubConfig.InstallationID, privateKey, githubclient.InstallationPermissions{ContentsRead: true})
+	jobInstallation, err := r.GitHub.Installation(ctx, githubConfig.AppID, githubConfig.InstallationID, privateKey, githubSource.Repository.Name, jobPermissions)
 	if err != nil {
-		return false, err
+		return r.handleJobTokenCreationError(ctx, workflowJob, jobPermissions, err)
+	}
+	actionInstallation, err := r.GitHub.InstallationForAllRepositories(ctx, githubConfig.AppID, githubConfig.InstallationID, privateKey, githubclient.InstallationPermissions{"contents": "read"})
+	if err != nil {
+		_ = jobInstallation.Revoke(ctx)
+		return false, fmt.Errorf("create action download token for WorkflowJob %q: %w", workflowJob.Name, err)
 	}
 	if cancellation, err := r.workflowJobCancellationRequested(ctx, workflowJob, run); err != nil {
+		_ = jobInstallation.Revoke(ctx)
+		_ = actionInstallation.Revoke(ctx)
 		return false, err
 	} else if cancellation != nil {
+		_ = jobInstallation.Revoke(ctx)
+		_ = actionInstallation.Revoke(ctx)
 		return true, r.cancelWorkflowJob(ctx, workflowJob, cancellation)
 	}
 	artifactToken := ""
 	if r.ArtifactResultsURL != "" {
 		if r.ArtifactTokens == nil {
+			_ = jobInstallation.Revoke(ctx)
+			_ = actionInstallation.Revoke(ctx)
 			return false, errors.New("artifact token codec is not configured")
 		}
 		attempt := int32(1)
@@ -547,18 +563,22 @@ func (r *RunnerReconciler) executeWorkflowJob(ctx context.Context, runnerObject 
 			WorkflowRunBackendID: string(run.UID), WorkflowJobBackendID: string(workflowJob.UID),
 		})
 		if err != nil {
+			_ = jobInstallation.Revoke(ctx)
+			_ = actionInstallation.Revoke(ctx)
 			return false, fmt.Errorf("create artifact token for WorkflowJob %q: %w", workflowJob.Name, err)
 		}
 	}
 	if err := r.ensureAuthSecret(ctx, workflowJob, jobInstallation.Token(), actionInstallation.Token(), artifactToken); err != nil {
+		_ = jobInstallation.Revoke(ctx)
+		_ = actionInstallation.Revoke(ctx)
 		return false, err
 	}
 	nativeJob, err := r.buildJob(workflowJob, run, project, runnerObject)
 	if err != nil {
-		return false, err
+		return false, errors.Join(err, r.cleanupAuthSecret(ctx, workflowJob))
 	}
 	if cancellation, err := r.workflowJobCancellationRequested(ctx, workflowJob, run); err != nil {
-		return false, err
+		return false, errors.Join(err, r.cleanupAuthSecret(ctx, workflowJob))
 	} else if cancellation != nil {
 		return true, r.cancelWorkflowJob(ctx, workflowJob, cancellation)
 	}
@@ -567,9 +587,18 @@ func (r *RunnerReconciler) executeWorkflowJob(ctx context.Context, runnerObject 
 			_, terminal, observeErr := r.observeNativeJob(ctx, workflowJob)
 			return terminal, observeErr
 		}
-		return false, err
+		return false, errors.Join(err, r.cleanupAuthSecret(ctx, workflowJob))
 	}
 	return false, r.updateWorkflowJobStatus(ctx, workflowJob, nativeJob, nil, false)
+}
+
+func (r *RunnerReconciler) handleJobTokenCreationError(ctx context.Context, workflowJob *actionsv1alpha1.WorkflowJob, permissions githubclient.InstallationPermissions, tokenError error) (bool, error) {
+	apiError := &githubclient.APIError{}
+	if !errors.As(tokenError, &apiError) || apiError.StatusCode != http.StatusUnprocessableEntity {
+		return false, fmt.Errorf("create GitHub token for WorkflowJob %q with permissions %s: %w", workflowJob.Name, permissions, tokenError)
+	}
+	message := fmt.Sprintf("Creating the GitHub token for WorkflowJob %q with permissions %s failed: %v", workflowJob.Name, permissions, tokenError)
+	return true, r.failAssignedWorkflowJob(ctx, workflowJob, "GitHubTokenPermissionsRejected", message)
 }
 
 func (r *RunnerReconciler) workflowJobCancellationRequested(ctx context.Context, workflowJob *actionsv1alpha1.WorkflowJob, run *actionsv1alpha1.WorkflowRun) (*workflowJobCancellation, error) {
@@ -776,6 +805,19 @@ func (r *RunnerReconciler) cleanupAuthSecret(ctx context.Context, workflowJob *a
 	} else {
 		if !metav1.IsControlledBy(secret, workflowJob) {
 			return fmt.Errorf("authentication Secret %q is not controlled by WorkflowJob %q", secret.Name, workflowJob.Name)
+		}
+		if r.GitHub != nil {
+			var revokeErrors []error
+			for _, key := range []string{jobTokenSecretKey, actionTokenSecretKey} {
+				if token := string(secret.Data[key]); token != "" {
+					if err := r.GitHub.RevokeInstallationToken(ctx, token); err != nil {
+						revokeErrors = append(revokeErrors, fmt.Errorf("revoke %s from authentication Secret %q for WorkflowJob %q: %w", key, secret.Name, workflowJob.Name, err))
+					}
+				}
+			}
+			if err := errors.Join(revokeErrors...); err != nil {
+				return err
+			}
 		}
 		if err := r.Delete(ctx, secret); err != nil && !apierrors.IsNotFound(err) {
 			return err

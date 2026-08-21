@@ -55,7 +55,7 @@ func TestInstallationAndRepositoryContents(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	installation, err := client.Installation(context.Background(), 1, 2, testPrivateKey(t), "example", InstallationPermissions{ContentsRead: true})
+	installation, err := client.Installation(context.Background(), 1, 2, testPrivateKey(t), "example", InstallationPermissions{"contents": "read"})
 	if err != nil {
 		t.Fatalf("installation client: %v", err)
 	}
@@ -102,15 +102,69 @@ func TestInstallationRequestsOnlySelectedPermissions(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	installation, err := client.Installation(context.Background(), 1, 2, testPrivateKey(t), "example", InstallationPermissions{ChecksWrite: true})
+	installation, err := client.Installation(context.Background(), 1, 2, testPrivateKey(t), "example", InstallationPermissions{"checks": "write"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if installation.Token() != "checks-token" {
 		t.Fatalf("token = %q", installation.Token())
 	}
-	if _, err := client.Installation(context.Background(), 1, 2, testPrivateKey(t), "example", InstallationPermissions{}); err == nil {
-		t.Fatal("Installation() accepted empty permissions")
+	if _, err := client.Installation(context.Background(), 1, 2, testPrivateKey(t), "example", nil); err == nil {
+		t.Fatal("Installation() accepted unspecified permissions")
+	}
+}
+
+func TestInstallationRequestsMetadataForEmptyPermissions(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		body := struct {
+			Permissions map[string]string `json:"permissions"`
+		}{}
+		if err := json.NewDecoder(request.Body).Decode(&body); err != nil || len(body.Permissions) != 1 || body.Permissions["metadata"] != "read" {
+			http.Error(writer, "unexpected permissions", http.StatusBadRequest)
+			return
+		}
+		fmt.Fprint(writer, `{"token":"metadata-token"}`)
+	}))
+	defer server.Close()
+	client, err := NewClient(server.URL, server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	installation, err := client.Installation(context.Background(), 1, 2, testPrivateKey(t), "example", InstallationPermissions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if installation.Token() != "metadata-token" {
+		t.Fatalf("token = %q", installation.Token())
+	}
+}
+
+func TestRevokeInstallationToken(t *testing.T) {
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		requests++
+		if request.Method != http.MethodDelete || request.URL.Path != "/installation/token" || request.Header.Get("Authorization") != "Bearer installation-token" {
+			http.Error(writer, "unexpected revoke request", http.StatusBadRequest)
+			return
+		}
+		if requests == 1 {
+			writer.WriteHeader(http.StatusNoContent)
+			return
+		}
+		writer.WriteHeader(http.StatusUnauthorized)
+	}))
+	defer server.Close()
+	client, err := NewClient(server.URL, server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		if err := client.RevokeInstallationToken(context.Background(), "installation-token"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if requests != 2 {
+		t.Fatalf("revoke requests = %d", requests)
 	}
 }
 
@@ -137,7 +191,7 @@ func TestInstallationForAllRepositoriesOmitsRepositorySelection(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	installation, err := client.InstallationForAllRepositories(context.Background(), 1, 2, testPrivateKey(t), InstallationPermissions{ContentsRead: true})
+	installation, err := client.InstallationForAllRepositories(context.Background(), 1, 2, testPrivateKey(t), InstallationPermissions{"contents": "read"})
 	if err != nil {
 		t.Fatal(err)
 	}
