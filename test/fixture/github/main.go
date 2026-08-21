@@ -22,6 +22,8 @@ const preparationWorkflowPath = ".open-actions/workflows/preparation.yaml"
 const dynamicMatrixWorkflowPath = ".open-actions/workflows/dynamic-matrix.yaml"
 const artifactWorkflowPath = ".open-actions/workflows/artifacts.yaml"
 const tokenPermissionsWorkflowPath = ".open-actions/workflows/token-permissions.yaml"
+const jobConcurrencyWorkflowPath = ".open-actions/workflows/job-concurrency.yaml"
+const concurrencyConflictWorkflowPath = ".open-actions/workflows/concurrency-conflict.yaml"
 const fixtureJobToken = "fixture-job-token"
 const fixtureActionToken = "fixture-action-token"
 
@@ -176,6 +178,39 @@ jobs:
         env:
           CONTEXT_TOKEN: ${{ github.token }}
           SECRET_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+`
+
+const jobConcurrencyWorkflowData = `name: Job concurrency
+on: push
+jobs:
+  first:
+    runs-on: ubuntu-latest
+    concurrency:
+      group: deploy-${{ github.repository }}
+      cancel-in-progress: ${{ false }}
+    steps:
+      - run: sleep 10
+  second:
+    runs-on: ubuntu-latest
+    concurrency:
+      group: deploy-${{ github.repository }}
+      cancel-in-progress: ${{ false }}
+    steps:
+      - run: sleep 10
+`
+
+const concurrencyConflictWorkflowData = `name: Concurrency conflict
+on: push
+concurrency:
+  group: parent
+jobs:
+  conflict:
+    runs-on: ubuntu-latest
+    concurrency:
+      group: PARENT
+      cancel-in-progress: ${{ true }}
+    steps:
+      - run: echo unreachable
 `
 
 const pullRequestWorkflowPath = ".open-actions/workflows/pull-request.yaml"
@@ -770,6 +805,12 @@ func main() {
 	})
 	mux.HandleFunc("/repos/acme/example/contents/"+tokenPermissionsWorkflowPath, func(writer http.ResponseWriter, _ *http.Request) {
 		writeJSON(writer, map[string]string{"encoding": "base64", "content": base64.StdEncoding.EncodeToString([]byte(tokenPermissionsWorkflowData))})
+	})
+	mux.HandleFunc("/repos/acme/example/contents/"+jobConcurrencyWorkflowPath, func(writer http.ResponseWriter, _ *http.Request) {
+		writeJSON(writer, map[string]string{"encoding": "base64", "content": base64.StdEncoding.EncodeToString([]byte(jobConcurrencyWorkflowData))})
+	})
+	mux.HandleFunc("/repos/acme/example/contents/"+concurrencyConflictWorkflowPath, func(writer http.ResponseWriter, _ *http.Request) {
+		writeJSON(writer, map[string]string{"encoding": "base64", "content": base64.StdEncoding.EncodeToString([]byte(concurrencyConflictWorkflowData))})
 	})
 	checkRunMutex := sync.RWMutex{}
 	checkRuns := map[string]map[string]any{}

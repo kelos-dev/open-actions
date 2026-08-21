@@ -7,6 +7,7 @@ import (
 
 const (
 	WorkflowJobConditionReady                 = "Ready"
+	WorkflowJobConditionConcurrencyAcquired   = "ConcurrencyAcquired"
 	WorkflowJobConditionScheduled             = "Scheduled"
 	WorkflowJobConditionSucceeded             = "Succeeded"
 	WorkflowJobConditionCancellationRequested = "CancellationRequested"
@@ -76,6 +77,12 @@ type WorkflowJobSpec struct {
 	// +optional
 	If string `json:"if,omitempty"`
 
+	// Concurrency delays Runner assignment until this job owns the evaluated
+	// group. The group expression is evaluated after Needs reaches terminal
+	// results and matrix values are available.
+	// +optional
+	Concurrency *WorkflowJobConcurrency `json:"concurrency,omitempty"`
+
 	// Matrix describes the matrix combination represented by this job.
 	// +optional
 	Matrix *WorkflowJobMatrix `json:"matrix,omitempty"`
@@ -90,6 +97,37 @@ type WorkflowJobSpec struct {
 	// +kubebuilder:validation:Maximum=9223372036
 	// +optional
 	TimeoutSeconds int64 `json:"timeoutSeconds,omitempty"`
+}
+
+// WorkflowJobConcurrency is the concurrency policy copied from the workflow.
+type WorkflowJobConcurrency struct {
+	// Group is a literal or expression template evaluated by the WorkflowRun
+	// controller. Group names are case-insensitive.
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=256
+	// +required
+	Group string `json:"group"`
+
+	// CancelInProgress is evaluated after dependencies reach terminal results
+	// and matrix values are available. Omit it to leave the executing member
+	// running when this job becomes pending.
+	// +optional
+	CancelInProgress *WorkflowJobConcurrencyCancellation `json:"cancelInProgress,omitempty"`
+}
+
+// WorkflowJobConcurrencyCancellation preserves a cancellation literal or
+// expression until job concurrency is evaluated.
+// +kubebuilder:validation:XValidation:rule="has(self.value) != has(self.expression)",message="exactly one of value or expression must be specified"
+type WorkflowJobConcurrencyCancellation struct {
+	// Value is a literal cancellation decision.
+	// +optional
+	Value *bool `json:"value,omitempty"`
+
+	// Expression is a whole expression that evaluates to a Boolean.
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=65536
+	// +optional
+	Expression string `json:"expression,omitempty"`
 }
 
 // WorkflowJobMatrix identifies one expanded combination of a logical workflow
@@ -110,6 +148,16 @@ type WorkflowJobMatrix struct {
 	// +kubebuilder:validation:XValidation:rule="self.all(k, size(k) > 0 && size(k) <= 256 && size(self[k]) <= 1024)",message="matrix keys must contain 1 to 256 characters and values must contain at most 1024 characters"
 	// +required
 	Values map[string]string `json:"values"`
+
+	// JobIndex is the zero-based index exposed through strategy.job-index.
+	// +kubebuilder:validation:Minimum=0
+	// +optional
+	JobIndex int32 `json:"jobIndex,omitempty"`
+
+	// JobTotal is the number of combinations exposed through strategy.job-total.
+	// +kubebuilder:validation:Minimum=1
+	// +optional
+	JobTotal int32 `json:"jobTotal,omitempty"`
 
 	// MaxParallel limits concurrently scheduled combinations in this logical
 	// job. Omit MaxParallel to apply no matrix-specific limit.
@@ -160,11 +208,18 @@ type WorkflowJobStatus struct {
 	// +optional
 	Outputs map[string]string `json:"outputs,omitempty"`
 
-	// Conditions describe dependency readiness, Runner assignment, cancellation,
-	// and the terminal result. When present, Ready is true when a Runner may claim
-	// the job. Dependency-free unconditional jobs are also claimable when Ready is
-	// absent. Scheduled is true after the scheduler assigns status.runnerRef. Known
-	// condition types are Ready, Scheduled, Succeeded, and CancellationRequested.
+	// Concurrency records the evaluated job concurrency policy. It is set before
+	// the job enters the concurrency gate and remains stable for the job's
+	// lifetime.
+	// +optional
+	Concurrency *ConcurrencyStatus `json:"concurrency,omitempty"`
+
+	// Conditions describe dependency readiness, concurrency acquisition, Runner
+	// assignment, cancellation, and the terminal result. When present, Ready is
+	// true when a Runner may claim the job. Dependency-free unconditional jobs
+	// without concurrency are also claimable when Ready is absent. Scheduled is
+	// true after the scheduler assigns status.runnerRef. Known condition types are
+	// Ready, ConcurrencyAcquired, Scheduled, Succeeded, and CancellationRequested.
 	// +listType=map
 	// +listMapKey=type
 	// +kubebuilder:validation:MaxItems=16

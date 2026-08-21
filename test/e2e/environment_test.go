@@ -33,16 +33,18 @@ import (
 )
 
 const (
-	webhookSecret             = "open-actions-e2e-secret"
-	fixtureURL                = "http://127.0.0.1:18081"
-	webhookURL                = "http://127.0.0.1:18080"
-	consoleURL                = "http://127.0.0.1:18082"
-	workflowPath              = ".open-actions/workflows/ci.yaml"
-	preparationWorkflowPath   = ".open-actions/workflows/preparation.yaml"
-	dynamicMatrixWorkflowPath = ".open-actions/workflows/dynamic-matrix.yaml"
-	artifactWorkflowPath      = ".open-actions/workflows/artifacts.yaml"
-	pullRequestWorkflowPath   = ".open-actions/workflows/pull-request.yaml"
-	dockerImage               = "docker:29.7.2-dind@sha256:12e683a161823b2a839aeea999b9d960e6e1f9a97b1679ad6b441982e2d9cf07"
+	webhookSecret                   = "open-actions-e2e-secret"
+	fixtureURL                      = "http://127.0.0.1:18081"
+	webhookURL                      = "http://127.0.0.1:18080"
+	consoleURL                      = "http://127.0.0.1:18082"
+	workflowPath                    = ".open-actions/workflows/ci.yaml"
+	preparationWorkflowPath         = ".open-actions/workflows/preparation.yaml"
+	dynamicMatrixWorkflowPath       = ".open-actions/workflows/dynamic-matrix.yaml"
+	artifactWorkflowPath            = ".open-actions/workflows/artifacts.yaml"
+	jobConcurrencyWorkflowPath      = ".open-actions/workflows/job-concurrency.yaml"
+	concurrencyConflictWorkflowPath = ".open-actions/workflows/concurrency-conflict.yaml"
+	pullRequestWorkflowPath         = ".open-actions/workflows/pull-request.yaml"
+	dockerImage                     = "docker:29.7.2-dind@sha256:12e683a161823b2a839aeea999b9d960e6e1f9a97b1679ad6b441982e2d9cf07"
 )
 
 const tokenPermissionsWorkflowPath = ".open-actions/workflows/token-permissions.yaml"
@@ -150,8 +152,8 @@ var _ = ReportAfterEach(func(report SpecReport) {
 		return
 	}
 	for _, arguments := range [][]string{
-		{"get", "projects,runners,workflowruns,workflowjobs,jobs,pods", "-A", "-o", "wide"},
-		{"get", "runners,workflowruns,workflowjobs,jobs,pods", "--namespace", e2eNamespace, "-o", "yaml"},
+		{"get", "projects,runners,workflowruns,workflowjobs,leases,jobs,pods", "-A", "-o", "wide"},
+		{"get", "runners,workflowruns,workflowjobs,leases,jobs,pods", "--namespace", e2eNamespace, "-o", "yaml"},
 		{"logs", "--namespace", e2eNamespace, "--all-containers=true", "--prefix=true", "--selector", "actions.kelos.dev/workflow-run-uid"},
 		{"logs", "--namespace", "open-actions-system", "deployment/open-actions-controller", "--tail=200"},
 		{"logs", "--namespace", "open-actions-system", "deployment/open-actions-console", "--tail=200"},

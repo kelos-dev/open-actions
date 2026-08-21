@@ -63,3 +63,16 @@ func TestPreparationWorkflowIsolatesDownloadBlock(t *testing.T) {
 		}
 	}
 }
+
+func TestConcurrencyWorkflowsAreValid(t *testing.T) {
+	for name, data := range map[string]string{
+		"job concurrency":      jobConcurrencyWorkflowData,
+		"concurrency conflict": concurrencyConflictWorkflowData,
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := workflow.Parse([]byte(data)); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
