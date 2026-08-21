@@ -18,6 +18,8 @@ func addKnownTypes(scheme *runtime.Scheme) error {
 		&ProjectList{},
 		&Runner{},
 		&RunnerList{},
+		&RunnerSet{},
+		&RunnerSetList{},
 		&WorkflowJob{},
 		&WorkflowJobList{},
 		&WorkflowRun{},
