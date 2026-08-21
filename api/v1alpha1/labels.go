@@ -3,6 +3,7 @@ package v1alpha1
 const (
 	LabelProjectUID         = "actions.kelos.dev/project-uid"
 	LabelRunnerUID          = "actions.kelos.dev/runner-uid"
+	LabelRunnerSetUID       = "actions.kelos.dev/runner-set-uid"
 	LabelWorkflowRunUID     = "actions.kelos.dev/workflow-run-uid"
 	LabelWorkflowRunRootUID = "actions.kelos.dev/workflow-run-root-uid"
 	LabelWorkflowJobUID     = "actions.kelos.dev/workflow-job-uid"

@@ -610,6 +610,17 @@ func TestRunnerAcceptsDockerExecution(t *testing.T) {
 	validateSample(t, crd, "actions_v1alpha1_docker_runner.yaml")
 }
 
+func TestRunnerSetTemplateProjectRefIsImmutable(t *testing.T) {
+	crd, _ := loadCRD(t, "actions.kelos.dev_runnersets.yaml")
+	original := loadSample(t, "actions_v1alpha1_runnerset.yaml")
+	updated := loadSample(t, "actions_v1alpha1_runnerset.yaml")
+	templateSpec := updated["spec"].(map[string]any)["template"].(map[string]any)["spec"].(map[string]any)
+	templateSpec["projectRef"].(map[string]any)["name"] = "other"
+	if errs := validateObject(t, crd, updated, original); len(errs) == 0 {
+		t.Fatal("RunnerSet template projectRef update passed CEL validation")
+	}
+}
+
 func TestCRDConventions(t *testing.T) {
 	tests := []struct {
 		file                    string
@@ -629,6 +640,12 @@ func TestCRDConventions(t *testing.T) {
 			sample:       "actions_v1alpha1_runner.yaml",
 			kind:         "Runner",
 			requiredSpec: []string{"execution", "projectRef", "labels"},
+		},
+		{
+			file:         "actions.kelos.dev_runnersets.yaml",
+			sample:       "actions_v1alpha1_runnerset.yaml",
+			kind:         "RunnerSet",
+			requiredSpec: []string{"template"},
 		},
 		{
 			file:                    "actions.kelos.dev_workflowjobs.yaml",
@@ -718,6 +735,19 @@ func TestCRDConventions(t *testing.T) {
 				docker := execution.Properties["docker"]
 				if !slices.Contains(docker.Required, "image") {
 					t.Error("spec.execution.docker.image is not required")
+				}
+			}
+			if tt.kind == "RunnerSet" {
+				replicas := spec.Properties["replicas"]
+				if replicas.Format != "int32" || replicas.Minimum == nil || *replicas.Minimum != 0 || replicas.Default == nil {
+					t.Errorf("spec.replicas schema = %#v", replicas)
+				}
+				template := spec.Properties["template"]
+				if !slices.Contains(template.Required, "spec") {
+					t.Error("spec.template.spec is not required")
+				}
+				if version.Subresources.Scale == nil || version.Subresources.Scale.SpecReplicasPath != ".spec.replicas" || version.Subresources.Scale.StatusReplicasPath != ".status.replicas" {
+					t.Errorf("scale subresource = %#v", version.Subresources.Scale)
 				}
 			}
 			if tt.kind == "WorkflowJob" {
@@ -881,6 +911,13 @@ func TestCRDRejectsInvalidCELValues(t *testing.T) {
 			mutate: func(object map[string]any) {
 				resources := object["spec"].(map[string]any)["execution"].(map[string]any)["resources"].(map[string]any)
 				resources["requests"].(map[string]any)["cpu"] = "3"
+			},
+		},
+		{
+			name: "RunnerSet with negative replicas",
+			crd:  "actions.kelos.dev_runnersets.yaml", sample: "actions_v1alpha1_runnerset.yaml",
+			mutate: func(object map[string]any) {
+				object["spec"].(map[string]any)["replicas"] = int64(-1)
 			},
 		},
 		{

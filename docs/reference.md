@@ -146,8 +146,8 @@ open-actions-console \
 
 ## Kubernetes API
 
-Open Actions exposes the namespaced `Project`, `Runner`, `WorkflowRun`, and
-`WorkflowJob` resources in `actions.kelos.dev/v1alpha1`. The installed CRD
+Open Actions exposes the namespaced `Project`, `Runner`, `RunnerSet`,
+`WorkflowRun`, and `WorkflowJob` resources in `actions.kelos.dev/v1alpha1`. The installed CRD
 schemas define their fields and validation. Example manifests are available
 under [`config/samples`](../config/samples).
 
@@ -171,9 +171,10 @@ immutable `spec.source.github.actor` records the source actor. Set
 `spec.cancelRequested` to gracefully cancel ordinary jobs while
 allowing cancellation-aware reporting and cleanup jobs to finish. Deleting a
 WorkflowRun force-cancels and removes its child resources. A Runner's
-`spec.projectRef` is
-immutable, and changes to `spec.execution` apply only to Kubernetes Jobs created
-afterward. A `WorkflowJob` spec is immutable, and `status.runnerRef` identifies
+`spec.projectRef` is immutable, and changes to `spec.execution` apply only to
+Kubernetes Jobs created afterward. A RunnerSet maintains homogeneous Runners
+from `spec.template.spec`; its template project reference is immutable. A
+`WorkflowJob` spec is immutable, and `status.runnerRef` identifies
 its one-time Runner assignment. `spec.needs` records direct workflow
 dependencies, `spec.if` records its scheduling condition,
 `spec.timeoutSeconds` records its effective execution timeout, and `status.result`
@@ -276,6 +277,18 @@ Runner labels are canonical lowercase ASCII in Kubernetes resources. Workflow
 `runs-on` labels use the same representation. Each Runner is one reusable
 execution slot and accepts one queued `WorkflowJob` from its `spec.projectRef`
 whose `runs-on` labels are all present in `spec.labels`.
+
+A RunnerSet creates and owns homogeneous Runner resources from
+`spec.template.spec`. `spec.replicas` defaults to one and may be zero. Template
+changes update non-terminating managed Runners and affect only WorkflowJobs
+created or assigned afterward according to the corresponding Runner field's
+contract. Scaling down removes idle Runners before busy Runners. A busy Runner
+selected for removal stops accepting assignments, finishes its current
+WorkflowJob, and then terminates. `status.replicas`, `readyReplicas`,
+`busyReplicas`, `idleReplicas`, and `terminatingReplicas` summarize the managed
+Runners. The scale subresource supports `kubectl scale` and compatible scaling
+controllers. See the [RunnerSet sample](../config/samples/actions_v1alpha1_runnerset.yaml)
+for a complete manifest.
 
 ### Docker execution
 
@@ -382,6 +395,8 @@ The resources expose these condition contracts:
 | `Runner` | `Ready` | `False` | `ProjectUnavailable`, `ProjectNotConfigured` |
 | `Runner` | `Busy` | `False` | `Idle` |
 | `Runner` | `Busy` | `True` | `JobAssigned` |
+| `RunnerSet` | `Ready` | `True` | `RunnersReady` |
+| `RunnerSet` | `Ready` | `False` | `ReplicaCountMismatch`, `RunnersTerminating`, `RunnersNotReady` |
 | `WorkflowRun` | `Planned` | `True` | `JobsPlanned` |
 | `WorkflowRun` | `Planned` | `Unknown` | `WaitingForConcurrency`, `WaitingForConcurrencyCancellation`, `ProjectUnavailable`, `CredentialsUnavailable`, `ProjectValuesUnavailable`, `GitHubAuthenticationFailed`, `WorkflowFetchFailed`, `ChildCreationFailed`, `ConcurrencyCheckFailed` |
 | `WorkflowRun` | `Planned` | `False` | `ProjectUnavailable`, `WorkflowFetchFailed`, `WorkflowInvalid`, `TriggerInvalid`, `RerunInvalid`, `ChildCreationFailed`, `ExecutionStateLost` |
@@ -412,7 +427,8 @@ message. Reconciliation of an unchanged condition does not emit another Event.
 ### Resource metadata
 
 Child resources carry `actions.kelos.dev/project-uid`, `runner-uid`,
-`workflow-run-uid`, and `workflow-job-uid` labels where applicable. WorkflowRun
+`runner-set-uid`, `workflow-run-uid`, and `workflow-job-uid` labels where
+applicable. WorkflowRun
 objects carry `actions.kelos.dev/workflow-run-root-uid`, which groups attempts
 in the same rerun lineage. The
 `actions.kelos.dev/workflow-job` label contains the workflow job ID when it is a

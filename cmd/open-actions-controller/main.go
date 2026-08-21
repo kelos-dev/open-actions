@@ -218,6 +218,12 @@ func runManager(arguments []string) error {
 	}).SetupWithManager(controllerManager); err != nil {
 		return fmt.Errorf("configure Runner controller: %w", err)
 	}
+	if err := (&controller.RunnerSetReconciler{
+		Client:    controllerManager.GetClient(),
+		APIReader: controllerManager.GetAPIReader(),
+	}).SetupWithManager(controllerManager); err != nil {
+		return fmt.Errorf("configure RunnerSet controller: %w", err)
+	}
 	if err := (&githubwebhook.DeliveryReconciler{
 		Client:                             controllerManager.GetClient(),
 		APIReader:                          controllerManager.GetAPIReader(),

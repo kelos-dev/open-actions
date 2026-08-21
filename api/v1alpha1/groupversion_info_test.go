@@ -12,7 +12,7 @@ func TestAddToScheme(t *testing.T) {
 		t.Fatalf("add API types to scheme: %v", err)
 	}
 
-	for _, kind := range []string{"Project", "ProjectList", "Runner", "RunnerList", "WorkflowJob", "WorkflowJobList", "WorkflowRun", "WorkflowRunList"} {
+	for _, kind := range []string{"Project", "ProjectList", "Runner", "RunnerList", "RunnerSet", "RunnerSetList", "WorkflowJob", "WorkflowJobList", "WorkflowRun", "WorkflowRunList"} {
 		gvk := GroupVersion.WithKind(kind)
 		if _, err := scheme.New(gvk); err != nil {
 			t.Errorf("construct %s: %v", gvk, err)

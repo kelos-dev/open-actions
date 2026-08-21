@@ -1,0 +1,25 @@
+apiVersion: actions.kelos.dev/v1alpha1
+kind: RunnerSet
+metadata:
+  name: linux
+  namespace: open-actions
+spec:
+  replicas: 3
+  template:
+    spec:
+      projectRef:
+        name: default
+      execution:
+        image: ghcr.io/kelos-dev/open-actions-runner:latest
+        resources:
+          requests:
+            cpu: "1"
+            memory: 1Gi
+          limits:
+            cpu: "2"
+            memory: 2Gi
+      labels:
+        - self-hosted
+        - linux
+        - x64
+        - ubuntu-latest

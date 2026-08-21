@@ -82,17 +82,18 @@ kubectl create secret generic open-actions-github-app \
 
 Put the App and installation IDs in the [Project
 sample](config/samples/actions_v1alpha1_project.yaml), then create the Project
-and a Runner:
+and a RunnerSet:
 
 ```console
 kubectl apply -f config/samples/actions_v1alpha1_project.yaml
-kubectl apply -f config/samples/actions_v1alpha1_runner.yaml
+kubectl apply -f config/samples/actions_v1alpha1_runnerset.yaml
 ```
 
-Each Runner executes one job at a time. Its labels must include every label in
-the job's `runs-on` value. Use the [Docker Runner
+Each RunnerSet maintains the number of Runner execution slots configured by
+`spec.replicas`. Each Runner executes one job at a time, and its labels must
+include every label in the job's `runs-on` value. Use the [Docker Runner
 sample](config/samples/actions_v1alpha1_docker_runner.yaml) for jobs that need
-Docker.
+Docker by copying its `spec` into the RunnerSet's `spec.template.spec`.
 
 ### 3. Migrate a workflow
 
