@@ -96,6 +96,35 @@ func TestWorkflowRunCancellationRequestIsMonotonic(t *testing.T) {
 	}
 }
 
+func TestWorkflowJobConcurrencyCancellationUnion(t *testing.T) {
+	crd, _ := loadCRD(t, "actions.kelos.dev_workflowjobs.yaml")
+	for _, test := range []struct {
+		name                string
+		cancelInProgress    map[string]any
+		wantValidationError bool
+	}{
+		{name: "literal", cancelInProgress: map[string]any{"value": false}},
+		{name: "expression", cancelInProgress: map[string]any{"expression": "${{ matrix.environment != 'production' }}"}},
+		{name: "neither", cancelInProgress: map[string]any{}, wantValidationError: true},
+		{name: "both", cancelInProgress: map[string]any{"value": true, "expression": "${{ true }}"}, wantValidationError: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			object := loadWorkflowJobSample(t)
+			object["spec"].(map[string]any)["concurrency"] = map[string]any{
+				"group":            "deploy",
+				"cancelInProgress": test.cancelInProgress,
+			}
+			errs := validateObject(t, crd, object, nil)
+			if test.wantValidationError && len(errs) == 0 {
+				t.Fatal("invalid concurrency cancellation passed CEL validation")
+			}
+			if !test.wantValidationError && len(errs) > 0 {
+				t.Fatalf("valid concurrency cancellation was rejected: %v", errs.ToAggregate())
+			}
+		})
+	}
+}
+
 func TestWorkflowRunRerunContract(t *testing.T) {
 	crd, _ := loadCRD(t, "actions.kelos.dev_workflowruns.yaml")
 	original := loadSample(t, "actions_v1alpha1_workflowrun.yaml")

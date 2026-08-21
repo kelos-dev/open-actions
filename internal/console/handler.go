@@ -1566,6 +1566,9 @@ func (h *Handler) waitForPod(ctx context.Context, job *actionsv1alpha1.WorkflowJ
 }
 
 func statusClass(status string) string {
+	if status == "Cancelling" {
+		return "running"
+	}
 	if status == "Timed out" {
 		return "failed"
 	}

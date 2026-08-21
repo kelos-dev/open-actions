@@ -142,6 +142,12 @@ func ParseCondition(input string) (*Program, error) {
 	return &Program{segments: []segment{{expression: parsed}}, whole: true}, nil
 }
 
+// IsWholeExpression reports whether the template consists of exactly one
+// expression and therefore preserves the expression's result type.
+func (p *Program) IsWholeExpression() bool {
+	return p.whole
+}
+
 func expressionEnd(input string, offset int) (int, error) {
 	quoted := false
 	for index := offset; index < len(input); index++ {

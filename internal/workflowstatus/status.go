@@ -70,6 +70,10 @@ func Job(job *actionsv1alpha1.WorkflowJob) string {
 			return failed
 		}
 	}
+	cancellation := meta.FindStatusCondition(job.Status.Conditions, actionsv1alpha1.WorkflowJobConditionCancellationRequested)
+	if cancellation != nil && cancellation.Status == metav1.ConditionTrue {
+		return cancelling
+	}
 	if job.Status.RunnerRef != nil {
 		return running
 	}

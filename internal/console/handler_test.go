@@ -305,7 +305,7 @@ func TestNewerRunQueryDetectsConcurrencyReplacementAndRerun(t *testing.T) {
 	replacement.Status.Identity = &actionsv1alpha1.WorkflowRunIdentityStatus{
 		ID: 2, Number: 2, Attempt: 1, URL: "https://actions.example/runs/default/ci-replacement",
 	}
-	replacement.Status.ConcurrencyGroup = "ci-main"
+	replacement.Status.Concurrency = &actionsv1alpha1.ConcurrencyStatus{Group: "ci-main"}
 	if err := clusterClient.Create(context.Background(), replacement); err != nil {
 		t.Fatal(err)
 	}

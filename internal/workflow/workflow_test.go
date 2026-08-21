@@ -501,6 +501,146 @@ func TestParseRejectsConcurrencyWithoutGroup(t *testing.T) {
 	}
 }
 
+func TestParseJobConcurrency(t *testing.T) {
+	for _, test := range []struct {
+		name               string
+		value              string
+		wantGroup          string
+		wantCancelProgress bool
+		wantCancelSource   string
+	}{
+		{name: "scalar", value: "deploy-${{ matrix.arch }}", wantGroup: "deploy-${{ matrix.arch }}"},
+		{name: "mapping", value: "{group: 'deploy-${{ needs.build.result }}', cancel-in-progress: true}", wantGroup: "deploy-${{ needs.build.result }}", wantCancelProgress: true},
+		{name: "expression", value: "{group: deploy, cancel-in-progress: '${{ matrix.environment != ''production'' }}'}", wantGroup: "deploy", wantCancelSource: "${{ matrix.environment != 'production' }}"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			data := []byte("name: CI\non: push\njobs:\n  build:\n    concurrency: " + test.value + "\n    runs-on: ubuntu-latest\n    steps:\n      - run: make test\n")
+			definition, err := Parse(data)
+			if err != nil {
+				t.Fatal(err)
+			}
+			concurrency := definition.Jobs["build"].Concurrency
+			if concurrency.Group != test.wantGroup || concurrency.CancelInProgress.Value != test.wantCancelProgress || concurrency.CancelInProgress.Expression != test.wantCancelSource {
+				t.Fatalf("job concurrency = %#v", concurrency)
+			}
+		})
+	}
+}
+
+func TestParseConcurrencyCancelInProgress(t *testing.T) {
+	tests := []struct {
+		name       string
+		value      string
+		wantValue  bool
+		wantSource string
+	}{
+		{name: "true literal", value: "true", wantValue: true},
+		{name: "false literal", value: "false"},
+		{name: "expression", value: "${{ github.ref != 'refs/heads/main' }}", wantSource: "${{ github.ref != 'refs/heads/main' }}"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			data := []byte("name: CI\non: push\nconcurrency:\n  group: ci\n  cancel-in-progress: " + tt.value + "\n" + minimalJob)
+			definition, err := Parse(data)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if definition.Concurrency.CancelInProgress.Value != tt.wantValue || definition.Concurrency.CancelInProgress.Expression != tt.wantSource {
+				t.Fatalf("cancel-in-progress = %#v", definition.Concurrency.CancelInProgress)
+			}
+		})
+	}
+}
+
+func TestParseConcurrencyCancelInProgressAlias(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		value      string
+		wantValue  bool
+		wantSource string
+	}{
+		{name: "literal", value: "true", wantValue: true},
+		{name: "expression", value: "\"${{ github.ref != 'refs/heads/main' }}\"", wantSource: "${{ github.ref != 'refs/heads/main' }}"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			data := []byte("name: CI\non: push\nenv:\n  CANCEL: &cancel " + test.value + "\nconcurrency:\n  group: ci\n  cancel-in-progress: *cancel\n" + minimalJob)
+			definition, err := Parse(data)
+			if err != nil {
+				t.Fatal(err)
+			}
+			cancel := definition.Concurrency.CancelInProgress
+			if cancel.Value != test.wantValue || cancel.Expression != test.wantSource {
+				t.Fatalf("cancel-in-progress = %#v", cancel)
+			}
+		})
+	}
+}
+
+func TestParseRejectsInvalidJobConcurrency(t *testing.T) {
+	for _, concurrency := range []string{"''", "{}", "{cancel-in-progress: true}", "${{ secrets.TOKEN }}", "{group: deploy, cancel-in-progress: '${{ secrets.TOKEN }}'}", "{group: deploy, cancel-in-progress: '${{ matrix.enabled }} and text'}"} {
+		data := []byte("name: CI\non: push\njobs:\n  build:\n    concurrency: " + concurrency + "\n    runs-on: ubuntu-latest\n    steps:\n      - run: make test\n")
+		if _, err := Parse(data); err == nil {
+			t.Fatalf("Parse() accepted job concurrency %q", concurrency)
+		}
+	}
+}
+
+func TestParseRejectsInvalidConcurrencyCancelInProgress(t *testing.T) {
+	tests := []struct {
+		name  string
+		value string
+		want  string
+	}{
+		{name: "quoted boolean", value: "'true'", want: "must contain exactly one expression"},
+		{name: "empty string", value: "''", want: "must contain exactly one expression"},
+		{name: "interpolated string", value: "'prefix-${{ github.ref }}'", want: "must contain exactly one expression"},
+		{name: "secret", value: "\"${{ secrets.TOKEN != '' }}\"", want: `context "secrets" is unavailable`},
+		{name: "job context", value: "${{ matrix.enabled }}", want: `context "matrix" is unavailable`},
+		{name: "number", value: "1", want: "must be a boolean or expression"},
+		{name: "null", value: "null", want: "must be a boolean or expression"},
+		{name: "sequence", value: "[true]", want: "must be a boolean or expression"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			data := []byte("name: CI\non: push\nconcurrency:\n  group: ci\n  cancel-in-progress: " + tt.value + "\n" + minimalJob)
+			_, err := Parse(data)
+			if err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("Parse() error = %v, want %q", err, tt.want)
+			}
+		})
+	}
+}
+
+func TestEvaluateJobConcurrencyUsesDeferredContexts(t *testing.T) {
+	concurrency := Concurrency{
+		Group:            "${{ github.ref_name }}-${{ needs.build.result }}-${{ strategy['job-index'] }}-${{ matrix.arch }}-${{ inputs.target }}-${{ vars.stage }}",
+		CancelInProgress: BooleanExpression{Expression: "${{ needs.build.result == 'success' && matrix.arch == 'arm64' }}"},
+	}
+	for _, test := range []struct {
+		arch       string
+		wantCancel bool
+	}{
+		{arch: "arm64", wantCancel: true},
+		{arch: "amd64"},
+	} {
+		group, cancelInProgress, err := EvaluateJobConcurrency("deploy", concurrency, workflowexpression.Context{Values: map[string]any{
+			"github":   map[string]any{"ref_name": "main"},
+			"needs":    map[string]any{"build": map[string]any{"result": "success"}},
+			"strategy": map[string]any{"job-index": int32(1)},
+			"matrix":   map[string]any{"arch": test.arch},
+			"inputs":   map[string]any{"target": "production"},
+			"vars":     map[string]any{"stage": "release"},
+		}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		wantGroup := "main-success-1-" + test.arch + "-production-release"
+		if group != wantGroup || cancelInProgress != test.wantCancel {
+			t.Fatalf("EvaluateJobConcurrency() = %q, %t, want %q, %t", group, cancelInProgress, wantGroup, test.wantCancel)
+		}
+	}
+}
+
 func TestEvaluateConcurrency(t *testing.T) {
 	data, err := os.ReadFile("testdata/ci.yaml")
 	if err != nil {
@@ -516,6 +656,107 @@ func TestEvaluateConcurrency(t *testing.T) {
 	}
 	if group != "CI-feature" || !cancel {
 		t.Errorf("group = %q, cancel = %v", group, cancel)
+	}
+}
+
+func TestEvaluateConcurrencyCancelInProgressExpression(t *testing.T) {
+	definition := &Definition{
+		Name: "CI",
+		Concurrency: Concurrency{
+			Group: "ci-${{ github.ref_name }}",
+			CancelInProgress: BooleanExpression{
+				Expression: "${{ github.event_name == 'pull_request' && github.ref != 'refs/heads/main' }}",
+			},
+		},
+	}
+	tests := []struct {
+		name  string
+		event Event
+		want  bool
+	}{
+		{name: "pull request", event: Event{Name: "pull_request", Ref: "refs/pull/42/merge", RefName: "42/merge"}, want: true},
+		{name: "main push", event: Event{Name: "push", Ref: "refs/heads/main", RefName: "main"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			group, cancel, err := EvaluateConcurrency(definition, tt.event, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if group != "ci-"+tt.event.RefName || cancel != tt.want {
+				t.Fatalf("EvaluateConcurrency() = %q, %v, want %q, %v", group, cancel, "ci-"+tt.event.RefName, tt.want)
+			}
+		})
+	}
+}
+
+func TestEvaluateConcurrencyCancelInProgressMissingProperty(t *testing.T) {
+	definition := &Definition{
+		Name: "CI",
+		Concurrency: Concurrency{
+			Group:            "ci",
+			CancelInProgress: BooleanExpression{Expression: "${{ github.event.pull_request.draft }}"},
+		},
+	}
+	_, _, err := EvaluateConcurrency(definition, Event{Name: "push"}, nil)
+	if err == nil || !strings.Contains(err.Error(), "expression returned string, expected boolean") {
+		t.Fatalf("EvaluateConcurrency() error = %v", err)
+	}
+
+	definition.Concurrency.CancelInProgress.Expression = "${{ github.event.pull_request.draft == true }}"
+	_, cancel, err := EvaluateConcurrency(definition, Event{Name: "push"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cancel {
+		t.Fatal("comparison with a missing property requested cancellation")
+	}
+}
+
+func TestEvaluateConcurrencyCancelInProgressRejectsInvalidTypes(t *testing.T) {
+	tests := []struct {
+		expression string
+		wantType   string
+	}{
+		{expression: "${{ github.ref_name }}", wantType: "string"},
+		{expression: "${{ 1 }}", wantType: "number"},
+		{expression: "${{ fromJSON('[true]') }}", wantType: "array"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.wantType, func(t *testing.T) {
+			definition := &Definition{
+				Name: "CI",
+				Concurrency: Concurrency{
+					Group:            "ci",
+					CancelInProgress: BooleanExpression{Expression: tt.expression},
+				},
+			}
+			_, _, err := EvaluateConcurrency(definition, Event{RefName: "main"}, nil)
+			if err == nil || !strings.Contains(err.Error(), "expression returned "+tt.wantType+", expected boolean") {
+				t.Fatalf("EvaluateConcurrency() error = %v", err)
+			}
+		})
+	}
+}
+
+func TestEvaluateConcurrencyCancelInProgressMasksSensitiveErrors(t *testing.T) {
+	definition := &Definition{
+		Name: "CI",
+		Concurrency: Concurrency{
+			Group:            "ci",
+			CancelInProgress: BooleanExpression{Expression: "${{ format(vars.FORMAT, vars.VALUE) }}"},
+		},
+	}
+	variables := map[string]any{
+		"FORMAT": workflowexpression.Secret("{9}"),
+		"VALUE":  workflowexpression.Secret("super-secret"),
+	}
+	_, _, err := EvaluateConcurrency(definition, Event{}, variables)
+	if err == nil {
+		t.Fatal("EvaluateConcurrency() accepted an invalid secret-derived format")
+	}
+	if strings.Contains(err.Error(), "{9}") || strings.Contains(err.Error(), "super-secret") {
+		t.Fatalf("EvaluateConcurrency() exposed sensitive content: %v", err)
 	}
 }
 
@@ -1303,6 +1544,7 @@ func TestParseEnforcesWorkflowConfigurationBounds(t *testing.T) {
 		{name: "continue-on-error", data: base + "      - continue-on-error: ${{ '" + strings.Repeat("x", MaxConditionBytes+1) + "' }}\n        run: true\n"},
 		{name: "aggregate job content", data: base + "      - run: " + strings.Repeat("x", 60_000) + "\n      - run: " + strings.Repeat("x", 60_000) + "\n"},
 		{name: "condition aggregate content", data: base + "      - if: ${{ '" + strings.Repeat("x", 50_000) + "' }}\n        run: " + strings.Repeat("x", 60_000) + "\n"},
+		{name: "concurrency cancellation aggregate content", data: "name: CI\non: push\njobs:\n  build:\n    concurrency:\n      group: deploy\n      cancel-in-progress: ${{ '" + strings.Repeat("x", 50_000) + "' != '' }}\n    runs-on: ubuntu-latest\n    steps:\n      - run: " + strings.Repeat("x", 60_000) + "\n"},
 		{name: "workflow environment aggregate content", data: "name: CI\non: push\nenv:\n  VALUE: " + strings.Repeat("x", 50_000) + "\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: " + strings.Repeat("x", 60_000) + "\n"},
 		{name: "branch patterns", data: workflowWithBranchPatterns(maxBranchPatterns + 1)},
 		{name: "environment entries", data: workflowWithEnvironment(maxMapEntries + 1)},

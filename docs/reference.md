@@ -176,15 +176,23 @@ Kubernetes Jobs created afterward. A RunnerSet maintains homogeneous Runners
 from `spec.template.spec`; its template project reference is immutable. A
 `WorkflowJob` spec is immutable, and `status.runnerRef` identifies
 its one-time Runner assignment. `spec.needs` records direct workflow
-dependencies, `spec.if` records its scheduling condition,
-`spec.timeoutSeconds` records its effective execution timeout, and `status.result`
-contains `success`, `failure`, `skipped`, or `cancelled` after completion. After
-execution, `status.outputs` contains the non-secret outputs declared by that
-workflow job. The controller copies these values from the completed runner Pod
-before allowing native Job cleanup, so they remain available after controller
-restarts and Pod deletion. `WorkflowRun.status.jobs.timedOut` counts jobs whose
-`Succeeded` condition has reason `JobTimedOut`; those jobs retain `failure` as
-their `status.result` for dependency evaluation.
+dependencies, `spec.if` records its scheduling condition, and
+`spec.concurrency` records the unevaluated job concurrency policy.
+`status.concurrency` contains the evaluated group and cancellation decision
+after dependencies and the job condition settle. WorkflowRun uses the same
+`status.concurrency` shape for its evaluated workflow-level policy.
+`WorkflowRun.status.concurrencyGroup` remains available as a deprecated group
+key fallback. For matrix jobs, `spec.matrix.jobIndex` and
+`spec.matrix.jobTotal` expose the values used by the `strategy` context.
+`spec.timeoutSeconds` records the effective execution timeout, and
+`status.result` contains `success`, `failure`, `skipped`, or `cancelled` after
+completion. After execution, `status.outputs` contains the non-secret outputs
+declared by that workflow job. The controller copies these values from the
+completed runner Pod before allowing native Job cleanup, so they remain
+available after controller restarts and Pod deletion.
+`WorkflowRun.status.jobs.timedOut` counts jobs whose `Succeeded` condition has
+reason `JobTimedOut`; those jobs retain `failure` as their `status.result` for
+dependency evaluation.
 
 ### Project secrets and variables
 
@@ -209,13 +217,13 @@ spec:
 
 The Project remains unconfigured while a referenced object is missing or its
 contents violate these constraints. Variables needed for workflow concurrency,
-job names, or runner labels are read during planning; job conditions read them
-when their dependencies settle. Job and step expressions remain unresolved in
-the immutable plan. Kubernetes mounts the Secret and ConfigMap into runner-only,
-read-only volumes when a job Pod starts, and the runner reads a consistent
-snapshot at startup. Rotations apply to new jobs. The Docker sidecar does not
-mount these volumes, and workflow commands do not receive the internal files as
-ambient environment variables.
+job names, or runner labels are read during planning; job conditions and job
+concurrency read them when dependencies settle. Job and step expressions remain
+unresolved in the immutable plan. Kubernetes mounts the Secret and ConfigMap
+into runner-only, read-only volumes when a job Pod starts, and the runner reads
+a consistent snapshot at startup. Rotations apply to new jobs. The Docker
+sidecar does not mount these volumes, and workflow commands do not receive the
+internal files as ambient environment variables.
 
 See the [Project value source sample](../config/samples/actions_v1alpha1_project-values.yaml)
 for a complete Project manifest.
@@ -452,20 +460,23 @@ The resources expose these condition contracts:
 | `RunnerSet` | `Ready` | `True` | `RunnersReady` |
 | `RunnerSet` | `Ready` | `False` | `ReplicaCountMismatch`, `RunnersTerminating`, `RunnersNotReady` |
 | `WorkflowRun` | `Planned` | `True` | `JobsPlanned` |
-| `WorkflowRun` | `Planned` | `Unknown` | `WaitingForConcurrency`, `WaitingForConcurrencyCancellation`, `ProjectUnavailable`, `CredentialsUnavailable`, `ProjectValuesUnavailable`, `GitHubAuthenticationFailed`, `WorkflowFetchFailed`, `ChildCreationFailed`, `ConcurrencyCheckFailed` |
+| `WorkflowRun` | `Planned` | `Unknown` | `WaitingForPriorRunPlanning`, `WaitingForConcurrency`, `WaitingForConcurrencyCancellation`, `ProjectUnavailable`, `CredentialsUnavailable`, `ProjectValuesUnavailable`, `GitHubAuthenticationFailed`, `WorkflowFetchFailed`, `ChildCreationFailed`, `ConcurrencyCheckFailed` |
 | `WorkflowRun` | `Planned` | `False` | `ProjectUnavailable`, `WorkflowFetchFailed`, `WorkflowInvalid`, `TriggerInvalid`, `RerunInvalid`, `ChildCreationFailed`, `ExecutionStateLost` |
 | `WorkflowRun` | `Succeeded` | `Unknown` | `JobsWaiting`, `JobsQueued`, `JobsRunning` |
 | `WorkflowRun` | `Succeeded` | `True` | `JobsSucceeded` |
 | `WorkflowRun` | `Succeeded` | `False` | `ProjectUnavailable`, `WorkflowFetchFailed`, `WorkflowInvalid`, `TriggerInvalid`, `RerunInvalid`, `ChildCreationFailed`, `JobFailed`, `JobTimedOut`, `JobCancelled`, `ExecutionStateLost` |
-| `WorkflowJob` | `Ready` | `Unknown` | `DependenciesPending` |
-| `WorkflowJob` | `Ready` | `True` | `ConditionPassed` |
-| `WorkflowJob` | `Ready` | `False` | `ConditionFalse`, `ConditionEvaluationFailed`, `MatrixEvaluationFailed`, `CancellationRequested`, `MatrixFailFast` |
+| `WorkflowJob` | `Ready` | `Unknown` | `DependenciesPending`, `WaitingForConcurrency` |
+| `WorkflowJob` | `Ready` | `True` | `ConditionPassed`, `ConcurrencyAcquired` |
+| `WorkflowJob` | `Ready` | `False` | `ConditionFalse`, `ConditionEvaluationFailed`, `MatrixEvaluationFailed`, `ConcurrencyEvaluationFailed`, `ConcurrencySuperseded`, `ConcurrencyCancelled`, `CancellationRequested`, `MatrixFailFast` |
+| `WorkflowJob` | `ConcurrencyAcquired` | `Unknown` | `WaitingForConcurrency` |
+| `WorkflowJob` | `ConcurrencyAcquired` | `True` | `ConcurrencyAcquired` |
+| `WorkflowJob` | `ConcurrencyAcquired` | `False` | `ConcurrencySuperseded` |
 | `WorkflowJob` | `Scheduled` | `True` | `RunnerAssigned` |
-| `WorkflowJob` | `Scheduled` | `False` | `ConditionFalse`, `ConditionEvaluationFailed`, `MatrixEvaluationFailed`, `CancellationRequested`, `MatrixFailFast`, `ProjectRecreated` |
+| `WorkflowJob` | `Scheduled` | `False` | `ConditionFalse`, `ConditionEvaluationFailed`, `MatrixEvaluationFailed`, `ConcurrencyEvaluationFailed`, `ConcurrencySuperseded`, `ConcurrencyCancelled`, `CancellationRequested`, `MatrixFailFast`, `ProjectRecreated` |
 | `WorkflowJob` | `Succeeded` | `Unknown` | `JobRunning` |
 | `WorkflowJob` | `Succeeded` | `True` | `JobSucceeded` |
-| `WorkflowJob` | `Succeeded` | `False` | `JobFailed`, `JobTimedOut`, `JobCancelled`, `JobResultInvalid`, `ConditionEvaluationFailed`, `MatrixEvaluationFailed`, `PlanUnavailable`, `JobStartFailed`, `GitHubTokenPermissionsRejected`, `ExecutionStateLost`, `CancellationRequested`, `MatrixFailFast`, `ProjectRecreated` |
-| `WorkflowJob` | `CancellationRequested` | `True` | `CancellationRequested`, `ConditionEvaluationFailed`, `MatrixFailFast` |
+| `WorkflowJob` | `Succeeded` | `False` | `JobFailed`, `JobTimedOut`, `JobCancelled`, `JobResultInvalid`, `ConditionEvaluationFailed`, `MatrixEvaluationFailed`, `ConcurrencyEvaluationFailed`, `PlanUnavailable`, `JobStartFailed`, `GitHubTokenPermissionsRejected`, `ExecutionStateLost`, `CancellationRequested`, `MatrixFailFast`, `ProjectRecreated` |
+| `WorkflowJob` | `CancellationRequested` | `True` | `CancellationRequested`, `ConditionEvaluationFailed`, `ConcurrencyCancelled`, `MatrixFailFast` |
 | `WorkflowJob` | `CancellationRequested` | `False` | `ConditionPassed` |
 
 `Project/Configured` covers local Secret and ConfigMap availability,
@@ -607,6 +618,7 @@ evaluation when the corresponding execution feature has not supplied it.
 | Phase | Allowed contexts and functions | Currently supplied |
 | --- | --- | --- |
 | Workflow concurrency | `github`, `inputs`, `vars` | All listed contexts |
+| Job concurrency | `github`, `open_actions`, `needs`, `strategy`, `matrix`, `inputs`, `vars` | All listed contexts after dependencies settle; `strategy` and `matrix` are present for matrix jobs |
 | Workflow environment | `github`, `open_actions`, `secrets`, `inputs`, `vars` | All listed contexts |
 | Matrix expansion | `github`, `open_actions`, `needs`, `vars`, `inputs` | All listed contexts; `needs` contains terminal direct dependencies |
 | Workflow job condition | `github`, `open_actions`, `needs`, `vars`, `inputs`, and status functions | `github`, `open_actions`, direct dependency results and outputs, `vars`, `inputs`, and status functions |
@@ -774,16 +786,58 @@ for graph cleanup jobs.
 
 ### Concurrency
 
-Concurrency groups are case-insensitive and scoped by Project and repository.
-One run may execute while one newer run waits. A newer waiting run gracefully
-cancels the existing waiting run. When `cancel-in-progress` is `true`, it also
-requests graceful cancellation of the executing run. A replacement waits for
-cancellation-aware reporting and cleanup jobs before taking the group. A run
-waits for an older run in the same repository until that run has evaluated its
-workflow concurrency configuration.
+Workflow and `jobs.<id>.concurrency` accept either a scalar group or a mapping
+with `group` and `cancel-in-progress`. Groups are
+case-insensitive, scoped by Project and repository, and shared by workflow runs
+and jobs. At most one member executes while one newer member waits. A newer
+waiting member cancels and replaces the existing waiting member. When
+`cancel-in-progress` is `true`, it also requests graceful cancellation of the
+executing member. Cancelling an executing job does not cancel its WorkflowRun or
+unrelated jobs. A replacement acquires the group only after the executing
+member's active workload and cancellation-aware cleanup have stopped.
 
-Concurrency expressions reject unavailable contexts and empty evaluated
-groups. Event properties that do not exist evaluate to an empty string. Use
+Workflow concurrency is acquired before any jobs in the run become ready. Job
+concurrency is evaluated after direct dependencies reach terminal results and
+the job condition passes, when `needs`, `strategy`, and `matrix` values are
+known. The job concurrency gate precedes Runner assignment, including matrix
+`max-parallel`. Matrix `fail-fast` and WorkflowRun cancellation can still cancel
+a job while it waits. A job whose evaluated group matches its parent
+WorkflowRun's group fails with reason `ConcurrencyEvaluationFailed` because the
+run holds that group until all of its jobs finish. WorkflowRuns and WorkflowJobs
+store their evaluated group and cancellation decision under `status.concurrency`
+before entering the gate, so controller restarts resume the same acquisition or
+replacement decision. A run waits for an older run in the same repository until
+that run has evaluated its workflow concurrency configuration.
+
+At workflow scope, the `group` and `cancel-in-progress` expressions are
+evaluated together during planning. Both may use `github`, `inputs`, and `vars`;
+`secrets` and job-only contexts are unavailable. At job scope, both expressions
+are evaluated after dependencies and the job condition settle. They may use
+`github`, `needs`, `strategy`, `matrix`, `inputs`, and `vars`; `strategy` and
+`matrix` are populated for matrix jobs. Secrets are unavailable at both scopes.
+
+`cancel-in-progress` accepts a Boolean literal or one whole expression that
+evaluates to a Boolean. A true result requests graceful cancellation of the
+executing member. A false result leaves that member executing and makes the new
+member wait while retaining the normal one-pending-member replacement behavior.
+For example:
+
+```yaml
+concurrency:
+  group: deploy-${{ github.ref_name }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' && github.ref != 'refs/heads/main' }}
+
+jobs:
+  deploy:
+    concurrency:
+      group: deploy-${{ matrix.environment }}
+      cancel-in-progress: ${{ needs.build.result == 'success' && matrix.environment != 'production' }}
+```
+
+Concurrency expressions reject unavailable contexts, non-Boolean
+`cancel-in-progress` results, and empty evaluated groups. Missing event
+properties evaluate to an empty string, which is invalid as the whole result of
+`cancel-in-progress` but may be compared explicitly. Use
 `github.head_ref || github.ref_name` for workflows that need a ref fallback.
 Pull request and merge group target branches are available as
 `github.base_ref`.

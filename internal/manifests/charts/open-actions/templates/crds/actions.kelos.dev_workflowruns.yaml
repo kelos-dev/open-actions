@@ -752,9 +752,29 @@ spec:
                 description: CompletionTime is when the run reached a terminal result.
                 format: date-time
                 type: string
+              concurrency:
+                description: |-
+                  Concurrency records the evaluated workflow concurrency policy. It is set
+                  before the run enters the concurrency gate and remains stable for the
+                  run's lifetime.
+                properties:
+                  cancelInProgress:
+                    description: CancelInProgress is the evaluated cancellation decision.
+                    type: boolean
+                  group:
+                    description: Group is the evaluated, case-insensitive concurrency
+                      key.
+                    maxLength: 256
+                    minLength: 1
+                    type: string
+                required:
+                - group
+                type: object
               concurrencyGroup:
-                description: ConcurrencyGroup is the evaluated workflow concurrency
-                  key, when present.
+                description: |-
+                  ConcurrencyGroup is the evaluated workflow concurrency key used when
+                  Concurrency has not been recorded.
+                  Deprecated: use Concurrency.
                 maxLength: 256
                 type: string
               conditions:

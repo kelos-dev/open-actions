@@ -64,6 +64,41 @@ spec:
             description: WorkflowJobSpec describes one immutable job expanded from
               a WorkflowRun.
             properties:
+              concurrency:
+                description: |-
+                  Concurrency delays Runner assignment until this job owns the evaluated
+                  group. The group expression is evaluated after Needs reaches terminal
+                  results and matrix values are available.
+                properties:
+                  cancelInProgress:
+                    description: |-
+                      CancelInProgress is evaluated after dependencies reach terminal results
+                      and matrix values are available. Omit it to leave the executing member
+                      running when this job becomes pending.
+                    properties:
+                      expression:
+                        description: Expression is a whole expression that evaluates
+                          to a Boolean.
+                        maxLength: 65536
+                        minLength: 1
+                        type: string
+                      value:
+                        description: Value is a literal cancellation decision.
+                        type: boolean
+                    type: object
+                    x-kubernetes-validations:
+                    - message: exactly one of value or expression must be specified
+                      rule: has(self.value) != has(self.expression)
+                  group:
+                    description: |-
+                      Group is a literal or expression template evaluated by the WorkflowRun
+                      controller. Group names are case-insensitive.
+                    maxLength: 256
+                    minLength: 1
+                    type: string
+                required:
+                - group
+                type: object
               displayName:
                 description: |-
                   DisplayName is the user-facing name of the workflow job. The controller
@@ -97,6 +132,18 @@ spec:
                       FailFast requests cancellation of unfinished combinations in this logical
                       job after one combination fails. It defaults to true.
                     type: boolean
+                  jobIndex:
+                    description: JobIndex is the zero-based index exposed through
+                      strategy.job-index.
+                    format: int32
+                    minimum: 0
+                    type: integer
+                  jobTotal:
+                    description: JobTotal is the number of combinations exposed through
+                      strategy.job-total.
+                    format: int32
+                    minimum: 1
+                    type: integer
                   logicalJobID:
                     description: LogicalJobID is the workflow-local identifier before
                       matrix expansion.
@@ -205,13 +252,32 @@ spec:
                 description: CompletionTime is when execution reached a terminal result.
                 format: date-time
                 type: string
+              concurrency:
+                description: |-
+                  Concurrency records the evaluated job concurrency policy. It is set before
+                  the job enters the concurrency gate and remains stable for the job's
+                  lifetime.
+                properties:
+                  cancelInProgress:
+                    description: CancelInProgress is the evaluated cancellation decision.
+                    type: boolean
+                  group:
+                    description: Group is the evaluated, case-insensitive concurrency
+                      key.
+                    maxLength: 256
+                    minLength: 1
+                    type: string
+                required:
+                - group
+                type: object
               conditions:
                 description: |-
-                  Conditions describe dependency readiness, Runner assignment, cancellation,
-                  and the terminal result. When present, Ready is true when a Runner may claim
-                  the job. Dependency-free unconditional jobs are also claimable when Ready is
-                  absent. Scheduled is true after the scheduler assigns status.runnerRef. Known
-                  condition types are Ready, Scheduled, Succeeded, and CancellationRequested.
+                  Conditions describe dependency readiness, concurrency acquisition, Runner
+                  assignment, cancellation, and the terminal result. When present, Ready is
+                  true when a Runner may claim the job. Dependency-free unconditional jobs
+                  without concurrency are also claimable when Ready is absent. Scheduled is
+                  true after the scheduler assigns status.runnerRef. Known condition types are
+                  Ready, ConcurrencyAcquired, Scheduled, Succeeded, and CancellationRequested.
                 items:
                   description: Condition contains details for one aspect of the current
                     state of this API Resource.

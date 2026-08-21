@@ -136,9 +136,17 @@ func EffectivePermissions(workflowPermissions, jobPermissions Permissions) Permi
 }
 
 type Concurrency struct {
-	Group            string `yaml:"group"`
-	CancelInProgress bool   `yaml:"cancel-in-progress"`
+	Group            string            `yaml:"group"`
+	CancelInProgress BooleanExpression `yaml:"cancel-in-progress"`
 	configured       bool
+}
+
+// BooleanExpression holds either a Boolean literal or an expression that must
+// evaluate to a Boolean.
+type BooleanExpression struct {
+	Value         bool
+	Expression    string
+	expressionSet bool
 }
 
 type Trigger struct {
@@ -201,6 +209,7 @@ type Job struct {
 	Outputs        map[string]any `yaml:"outputs"`
 	Steps          []Step         `yaml:"steps"`
 	Strategy       Strategy       `yaml:"strategy"`
+	Concurrency    Concurrency    `yaml:"concurrency"`
 	Container      yaml.Node      `yaml:"container"`
 	Services       yaml.Node      `yaml:"services"`
 	If             string         `yaml:"if"`
@@ -326,6 +335,7 @@ var (
 	jobNameAvailability             = expression.NewAvailability("github", "open_actions", "needs", "strategy", "matrix", "vars", "inputs")
 	jobEnvironmentAvailability      = expression.NewAvailability("github", "open_actions", "needs", "strategy", "matrix", "vars", "secrets", "inputs")
 	jobConditionAvailability        = expression.NewAvailability("github", "open_actions", "needs", "vars", "inputs").WithStatusFunctions()
+	jobConcurrencyAvailability      = expression.NewAvailability("github", "open_actions", "needs", "strategy", "matrix", "vars", "inputs")
 	matrixAvailability              = expression.NewAvailability("github", "open_actions", "needs", "vars", "inputs")
 	stepAvailability                = expression.NewAvailability("github", "open_actions", "needs", "strategy", "matrix", "job", "runner", "env", "vars", "secrets", "steps", "inputs").WithHashFiles()
 	stepConditionAvailability       = expression.NewAvailability("github", "open_actions", "needs", "strategy", "matrix", "job", "runner", "env", "vars", "steps", "inputs").WithStatusFunctions().WithHashFiles()
@@ -362,6 +372,9 @@ func Parse(data []byte) (*Definition, error) {
 	}
 	if definition.Concurrency.Group != "" {
 		if err := validateTemplate("workflow concurrency group", definition.Concurrency.Group, workflowConcurrencyAvailability); err != nil {
+			return nil, err
+		}
+		if err := validateBooleanExpression("workflow concurrency cancel-in-progress", definition.Concurrency.CancelInProgress, workflowConcurrencyAvailability); err != nil {
 			return nil, err
 		}
 	}
@@ -476,6 +489,20 @@ func validateJob(id string, job *Job, workflowEnv map[string]any) error {
 			return fmt.Errorf("job %q if: %w", id, err)
 		}
 	}
+	if utf8.RuneCountInString(job.Concurrency.Group) > maxConcurrencyGroupLength {
+		return fmt.Errorf("job %q concurrency group exceeds %d characters", id, maxConcurrencyGroupLength)
+	}
+	if job.Concurrency.configured && job.Concurrency.Group == "" {
+		return fmt.Errorf("job %q concurrency group must not be empty", id)
+	}
+	if job.Concurrency.Group != "" {
+		if err := validateTemplate(fmt.Sprintf("job %q concurrency group", id), job.Concurrency.Group, jobConcurrencyAvailability); err != nil {
+			return err
+		}
+		if err := validateBooleanExpression(fmt.Sprintf("job %q concurrency cancel-in-progress", id), job.Concurrency.CancelInProgress, jobConcurrencyAvailability); err != nil {
+			return err
+		}
+	}
 	if job.Container.Kind != 0 || job.Services.Kind != 0 {
 		return fmt.Errorf("job %q uses an unsupported job feature", id)
 	}
@@ -485,7 +512,7 @@ func validateJob(id string, job *Job, workflowEnv map[string]any) error {
 	if len(job.Steps) > maxSteps {
 		return fmt.Errorf("job %q defines %d steps; maximum is %d", id, len(job.Steps), maxSteps)
 	}
-	contentBytes := len(job.Name) + len(job.If) + len(job.TimeoutMinutes.expression)
+	contentBytes := len(job.Name) + len(job.If) + len(job.Concurrency.Group) + len(job.Concurrency.CancelInProgress.Expression) + len(job.TimeoutMinutes.expression)
 	for _, dependency := range job.Needs {
 		contentBytes += len(dependency)
 	}
@@ -1283,6 +1310,26 @@ func validateTemplate(field, input string, availability expression.Availability)
 	return nil
 }
 
+func validateBooleanExpression(field string, input BooleanExpression, availability expression.Availability) error {
+	if !input.usesExpression() {
+		return nil
+	}
+	if len(input.Expression) > MaxConditionBytes {
+		return fmt.Errorf("%s exceeds %d bytes", field, MaxConditionBytes)
+	}
+	program, err := expression.Parse(input.Expression)
+	if err != nil {
+		return fmt.Errorf("%s: %w", field, err)
+	}
+	if !program.IsWholeExpression() {
+		return fmt.Errorf("%s must contain exactly one expression", field)
+	}
+	if err := program.Validate(availability); err != nil {
+		return fmt.Errorf("%s: %w", field, err)
+	}
+	return nil
+}
+
 func scalarString(value any) (string, bool) {
 	switch typed := value.(type) {
 	case string:
@@ -1372,6 +1419,38 @@ func EvaluateJobCondition(id, input string, context expression.Context) (bool, e
 	return result.Bool(), nil
 }
 
+// EvaluateJobConcurrency evaluates a job concurrency group after its
+// dependencies and matrix combination are available.
+func EvaluateJobConcurrency(id string, concurrency Concurrency, context expression.Context) (string, bool, error) {
+	if concurrency.Group == "" {
+		return "", false, nil
+	}
+	program, err := expression.Parse(concurrency.Group)
+	if err != nil {
+		return "", false, fmt.Errorf("job %q concurrency group: %w", id, err)
+	}
+	context.Availability = jobConcurrencyAvailability
+	result, err := program.Evaluate(context)
+	if err != nil {
+		return "", false, fmt.Errorf("job %q concurrency group: %w", id, err)
+	}
+	group, err := result.String()
+	if err != nil {
+		return "", false, fmt.Errorf("job %q concurrency group: %w", id, err)
+	}
+	if group == "" {
+		return "", false, fmt.Errorf("job %q evaluated concurrency group must not be empty", id)
+	}
+	if utf8.RuneCountInString(group) > maxConcurrencyGroupLength {
+		return "", false, fmt.Errorf("job %q evaluated concurrency group exceeds %d characters", id, maxConcurrencyGroupLength)
+	}
+	cancelInProgress, err := evaluateBooleanExpression(concurrency.CancelInProgress, context)
+	if err != nil {
+		return "", false, fmt.Errorf("job %q concurrency cancel-in-progress: %w", id, err)
+	}
+	return group, cancelInProgress, nil
+}
+
 func EvaluateConcurrency(definition *Definition, event Event, variables any) (string, bool, error) {
 	if definition.Concurrency.Group == "" {
 		return "", false, nil
@@ -1381,8 +1460,8 @@ func EvaluateConcurrency(definition *Definition, event Event, variables any) (st
 		return "", false, fmt.Errorf("parse concurrency group: %w", err)
 	}
 	eventValues := eventExpressionValue(event)
-	result, err := program.Evaluate(expression.Context{
-		Availability: expression.NewAvailability("github", "inputs", "vars"),
+	context := expression.Context{
+		Availability: workflowConcurrencyAvailability,
 		Values: map[string]any{
 			"inputs": event.InputValues,
 			"vars":   variables,
@@ -1396,7 +1475,8 @@ func EvaluateConcurrency(definition *Definition, event Event, variables any) (st
 				"base_ref":   event.BaseRef,
 			},
 		},
-	})
+	}
+	result, err := program.Evaluate(context)
 	if err != nil {
 		return "", false, fmt.Errorf("evaluate concurrency group: %w", err)
 	}
@@ -1410,7 +1490,51 @@ func EvaluateConcurrency(definition *Definition, event Event, variables any) (st
 	if utf8.RuneCountInString(group) > maxConcurrencyGroupLength {
 		return "", false, fmt.Errorf("evaluated concurrency group exceeds %d characters", maxConcurrencyGroupLength)
 	}
-	return group, definition.Concurrency.CancelInProgress, nil
+	cancelInProgress, err := evaluateBooleanExpression(definition.Concurrency.CancelInProgress, context)
+	if err != nil {
+		return "", false, fmt.Errorf("evaluate workflow concurrency cancel-in-progress: %w", err)
+	}
+	return group, cancelInProgress, nil
+}
+
+func evaluateBooleanExpression(input BooleanExpression, context expression.Context) (bool, error) {
+	if !input.usesExpression() {
+		return input.Value, nil
+	}
+	program, err := expression.Parse(input.Expression)
+	if err != nil {
+		return false, err
+	}
+	result, err := program.Evaluate(context)
+	if err != nil {
+		return false, err
+	}
+	value, ok := result.Value.(bool)
+	if !ok {
+		return false, fmt.Errorf("expression returned %s, expected boolean", expressionValueType(result.Value))
+	}
+	return value, nil
+}
+
+func (b BooleanExpression) usesExpression() bool {
+	return b.expressionSet || b.Expression != ""
+}
+
+func expressionValueType(value any) string {
+	switch value.(type) {
+	case nil:
+		return "null"
+	case string:
+		return "string"
+	case float64:
+		return "number"
+	case []any:
+		return "array"
+	case map[string]any:
+		return "object"
+	default:
+		return fmt.Sprintf("%T", value)
+	}
 }
 
 func eventExpressionValue(event Event) map[string]any {
@@ -1956,9 +2080,9 @@ func (c *Concurrency) UnmarshalYAML(node *yaml.Node) error {
 		return nil
 	}
 	if node.Kind != yaml.MappingNode {
-		return fmt.Errorf("workflow concurrency must be a string or mapping")
+		return fmt.Errorf("concurrency must be a string or mapping")
 	}
-	if err := rejectDuplicateMappingKeys(node, "workflow concurrency"); err != nil {
+	if err := rejectDuplicateMappingKeys(node, "concurrency"); err != nil {
 		return err
 	}
 	for index := 0; index < len(node.Content); index += 2 {
@@ -1970,8 +2094,20 @@ func (c *Concurrency) UnmarshalYAML(node *yaml.Node) error {
 				return err
 			}
 		case "cancel-in-progress":
-			if err := value.Decode(&c.CancelInProgress); err != nil {
-				return err
+			resolved := value
+			for resolved.Kind == yaml.AliasNode && resolved.Alias != nil {
+				resolved = resolved.Alias
+			}
+			switch resolved.Tag {
+			case "!!bool":
+				if err := resolved.Decode(&c.CancelInProgress.Value); err != nil {
+					return err
+				}
+			case "!!str":
+				c.CancelInProgress.Expression = resolved.Value
+				c.CancelInProgress.expressionSet = true
+			default:
+				return fmt.Errorf("concurrency cancel-in-progress must be a boolean or expression")
 			}
 		default:
 			return fmt.Errorf("unsupported concurrency field %q", name)
