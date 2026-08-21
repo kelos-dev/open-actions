@@ -124,6 +124,10 @@ jobs:
             image:
               tag: ${OPEN_ACTIONS_IMAGE_TAG}
               pullPolicy: Always
+          artifacts:
+            image:
+              tag: ${OPEN_ACTIONS_IMAGE_TAG}
+              pullPolicy: Always
           console:
             publicURL: https://dev-open-actions-console.kelos.dev
             secretName: open-actions-console-auth
@@ -160,6 +164,7 @@ jobs:
             | kubectl apply -f -
           bin/open-actions install --values "${VALUES_FILE}"
           kubectl rollout status deployment/open-actions-controller -n open-actions-system --timeout=300s
+          kubectl rollout status statefulset/open-actions-artifacts -n open-actions-system --timeout=300s
           kubectl rollout status deployment/open-actions-console -n open-actions-system --timeout=300s
           echo "deployed=true" >> "${GITHUB_OUTPUT}"
 

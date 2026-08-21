@@ -15,13 +15,14 @@ constraints. Unsupported workflows fail explicitly.
 
 ## Architecture
 
-![Open Actions controller, Console, and execution flow](docs/architecture.drawio.svg)
+![Open Actions controller, artifact service, Console, and execution flow](docs/architecture.drawio.svg)
 
 The controller receives GitHub webhooks, creates `WorkflowRun` and `WorkflowJob`
 resources, schedules jobs on matching `Runner` resources, and reports status
-through GitHub Check Runs. Runners execute steps in Kubernetes Jobs. The Console
-shows runs, jobs, and live logs. Each `Project` defines an execution domain and
-its GitHub App integration.
+through GitHub Check Runs. Runners execute steps in Kubernetes Jobs and use the
+standalone artifact service for workflow artifact uploads and downloads. The
+Console shows runs, jobs, and live logs. Each `Project` defines an execution
+domain and its GitHub App integration.
 
 ## Migrate from GitHub Actions
 
@@ -141,8 +142,8 @@ configuration, supported workflow syntax, and the webhook contract.
 make update     # Format, generate Go code and CRDs, and tidy modules.
 make verify     # Check generated files, formatting, modules, and go vet.
 make test       # Run unit and schema tests.
-make build      # Build the CLI, controller, Console, and runner binaries under bin/.
-make image      # Build the controller, Console, and runner images.
+make build      # Build the CLI, controller, artifact service, Console, and runner binaries under bin/.
+make image      # Build the controller, artifact service, Console, and runner images.
 ```
 
 Install the control plane before running the end-to-end suite against the
@@ -157,6 +158,9 @@ kubectl wait --for=condition=Available --timeout=180s \
   deployment/open-actions-controller \
   deployment/open-actions-console \
   deployment/github-fixture
+kubectl rollout status statefulset/open-actions-artifacts \
+  --namespace open-actions-system \
+  --timeout=180s
 make test-e2e
 ```
 

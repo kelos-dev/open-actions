@@ -5,6 +5,8 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -25,6 +27,11 @@ func TestRunManagerRejectsInvalidEndpointURLs(t *testing.T) {
 		{name: "excessive WorkflowRun TTL", arguments: []string{"--workflow-run-ttl-seconds-after-finished=2147483648"}, want: "must be an integer between"},
 		{name: "short maximum job timeout", arguments: []string{"--max-job-timeout=59s"}, want: "max job timeout must be a positive whole number of minutes"},
 		{name: "fractional maximum job timeout", arguments: []string{"--max-job-timeout=90s"}, want: "max job timeout must be a positive whole number of minutes"},
+		{name: "artifact key without URL", arguments: []string{"--artifact-signing-key-file=/tmp/key"}, want: "must be specified together"},
+		{name: "artifact URL without key", arguments: []string{"--artifact-service-url=https://artifacts.example"}, want: "must be specified together"},
+		{name: "artifact URL scheme", arguments: []string{"--artifact-service-url=git://artifacts.example", "--artifact-signing-key-file=/tmp/key"}, want: "Artifact service URL must use http or https"},
+		{name: "artifact retention", arguments: []string{"--artifact-service-url=https://artifacts.example", "--artifact-signing-key-file=/tmp/key", "--artifact-max-retention-days=0"}, want: "artifact maximum retention"},
+		{name: "artifact key file", arguments: []string{"--artifact-service-url=https://artifacts.example", "--artifact-signing-key-file=/path/that/does/not/exist"}, want: "read artifact signing key"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			err := runManager(tt.arguments)
@@ -32,6 +39,17 @@ func TestRunManagerRejectsInvalidEndpointURLs(t *testing.T) {
 				t.Fatalf("runManager() error = %v, want %q", err, tt.want)
 			}
 		})
+	}
+}
+
+func TestRunManagerRejectsShortArtifactSigningKey(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "signing-key")
+	if err := os.WriteFile(path, []byte("short"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	err := runManager([]string{"--artifact-service-url=https://artifacts.example", "--artifact-signing-key-file=" + path})
+	if err == nil || !strings.Contains(err.Error(), "at least 32 bytes") {
+		t.Fatalf("runManager() error = %v", err)
 	}
 }
 

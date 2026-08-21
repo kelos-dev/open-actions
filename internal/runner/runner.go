@@ -25,12 +25,14 @@ import (
 )
 
 const (
-	minimumPlanVersion = 1
-	PlanVersion        = 7
-	ContainerName      = "runner"
-	GitHubTokenEnvVar  = "OPEN_ACTIONS_GITHUB_TOKEN"
-	ActionTokenEnvVar  = "OPEN_ACTIONS_ACTION_TOKEN"
-	CleanupTimeout     = 5 * time.Minute
+	minimumPlanVersion       = 1
+	PlanVersion              = 7
+	ContainerName            = "runner"
+	GitHubTokenEnvVar        = "OPEN_ACTIONS_GITHUB_TOKEN"
+	ActionTokenEnvVar        = "OPEN_ACTIONS_ACTION_TOKEN"
+	ArtifactTokenEnvVar      = "ACTIONS_RUNTIME_TOKEN"
+	ArtifactResultsURLEnvVar = "ACTIONS_RESULTS_URL"
+	CleanupTimeout           = 5 * time.Minute
 )
 
 const runnerLogMarker = "open_actions_runner"
@@ -142,14 +144,15 @@ type Step struct {
 }
 
 type ExecutorConfig struct {
-	Logger      *slog.Logger
-	GitHubToken string
-	ActionToken string
-	Secrets     map[string]string
-	Variables   map[string]string
-	Environment []string
-	Stdout      io.Writer
-	Stderr      io.Writer
+	Logger        *slog.Logger
+	GitHubToken   string
+	ActionToken   string
+	ArtifactToken string
+	Secrets       map[string]string
+	Variables     map[string]string
+	Environment   []string
+	Stdout        io.Writer
+	Stderr        io.Writer
 }
 
 type Executor struct {
@@ -225,6 +228,9 @@ func NewExecutor(config ExecutorConfig) (*Executor, error) {
 	masker := newOutputMasker()
 	addCredentialMasks(masker, config.GitHubToken)
 	addCredentialMasks(masker, config.ActionToken)
+	if config.ArtifactToken != "" {
+		addCredentialMasks(masker, config.ArtifactToken)
+	}
 	for _, secret := range config.Secrets {
 		masker.addSecret(secret)
 	}

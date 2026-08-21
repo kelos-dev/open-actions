@@ -21,6 +21,8 @@ spec:
       serviceAccountName: open-actions-controller
       securityContext:
         runAsNonRoot: true
+        fsGroup: 65532
+        fsGroupChangePolicy: OnRootMismatch
         seccompProfile:
           type: RuntimeDefault
       containers:
@@ -41,6 +43,11 @@ spec:
             {{- if .Values.console.enabled }}
             - {{ printf "--console-url=%s" .Values.console.publicURL | quote }}
             {{- end }}
+            {{- if .Values.artifacts.enabled }}
+            - {{ printf "--artifact-service-url=http://open-actions-artifacts.%s.svc" .Release.Namespace | quote }}
+            - --artifact-signing-key-file=/var/run/secrets/open-actions-artifacts/signing-key
+            - {{ printf "--artifact-max-retention-days=%d" (int64 .Values.artifacts.maxRetentionDays) | quote }}
+            {{- end }}
           ports:
             - name: webhook
               containerPort: 8080
@@ -51,6 +58,11 @@ spec:
           volumeMounts:
             - name: temporary
               mountPath: /tmp
+            {{- if .Values.artifacts.enabled }}
+            - name: artifact-auth
+              mountPath: /var/run/secrets/open-actions-artifacts
+              readOnly: true
+            {{- end }}
           readinessProbe:
             httpGet:
               path: /readyz
@@ -78,4 +90,13 @@ spec:
       volumes:
         - name: temporary
           emptyDir: {}
+        {{- if .Values.artifacts.enabled }}
+        - name: artifact-auth
+          secret:
+            secretName: {{ default "open-actions-artifact-auth" .Values.artifacts.signingKeySecretName }}
+            defaultMode: 0440
+            items:
+              - key: {{ .Values.artifacts.signingKeyKey }}
+                path: signing-key
+        {{- end }}
       terminationGracePeriodSeconds: 10

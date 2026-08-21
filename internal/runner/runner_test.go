@@ -318,21 +318,22 @@ func TestExecuteResolvesAndMasksRepositoryValues(t *testing.T) {
 	plan.Steps = []Step{{
 		ID: "value",
 		Run: fmt.Sprintf(
-			`test "$BUILTIN_TOKEN" = installation-token && test "$REPOSITORY_TOKEN" = %q && test "$NAMESPACE" = production && printf 'secret=%%s\n' "$REPOSITORY_TOKEN" >> "$GITHUB_OUTPUT" && printf '%%s\n%%s\n%%s\naction-installation-token\n' "$REPOSITORY_TOKEN" %q "$NAMESPACE"`,
+			`test "$BUILTIN_TOKEN" = installation-token && test "$REPOSITORY_TOKEN" = %q && test "$NAMESPACE" = production && printf 'secret=%%s\n' "$REPOSITORY_TOKEN" >> "$GITHUB_OUTPUT" && printf '%%s\n%%s\n%%s\naction-installation-token\nartifact-runtime-token\n' "$REPOSITORY_TOKEN" %q "$NAMESPACE"`,
 			secret,
 			encodedSecret,
 		),
 	}}
 	var output bytes.Buffer
 	executor, err := NewExecutor(ExecutorConfig{
-		Logger:      slog.New(slog.NewTextHandler(&output, nil)),
-		GitHubToken: "installation-token",
-		ActionToken: "action-installation-token",
-		Secrets:     map[string]string{"REPOSITORY_TOKEN": secret},
-		Variables:   map[string]string{"DEPLOYMENT_NAMESPACE": "production"},
-		Environment: os.Environ(),
-		Stdout:      &output,
-		Stderr:      &output,
+		Logger:        slog.New(slog.NewTextHandler(&output, nil)),
+		GitHubToken:   "installation-token",
+		ActionToken:   "action-installation-token",
+		ArtifactToken: "artifact-runtime-token",
+		Secrets:       map[string]string{"REPOSITORY_TOKEN": secret},
+		Variables:     map[string]string{"DEPLOYMENT_NAMESPACE": "production"},
+		Environment:   os.Environ(),
+		Stdout:        &output,
+		Stderr:        &output,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -344,7 +345,7 @@ func TestExecuteResolvesAndMasksRepositoryValues(t *testing.T) {
 	if _, found := result.Outputs["secret"]; found {
 		t.Fatalf("secret-derived output was persisted: %#v", result.Outputs)
 	}
-	if strings.Contains(output.String(), secret) || strings.Contains(output.String(), encodedSecret) || strings.Contains(output.String(), "action-installation-token") {
+	if strings.Contains(output.String(), secret) || strings.Contains(output.String(), encodedSecret) || strings.Contains(output.String(), "action-installation-token") || strings.Contains(output.String(), "artifact-runtime-token") {
 		t.Fatalf("runner output exposed a credential: %s", output.String())
 	}
 	if !strings.Contains(output.String(), "production") || !strings.Contains(output.String(), "***") {

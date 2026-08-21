@@ -77,6 +77,32 @@ func TestConsoleServiceTemplate(t *testing.T) {
 	}
 }
 
+func TestArtifactServicesTargetArtifactPods(t *testing.T) {
+	chart := Chart()
+	valuesData, err := fs.ReadFile(chart, "values.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var values map[string]any
+	if err := yaml.Unmarshal(valuesData, &values); err != nil {
+		t.Fatalf("parse values: %v", err)
+	}
+	service := renderService(t, chart, "templates/artifact-service.yaml", values)
+	if service.Name != "open-actions-artifacts" || service.Spec.Selector["app.kubernetes.io/component"] != "artifacts" {
+		t.Fatalf("artifact Service = %#v", service)
+	}
+	if service.Spec.Ports[0].TargetPort.StrVal != "http" {
+		t.Fatalf("artifact Service target port = %#v", service.Spec.Ports[0].TargetPort)
+	}
+	headless := renderService(t, chart, "templates/artifact-headless-service.yaml", values)
+	if headless.Name != "open-actions-artifacts-headless" || headless.Spec.ClusterIP != corev1.ClusterIPNone {
+		t.Fatalf("artifact headless Service = %#v", headless)
+	}
+	if headless.Spec.Selector["app.kubernetes.io/component"] != "artifacts" {
+		t.Fatalf("artifact headless Service selector = %#v", headless.Spec.Selector)
+	}
+}
+
 func renderService(t *testing.T, chart fs.FS, path string, values map[string]any) corev1.Service {
 	t.Helper()
 	data, err := fs.ReadFile(chart, path)

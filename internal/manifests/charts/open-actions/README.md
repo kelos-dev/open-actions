@@ -6,7 +6,7 @@ Install or upgrade Open Actions with custom values:
 open-actions install --values values.yaml
 ```
 
-The chart installs the controller, Console, and the Open Actions CRDs.
+The chart installs the controller, artifact service, Console, and the Open Actions CRDs.
 CRDs carry the `helm.sh/resource-policy: keep` annotation so uninstalling the
 release does not delete Open Actions resources.
 
@@ -32,6 +32,37 @@ after completion. Changing the chart value does not alter existing runs.
 Deleting an expired WorkflowRun also deletes its owned WorkflowJobs and execution
 resources.
 
+The chart enables the internal artifact service as a standalone, one-replica
+StatefulSet. By default, its volume claim template provisions persistent
+storage for content and metadata and retains the claim when the StatefulSet is
+deleted or scaled down. The StatefulSet replaces its only Pod sequentially;
+its headless Service governs Pod identity, while workflow jobs use the separate
+`open-actions-artifacts` ClusterIP Service. Controller rollouts do not interrupt
+artifact traffic. The artifact service has no Kubernetes API access and does
+not mount a service account token. Set
+`artifacts.persistence.existingClaim` to mount a claim managed outside the
+StatefulSet; that claim must be writable by the artifact Pod's supplemental
+group `65532`. Size the volume for all artifacts retained across Projects and
+attempts; `artifacts.maxRunBytes` is a per-attempt quota, not a volume-wide
+quota. Storage administrators and principals that can mount or snapshot the
+claim can read artifact content. Use storage-class encryption and access
+controls appropriate for workflow output.
+
+The controller signs job credentials for each job's effective execution timeout
+plus startup and cleanup allowances, and the artifact service validates them
+with a shared key. The chart generates the key in
+`open-actions-artifact-auth` by default and reuses it across upgrades. Set
+`artifacts.signingKeySecretName` to mount an externally managed Secret and
+`artifacts.signingKeyKey` to select its key, which must contain at least 32
+bytes. Readers of that key can mint artifact credentials. Restart the
+controller Deployment and artifact StatefulSet after rotating an external key;
+credentials signed with the previous key stop working.
+
+`artifacts.persistence.enabled=false` replaces the claim with an `emptyDir`.
+That setting is suitable for disposable test clusters only because an artifact
+Pod replacement loses every artifact. `artifacts.enabled=false` omits the
+artifact Service and does not issue artifact runtime credentials to jobs.
+
 ## Values
 
 | Value | Default | Description |
@@ -44,6 +75,22 @@ resources.
 | `controller.actionCloneBaseURL` | `""` | Base URL used to clone external action repositories; defaults to `controller.githubServerURL` when empty |
 | `controller.maxJobTimeout` | `6h` | Maximum execution timeout available to workflow jobs, expressed in whole hours and minutes such as `1h30m`; longer `timeout-minutes` values are capped |
 | `controller.workflowRunTTLSecondsAfterFinished` | `null` | Default `spec.ttlSecondsAfterFinished` for generated WorkflowRuns; `null` retains them indefinitely |
+| `artifacts.enabled` | `true` | Deploy the internal artifact service and issue job-scoped runtime credentials |
+| `artifacts.image.repository` | `ghcr.io/kelos-dev/open-actions-artifact-server` | Artifact service image repository |
+| `artifacts.image.tag` | `latest` | Artifact service image tag |
+| `artifacts.image.pullPolicy` | `IfNotPresent` | Artifact service image pull policy |
+| `artifacts.signingKeySecretName` | `""` | Existing credential signing Secret; the chart creates `open-actions-artifact-auth` when empty |
+| `artifacts.signingKeyKey` | `signing-key` | Secret key containing at least 32 bytes of signing material |
+| `artifacts.defaultRetentionDays` | `7` | Retention used when an upload omits `retention-days` |
+| `artifacts.maxRetentionDays` | `30` | Maximum accepted artifact retention and value exposed to upload actions |
+| `artifacts.maxFileBytes` | `1073741824` | Maximum uncompressed size of one file |
+| `artifacts.maxArtifactBytes` | `2147483648` | Maximum stored and total uncompressed size of one artifact |
+| `artifacts.maxRunBytes` | `10737418240` | Maximum stored artifact bytes in one WorkflowRun attempt |
+| `artifacts.persistence.enabled` | `true` | Use StatefulSet-managed persistent storage instead of an ephemeral `emptyDir` |
+| `artifacts.persistence.existingClaim` | `""` | Existing claim to mount instead of creating one from the StatefulSet volume claim template |
+| `artifacts.persistence.storageClass` | `null` | Storage class for the StatefulSet-managed claim; `null` uses the cluster default |
+| `artifacts.persistence.accessModes` | `[ReadWriteOnce]` | Access modes for the StatefulSet-managed claim |
+| `artifacts.persistence.size` | `20Gi` | Requested capacity for the StatefulSet-managed claim |
 | `console.enabled` | `true` | Deploy the Open Actions Console |
 | `console.replicas` | `1` | Console replica count |
 | `console.publicURL` | `http://localhost:8080` | Public Console URL used by GitHub Check Run links |

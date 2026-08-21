@@ -1,10 +1,11 @@
 REGISTRY ?= ghcr.io/kelos-dev
 VERSION ?= latest
 CONTROLLER_IMAGE ?= $(REGISTRY)/open-actions-controller:$(VERSION)
+ARTIFACT_SERVER_IMAGE ?= $(REGISTRY)/open-actions-artifact-server:$(VERSION)
 CONSOLE_IMAGE ?= $(REGISTRY)/open-actions-console:$(VERSION)
 RUNNER_IMAGE ?= $(REGISTRY)/open-actions-runner:$(VERSION)
 FIXTURE_IMAGE ?= $(REGISTRY)/open-actions-fixture:$(VERSION)
-IMAGE_DIRS ?= cmd/open-actions-controller cmd/open-actions-console cmd/open-actions-runner
+IMAGE_DIRS ?= cmd/open-actions-controller cmd/open-actions-artifact-server cmd/open-actions-console cmd/open-actions-runner
 TEST_FLAGS ?=
 E2E_PROCS ?= 1
 
@@ -62,6 +63,10 @@ verify:
 	fi
 	$(HELM) template open-actions $(CHART_DIR) --namespace open-actions-system --set console.secretName=open-actions-console-auth >/dev/null
 	$(HELM) template open-actions $(CHART_DIR) --namespace open-actions-system --set console.enabled=false >/dev/null
+	$(HELM) template open-actions $(CHART_DIR) --namespace open-actions-system --set artifacts.signingKeySecretName=open-actions-artifact-auth >/dev/null
+	$(HELM) template open-actions $(CHART_DIR) --namespace open-actions-system --set artifacts.persistence.existingClaim=open-actions-artifacts >/dev/null
+	$(HELM) template open-actions $(CHART_DIR) --namespace open-actions-system --set artifacts.persistence.enabled=false >/dev/null
+	$(HELM) template open-actions $(CHART_DIR) --namespace open-actions-system --set artifacts.enabled=false >/dev/null
 	@if $(HELM) template open-actions $(CHART_DIR) --namespace open-actions-system --set console.publicURL= >/dev/null 2>&1; then \
 		echo "Helm accepted an enabled Console without a public URL" >&2; \
 		exit 1; \
@@ -80,6 +85,7 @@ image:
 	@set -e; for dir in $(or $(WHAT),$(IMAGE_DIRS)); do \
 		case "$${dir#./}" in \
 			cmd/open-actions-controller) image="$(CONTROLLER_IMAGE)" ;; \
+			cmd/open-actions-artifact-server) image="$(ARTIFACT_SERVER_IMAGE)" ;; \
 			cmd/open-actions-console) image="$(CONSOLE_IMAGE)" ;; \
 			cmd/open-actions-runner) image="$(RUNNER_IMAGE)" ;; \
 			test/fixture/github) image="$(FIXTURE_IMAGE)" ;; \

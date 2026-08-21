@@ -1,0 +1,127 @@
+{{- if and .Values.artifacts.enabled (gt (int64 .Values.artifacts.defaultRetentionDays) (int64 .Values.artifacts.maxRetentionDays)) }}
+{{- fail "artifacts.defaultRetentionDays must not exceed artifacts.maxRetentionDays" }}
+{{- end }}
+{{- if and .Values.artifacts.enabled (gt (int64 .Values.artifacts.maxFileBytes) (int64 .Values.artifacts.maxArtifactBytes)) }}
+{{- fail "artifacts.maxFileBytes must not exceed artifacts.maxArtifactBytes" }}
+{{- end }}
+{{- if and .Values.artifacts.enabled (gt (int64 .Values.artifacts.maxArtifactBytes) (int64 .Values.artifacts.maxRunBytes)) }}
+{{- fail "artifacts.maxArtifactBytes must not exceed artifacts.maxRunBytes" }}
+{{- end }}
+{{- if .Values.artifacts.enabled }}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: open-actions-artifacts
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: open-actions
+    app.kubernetes.io/component: artifacts
+spec:
+  replicas: 1
+  serviceName: open-actions-artifacts-headless
+  updateStrategy:
+    type: RollingUpdate
+  {{- if and .Values.artifacts.persistence.enabled (not .Values.artifacts.persistence.existingClaim) }}
+  persistentVolumeClaimRetentionPolicy:
+    whenDeleted: Retain
+    whenScaled: Retain
+  {{- end }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: open-actions
+      app.kubernetes.io/component: artifacts
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: open-actions
+        app.kubernetes.io/component: artifacts
+    spec:
+      serviceAccountName: open-actions-artifacts
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        fsGroup: 65532
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: artifacts
+          image: "{{ .Values.artifacts.image.repository }}:{{ .Values.artifacts.image.tag }}"
+          imagePullPolicy: {{ .Values.artifacts.image.pullPolicy }}
+          args:
+            - {{ printf "--public-url=http://open-actions-artifacts.%s.svc" .Release.Namespace | quote }}
+            - --storage-directory=/var/lib/open-actions/artifacts
+            - --signing-key-file=/var/run/secrets/open-actions-artifacts/signing-key
+            - {{ printf "--max-file-bytes=%d" (int64 .Values.artifacts.maxFileBytes) | quote }}
+            - {{ printf "--max-artifact-bytes=%d" (int64 .Values.artifacts.maxArtifactBytes) | quote }}
+            - {{ printf "--max-run-bytes=%d" (int64 .Values.artifacts.maxRunBytes) | quote }}
+            - {{ printf "--default-retention-days=%d" (int64 .Values.artifacts.defaultRetentionDays) | quote }}
+            - {{ printf "--max-retention-days=%d" (int64 .Values.artifacts.maxRetentionDays) | quote }}
+          ports:
+            - name: http
+              containerPort: 8080
+          volumeMounts:
+            - name: artifact-storage
+              mountPath: /var/lib/open-actions/artifacts
+            - name: artifact-auth
+              mountPath: /var/run/secrets/open-actions-artifacts
+              readOnly: true
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: "1"
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+            readOnlyRootFilesystem: true
+      volumes:
+        {{- if .Values.artifacts.persistence.existingClaim }}
+        - name: artifact-storage
+          persistentVolumeClaim:
+            claimName: {{ .Values.artifacts.persistence.existingClaim }}
+        {{- else if not .Values.artifacts.persistence.enabled }}
+        - name: artifact-storage
+          emptyDir: {}
+        {{- end }}
+        - name: artifact-auth
+          secret:
+            secretName: {{ default "open-actions-artifact-auth" .Values.artifacts.signingKeySecretName }}
+            defaultMode: 0440
+            items:
+              - key: {{ .Values.artifacts.signingKeyKey }}
+                path: signing-key
+      terminationGracePeriodSeconds: 10
+  {{- if and .Values.artifacts.persistence.enabled (not .Values.artifacts.persistence.existingClaim) }}
+  volumeClaimTemplates:
+    - metadata:
+        name: artifact-storage
+        labels:
+          app.kubernetes.io/name: open-actions
+          app.kubernetes.io/component: artifacts
+      spec:
+        accessModes:
+          {{- toYaml .Values.artifacts.persistence.accessModes | nindent 10 }}
+        resources:
+          requests:
+            storage: {{ .Values.artifacts.persistence.size }}
+        {{- with .Values.artifacts.persistence.storageClass }}
+        storageClassName: {{ . }}
+        {{- end }}
+  {{- end }}
+{{- end }}

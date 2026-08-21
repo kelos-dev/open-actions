@@ -40,6 +40,7 @@ const (
 	workflowPath              = ".open-actions/workflows/ci.yaml"
 	preparationWorkflowPath   = ".open-actions/workflows/preparation.yaml"
 	dynamicMatrixWorkflowPath = ".open-actions/workflows/dynamic-matrix.yaml"
+	artifactWorkflowPath      = ".open-actions/workflows/artifacts.yaml"
 	pullRequestWorkflowPath   = ".open-actions/workflows/pull-request.yaml"
 	dockerImage               = "docker:29.7.2-dind@sha256:12e683a161823b2a839aeea999b9d960e6e1f9a97b1679ad6b441982e2d9cf07"
 )
