@@ -863,11 +863,14 @@ func (r *RunnerReconciler) buildJob(workflowJob *actionsv1alpha1.WorkflowJob, ru
 		annotations[actionsv1alpha1.AnnotationWorkflowJobDisplayName] = workflowJob.Spec.DisplayName
 	}
 	timeoutSeconds := int64(r.effectiveJobTimeout(workflowJob) / time.Second)
-	cleanupTimeoutSeconds := int64(runner.CleanupTimeout / time.Second)
+	var terminationGracePeriodSeconds *int64
+	if configured := runnerObject.Spec.Execution.TerminationGracePeriodSeconds; configured != nil {
+		terminationGracePeriodSeconds = pointerTo(*configured)
+	}
 	podTemplate := corev1.PodTemplateSpec{
 		ObjectMeta: metav1.ObjectMeta{Labels: labels, Annotations: annotations},
 		Spec: corev1.PodSpec{
-			TerminationGracePeriodSeconds: pointerTo(cleanupTimeoutSeconds),
+			TerminationGracePeriodSeconds: terminationGracePeriodSeconds,
 			AutomountServiceAccountToken:  pointerTo(false),
 			RestartPolicy:                 corev1.RestartPolicyNever,
 			SecurityContext: &corev1.PodSecurityContext{
@@ -878,9 +881,10 @@ func (r *RunnerReconciler) buildJob(workflowJob *actionsv1alpha1.WorkflowJob, ru
 				},
 			},
 			Containers: []corev1.Container{{
-				Name:      runner.ContainerName,
-				Image:     runnerObject.Spec.Execution.Image,
-				Resources: runnerResources(runnerObject.Spec.Execution.Resources),
+				Name:            runner.ContainerName,
+				Image:           runnerObject.Spec.Execution.Image,
+				ImagePullPolicy: runnerObject.Spec.Execution.ImagePullPolicy,
+				Resources:       runnerResources(runnerObject.Spec.Execution.Resources),
 				SecurityContext: &corev1.SecurityContext{
 					AllowPrivilegeEscalation: pointerTo(false),
 					Capabilities: &corev1.Capabilities{

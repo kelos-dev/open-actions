@@ -621,6 +621,42 @@ func TestRunnerSetTemplateProjectRefIsImmutable(t *testing.T) {
 	}
 }
 
+func TestRunnerTerminationGracePeriodContract(t *testing.T) {
+	crd, _ := loadCRD(t, "actions.kelos.dev_runners.yaml")
+	object := loadSample(t, "actions_v1alpha1_runner.yaml")
+	execution := object["spec"].(map[string]any)["execution"].(map[string]any)
+	execution["terminationGracePeriodSeconds"] = int64(0)
+	if errs := validateObject(t, crd, object, nil); len(errs) > 0 {
+		t.Fatalf("zero termination grace period was rejected: %v", errs.ToAggregate())
+	}
+
+	execution["terminationGracePeriodSeconds"] = int64(-1)
+	if errs := validateObject(t, crd, object, nil); len(errs) == 0 {
+		t.Fatal("negative termination grace period passed validation")
+	}
+}
+
+func TestRunnerImagePullPolicyContract(t *testing.T) {
+	crd, _ := loadCRD(t, "actions.kelos.dev_runners.yaml")
+	for _, policy := range []string{"Always", "Never", "IfNotPresent"} {
+		t.Run(policy, func(t *testing.T) {
+			object := loadSample(t, "actions_v1alpha1_runner.yaml")
+			execution := object["spec"].(map[string]any)["execution"].(map[string]any)
+			execution["imagePullPolicy"] = policy
+			if errs := validateObject(t, crd, object, nil); len(errs) > 0 {
+				t.Fatalf("image pull policy %q was rejected: %v", policy, errs.ToAggregate())
+			}
+		})
+	}
+
+	object := loadSample(t, "actions_v1alpha1_runner.yaml")
+	execution := object["spec"].(map[string]any)["execution"].(map[string]any)
+	execution["imagePullPolicy"] = "Sometimes"
+	if errs := validateObject(t, crd, object, nil); len(errs) == 0 {
+		t.Fatal("invalid image pull policy passed validation")
+	}
+}
+
 func TestCRDConventions(t *testing.T) {
 	tests := []struct {
 		file                    string
@@ -721,6 +757,13 @@ func TestCRDConventions(t *testing.T) {
 				execution := spec.Properties["execution"]
 				if !slices.Contains(execution.Required, "image") {
 					t.Error("spec.execution.image is not required")
+				}
+				terminationGracePeriod := execution.Properties["terminationGracePeriodSeconds"]
+				if slices.Contains(execution.Required, "terminationGracePeriodSeconds") {
+					t.Error("spec.execution.terminationGracePeriodSeconds is required")
+				}
+				if terminationGracePeriod.Format != "int64" || terminationGracePeriod.Minimum == nil || *terminationGracePeriod.Minimum != 0 || terminationGracePeriod.Default != nil {
+					t.Errorf("spec.execution.terminationGracePeriodSeconds schema = %#v", terminationGracePeriod)
 				}
 				if slices.Contains(execution.Required, "docker") {
 					t.Error("spec.execution.docker is required")

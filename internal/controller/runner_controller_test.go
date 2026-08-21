@@ -37,7 +37,8 @@ func TestRunnerBuildsOwnedJob(t *testing.T) {
 	runnerObject := &actionsv1alpha1.Runner{
 		ObjectMeta: metav1.ObjectMeta{Name: "runner-1", Namespace: "default", UID: types.UID("runner-uid")},
 		Spec: actionsv1alpha1.RunnerSpec{Execution: actionsv1alpha1.RunnerExecutionSpec{
-			Image: "runner:test",
+			Image:           "runner:test",
+			ImagePullPolicy: corev1.PullAlways,
 			Resources: &actionsv1alpha1.RunnerResources{Requests: actionsv1alpha1.RunnerResourceList{
 				corev1.ResourceCPU: resource.MustParse("1"),
 			}},
@@ -60,6 +61,9 @@ func TestRunnerBuildsOwnedJob(t *testing.T) {
 	container := job.Spec.Template.Spec.Containers[0]
 	if container.Image != "runner:test" {
 		t.Errorf("image = %q", container.Image)
+	}
+	if container.ImagePullPolicy != corev1.PullAlways {
+		t.Errorf("image pull policy = %q", container.ImagePullPolicy)
 	}
 	if container.Resources.Requests.Cpu().String() != "1" {
 		t.Errorf("cpu request = %s", container.Resources.Requests.Cpu().String())
@@ -102,8 +106,8 @@ func TestRunnerBuildsOwnedJob(t *testing.T) {
 	if job.Spec.ActiveDeadlineSeconds == nil || *job.Spec.ActiveDeadlineSeconds != 90*60 {
 		t.Errorf("active deadline = %v", job.Spec.ActiveDeadlineSeconds)
 	}
-	if job.Spec.Template.Spec.TerminationGracePeriodSeconds == nil || *job.Spec.Template.Spec.TerminationGracePeriodSeconds != int64(runner.CleanupTimeout/time.Second) {
-		t.Errorf("termination grace period = %v", job.Spec.Template.Spec.TerminationGracePeriodSeconds)
+	if job.Spec.Template.Spec.TerminationGracePeriodSeconds != nil {
+		t.Errorf("termination grace period = %v, want nil", job.Spec.Template.Spec.TerminationGracePeriodSeconds)
 	}
 	if job.Labels[actionsv1alpha1.LabelRunnerUID] != string(runnerObject.UID) {
 		t.Errorf("runner label = %q", job.Labels[actionsv1alpha1.LabelRunnerUID])
@@ -126,6 +130,29 @@ func TestRunnerBuildsOwnedJob(t *testing.T) {
 	}
 	if len(job.Spec.Template.Spec.Volumes) != 2 {
 		t.Errorf("volumes = %#v", job.Spec.Template.Spec.Volumes)
+	}
+}
+
+func TestRunnerUsesConfiguredTerminationGracePeriod(t *testing.T) {
+	scheme := runnerTestScheme(t)
+	reconciler := &RunnerReconciler{Client: fake.NewClientBuilder().WithScheme(scheme).Build()}
+	terminationGracePeriodSeconds := int64(0)
+	runnerObject := &actionsv1alpha1.Runner{Spec: actionsv1alpha1.RunnerSpec{Execution: actionsv1alpha1.RunnerExecutionSpec{
+		Image:                         "runner:test",
+		TerminationGracePeriodSeconds: &terminationGracePeriodSeconds,
+	}}}
+
+	job, err := reconciler.buildJob(
+		&actionsv1alpha1.WorkflowJob{ObjectMeta: metav1.ObjectMeta{Name: "ci-build", Namespace: "default", UID: types.UID("workflow-job-uid")}},
+		&actionsv1alpha1.WorkflowRun{},
+		&actionsv1alpha1.Project{},
+		runnerObject,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if job.Spec.Template.Spec.TerminationGracePeriodSeconds == nil || *job.Spec.Template.Spec.TerminationGracePeriodSeconds != 0 {
+		t.Fatalf("termination grace period = %v, want 0", job.Spec.Template.Spec.TerminationGracePeriodSeconds)
 	}
 }
 

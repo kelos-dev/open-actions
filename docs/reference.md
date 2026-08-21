@@ -172,9 +172,15 @@ immutable `spec.source.github.actor` records the source actor. Set
 allowing cancellation-aware reporting and cleanup jobs to finish. Deleting a
 WorkflowRun force-cancels and removes its child resources. A Runner's
 `spec.projectRef` is immutable, and changes to `spec.execution` apply only to
-Kubernetes Jobs created afterward. A RunnerSet maintains homogeneous Runners
-from `spec.template.spec`; its template project reference is immutable. A
-`WorkflowJob` spec is immutable, and `status.runnerRef` identifies
+Kubernetes Jobs created afterward. `spec.execution.imagePullPolicy` controls
+when Kubernetes pulls the runner image and accepts `Always`, `IfNotPresent`, or
+`Never`; omitting it uses Kubernetes defaulting.
+`spec.execution.terminationGracePeriodSeconds` sets how long Kubernetes waits
+for a workflow Pod's containers to stop after termination is requested. Omitting
+it leaves the generated Pod field unset so Kubernetes applies its 30-second
+default; zero requests immediate shutdown. A RunnerSet maintains homogeneous
+Runners from `spec.template.spec`; its template project reference is immutable.
+A `WorkflowJob` spec is immutable, and `status.runnerRef` identifies
 its one-time Runner assignment. `spec.needs` records direct workflow
 dependencies, `spec.if` records its scheduling condition,
 `spec.timeoutSeconds` records its effective execution timeout, and `status.result`
@@ -371,9 +377,13 @@ The effective timeout is applied to both the runner execution context and the
 native Kubernetes Job's `activeDeadlineSeconds`. When it expires, the active
 command is cancelled and eligible `cancelled()` and `always()` workflow and
 composite steps run before action post hooks. All timeout and cancellation
-cleanup shares one five-minute window. The Pod's
-`terminationGracePeriodSeconds` enforces the same cleanup bound if the native
-Job deadline expires or a cancellation deletes the Job.
+cleanup has an internal five-minute deadline. The Runner's
+`spec.execution.terminationGracePeriodSeconds` controls the workflow Pod's
+termination grace period when set; omitting it uses Kubernetes' 30-second
+default. If the native Job deadline expires or a cancellation deletes the Job,
+the time available for cleanup is bounded by both the Pod's termination grace
+period and the runner's five-minute cleanup deadline. A longer Pod grace period
+does not extend the runner's cleanup deadline.
 
 A timed-out WorkflowJob has `status.result: failure` and a false `Succeeded`
 condition with reason `JobTimedOut`, while user cancellation has
@@ -570,8 +580,9 @@ Values derived from `github.token` or the `secrets` context are marked sensitive
 through interpolation and function calls, and evaluation diagnostics do not
 include resolved values. The runner maps interrupt and termination signals to
 cancelled status, separately from failure and timeout, so eligible workflow and
-composite cleanup steps can run during Pod termination. A single five-minute
-cleanup deadline is shared by those steps and action post hooks.
+composite cleanup steps can run during Pod termination. Those steps and action
+post hooks share an internal five-minute cleanup deadline, while Kubernetes may
+stop the Pod sooner when its termination grace period expires.
 
 ### Run identity and stale-run queries
 

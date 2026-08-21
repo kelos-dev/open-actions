@@ -182,6 +182,15 @@ spec:
                             minLength: 1
                             pattern: ^[^[:space:]]+$
                             type: string
+                          imagePullPolicy:
+                            description: |-
+                              ImagePullPolicy controls when Kubernetes pulls the runner image. Omit it
+                              to use Kubernetes image pull policy defaulting.
+                            enum:
+                            - Always
+                            - Never
+                            - IfNotPresent
+                            type: string
                           resources:
                             description: Resources describes the compute resources
                               available to the runner.
@@ -257,6 +266,15 @@ spec:
                                 == ''cpu'' || k == ''memory'' || k == ''ephemeral-storage''
                                 || (has(self.limits) && k in self.limits && quantity(string(self.requests[k])).compareTo(quantity(string(self.limits[k])))
                                 == 0))'
+                          terminationGracePeriodSeconds:
+                            description: |-
+                              TerminationGracePeriodSeconds is how long Kubernetes waits for a workflow
+                              Pod's containers to stop after termination is requested. Omit it to use
+                              Kubernetes termination grace period defaulting. Set it to zero to stop
+                              containers immediately.
+                            format: int64
+                            minimum: 0
+                            type: integer
                         required:
                         - image
                         type: object
