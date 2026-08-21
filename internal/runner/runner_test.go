@@ -701,7 +701,11 @@ func TestLoadPlanSupportsCompatibleVersions(t *testing.T) {
 			if version >= 6 {
 				timeouts = `,"timeoutSeconds":21600,"cleanupTimeoutSeconds":300`
 			}
-			data := fmt.Sprintf(`{"version":%d%s,"repository":{"id":1,"owner":"acme","name":"example","serverURL":"https://github.com","apiURL":"https://api.github.com","actionCloneBaseURL":"https://github.com"},"event":{"name":"push","deliveryID":"delivery"},"revision":{"sha":"abc","ref":"refs/heads/main","refName":"main"},"workflowName":"CI","jobID":"build"%s,"steps":[{"run":"true"}]}`, version, run, timeouts)
+			permissions := ""
+			if version >= 8 {
+				permissions = `,"githubTokenPermissions":{"contents":"read"}`
+			}
+			data := fmt.Sprintf(`{"version":%d%s,"repository":{"id":1,"owner":"acme","name":"example","serverURL":"https://github.com","apiURL":"https://api.github.com","actionCloneBaseURL":"https://github.com"},"event":{"name":"push","deliveryID":"delivery"},"revision":{"sha":"abc","ref":"refs/heads/main","refName":"main"},"workflowName":"CI","jobID":"build"%s%s,"steps":[{"run":"true"}]}`, version, run, timeouts, permissions)
 			if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
 				t.Fatal(err)
 			}
@@ -773,6 +777,20 @@ func TestLoadPlanRequiresVersionSevenRunIdentity(t *testing.T) {
 	}
 	if _, err := LoadPlan(path); err == nil || !strings.Contains(err.Error(), "run identity is incomplete") {
 		t.Fatalf("LoadPlan() error = %v", err)
+	}
+}
+
+func TestLoadPlanRequiresVersionEightGitHubTokenPermissions(t *testing.T) {
+	for _, permissions := range []map[string]string{nil, {"administration": "write"}, {"contents": "none"}} {
+		plan := testPlan()
+		plan.GitHubTokenPermissions = permissions
+		data, err := json.Marshal(plan)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := DecodePlan(data); err == nil || !strings.Contains(err.Error(), "GitHub token permissions are incomplete") {
+			t.Fatalf("DecodePlan() error = %v", err)
+		}
 	}
 }
 
@@ -2327,16 +2345,17 @@ func waitForFile(t *testing.T, path, timeoutMessage string) {
 
 func testPlan() *Plan {
 	return &Plan{
-		Version:               PlanVersion,
-		Run:                   Run{ID: 101, Number: 7, Attempt: 1, Actor: "octocat", URL: "https://actions.example/runs/default/ci", QueryURL: "https://actions.example/api/v1/runs/default/ci/newer"},
-		Repository:            Repository{ID: 1, Owner: "acme", Name: "example", ServerURL: "https://github.com", APIURL: "https://api.github.com", ActionCloneBaseURL: "https://github.com"},
-		Event:                 Event{Name: "push", DeliveryID: "delivery"},
-		Revision:              Revision{SHA: strings.Repeat("a", 40), Ref: "refs/heads/main", RefName: "main"},
-		WorkflowName:          "CI",
-		JobID:                 "test",
-		TimeoutSeconds:        int64((6 * time.Hour) / time.Second),
-		CleanupTimeoutSeconds: int64(CleanupTimeout / time.Second),
-		Steps:                 []Step{{Run: "true"}},
+		Version:                PlanVersion,
+		Run:                    Run{ID: 101, Number: 7, Attempt: 1, Actor: "octocat", URL: "https://actions.example/runs/default/ci", QueryURL: "https://actions.example/api/v1/runs/default/ci/newer"},
+		Repository:             Repository{ID: 1, Owner: "acme", Name: "example", ServerURL: "https://github.com", APIURL: "https://api.github.com", ActionCloneBaseURL: "https://github.com"},
+		Event:                  Event{Name: "push", DeliveryID: "delivery"},
+		Revision:               Revision{SHA: strings.Repeat("a", 40), Ref: "refs/heads/main", RefName: "main"},
+		WorkflowName:           "CI",
+		JobID:                  "test",
+		GitHubTokenPermissions: map[string]string{"contents": "read"},
+		TimeoutSeconds:         int64((6 * time.Hour) / time.Second),
+		CleanupTimeoutSeconds:  int64(CleanupTimeout / time.Second),
+		Steps:                  []Step{{Run: "true"}},
 	}
 }
 

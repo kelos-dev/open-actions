@@ -4,6 +4,8 @@ package e2e_test
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"net/http"
 	"time"
 
@@ -275,6 +277,53 @@ var _ = Describe("Runner", func() {
 		Expect(matrixValues).To(Equal(map[string]bool{"first": true, "second": true}))
 	})
 
+	It("applies workflow and job permissions to GitHub tokens", func() {
+		ctx := context.Background()
+		Expect(resetInstallationTokenRequests()).To(Succeed())
+		DeferCleanup(func() {
+			Expect(resetInstallationTokenRequests()).To(Succeed())
+		})
+		run := &actionsv1alpha1.WorkflowRun{
+			ObjectMeta: metav1.ObjectMeta{Name: "token-permissions", Namespace: e2eNamespace},
+			Spec: actionsv1alpha1.WorkflowRunSpec{
+				ProjectRef: corev1.LocalObjectReference{Name: "default"},
+				Source: actionsv1alpha1.WorkflowRunSource{
+					Type: actionsv1alpha1.SourceTypeGitHub,
+					GitHub: &actionsv1alpha1.GitHubWorkflowRunSource{
+						Repository: actionsv1alpha1.GitHubRepository{ID: 123456789, Owner: "acme", Name: "example"},
+						Event:      actionsv1alpha1.GitHubEvent{Name: "push", DeliveryID: "81111111-2222-3333-4444-555555555555"},
+						Revision:   actionsv1alpha1.GitRevision{SHA: fixtureRevision, Ref: "refs/heads/main"},
+					},
+				},
+				WorkflowPath: tokenPermissionsWorkflowPath,
+			},
+		}
+		Expect(clusterClient.Create(ctx, run)).To(Succeed())
+
+		Eventually(func(g Gomega) {
+			stored := &actionsv1alpha1.WorkflowRun{}
+			g.Expect(clusterClient.Get(ctx, client.ObjectKeyFromObject(run), stored)).To(Succeed())
+			condition := meta.FindStatusCondition(stored.Status.Conditions, actionsv1alpha1.WorkflowRunConditionSucceeded)
+			g.Expect(condition).NotTo(BeNil())
+			if condition != nil {
+				g.Expect(condition.Status).To(Equal(metav1.ConditionTrue), condition.Message)
+			}
+		}, 180*time.Second, time.Second).Should(Succeed())
+
+		requests, err := getInstallationTokenRequests()
+		Expect(err).NotTo(HaveOccurred())
+		for _, permissions := range []map[string]string{
+			{"issues": "write"},
+			{"statuses": "read"},
+			{"metadata": "read"},
+		} {
+			Expect(requests).To(ContainElement(fixtureInstallationTokenRequest{
+				Repositories: []string{"example"},
+				Permissions:  permissions,
+			}))
+		}
+	})
+
 	It("uploads artifacts from parallel matrix jobs and aggregates them in a dependent job", func() {
 		ctx := context.Background()
 		runnerOne := &actionsv1alpha1.Runner{}
@@ -438,6 +487,43 @@ func resetPreparationActionDownloads() {
 	Expect(err).NotTo(HaveOccurred())
 	Expect(response.Body.Close()).To(Succeed())
 	Expect(response.StatusCode).To(Equal(http.StatusNoContent))
+}
+
+type fixtureInstallationTokenRequest struct {
+	Repositories []string          `json:"repositories"`
+	Permissions  map[string]string `json:"permissions"`
+}
+
+func resetInstallationTokenRequests() error {
+	request, err := http.NewRequest(http.MethodDelete, fmt.Sprintf("%s/fixture/installation-token-requests/%d", fixtureURL, installationID), nil)
+	if err != nil {
+		return err
+	}
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		return err
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusNoContent {
+		return fmt.Errorf("reset installation token requests returned status %d", response.StatusCode)
+	}
+	return nil
+}
+
+func getInstallationTokenRequests() ([]fixtureInstallationTokenRequest, error) {
+	response, err := http.Get(fmt.Sprintf("%s/fixture/installation-token-requests/%d", fixtureURL, installationID))
+	if err != nil {
+		return nil, err
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("get installation token requests returned status %d", response.StatusCode)
+	}
+	requests := []fixtureInstallationTokenRequest{}
+	if err := json.NewDecoder(response.Body).Decode(&requests); err != nil {
+		return nil, err
+	}
+	return requests, nil
 }
 
 func findJobCondition(conditions []batchv1.JobCondition, conditionType batchv1.JobConditionType) *batchv1.JobCondition {

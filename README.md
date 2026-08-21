@@ -52,8 +52,8 @@ Console or customize the installation.
 [Create a GitHub App](https://docs.github.com/en/apps/creating-github-apps/registering-a-github-app/registering-a-github-app)
 with the public webhook URL and a webhook secret. Configure it with:
 
-- repository permissions: Contents read, Actions read, Issues read, Pull
-  requests read, Merge queues read, and Checks read and write
+- repository permissions: Actions, Checks, Contents, Issues, Packages, Pull
+  requests, and Commit statuses read and write, plus Merge queues read
 - events: Push, Pull request, Merge group, Workflow run, Issues, Issue comment,
   Pull request review comment, Pull request review, Release, and Check run
 
@@ -61,6 +61,8 @@ Trusted fork workflows load definitions and `refs/pull/<number>/merge` from the
 base repository with Contents read permission. The App does not need to be
 installed on a public fork for that path. Checks read and write reports run
 state; no GitHub App permission by itself makes fork code safe to execute.
+Each job token is narrowed to the permissions requested by its workflow and
+cannot exceed these App permissions.
 
 Generate a private key, [install the App](https://docs.github.com/en/apps/using-github-apps/installing-your-own-github-app)
 on every repository whose workflows or actions Open Actions runs, and record

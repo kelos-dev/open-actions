@@ -21,13 +21,14 @@ func TestRunWritesWorkflowJobResult(t *testing.T) {
 		Repository: runner.Repository{
 			ID: 1, Owner: "acme", Name: "example", ServerURL: "https://github.com", APIURL: "https://api.github.com", ActionCloneBaseURL: "https://github.com",
 		},
-		Event:                 runner.Event{Name: "push", DeliveryID: "delivery"},
-		Revision:              runner.Revision{SHA: strings.Repeat("a", 40), Ref: "refs/heads/main", RefName: "main"},
-		WorkflowName:          "CI",
-		JobID:                 "build",
-		TimeoutSeconds:        int64((6 * time.Hour) / time.Second),
-		CleanupTimeoutSeconds: int64(runner.CleanupTimeout / time.Second),
-		Outputs:               map[string]string{"value": "${{ steps.producer.outputs.value }}"},
+		Event:                  runner.Event{Name: "push", DeliveryID: "delivery"},
+		Revision:               runner.Revision{SHA: strings.Repeat("a", 40), Ref: "refs/heads/main", RefName: "main"},
+		WorkflowName:           "CI",
+		JobID:                  "build",
+		GitHubTokenPermissions: map[string]string{"contents": "read"},
+		TimeoutSeconds:         int64((6 * time.Hour) / time.Second),
+		CleanupTimeoutSeconds:  int64(runner.CleanupTimeout / time.Second),
+		Outputs:                map[string]string{"value": "${{ steps.producer.outputs.value }}"},
 		Steps: []runner.Step{{
 			ID: "producer", Run: `test -z "$OPEN_ACTIONS_GITHUB_TOKEN"
 test -z "$OPEN_ACTIONS_ACTION_TOKEN"
@@ -69,13 +70,14 @@ func TestRunLoadsNeedsContext(t *testing.T) {
 		Repository: runner.Repository{
 			ID: 1, Owner: "acme", Name: "example", ServerURL: "https://github.com", APIURL: "https://api.github.com", ActionCloneBaseURL: "https://github.com",
 		},
-		Event:                 runner.Event{Name: "push", DeliveryID: "delivery"},
-		Revision:              runner.Revision{SHA: strings.Repeat("a", 40), Ref: "refs/heads/main", RefName: "main"},
-		WorkflowName:          "CI",
-		JobID:                 "report",
-		TimeoutSeconds:        int64((6 * time.Hour) / time.Second),
-		CleanupTimeoutSeconds: int64(runner.CleanupTimeout / time.Second),
-		Outputs:               map[string]string{"artifact": "${{ needs.build.outputs.artifact }}"},
+		Event:                  runner.Event{Name: "push", DeliveryID: "delivery"},
+		Revision:               runner.Revision{SHA: strings.Repeat("a", 40), Ref: "refs/heads/main", RefName: "main"},
+		WorkflowName:           "CI",
+		JobID:                  "report",
+		GitHubTokenPermissions: map[string]string{"contents": "read"},
+		TimeoutSeconds:         int64((6 * time.Hour) / time.Second),
+		CleanupTimeoutSeconds:  int64(runner.CleanupTimeout / time.Second),
+		Outputs:                map[string]string{"artifact": "${{ needs.build.outputs.artifact }}"},
 		Steps: []runner.Step{{
 			If:  "needs.build.result == 'success'",
 			Run: `test "${{ needs.build.outputs.artifact }}" = ready`,

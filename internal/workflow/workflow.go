@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"maps"
 	"math"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -60,9 +62,77 @@ const (
 type Definition struct {
 	Name        string         `yaml:"name"`
 	On          Trigger        `yaml:"on"`
+	Permissions Permissions    `yaml:"permissions"`
 	Env         map[string]any `yaml:"env"`
 	Concurrency Concurrency    `yaml:"concurrency"`
 	Jobs        map[string]Job `yaml:"jobs"`
+}
+
+// Permissions contains the repository access requested for a workflow job.
+type Permissions map[string]string
+
+var permissionNames = []string{
+	"actions",
+	"checks",
+	"contents",
+	"issues",
+	"packages",
+	"pull-requests",
+	"statuses",
+}
+
+func (p *Permissions) UnmarshalYAML(node *yaml.Node) error {
+	switch node.Kind {
+	case yaml.ScalarNode:
+		if node.Tag != "!!str" || (node.Value != "read-all" && node.Value != "write-all") {
+			return fmt.Errorf("permissions must be read-all, write-all, or a mapping")
+		}
+		level := strings.TrimSuffix(node.Value, "-all")
+		*p = make(Permissions, len(permissionNames))
+		for _, name := range permissionNames {
+			(*p)[name] = level
+		}
+		return nil
+	case yaml.MappingNode:
+		if err := rejectDuplicateMappingKeys(node, "permissions"); err != nil {
+			return err
+		}
+		*p = make(Permissions, len(node.Content)/2)
+		for index := 0; index < len(node.Content); index += 2 {
+			name := node.Content[index].Value
+			if !slices.Contains(permissionNames, name) {
+				return fmt.Errorf("permissions contains unsupported permission %q", name)
+			}
+			value := node.Content[index+1]
+			if value.Kind != yaml.ScalarNode || value.Tag != "!!str" || (value.Value != "read" && value.Value != "write" && value.Value != "none") {
+				return fmt.Errorf("permission %q must be read, write, or none", name)
+			}
+			if value.Value != "none" {
+				(*p)[name] = value.Value
+			}
+		}
+		return nil
+	default:
+		return fmt.Errorf("permissions must be read-all, write-all, or a mapping")
+	}
+}
+
+// DefaultPermissions returns the job permissions used when the workflow does
+// not configure them.
+func DefaultPermissions() Permissions {
+	return Permissions{"contents": "read"}
+}
+
+// EffectivePermissions applies job, workflow, and default precedence.
+func EffectivePermissions(workflowPermissions, jobPermissions Permissions) Permissions {
+	permissions := jobPermissions
+	if permissions == nil {
+		permissions = workflowPermissions
+	}
+	if permissions == nil {
+		permissions = DefaultPermissions()
+	}
+	return maps.Clone(permissions)
 }
 
 type Concurrency struct {
@@ -127,6 +197,7 @@ type Job struct {
 	Name           string         `yaml:"name"`
 	RunsOn         StringList     `yaml:"runs-on"`
 	Needs          StringList     `yaml:"needs"`
+	Permissions    Permissions    `yaml:"permissions"`
 	Outputs        map[string]any `yaml:"outputs"`
 	Steps          []Step         `yaml:"steps"`
 	Strategy       Strategy       `yaml:"strategy"`

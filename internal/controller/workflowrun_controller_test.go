@@ -10,6 +10,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -96,11 +97,49 @@ func TestJobPlanCoversSupportedSteps(t *testing.T) {
 	if plan.Inputs["enabled"] != false || plan.Inputs["retries"] != float64(2) {
 		t.Errorf("plan inputs = %#v", plan.Inputs)
 	}
+	if !maps.Equal(plan.GitHubTokenPermissions, map[string]string{"contents": "read"}) {
+		t.Errorf("GitHub token permissions = %#v", plan.GitHubTokenPermissions)
+	}
 	if len(plan.Steps) != 3 {
 		t.Errorf("steps = %d", len(plan.Steps))
 	}
 	if plan.Steps[2].ID != "build" || plan.Outputs["artifact"] == "" {
 		t.Errorf("output plan = %#v", plan)
+	}
+}
+
+func TestGitHubTokenPermissionsRestrictsForkWrites(t *testing.T) {
+	requested := workflow.Permissions{"contents": "write", "issues": "read", "pull-requests": "write", "statuses": "write"}
+	for _, tt := range []struct {
+		name      string
+		eventName actionsv1alpha1.GitHubEventName
+		headID    int64
+		want      map[string]string
+	}{
+		{
+			name: "fork pull request", eventName: actionsv1alpha1.GitHubEventNamePullRequest, headID: 2,
+			want: map[string]string{"contents": "read", "issues": "read", "pull_requests": "read", "statuses": "read"},
+		},
+		{
+			name: "same repository pull request", eventName: actionsv1alpha1.GitHubEventNamePullRequest, headID: 1,
+			want: map[string]string{"contents": "write", "issues": "read", "pull_requests": "write", "statuses": "write"},
+		},
+		{
+			name: "pull request target", eventName: actionsv1alpha1.GitHubEventNamePullRequestTarget, headID: 2,
+			want: map[string]string{"contents": "write", "issues": "read", "pull_requests": "write", "statuses": "write"},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			run := &actionsv1alpha1.WorkflowRun{Spec: actionsv1alpha1.WorkflowRunSpec{Source: actionsv1alpha1.WorkflowRunSource{GitHub: &actionsv1alpha1.GitHubWorkflowRunSource{
+				Repository: actionsv1alpha1.GitHubRepository{ID: 1},
+				Event: actionsv1alpha1.GitHubEvent{Name: tt.eventName, PullRequest: &actionsv1alpha1.GitHubPullRequest{
+					HeadRepository: actionsv1alpha1.GitHubRepository{ID: tt.headID},
+				}},
+			}}}}
+			if got := githubTokenPermissions(run, requested); !maps.Equal(got, tt.want) {
+				t.Fatalf("permissions = %#v, want %#v", got, tt.want)
+			}
+		})
 	}
 }
 
@@ -169,6 +208,41 @@ func TestPlanWorkflowJobsInheritsWorkflowEnvironment(t *testing.T) {
 	}
 	if replanned[0].plan != planned[0].plan || replanned[1].plan != planned[1].plan {
 		t.Fatal("workflow environment planning is not deterministic")
+	}
+}
+
+func TestPlanWorkflowJobsAppliesPermissionPrecedence(t *testing.T) {
+	definition, err := workflow.Parse([]byte("name: CI\non: push\npermissions:\n  contents: write\n  issues: read\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: true\n  publish:\n    permissions:\n      packages: write\n    runs-on: ubuntu-latest\n    steps:\n      - run: true\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := &actionsv1alpha1.WorkflowRun{Spec: actionsv1alpha1.WorkflowRunSpec{Source: actionsv1alpha1.WorkflowRunSource{
+		Type: actionsv1alpha1.SourceTypeGitHub,
+		GitHub: &actionsv1alpha1.GitHubWorkflowRunSource{
+			Actor:      "octocat",
+			Repository: actionsv1alpha1.GitHubRepository{ID: 1, Owner: "acme", Name: "example"},
+			Event:      actionsv1alpha1.GitHubEvent{Name: "push", DeliveryID: "delivery"},
+			Revision:   actionsv1alpha1.GitRevision{SHA: strings.Repeat("a", 40), Ref: "refs/heads/main"},
+		},
+	}}}
+	setTestWorkflowRunIdentity(run)
+	reconciler := &WorkflowRunReconciler{GitHubServerURL: "https://github.com", GitHubAPIBase: "https://api.github.com", ActionCloneBaseURL: "https://github.com"}
+	planned, _, err := reconciler.planWorkflowJobs(run, definition, nil, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(planned) != 2 {
+		t.Fatalf("planned jobs = %d", len(planned))
+	}
+	want := []map[string]string{{"contents": "write", "issues": "read"}, {"packages": "write"}}
+	for index := range planned {
+		plan, err := runner.DecodePlan([]byte(planned[index].plan))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !maps.Equal(plan.GitHubTokenPermissions, want[index]) {
+			t.Errorf("job %q permissions = %#v, want %#v", planned[index].id, plan.GitHubTokenPermissions, want[index])
+		}
 	}
 }
 
@@ -1178,7 +1252,7 @@ func TestReconcileDynamicMatrixFromDependencyOutput(t *testing.T) {
 	}
 	setTestWorkflowRunIdentity(run)
 	project := &actionsv1alpha1.Project{ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: "default", UID: types.UID("project-uid")}}
-	definition, err := workflow.Parse([]byte("name: Dynamic\non: push\njobs:\n  prepare:\n    runs-on: ubuntu-latest\n    outputs:\n      arches: ${{ steps.prepare.outputs.arches }}\n    steps:\n      - id: prepare\n        run: prepare\n  build:\n    needs: prepare\n    strategy:\n      max-parallel: 1\n      matrix:\n        arch: ${{ fromJSON(needs.prepare.outputs.arches) }}\n        runner: ['${{ vars.RUNNER }}']\n        build-date: [20260820]\n        run-url: ['${{ open_actions.run_url }}']\n        include:\n          - arch: ppc64le\n            runner: self-hosted\n    name: Build ${{ matrix.arch }} in ${{ vars.ENVIRONMENT }} from ${{ github.event.channel }}\n    runs-on: ${{ matrix.runner }}\n    env:\n      BUILD_DATE: 20260820\n    steps:\n      - run: build ${{ matrix.arch }}\n"))
+	definition, err := workflow.Parse([]byte("name: Dynamic\non: push\npermissions:\n  issues: write\njobs:\n  prepare:\n    runs-on: ubuntu-latest\n    outputs:\n      arches: ${{ steps.prepare.outputs.arches }}\n    steps:\n      - id: prepare\n        run: prepare\n  build:\n    needs: prepare\n    strategy:\n      max-parallel: 1\n      matrix:\n        arch: ${{ fromJSON(needs.prepare.outputs.arches) }}\n        runner: ['${{ vars.RUNNER }}']\n        build-date: [20260820]\n        run-url: ['${{ open_actions.run_url }}']\n        include:\n          - arch: ppc64le\n            runner: self-hosted\n    name: Build ${{ matrix.arch }} in ${{ vars.ENVIRONMENT }} from ${{ github.event.channel }}\n    runs-on: ${{ matrix.runner }}\n    env:\n      BUILD_DATE: 20260820\n    steps:\n      - run: build ${{ matrix.arch }}\n"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1273,6 +1347,9 @@ func TestReconcileDynamicMatrixFromDependencyOutput(t *testing.T) {
 	}
 	if jobPlan.Env["BUILD_DATE"] != "20260820" {
 		t.Fatalf("BUILD_DATE = %q, want exact integer", jobPlan.Env["BUILD_DATE"])
+	}
+	if !maps.Equal(jobPlan.GitHubTokenPermissions, map[string]string{"issues": "write"}) {
+		t.Fatalf("GitHub token permissions = %#v", jobPlan.GitHubTokenPermissions)
 	}
 
 	restarted := &WorkflowRunReconciler{Client: clusterClient, APIReader: clusterClient, GitHubAPIBase: "https://api.github.example", GitHubServerURL: "https://github.example"}

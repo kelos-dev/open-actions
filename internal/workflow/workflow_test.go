@@ -15,6 +15,53 @@ import (
 
 const minimalJob = "jobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: make test\n"
 
+func TestParsePermissionsPrecedence(t *testing.T) {
+	for _, tt := range []struct {
+		name       string
+		workflow   string
+		job        string
+		want       Permissions
+		configured bool
+	}{
+		{name: "default", want: Permissions{"contents": "read"}},
+		{name: "workflow", workflow: "permissions:\n  contents: read\n  issues: write\n", want: Permissions{"contents": "read", "issues": "write"}, configured: true},
+		{name: "job overrides workflow", workflow: "permissions:\n  contents: write\n  issues: read\n", job: "    permissions:\n      statuses: write\n", want: Permissions{"statuses": "write"}, configured: true},
+		{name: "empty job", workflow: "permissions: write-all\n", job: "    permissions: {}\n", want: Permissions{}, configured: true},
+		{name: "read all", workflow: "permissions: read-all\n", want: Permissions{"actions": "read", "checks": "read", "contents": "read", "issues": "read", "packages": "read", "pull-requests": "read", "statuses": "read"}, configured: true},
+		{name: "none omits permission", job: "    permissions:\n      contents: none\n      packages: write\n", want: Permissions{"packages": "write"}, configured: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			data := tt.workflow + "name: CI\non: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n" + tt.job + "    steps:\n      - run: true\n"
+			definition, err := Parse([]byte(data))
+			if err != nil {
+				t.Fatal(err)
+			}
+			jobPermissions := definition.Jobs["build"].Permissions
+			if tt.configured && definition.Permissions == nil && jobPermissions == nil {
+				t.Fatal("configured permissions were lost")
+			}
+			got := EffectivePermissions(definition.Permissions, jobPermissions)
+			if !maps.Equal(got, tt.want) {
+				t.Fatalf("permissions = %#v, want %#v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestParseRejectsInvalidPermissions(t *testing.T) {
+	for _, permissions := range []string{
+		"permissions: admin-all\n",
+		"permissions:\n  deployments: write\n",
+		"permissions:\n  contents: admin\n",
+		"permissions:\n  contents: read\n  contents: write\n",
+	} {
+		data := permissions + "name: CI\non: push\n" + minimalJob
+		if _, err := Parse([]byte(data)); err == nil {
+			t.Fatalf("Parse() accepted invalid permissions:\n%s", permissions)
+		}
+	}
+}
+
 func TestParseRemainingKelosTriggers(t *testing.T) {
 	triggers := map[string]string{
 		"workflow run":                "workflow_run:\n    workflows: [Release]\n    types: [completed]\n    branches: [main]",
