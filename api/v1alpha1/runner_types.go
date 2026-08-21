@@ -53,6 +53,20 @@ type RunnerExecutionSpec struct {
 	// +required
 	Image string `json:"image"`
 
+	// ImagePullPolicy controls when Kubernetes pulls the runner image. Omit it
+	// to use Kubernetes image pull policy defaulting.
+	// +kubebuilder:validation:Enum=Always;Never;IfNotPresent
+	// +optional
+	ImagePullPolicy corev1.PullPolicy `json:"imagePullPolicy,omitempty"`
+
+	// TerminationGracePeriodSeconds is how long Kubernetes waits for a workflow
+	// Pod's containers to stop after termination is requested. Omit it to use
+	// Kubernetes termination grace period defaulting. Set it to zero to stop
+	// containers immediately.
+	// +kubebuilder:validation:Minimum=0
+	// +optional
+	TerminationGracePeriodSeconds *int64 `json:"terminationGracePeriodSeconds,omitempty"`
+
 	// Resources describes the compute resources available to the runner.
 	// +optional
 	Resources *RunnerResources `json:"resources,omitempty"`
