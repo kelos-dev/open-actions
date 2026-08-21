@@ -134,6 +134,21 @@ func TestConsoleKeepsTimestampedLogContentOnOneGridRow(t *testing.T) {
 	}
 }
 
+func TestConsoleKeepsFourDigitLineNumbersOnOneRow(t *testing.T) {
+	handler := newTestHandler(t, false)
+	request := httptest.NewRequest(http.MethodGet, "/runs/default/ci/jobs/build", nil)
+	request.Header.Set("Authorization", "Bearer "+testConsoleToken)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("log page status = %d, want %d", response.Code, http.StatusOK)
+	}
+	if !strings.Contains(response.Body.String(), ".line-number{width:42px;padding-right:14px;color:#484f58;text-align:right;white-space:nowrap;user-select:none}") {
+		t.Fatal("log page allows line numbers to wrap")
+	}
+}
+
 func TestConsoleResumesReconnectedLogStream(t *testing.T) {
 	handler := newTestHandler(t, false)
 	source := handler.logs.(*testLogSource)
