@@ -15,6 +15,19 @@
 - **Keep `docs/reference.md` user-facing.** Document API fields, configuration, validation, defaults, and observable operational behavior. Include implementation details only when users need them to configure, operate, or troubleshoot Open Actions.
 - **Name resources in errors.** Errors for operations on a named Project, Runner, WorkflowRun, WorkflowJob, or other resource must include that resource's name.
 
+## GitHub Actions compatibility
+
+Use the current [GitHub Actions documentation](https://docs.github.com/en/actions)
+as the source of truth. Open Actions must match its documented workflow syntax,
+behavior, and security rules.
+
+- Verify changes against the relevant GitHub documentation and add conformance
+  tests.
+- Treat differences as bugs. Reject unsupported behavior explicitly, document
+  it, and link a tracking issue.
+- Kubernetes-specific features must not change the meaning of a valid GitHub
+  Actions workflow.
+
 ## Tests
 
 - Do not use Gomega's global `Expect()` inside `Eventually` polling blocks. Use `Eventually(func(g Gomega) { ... })` when assertions should be retried, or return a value or error for `Eventually` to evaluate.
