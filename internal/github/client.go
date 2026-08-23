@@ -21,25 +21,54 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/kelos-dev/open-actions/internal/endpointurl"
 )
 
 const (
-	maxResponseBytes = 4 << 20
-	gitSHA1Bytes     = 20
+	maxResponseBytes        = 4 << 20
+	gitSHA1Bytes            = 20
+	installationTokenSkew   = 5 * time.Minute
+	defaultRateLimitBackoff = time.Minute
 )
 
 type Client struct {
-	baseURL    *url.URL
-	httpClient *http.Client
-	now        func() time.Time
+	baseURL             *url.URL
+	httpClient          *http.Client
+	now                 func() time.Time
+	installationMutex   sync.Mutex
+	installationCache   map[installationCacheKey]cachedInstallation
+	installationPending map[installationCacheKey]*installationRequest
+	rateLimitMutex      sync.Mutex
+	rateLimitReset      map[int64]time.Time
 }
 
 type InstallationClient struct {
-	client *Client
-	token  string
+	client         *Client
+	token          string
+	installationID int64
+	cacheKey       *installationCacheKey
+}
+
+type installationCacheKey struct {
+	AppID          int64
+	InstallationID int64
+	PrivateKeyHash [sha256.Size]byte
+	Repository     string
+	Permissions    string
+}
+
+type cachedInstallation struct {
+	client    *InstallationClient
+	expiresAt time.Time
+}
+
+type installationRequest struct {
+	done   chan struct{}
+	client *InstallationClient
+	err    error
 }
 
 type Content struct {
@@ -144,9 +173,12 @@ type UpdateCheckRunRequest struct {
 
 // APIError describes a non-success response from the GitHub API.
 type APIError struct {
-	StatusCode int
-	Status     string
-	Message    string
+	StatusCode         int
+	Status             string
+	Message            string
+	RetryAfter         time.Duration
+	RateLimitRemaining *int
+	RateLimitReset     time.Time
 }
 
 func (e *APIError) Error() string {
@@ -154,6 +186,61 @@ func (e *APIError) Error() string {
 		return fmt.Sprintf("GitHub API returned %s", e.Status)
 	}
 	return fmt.Sprintf("GitHub API returned %s: %s", e.Status, e.Message)
+}
+
+// RateLimitError reports that GitHub asked this client to defer requests for
+// an installation.
+type RateLimitError struct {
+	RetryAt time.Time
+}
+
+func (e *RateLimitError) Error() string {
+	return fmt.Sprintf("GitHub API rate limit remains active until %s", e.RetryAt.UTC().Format(time.RFC3339))
+}
+
+// RetryDelay returns how long a rate-limited operation should wait before it
+// is attempted again.
+func RetryDelay(err error, now time.Time) (time.Duration, bool) {
+	if err == nil {
+		return 0, false
+	}
+	if joined, ok := err.(interface{ Unwrap() []error }); ok {
+		var delay time.Duration
+		for _, nested := range joined.Unwrap() {
+			nestedDelay, limited := RetryDelay(nested, now)
+			if !limited {
+				return 0, false
+			}
+			delay = max(delay, nestedDelay)
+		}
+		return delay, delay > 0
+	}
+	if wrapped, ok := err.(interface{ Unwrap() error }); ok {
+		return RetryDelay(wrapped.Unwrap(), now)
+	}
+	if rateLimitError, ok := err.(*RateLimitError); ok {
+		return max(rateLimitError.RetryAt.Sub(now), time.Second), true
+	}
+	apiError, ok := err.(*APIError)
+	if !ok {
+		return 0, false
+	}
+	if apiError.RetryAfter > 0 {
+		return apiError.RetryAfter, true
+	}
+	if primaryRateLimited(apiError) {
+		return max(apiError.RateLimitReset.Sub(now), time.Second), true
+	}
+	message := strings.ToLower(apiError.Message)
+	if apiError.StatusCode == http.StatusTooManyRequests || apiError.StatusCode == http.StatusForbidden && (strings.Contains(message, "rate limit") || strings.Contains(message, "abuse")) {
+		return defaultRateLimitBackoff, true
+	}
+	return 0, false
+}
+
+func primaryRateLimited(apiError *APIError) bool {
+	return (apiError.StatusCode == http.StatusForbidden || apiError.StatusCode == http.StatusTooManyRequests) &&
+		apiError.RateLimitRemaining != nil && *apiError.RateLimitRemaining == 0 && !apiError.RateLimitReset.IsZero()
 }
 
 // NormalizeAPIURL validates and canonicalizes a GitHub REST API base URL.
@@ -194,7 +281,11 @@ func NewClient(baseURL string, httpClient *http.Client) (*Client, error) {
 	if httpClient == nil {
 		httpClient = &http.Client{Timeout: 30 * time.Second}
 	}
-	return &Client{baseURL: parsed, httpClient: httpClient, now: time.Now}, nil
+	return &Client{
+		baseURL: parsed, httpClient: httpClient, now: time.Now,
+		installationCache: map[installationCacheKey]cachedInstallation{}, installationPending: map[installationCacheKey]*installationRequest{},
+		rateLimitReset: map[int64]time.Time{},
+	}, nil
 }
 
 func ValidatePrivateKey(data []byte) error {
@@ -209,25 +300,99 @@ func (c *Client) Installation(ctx context.Context, appID, installationID int64, 
 	return c.installation(ctx, appID, installationID, privateKey, []string{repository}, permissions)
 }
 
+// CachedInstallation returns a repository-scoped installation client and
+// reuses its token until shortly before GitHub expires it. It is intended for
+// control-plane requests; workflow jobs should continue to use Installation so
+// every job receives an independently revocable token.
+func (c *Client) CachedInstallation(ctx context.Context, appID, installationID int64, privateKey []byte, repository string, permissions InstallationPermissions) (*InstallationClient, error) {
+	if repository == "" {
+		return nil, errors.New("repository must be specified for an installation token")
+	}
+	return c.cachedInstallation(ctx, appID, installationID, privateKey, []string{repository}, repository, permissions)
+}
+
 func (c *Client) InstallationForAllRepositories(ctx context.Context, appID, installationID int64, privateKey []byte, permissions InstallationPermissions) (*InstallationClient, error) {
 	return c.installation(ctx, appID, installationID, privateKey, nil, permissions)
 }
 
-func (c *Client) installation(ctx context.Context, appID, installationID int64, privateKey []byte, repositories []string, permissions InstallationPermissions) (*InstallationClient, error) {
+// CachedInstallationForAllRepositories returns a cached installation client
+// with access to every repository granted to the installation.
+func (c *Client) CachedInstallationForAllRepositories(ctx context.Context, appID, installationID int64, privateKey []byte, permissions InstallationPermissions) (*InstallationClient, error) {
+	return c.cachedInstallation(ctx, appID, installationID, privateKey, nil, "", permissions)
+}
+
+func (c *Client) cachedInstallation(ctx context.Context, appID, installationID int64, privateKey []byte, repositories []string, repository string, permissions InstallationPermissions) (*InstallationClient, error) {
 	if err := permissions.validate(); err != nil {
 		return nil, err
 	}
+	key := installationCacheKey{
+		AppID: appID, InstallationID: installationID, PrivateKeyHash: sha256.Sum256(privateKey),
+		Repository: repository, Permissions: permissions.String(),
+	}
+	now := c.now()
+	c.installationMutex.Lock()
+	c.pruneInstallationCache(now)
+	if cached, found := c.installationCache[key]; found && cached.expiresAt.After(now.Add(installationTokenSkew)) {
+		c.installationMutex.Unlock()
+		return cached.client, nil
+	}
+	if pending, found := c.installationPending[key]; found {
+		c.installationMutex.Unlock()
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-pending.done:
+			return pending.client, pending.err
+		}
+	}
+	pending := &installationRequest{done: make(chan struct{})}
+	c.installationPending[key] = pending
+	c.installationMutex.Unlock()
+
+	installation, expiresAt, err := c.createInstallation(ctx, appID, installationID, privateKey, repositories, permissions)
+	if installation != nil {
+		installation.cacheKey = &key
+	}
+	c.installationMutex.Lock()
+	pending.client, pending.err = installation, err
+	delete(c.installationPending, key)
+	if err == nil && expiresAt.After(c.now().Add(installationTokenSkew)) {
+		c.installationCache[key] = cachedInstallation{client: installation, expiresAt: expiresAt}
+	}
+	close(pending.done)
+	c.installationMutex.Unlock()
+	return installation, err
+}
+
+func (c *Client) pruneInstallationCache(now time.Time) {
+	for key, cached := range c.installationCache {
+		if !cached.expiresAt.After(now.Add(installationTokenSkew)) {
+			delete(c.installationCache, key)
+		}
+	}
+}
+
+func (c *Client) installation(ctx context.Context, appID, installationID int64, privateKey []byte, repositories []string, permissions InstallationPermissions) (*InstallationClient, error) {
+	installation, _, err := c.createInstallation(ctx, appID, installationID, privateKey, repositories, permissions)
+	return installation, err
+}
+
+func (c *Client) createInstallation(ctx context.Context, appID, installationID int64, privateKey []byte, repositories []string, permissions InstallationPermissions) (*InstallationClient, time.Time, error) {
+	if err := permissions.validate(); err != nil {
+		return nil, time.Time{}, err
+	}
 	key, err := parsePrivateKey(privateKey)
 	if err != nil {
-		return nil, err
+		return nil, time.Time{}, err
 	}
 	jwt, err := signJWT(key, appID, c.now())
 	if err != nil {
-		return nil, err
+		return nil, time.Time{}, err
 	}
 	requestPath := fmt.Sprintf("app/installations/%d/access_tokens", installationID)
 	response := struct {
-		Token string `json:"token"`
+		Token     string    `json:"token"`
+		ExpiresAt time.Time `json:"expires_at"`
 	}{}
 	tokenPermissions := permissions
 	if len(tokenPermissions) == 0 {
@@ -237,13 +402,13 @@ func (c *Client) installation(ctx context.Context, appID, installationID int64, 
 	if len(repositories) > 0 {
 		tokenRequest["repositories"] = repositories
 	}
-	if err := c.doJSONWithBody(ctx, http.MethodPost, requestPath, jwt, tokenRequest, &response); err != nil {
-		return nil, fmt.Errorf("create installation access token: %w", err)
+	if err := c.doJSONWithBodyForInstallation(ctx, installationID, http.MethodPost, requestPath, jwt, tokenRequest, &response); err != nil {
+		return nil, time.Time{}, fmt.Errorf("create installation access token: %w", err)
 	}
 	if response.Token == "" {
-		return nil, errors.New("GitHub returned an empty installation access token")
+		return nil, time.Time{}, errors.New("GitHub returned an empty installation access token")
 	}
-	return &InstallationClient{client: c, token: response.Token}, nil
+	return &InstallationClient{client: c, token: response.Token, installationID: installationID}, response.ExpiresAt, nil
 }
 
 func (c *InstallationClient) Token() string {
@@ -252,21 +417,53 @@ func (c *InstallationClient) Token() string {
 
 // Revoke invalidates this installation access token.
 func (c *InstallationClient) Revoke(ctx context.Context) error {
-	return c.client.RevokeInstallationToken(ctx, c.token)
+	c.client.invalidateCachedInstallation(c.cacheKey, c.token)
+	return c.client.revokeInstallationToken(ctx, c.installationID, c.token)
 }
 
 // RevokeInstallationToken invalidates an installation access token. An already
 // expired or revoked token is considered successfully revoked.
 func (c *Client) RevokeInstallationToken(ctx context.Context, token string) error {
+	return c.revokeInstallationToken(ctx, 0, token)
+}
+
+func (c *Client) revokeInstallationToken(ctx context.Context, installationID int64, token string) error {
 	if token == "" {
 		return errors.New("installation token is required")
 	}
-	err := c.doJSONWithBody(ctx, http.MethodDelete, "installation/token", token, nil, nil)
+	err := c.doJSONWithBodyForInstallation(ctx, installationID, http.MethodDelete, "installation/token", token, nil, nil)
 	apiError := &APIError{}
 	if errors.As(err, &apiError) && apiError.StatusCode == http.StatusUnauthorized {
 		return nil
 	}
 	return err
+}
+
+func (c *Client) invalidateCachedInstallation(key *installationCacheKey, token string) {
+	if key == nil {
+		return
+	}
+	c.installationMutex.Lock()
+	defer c.installationMutex.Unlock()
+	if cached, found := c.installationCache[*key]; found && cached.client.token == token {
+		delete(c.installationCache, *key)
+	}
+}
+
+func (c *InstallationClient) finish(err error) error {
+	apiError := &APIError{}
+	if errors.As(err, &apiError) && apiError.StatusCode == http.StatusUnauthorized {
+		c.client.invalidateCachedInstallation(c.cacheKey, c.token)
+	}
+	return err
+}
+
+func (c *InstallationClient) doJSONWithQuery(ctx context.Context, method, requestPath string, query url.Values, destination any) error {
+	return c.finish(c.client.doJSONWithQueryForInstallation(ctx, c.installationID, method, requestPath, query, c.token, destination))
+}
+
+func (c *InstallationClient) doJSONWithBody(ctx context.Context, method, requestPath string, requestBody, destination any) error {
+	return c.finish(c.client.doJSONWithBodyForInstallation(ctx, c.installationID, method, requestPath, c.token, requestBody, destination))
 }
 
 func (c *InstallationClient) ListRepositories(ctx context.Context, limit int) ([]Repository, error) {
@@ -281,7 +478,7 @@ func (c *InstallationClient) ListRepositories(ctx context.Context, limit int) ([
 			Repositories []Repository `json:"repositories"`
 		}{}
 		query := url.Values{"page": []string{strconv.Itoa(page)}, "per_page": []string{strconv.Itoa(perPage)}}
-		if err := c.client.doJSONWithQuery(ctx, http.MethodGet, "installation/repositories", query, c.token, &response); err != nil {
+		if err := c.doJSONWithQuery(ctx, http.MethodGet, "installation/repositories", query, &response); err != nil {
 			return nil, fmt.Errorf("list installation repositories: %w", err)
 		}
 		repositories = append(repositories, response.Repositories...)
@@ -297,7 +494,7 @@ func (c *InstallationClient) ListRepositories(ctx context.Context, limit int) ([
 func (c *InstallationClient) ListDirectory(ctx context.Context, owner, repository, directory, revision string) ([]Content, error) {
 	requestPath := repositoryContentPath(owner, repository, directory)
 	contents := []Content{}
-	if err := c.client.doJSONWithQuery(ctx, http.MethodGet, requestPath, url.Values{"ref": []string{revision}}, c.token, &contents); err != nil {
+	if err := c.doJSONWithQuery(ctx, http.MethodGet, requestPath, url.Values{"ref": []string{revision}}, &contents); err != nil {
 		return nil, fmt.Errorf("list repository directory %q from %s/%s at revision %q: %w", directory, owner, repository, revision, err)
 	}
 	return contents, nil
@@ -309,7 +506,7 @@ func (c *InstallationClient) GetFile(ctx context.Context, owner, repository, fil
 		Content  string `json:"content"`
 		Encoding string `json:"encoding"`
 	}{}
-	if err := c.client.doJSONWithQuery(ctx, http.MethodGet, requestPath, url.Values{"ref": []string{revision}}, c.token, &content); err != nil {
+	if err := c.doJSONWithQuery(ctx, http.MethodGet, requestPath, url.Values{"ref": []string{revision}}, &content); err != nil {
 		return nil, fmt.Errorf("get repository file %q from %s/%s at revision %q: %w", filePath, owner, repository, revision, err)
 	}
 	if content.Encoding != "base64" {
@@ -336,7 +533,7 @@ func (c *InstallationClient) resolveRevision(ctx context.Context, owner, reposit
 	identity := fmt.Sprintf("resolve repository revision %q from %s/%s", revision, owner, repository)
 	requestPath := "repos/" + owner + "/" + repository + "/commits"
 	commits := []repositoryCommit{}
-	if err := c.client.doJSONWithQuery(ctx, http.MethodGet, requestPath, url.Values{"sha": []string{revision}, "per_page": []string{"1"}}, c.token, &commits); err != nil {
+	if err := c.doJSONWithQuery(ctx, http.MethodGet, requestPath, url.Values{"sha": []string{revision}, "per_page": []string{"1"}}, &commits); err != nil {
 		return repositoryCommit{}, fmt.Errorf("%s: %w", identity, err)
 	}
 	if len(commits) == 0 {
@@ -359,7 +556,7 @@ func (c *InstallationClient) ResolveMergeBase(ctx context.Context, owner, reposi
 	response := struct {
 		MergeBaseCommit repositoryCommit `json:"merge_base_commit"`
 	}{}
-	if err := c.client.doJSONWithQuery(ctx, http.MethodGet, requestPath, url.Values{"per_page": []string{"1"}}, c.token, &response); err != nil {
+	if err := c.doJSONWithQuery(ctx, http.MethodGet, requestPath, url.Values{"per_page": []string{"1"}}, &response); err != nil {
 		return "", fmt.Errorf("%s: %w", identity, err)
 	}
 	sha := response.MergeBaseCommit.SHA
@@ -374,7 +571,7 @@ func (c *InstallationClient) ResolveMergeBase(ctx context.Context, owner, reposi
 func (c *InstallationClient) CreateCheckRun(ctx context.Context, owner, repository string, request CreateCheckRunRequest) (*CheckRun, error) {
 	result := &CheckRun{}
 	requestPath := "repos/" + owner + "/" + repository + "/check-runs"
-	if err := c.client.doJSONWithBody(ctx, http.MethodPost, requestPath, c.token, request, result); err != nil {
+	if err := c.doJSONWithBody(ctx, http.MethodPost, requestPath, request, result); err != nil {
 		return nil, fmt.Errorf("create check run for %s/%s: %w", owner, repository, err)
 	}
 	return result, nil
@@ -384,7 +581,7 @@ func (c *InstallationClient) CreateCheckRun(ctx context.Context, owner, reposito
 func (c *InstallationClient) UpdateCheckRun(ctx context.Context, owner, repository string, id int64, request UpdateCheckRunRequest) (*CheckRun, error) {
 	result := &CheckRun{}
 	requestPath := "repos/" + owner + "/" + repository + "/check-runs/" + strconv.FormatInt(id, 10)
-	if err := c.client.doJSONWithBody(ctx, http.MethodPatch, requestPath, c.token, request, result); err != nil {
+	if err := c.doJSONWithBody(ctx, http.MethodPatch, requestPath, request, result); err != nil {
 		return nil, fmt.Errorf("update check run %d for %s/%s: %w", id, owner, repository, err)
 	}
 	return result, nil
@@ -404,7 +601,7 @@ func (c *InstallationClient) FindCheckRun(ctx context.Context, owner, repository
 			"page":     []string{strconv.Itoa(page)},
 			"per_page": []string{"100"},
 		}
-		if err := c.client.doJSONWithQuery(ctx, http.MethodGet, requestPath, query, c.token, &response); err != nil {
+		if err := c.doJSONWithQuery(ctx, http.MethodGet, requestPath, query, &response); err != nil {
 			return nil, fmt.Errorf("list check runs for %s/%s at revision %q: %w", owner, repository, revision, err)
 		}
 		for index := range response.CheckRuns {
@@ -418,19 +615,18 @@ func (c *InstallationClient) FindCheckRun(ctx context.Context, owner, repository
 	}
 }
 
-func (c *Client) doJSON(ctx context.Context, method, requestPath, token string, destination any) error {
-	return c.doJSONWithBodyAndQuery(ctx, method, requestPath, nil, token, nil, destination)
+func (c *Client) doJSONWithQueryForInstallation(ctx context.Context, installationID int64, method, requestPath string, query url.Values, token string, destination any) error {
+	return c.doJSONWithBodyAndQueryForInstallation(ctx, installationID, method, requestPath, query, token, nil, destination)
 }
 
-func (c *Client) doJSONWithQuery(ctx context.Context, method, requestPath string, query url.Values, token string, destination any) error {
-	return c.doJSONWithBodyAndQuery(ctx, method, requestPath, query, token, nil, destination)
+func (c *Client) doJSONWithBodyForInstallation(ctx context.Context, installationID int64, method, requestPath, token string, requestBody, destination any) error {
+	return c.doJSONWithBodyAndQueryForInstallation(ctx, installationID, method, requestPath, nil, token, requestBody, destination)
 }
 
-func (c *Client) doJSONWithBody(ctx context.Context, method, requestPath, token string, requestBody, destination any) error {
-	return c.doJSONWithBodyAndQuery(ctx, method, requestPath, nil, token, requestBody, destination)
-}
-
-func (c *Client) doJSONWithBodyAndQuery(ctx context.Context, method, requestPath string, query url.Values, token string, requestBody, destination any) error {
+func (c *Client) doJSONWithBodyAndQueryForInstallation(ctx context.Context, installationID int64, method, requestPath string, query url.Values, token string, requestBody, destination any) error {
+	if err := c.checkRateLimit(installationID); err != nil {
+		return err
+	}
 	reference := &url.URL{Path: requestPath, RawQuery: query.Encode()}
 	requestURL := c.baseURL.ResolveReference(reference)
 	var requestReader io.Reader
@@ -466,6 +662,13 @@ func (c *Client) doJSONWithBodyAndQuery(ctx context.Context, method, requestPath
 	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		apiError := &APIError{StatusCode: response.StatusCode, Status: response.Status}
+		apiError.RetryAfter = retryAfter(response.Header.Get("Retry-After"), c.now())
+		if remaining, parseErr := strconv.Atoi(response.Header.Get("X-RateLimit-Remaining")); parseErr == nil {
+			apiError.RateLimitRemaining = &remaining
+		}
+		if reset, parseErr := strconv.ParseInt(response.Header.Get("X-RateLimit-Reset"), 10, 64); parseErr == nil {
+			apiError.RateLimitReset = time.Unix(reset, 0)
+		}
 		message := struct {
 			Message string `json:"message"`
 		}{}
@@ -474,6 +677,11 @@ func (c *Client) doJSONWithBodyAndQuery(ctx context.Context, method, requestPath
 		}
 		if apiError.Message == "" {
 			apiError.Message = strings.TrimSpace(string(responseBody))
+		}
+		if delay, limited := RetryDelay(apiError, c.now()); limited {
+			if scope, record := rateLimitScope(apiError, installationID); record {
+				c.recordRateLimit(scope, c.now().Add(delay))
+			}
 		}
 		return apiError
 	}
@@ -484,6 +692,48 @@ func (c *Client) doJSONWithBodyAndQuery(ctx context.Context, method, requestPath
 		return fmt.Errorf("decode GitHub response: %w", err)
 	}
 	return nil
+}
+
+func rateLimitScope(apiError *APIError, installationID int64) (int64, bool) {
+	if primaryRateLimited(apiError) {
+		return installationID, installationID != 0
+	}
+	return 0, true
+}
+
+func (c *Client) checkRateLimit(installationID int64) error {
+	now := c.now()
+	c.rateLimitMutex.Lock()
+	defer c.rateLimitMutex.Unlock()
+	retryAt := c.rateLimitReset[installationID]
+	if installationID != 0 {
+		if globalRetryAt := c.rateLimitReset[0]; globalRetryAt.After(retryAt) {
+			retryAt = globalRetryAt
+		}
+	}
+	if retryAt.After(now) {
+		return &RateLimitError{RetryAt: retryAt}
+	}
+	delete(c.rateLimitReset, installationID)
+	return nil
+}
+
+func (c *Client) recordRateLimit(installationID int64, retryAt time.Time) {
+	c.rateLimitMutex.Lock()
+	defer c.rateLimitMutex.Unlock()
+	if retryAt.After(c.rateLimitReset[installationID]) {
+		c.rateLimitReset[installationID] = retryAt
+	}
+}
+
+func retryAfter(value string, now time.Time) time.Duration {
+	if seconds, err := strconv.ParseInt(value, 10, 64); err == nil && seconds > 0 {
+		return time.Duration(seconds) * time.Second
+	}
+	if retryAt, err := http.ParseTime(value); err == nil {
+		return max(retryAt.Sub(now), time.Second)
+	}
+	return 0
 }
 
 func repositoryContentPath(owner, repository, contentPath string) string {

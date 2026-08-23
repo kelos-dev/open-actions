@@ -1080,40 +1080,53 @@ func TestLoadPlanRejectsIncompatibleSchemas(t *testing.T) {
 	}
 }
 
-func TestNewExecutorRequiresTokens(t *testing.T) {
-	for name, tokens := range map[string]struct {
-		github string
-		action string
-	}{
-		"GitHub": {action: "action-installation-token"},
-		"action": {github: "installation-token"},
-	} {
-		t.Run(name, func(t *testing.T) {
-			_, err := NewExecutor(ExecutorConfig{
-				Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
-				GitHubToken: tokens.github,
-				ActionToken: tokens.action,
-				Environment: os.Environ(),
-				Stdout:      io.Discard,
-				Stderr:      io.Discard,
-			})
-			if err == nil {
-				t.Fatalf("NewExecutor() accepted an empty %s token", name)
-			}
-		})
+func TestNewExecutorRequiresGitHubToken(t *testing.T) {
+	_, err := NewExecutor(ExecutorConfig{
+		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+		ActionToken: "action-installation-token",
+		Environment: os.Environ(),
+		Stdout:      io.Discard,
+		Stderr:      io.Discard,
+	})
+	if err == nil {
+		t.Fatal("NewExecutor() accepted an empty GitHub token")
+	}
+}
+
+func TestNewExecutorAllowsEmptyActionToken(t *testing.T) {
+	if _, err := NewExecutor(ExecutorConfig{
+		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+		GitHubToken: "installation-token",
+		Environment: os.Environ(),
+		Stdout:      io.Discard,
+		Stderr:      io.Discard,
+	}); err != nil {
+		t.Fatal(err)
 	}
 }
 
 func TestActionTokenForClone(t *testing.T) {
 	plan := testPlan()
+	plan.Steps = []Step{{Uses: "actions/checkout@v4"}}
 	plan.Repository.ServerURL = "https://github.example"
 	plan.Repository.ActionCloneBaseURL = "https://github.example"
 	if got := actionTokenForClone(plan, "action-installation-token"); got != "action-installation-token" {
 		t.Fatalf("same-origin action clone token = %q", got)
 	}
+	if !ActionTokenRequired(plan) {
+		t.Fatal("same-origin external action did not require an action token")
+	}
 	plan.Repository.ActionCloneBaseURL = "https://actions.example"
 	if got := actionTokenForClone(plan, "action-installation-token"); got != "" {
 		t.Fatalf("different-origin action clone token = %q", got)
+	}
+	if ActionTokenRequired(plan) {
+		t.Fatal("different-origin external action required an action token")
+	}
+	plan.Steps = []Step{{Run: "true"}}
+	plan.Repository.ActionCloneBaseURL = plan.Repository.ServerURL
+	if ActionTokenRequired(plan) {
+		t.Fatal("script-only job required an action token")
 	}
 }
 

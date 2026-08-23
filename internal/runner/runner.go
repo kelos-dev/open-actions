@@ -224,12 +224,14 @@ func (s *executionState) commandContext(ctx context.Context) context.Context {
 }
 
 func NewExecutor(config ExecutorConfig) (*Executor, error) {
-	if config.Logger == nil || config.GitHubToken == "" || config.ActionToken == "" || config.Environment == nil || config.Stdout == nil || config.Stderr == nil {
+	if config.Logger == nil || config.GitHubToken == "" || config.Environment == nil || config.Stdout == nil || config.Stderr == nil {
 		return nil, errors.New("runner executor configuration is incomplete")
 	}
 	masker := newOutputMasker()
 	addCredentialMasks(masker, config.GitHubToken)
-	addCredentialMasks(masker, config.ActionToken)
+	if config.ActionToken != "" {
+		addCredentialMasks(masker, config.ActionToken)
+	}
 	if config.ArtifactToken != "" {
 		addCredentialMasks(masker, config.ArtifactToken)
 	}

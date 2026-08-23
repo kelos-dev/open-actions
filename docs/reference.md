@@ -124,6 +124,14 @@ The controller image must provide Git with support for
 `merge-tree --write-tree` so it can construct pull request integration
 revisions.
 
+The controller reuses installation tokens for workflow discovery, planning,
+and GitHub Check reporting until five minutes before their GitHub expiration.
+Job tokens remain unique to each job. When GitHub returns a rate-limit response,
+the controller pauses requests for the affected installation until
+`X-RateLimit-Reset` permits another attempt. A secondary limit with
+`Retry-After` pauses GitHub requests across installations so work from another
+Project cannot continue the same burst.
+
 ```console
 open-actions-controller \
   --github-api-url=https://github.example/api/v3 \
@@ -291,11 +299,13 @@ requested writes are reduced to reads;
 `pull_request_target` keeps the permissions declared by its trusted base
 workflow.
 
-The controller stores the job token and the separate action-download token in
-an owned Kubernetes Secret, revokes both after the job finishes, and then
-deletes the Secret. GitHub App installation tokens also expire one hour after
-creation, so a token used by a job running longer than one hour can expire
-before the job completes.
+The controller stores the job token in an owned Kubernetes Secret. Jobs that
+reference external actions on the configured GitHub server also receive a
+separate action-download token; script-only jobs do not request one. The
+controller revokes the tokens after the job finishes and then deletes the
+Secret. GitHub App installation tokens also expire one hour after creation, so
+a token used by a job running longer than one hour can expire before the job
+completes.
 
 Because this token belongs to the Project's GitHub App, GitHub treats events it
 creates as ordinary App events. It does not receive the special recursive-run
@@ -313,7 +323,8 @@ security boundary, so every workflow using an installation must be trusted to
 read every repository granted to it. Limit the installation to repositories
 within that trust boundary. No GitHub credential is sent when
 `--action-clone-base-url` has a different scheme or host from
-`--github-server-url`.
+`--github-server-url`, and jobs using such a clone endpoint do not request an
+action-download token.
 
 Before the first workflow step runs, the runner recursively resolves and
 downloads every external action referenced by the job or by a nested composite

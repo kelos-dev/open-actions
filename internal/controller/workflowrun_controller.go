@@ -117,7 +117,10 @@ type WorkflowRunReconciler struct {
 	Recorder           events.EventRecorder
 }
 
-func (r *WorkflowRunReconciler) Reconcile(ctx context.Context, request ctrl.Request) (ctrl.Result, error) {
+func (r *WorkflowRunReconciler) Reconcile(ctx context.Context, request ctrl.Request) (result ctrl.Result, reconcileErr error) {
+	defer func() {
+		result, reconcileErr = requeueAfterGitHubRateLimit(ctx, result, reconcileErr, r.now())
+	}()
 	run := &actionsv1alpha1.WorkflowRun{}
 	if err := r.Get(ctx, request.NamespacedName, run); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
@@ -168,6 +171,10 @@ func (r *WorkflowRunReconciler) Reconcile(ctx context.Context, request ctrl.Requ
 	if reportError != nil {
 		if !terminalRun(run) && (result.Requeue || result.RequeueAfter > 0) {
 			ctrl.LoggerFrom(ctx).Error(reportError, "GitHub Check reporting failed while workflow reconciliation is pending")
+			if delay, limited := githubclient.RetryDelay(reportError, r.now()); limited {
+				result.Requeue = false
+				result.RequeueAfter = max(result.RequeueAfter, delay)
+			}
 			return result, nil
 		}
 		return result, reportError
@@ -401,7 +408,7 @@ func (r *WorkflowRunReconciler) reconcileWorkflowRun(ctx context.Context, run *a
 	if err != nil {
 		return r.planningFailed(ctx, run, "CredentialsUnavailable", err, planningFailureRetry)
 	}
-	installation, err := r.GitHub.Installation(ctx, githubConfig.AppID, githubConfig.InstallationID, privateKey, githubSource.Repository.Name, githubclient.InstallationPermissions{"contents": "read"})
+	installation, err := r.GitHub.CachedInstallation(ctx, githubConfig.AppID, githubConfig.InstallationID, privateKey, githubSource.Repository.Name, githubclient.InstallationPermissions{"contents": "read"})
 	if err != nil {
 		return r.planningFailed(ctx, run, "GitHubAuthenticationFailed", err, planningFailureRetry)
 	}
@@ -685,7 +692,7 @@ func (r *WorkflowRunReconciler) reconcileGitHubCheck(ctx context.Context, run *a
 	if err != nil {
 		return fmt.Errorf("read credentials for GitHub check: %w", err)
 	}
-	installation, err := r.GitHub.Installation(ctx, githubConfig.AppID, githubConfig.InstallationID, privateKey, githubSource.Repository.Name, githubclient.InstallationPermissions{"checks": "write"})
+	installation, err := r.GitHub.CachedInstallation(ctx, githubConfig.AppID, githubConfig.InstallationID, privateKey, githubSource.Repository.Name, githubclient.InstallationPermissions{"checks": "write"})
 	if err != nil {
 		return fmt.Errorf("authenticate GitHub check reporter: %w", err)
 	}
@@ -3206,6 +3213,9 @@ func (r *WorkflowRunReconciler) scheduleFinalizerRemaining(run *actionsv1alpha1.
 }
 
 func (r *WorkflowRunReconciler) githubCheckReportPermanentlyUnavailable(ctx context.Context, run *actionsv1alpha1.WorkflowRun, reportError error) bool {
+	if _, limited := githubclient.RetryDelay(reportError, r.now()); limited {
+		return false
+	}
 	apiError := &githubclient.APIError{}
 	if errors.As(reportError, &apiError) && apiError.StatusCode >= 400 && apiError.StatusCode < 500 && apiError.StatusCode != 408 && apiError.StatusCode != 409 && apiError.StatusCode != 429 {
 		return true
