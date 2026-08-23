@@ -12,8 +12,10 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestInstallationAndRepositoryContents(t *testing.T) {
@@ -200,6 +202,225 @@ func TestInstallationForAllRepositoriesOmitsRepositorySelection(t *testing.T) {
 	}
 }
 
+func TestCachedInstallationReusesTokenUntilExpiry(t *testing.T) {
+	now := time.Date(2026, time.August, 23, 12, 0, 0, 0, time.UTC)
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodPost || request.URL.Path != "/app/installations/2/access_tokens" {
+			http.NotFound(writer, request)
+			return
+		}
+		requests++
+		_ = json.NewEncoder(writer).Encode(map[string]any{
+			"token": fmt.Sprintf("token-%d", requests), "expires_at": now.Add(time.Hour),
+		})
+	}))
+	defer server.Close()
+	client, err := NewClient(server.URL, server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.now = func() time.Time { return now }
+	privateKey := testPrivateKey(t)
+	first, err := client.CachedInstallation(context.Background(), 1, 2, privateKey, "example", InstallationPermissions{"contents": "read"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := client.CachedInstallation(context.Background(), 1, 2, privateKey, "example", InstallationPermissions{"contents": "read"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Token() != "token-1" || second.Token() != first.Token() || requests != 1 {
+		t.Fatalf("cached tokens = %q, %q; requests = %d", first.Token(), second.Token(), requests)
+	}
+
+	now = now.Add(55*time.Minute + time.Second)
+	refreshed, err := client.CachedInstallation(context.Background(), 1, 2, privateKey, "example", InstallationPermissions{"contents": "read"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if refreshed.Token() != "token-2" || requests != 2 {
+		t.Fatalf("refreshed token = %q; requests = %d", refreshed.Token(), requests)
+	}
+}
+
+func TestCachedInstallationInvalidatesUnauthorizedToken(t *testing.T) {
+	now := time.Date(2026, time.August, 23, 12, 0, 0, 0, time.UTC)
+	tokenRequests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/app/installations/2/access_tokens":
+			tokenRequests++
+			_ = json.NewEncoder(writer).Encode(map[string]any{
+				"token": fmt.Sprintf("token-%d", tokenRequests), "expires_at": now.Add(time.Hour),
+			})
+		case "/repos/acme/example/contents/.open-actions/workflows/ci.yaml":
+			if request.Header.Get("Authorization") == "Bearer token-1" {
+				writer.WriteHeader(http.StatusUnauthorized)
+				return
+			}
+			fmt.Fprint(writer, `{"encoding":"base64","content":"bmFtZTogQ0kK"}`)
+		default:
+			http.NotFound(writer, request)
+		}
+	}))
+	defer server.Close()
+	client, err := NewClient(server.URL, server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.now = func() time.Time { return now }
+	privateKey := testPrivateKey(t)
+	installation, err := client.CachedInstallation(context.Background(), 1, 2, privateKey, "example", InstallationPermissions{"contents": "read"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := installation.GetFile(context.Background(), "acme", "example", ".open-actions/workflows/ci.yaml", strings.Repeat("a", 40)); err == nil {
+		t.Fatal("cached installation accepted an unauthorized response")
+	}
+	installation, err = client.CachedInstallation(context.Background(), 1, 2, privateKey, "example", InstallationPermissions{"contents": "read"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if installation.Token() != "token-2" || tokenRequests != 2 {
+		t.Fatalf("replacement token = %q; token requests = %d", installation.Token(), tokenRequests)
+	}
+}
+
+func TestRateLimitCooldownIsScopedToInstallation(t *testing.T) {
+	now := time.Date(2026, time.August, 23, 12, 0, 0, 0, time.UTC)
+	requests := map[string]int{}
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		token := strings.TrimPrefix(request.Header.Get("Authorization"), "Bearer ")
+		requests[token]++
+		if token == "limited" && requests[token] == 1 {
+			writer.Header().Set("X-RateLimit-Remaining", "0")
+			writer.Header().Set("X-RateLimit-Reset", strconv.FormatInt(now.Add(30*time.Second).Unix(), 10))
+			writer.WriteHeader(http.StatusForbidden)
+			fmt.Fprint(writer, `{"message":"API rate limit exceeded"}`)
+			return
+		}
+		fmt.Fprint(writer, `[]`)
+	}))
+	defer server.Close()
+	client, err := NewClient(server.URL, server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.now = func() time.Time { return now }
+	limited := &InstallationClient{client: client, token: "limited", installationID: 1}
+	other := &InstallationClient{client: client, token: "other", installationID: 2}
+	_, firstError := limited.ListDirectory(context.Background(), "acme", "example", ".open-actions/workflows", strings.Repeat("a", 40))
+	if delay, found := RetryDelay(firstError, now); !found || delay != 30*time.Second {
+		t.Fatalf("first retry delay = %v, %v; error = %v", delay, found, firstError)
+	}
+	_, cooldownError := limited.ListDirectory(context.Background(), "acme", "example", ".open-actions/workflows", strings.Repeat("a", 40))
+	if delay, found := RetryDelay(cooldownError, now); !found || delay != 30*time.Second {
+		t.Fatalf("cooldown retry delay = %v, %v; error = %v", delay, found, cooldownError)
+	}
+	if _, err := other.ListDirectory(context.Background(), "acme", "example", ".open-actions/workflows", strings.Repeat("a", 40)); err != nil {
+		t.Fatalf("other installation was rate limited: %v", err)
+	}
+	if requests["limited"] != 1 || requests["other"] != 1 {
+		t.Fatalf("requests = %#v", requests)
+	}
+	now = now.Add(31 * time.Second)
+	if _, err := limited.ListDirectory(context.Background(), "acme", "example", ".open-actions/workflows", strings.Repeat("a", 40)); err != nil {
+		t.Fatalf("request after cooldown: %v", err)
+	}
+	if requests["limited"] != 2 {
+		t.Fatalf("limited requests = %d", requests["limited"])
+	}
+}
+
+func TestUnknownInstallationPrimaryRateLimitDoesNotSetGlobalCooldown(t *testing.T) {
+	now := time.Date(2026, time.August, 23, 12, 0, 0, 0, time.UTC)
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		requests++
+		if request.Method == http.MethodDelete && request.URL.Path == "/installation/token" {
+			writer.Header().Set("X-RateLimit-Remaining", "0")
+			writer.Header().Set("X-RateLimit-Reset", strconv.FormatInt(now.Add(30*time.Second).Unix(), 10))
+			writer.WriteHeader(http.StatusForbidden)
+			fmt.Fprint(writer, `{"message":"API rate limit exceeded"}`)
+			return
+		}
+		fmt.Fprint(writer, `[]`)
+	}))
+	defer server.Close()
+	client, err := NewClient(server.URL, server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.now = func() time.Time { return now }
+	if err := client.RevokeInstallationToken(context.Background(), "limited"); err == nil {
+		t.Fatal("token revocation succeeded during primary rate limit")
+	}
+	other := &InstallationClient{client: client, token: "other", installationID: 2}
+	if _, err := other.ListDirectory(context.Background(), "acme", "example", ".open-actions/workflows", strings.Repeat("a", 40)); err != nil {
+		t.Fatalf("other installation was rate limited: %v", err)
+	}
+	if requests != 2 {
+		t.Fatalf("GitHub requests = %d, want 2", requests)
+	}
+}
+
+func TestSecondaryRateLimitCooldownAppliesGlobally(t *testing.T) {
+	now := time.Date(2026, time.August, 23, 12, 0, 0, 0, time.UTC)
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		requests++
+		writer.Header().Set("Retry-After", "30")
+		writer.WriteHeader(http.StatusTooManyRequests)
+		fmt.Fprint(writer, `{"message":"secondary rate limit exceeded"}`)
+	}))
+	defer server.Close()
+	client, err := NewClient(server.URL, server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.now = func() time.Time { return now }
+	limited := &InstallationClient{client: client, token: "limited", installationID: 1}
+	other := &InstallationClient{client: client, token: "other", installationID: 2}
+	_, firstError := limited.ListDirectory(context.Background(), "acme", "example", ".open-actions/workflows", strings.Repeat("a", 40))
+	if delay, found := RetryDelay(firstError, now); !found || delay != 30*time.Second {
+		t.Fatalf("first retry delay = %v, %v; error = %v", delay, found, firstError)
+	}
+	_, cooldownError := other.ListDirectory(context.Background(), "acme", "example", ".open-actions/workflows", strings.Repeat("a", 40))
+	if delay, found := RetryDelay(cooldownError, now); !found || delay != 30*time.Second {
+		t.Fatalf("global retry delay = %v, %v; error = %v", delay, found, cooldownError)
+	}
+	if requests != 1 {
+		t.Fatalf("GitHub requests = %d", requests)
+	}
+}
+
+func TestRetryDelayRecognizesRateLimitResponses(t *testing.T) {
+	now := time.Date(2026, time.August, 23, 12, 0, 0, 0, time.UTC)
+	remaining := 0
+	for _, test := range []struct {
+		name  string
+		err   error
+		want  time.Duration
+		found bool
+	}{
+		{name: "retry after", err: &APIError{StatusCode: http.StatusForbidden, RetryAfter: 30 * time.Second}, want: 30 * time.Second, found: true},
+		{name: "primary reset", err: &APIError{StatusCode: http.StatusForbidden, RateLimitRemaining: &remaining, RateLimitReset: now.Add(10 * time.Minute)}, want: 10 * time.Minute, found: true},
+		{name: "secondary message", err: &APIError{StatusCode: http.StatusForbidden, Message: "secondary rate limit exceeded"}, want: time.Minute, found: true},
+		{name: "ordinary forbidden", err: &APIError{StatusCode: http.StatusForbidden, Message: "Resource not accessible by integration"}},
+		{name: "not found at zero remaining", err: &APIError{StatusCode: http.StatusNotFound, RateLimitRemaining: &remaining, RateLimitReset: now.Add(10 * time.Minute)}},
+		{name: "joined rate limits", err: errors.Join(&APIError{StatusCode: http.StatusTooManyRequests, RetryAfter: 10 * time.Second}, &RateLimitError{RetryAt: now.Add(30 * time.Second)}), want: 30 * time.Second, found: true},
+		{name: "joined rate limit and ordinary error", err: errors.Join(&APIError{StatusCode: http.StatusTooManyRequests, RetryAfter: 30 * time.Second}, errors.New("reconcile workflow"))},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			got, found := RetryDelay(test.err, now)
+			if got != test.want || found != test.found {
+				t.Fatalf("RetryDelay() = %v, %v; want %v, %v", got, found, test.want, test.found)
+			}
+		})
+	}
+}
+
 func TestListRepositoriesStopsAtLimit(t *testing.T) {
 	requests := 0
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
@@ -361,7 +582,10 @@ func TestResolveMergeBase(t *testing.T) {
 }
 
 func TestAPIErrorPreservesStatusAndMessage(t *testing.T) {
+	now := time.Date(2026, time.August, 23, 12, 0, 0, 0, time.UTC)
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		writer.Header().Set("X-RateLimit-Remaining", "0")
+		writer.Header().Set("X-RateLimit-Reset", strconv.FormatInt(now.Add(10*time.Minute).Unix(), 10))
 		writer.WriteHeader(http.StatusNotFound)
 		fmt.Fprint(writer, `{"message":"Not Found"}`)
 	}))
@@ -370,13 +594,14 @@ func TestAPIErrorPreservesStatusAndMessage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	client.now = func() time.Time { return now }
 	installation := &InstallationClient{client: client, token: "token"}
 	_, err = installation.ListDirectory(context.Background(), "acme", "example", ".open-actions/workflows", strings.Repeat("a", 40))
 	apiError := &APIError{}
 	if !errors.As(err, &apiError) {
 		t.Fatalf("error type = %T, want *APIError", err)
 	}
-	if apiError.StatusCode != http.StatusNotFound || apiError.Message != "Not Found" {
+	if apiError.StatusCode != http.StatusNotFound || apiError.Message != "Not Found" || apiError.RateLimitRemaining == nil || *apiError.RateLimitRemaining != 0 || !apiError.RateLimitReset.Equal(now.Add(10*time.Minute)) {
 		t.Errorf("API error = %#v", apiError)
 	}
 }

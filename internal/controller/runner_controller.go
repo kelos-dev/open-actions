@@ -84,7 +84,10 @@ type RunnerReconciler struct {
 	ArtifactTokens           *artifact.TokenCodec
 }
 
-func (r *RunnerReconciler) Reconcile(ctx context.Context, request ctrl.Request) (ctrl.Result, error) {
+func (r *RunnerReconciler) Reconcile(ctx context.Context, request ctrl.Request) (result ctrl.Result, reconcileErr error) {
+	defer func() {
+		result, reconcileErr = requeueAfterGitHubRateLimit(ctx, result, reconcileErr, time.Now())
+	}()
 	runnerObject := &actionsv1alpha1.Runner{}
 	if err := r.Get(ctx, request.NamespacedName, runnerObject); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
@@ -526,25 +529,31 @@ func (r *RunnerReconciler) executeWorkflowJob(ctx context.Context, runnerObject 
 	if err != nil {
 		return r.handleJobTokenCreationError(ctx, workflowJob, jobPermissions, err)
 	}
-	actionInstallation, err := r.GitHub.InstallationForAllRepositories(ctx, githubConfig.AppID, githubConfig.InstallationID, privateKey, githubclient.InstallationPermissions{"contents": "read"})
-	if err != nil {
+	var actionInstallation *githubclient.InstallationClient
+	if runner.ActionTokenRequired(decodedPlan) {
+		actionInstallation, err = r.GitHub.InstallationForAllRepositories(ctx, githubConfig.AppID, githubConfig.InstallationID, privateKey, githubclient.InstallationPermissions{"contents": "read"})
+		if err != nil {
+			_ = jobInstallation.Revoke(ctx)
+			return false, fmt.Errorf("create action download token for WorkflowJob %q: %w", workflowJob.Name, err)
+		}
+	}
+	revokeInstallations := func() {
 		_ = jobInstallation.Revoke(ctx)
-		return false, fmt.Errorf("create action download token for WorkflowJob %q: %w", workflowJob.Name, err)
+		if actionInstallation != nil {
+			_ = actionInstallation.Revoke(ctx)
+		}
 	}
 	if cancellation, err := r.workflowJobCancellationRequested(ctx, workflowJob, run); err != nil {
-		_ = jobInstallation.Revoke(ctx)
-		_ = actionInstallation.Revoke(ctx)
+		revokeInstallations()
 		return false, err
 	} else if cancellation != nil {
-		_ = jobInstallation.Revoke(ctx)
-		_ = actionInstallation.Revoke(ctx)
+		revokeInstallations()
 		return true, r.cancelWorkflowJob(ctx, workflowJob, cancellation)
 	}
 	artifactToken := ""
 	if r.ArtifactResultsURL != "" {
 		if r.ArtifactTokens == nil {
-			_ = jobInstallation.Revoke(ctx)
-			_ = actionInstallation.Revoke(ctx)
+			revokeInstallations()
 			return false, errors.New("artifact token codec is not configured")
 		}
 		attempt := int32(1)
@@ -563,14 +572,16 @@ func (r *RunnerReconciler) executeWorkflowJob(ctx context.Context, runnerObject 
 			WorkflowRunBackendID: string(run.UID), WorkflowJobBackendID: string(workflowJob.UID),
 		})
 		if err != nil {
-			_ = jobInstallation.Revoke(ctx)
-			_ = actionInstallation.Revoke(ctx)
+			revokeInstallations()
 			return false, fmt.Errorf("create artifact token for WorkflowJob %q: %w", workflowJob.Name, err)
 		}
 	}
-	if err := r.ensureAuthSecret(ctx, workflowJob, jobInstallation.Token(), actionInstallation.Token(), artifactToken); err != nil {
-		_ = jobInstallation.Revoke(ctx)
-		_ = actionInstallation.Revoke(ctx)
+	actionToken := ""
+	if actionInstallation != nil {
+		actionToken = actionInstallation.Token()
+	}
+	if err := r.ensureAuthSecret(ctx, workflowJob, jobInstallation.Token(), actionToken, artifactToken); err != nil {
+		revokeInstallations()
 		return false, err
 	}
 	nativeJob, err := r.buildJob(workflowJob, run, project, runnerObject)

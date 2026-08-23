@@ -213,6 +213,17 @@ func actionTokenForClone(plan *Plan, actionToken string) string {
 	return actionToken
 }
 
+// ActionTokenRequired reports whether a job references an external action on
+// the GitHub server that can receive the installation's action token.
+func ActionTokenRequired(plan *Plan) bool {
+	for _, step := range plan.Steps {
+		if step.Uses != "" {
+			return actionTokenForClone(plan, "required") != ""
+		}
+	}
+	return false
+}
+
 func (r *actionResolver) download(ctx context.Context, reference actionref.Reference, directory string) error {
 	remoteURL := r.cloneBaseURL + "/" + url.PathEscape(reference.Owner) + "/" + url.PathEscape(reference.Repository)
 	environment := actionDownloadEnvironment(r.environment, remoteURL, r.actionToken)

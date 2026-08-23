@@ -307,7 +307,13 @@ func unavailableDeliveryRevision(err error) bool {
 	return strings.Contains(err.Error(), "GitHub returned no commits")
 }
 
-func (r *DeliveryReconciler) Reconcile(ctx context.Context, request ctrl.Request) (ctrl.Result, error) {
+func (r *DeliveryReconciler) Reconcile(ctx context.Context, request ctrl.Request) (result ctrl.Result, reconcileErr error) {
+	defer func() {
+		if delay, limited := githubclient.RetryDelay(reconcileErr, r.now()); limited {
+			ctrl.LoggerFrom(ctx).Info("Deferring reconciliation for GitHub API rate limit", "retry_after", delay, "error", reconcileErr)
+			result, reconcileErr = ctrl.Result{RequeueAfter: delay}, nil
+		}
+	}()
 	object := &corev1.ConfigMap{}
 	if err := r.Get(ctx, request.NamespacedName, object); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
@@ -360,7 +366,7 @@ func (r *DeliveryReconciler) Reconcile(ctx context.Context, request ctrl.Request
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	installation, err := r.GitHub.Installation(ctx, githubConfig.AppID, githubConfig.InstallationID, privateKey, delivery.Repository.Name, githubclient.InstallationPermissions{"contents": "read"})
+	installation, err := r.GitHub.CachedInstallation(ctx, githubConfig.AppID, githubConfig.InstallationID, privateKey, delivery.Repository.Name, githubclient.InstallationPermissions{"contents": "read"})
 	if err != nil {
 		return ctrl.Result{}, err
 	}

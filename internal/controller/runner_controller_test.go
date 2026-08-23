@@ -1376,6 +1376,15 @@ func TestMissingPlanFailsAssignedWorkflowJob(t *testing.T) {
 }
 
 func TestExecuteWorkflowJobMintsPlannedTokenPermissions(t *testing.T) {
+	t.Run("external action", func(t *testing.T) {
+		testExecuteWorkflowJobMintsPlannedTokenPermissions(t, []runner.Step{{Uses: "actions/checkout@v4"}}, true)
+	})
+	t.Run("script only", func(t *testing.T) {
+		testExecuteWorkflowJobMintsPlannedTokenPermissions(t, []runner.Step{{Run: "true"}}, false)
+	})
+}
+
+func testExecuteWorkflowJobMintsPlannedTokenPermissions(t *testing.T, steps []runner.Step, wantActionToken bool) {
 	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
 		t.Fatal(err)
@@ -1448,7 +1457,7 @@ func TestExecuteWorkflowJobMintsPlannedTokenPermissions(t *testing.T) {
 	}
 	plan := &corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{Name: childName(workflowJob.Name, "plan"), Namespace: workflowJob.Namespace},
-		Data:       map[string]string{jobPlanKey: runnerControllerPlanData(t, map[string]string{"issues": "write", "statuses": "read"})},
+		Data:       map[string]string{jobPlanKey: runnerControllerPlanData(t, map[string]string{"issues": "write", "statuses": "read"}, steps...)},
 	}
 	if err := controllerutil.SetControllerReference(workflowJob, plan, scheme); err != nil {
 		t.Fatal(err)
@@ -1466,16 +1475,26 @@ func TestExecuteWorkflowJobMintsPlannedTokenPermissions(t *testing.T) {
 	if err != nil || terminal {
 		t.Fatalf("executeWorkflowJob() = terminal %v, error %v", terminal, err)
 	}
-	if len(requests) != 2 || !slices.Equal(requests[0].Repositories, []string{"example"}) ||
-		len(requests[1].Repositories) != 0 || !maps.Equal(requests[0].Permissions, map[string]string{"issues": "write", "statuses": "read"}) ||
-		!maps.Equal(requests[1].Permissions, map[string]string{"contents": "read"}) {
+	wantRequests := 1
+	if wantActionToken {
+		wantRequests = 2
+	}
+	if len(requests) != wantRequests || !slices.Equal(requests[0].Repositories, []string{"example"}) ||
+		!maps.Equal(requests[0].Permissions, map[string]string{"issues": "write", "statuses": "read"}) {
 		t.Fatalf("installation token requests = %#v", requests)
+	}
+	if wantActionToken && (len(requests[1].Repositories) != 0 || !maps.Equal(requests[1].Permissions, map[string]string{"contents": "read"})) {
+		t.Fatalf("action installation token request = %#v", requests[1])
 	}
 	auth := &corev1.Secret{}
 	if err := clusterClient.Get(context.Background(), client.ObjectKey{Namespace: "default", Name: childName(workflowJob.Name, "auth")}, auth); err != nil {
 		t.Fatal(err)
 	}
-	if string(auth.Data[jobTokenSecretKey]) != "job-token" || string(auth.Data[actionTokenSecretKey]) != "action-token" {
+	wantActionTokenValue := ""
+	if wantActionToken {
+		wantActionTokenValue = "action-token"
+	}
+	if string(auth.Data[jobTokenSecretKey]) != "job-token" || string(auth.Data[actionTokenSecretKey]) != wantActionTokenValue {
 		t.Fatalf("authentication Secret data = %#v", auth.Data)
 	}
 }
@@ -1956,8 +1975,11 @@ func TestEnsureAuthSecretRejectsUnownedCollision(t *testing.T) {
 	}
 }
 
-func runnerControllerPlanData(t *testing.T, permissions map[string]string) string {
+func runnerControllerPlanData(t *testing.T, permissions map[string]string, steps ...runner.Step) string {
 	t.Helper()
+	if len(steps) == 0 {
+		steps = []runner.Step{{Run: "true"}}
+	}
 	plan := runner.Plan{
 		Version:                runner.PlanVersion,
 		Run:                    runner.Run{ID: 1, Number: 1, Attempt: 1, Actor: "octocat"},
@@ -1969,7 +1991,7 @@ func runnerControllerPlanData(t *testing.T, permissions map[string]string) strin
 		GitHubTokenPermissions: permissions,
 		TimeoutSeconds:         int64((6 * time.Hour) / time.Second),
 		CleanupTimeoutSeconds:  int64(runner.CleanupTimeout / time.Second),
-		Steps:                  []runner.Step{{Run: "true"}},
+		Steps:                  steps,
 	}
 	data, err := json.Marshal(plan)
 	if err != nil {

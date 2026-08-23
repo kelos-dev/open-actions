@@ -90,7 +90,10 @@ type scheduledTrigger struct {
 	Schedule   cron.Schedule
 }
 
-func (r *ScheduleReconciler) Reconcile(ctx context.Context, request ctrl.Request) (ctrl.Result, error) {
+func (r *ScheduleReconciler) Reconcile(ctx context.Context, request ctrl.Request) (result ctrl.Result, reconcileErr error) {
+	defer func() {
+		result, reconcileErr = requeueAfterGitHubRateLimit(ctx, result, reconcileErr, r.now())
+	}()
 	project := &actionsv1alpha1.Project{}
 	if err := r.Get(ctx, request.NamespacedName, project); err != nil {
 		if apierrors.IsNotFound(err) {
@@ -108,7 +111,7 @@ func (r *ScheduleReconciler) Reconcile(ctx context.Context, request ctrl.Request
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	installation, err := r.GitHub.InstallationForAllRepositories(ctx, githubConfig.AppID, githubConfig.InstallationID, privateKey, githubclient.InstallationPermissions{"contents": "read"})
+	installation, err := r.GitHub.CachedInstallationForAllRepositories(ctx, githubConfig.AppID, githubConfig.InstallationID, privateKey, githubclient.InstallationPermissions{"contents": "read"})
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -125,6 +128,9 @@ func (r *ScheduleReconciler) Reconcile(ctx context.Context, request ctrl.Request
 	for _, repository := range repositories {
 		count, err := r.reconcileRepository(ctx, project, installation, repository, now)
 		if err != nil {
+			if _, limited := githubclient.RetryDelay(err, r.now()); limited {
+				return ctrl.Result{}, err
+			}
 			r.Logger.Warn("skipping repository during scheduled workflow discovery", "repository", repository.Owner.Login+"/"+repository.Name, "error", err)
 			if retryScheduleRepository(err) {
 				repositoryFailed = true
