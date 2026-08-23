@@ -15,4 +15,9 @@ spec:
       webhookSecretRef:
         name: open-actions-github-app
         key: webhook-secret
+      forkPullRequests:
+        enabled: true
+        requireApproval: true
+        sendWriteTokens: false
+        sendSecrets: false
   workflowDirectory: .open-actions/workflows

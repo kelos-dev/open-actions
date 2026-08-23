@@ -317,6 +317,48 @@ func TestRunnerBuildsJobWithProjectValues(t *testing.T) {
 	}
 }
 
+func TestRunnerWithholdsProjectSecretsFromForkPullRequests(t *testing.T) {
+	scheme := runnerTestScheme(t)
+	reconciler := &RunnerReconciler{Client: fake.NewClientBuilder().WithScheme(scheme).Build()}
+	project := &actionsv1alpha1.Project{Spec: actionsv1alpha1.ProjectSpec{
+		Secrets:   &actionsv1alpha1.ProjectSecretSource{SecretRef: corev1.LocalObjectReference{Name: "project-secrets"}},
+		Variables: &actionsv1alpha1.ProjectVariableSource{ConfigMapRef: corev1.LocalObjectReference{Name: "project-variables"}},
+	}}
+	run := &actionsv1alpha1.WorkflowRun{Spec: actionsv1alpha1.WorkflowRunSpec{ForkPullRequest: &actionsv1alpha1.WorkflowRunForkPullRequest{}}}
+	runnerObject := &actionsv1alpha1.Runner{Spec: actionsv1alpha1.RunnerSpec{Execution: actionsv1alpha1.RunnerExecutionSpec{Image: "runner:test"}}}
+	workflowJob := &actionsv1alpha1.WorkflowJob{ObjectMeta: metav1.ObjectMeta{Name: "ci-build", Namespace: "default", UID: types.UID("workflow-job-uid")}}
+	job, err := reconciler.buildJob(workflowJob, run, project, runnerObject)
+	if err != nil {
+		t.Fatal(err)
+	}
+	container := job.Spec.Template.Spec.Containers[0]
+	if slices.Contains(container.Args, "--secrets-directory="+jobContextMountPath+"/secrets") ||
+		slices.Contains(container.VolumeMounts, corev1.VolumeMount{Name: jobSecretsVolume, MountPath: jobContextMountPath + "/secrets", ReadOnly: true}) {
+		t.Fatalf("runner exposed Project secrets: args %#v, mounts %#v", container.Args, container.VolumeMounts)
+	}
+	if !slices.Contains(container.Args, "--variables-directory="+jobContextMountPath+"/variables") ||
+		!slices.Contains(container.VolumeMounts, corev1.VolumeMount{Name: jobVariablesVolume, MountPath: jobContextMountPath + "/variables", ReadOnly: true}) {
+		t.Fatalf("runner omitted Project variables: args %#v, mounts %#v", container.Args, container.VolumeMounts)
+	}
+	for _, volume := range job.Spec.Template.Spec.Volumes {
+		if volume.Name == jobSecretsVolume {
+			t.Fatalf("runner volumes expose Project secrets: %#v", job.Spec.Template.Spec.Volumes)
+		}
+	}
+
+	trustedRun := run.DeepCopy()
+	trustedRun.Spec.ForkPullRequest.SendSecrets = true
+	trustedJob, err := reconciler.buildJob(workflowJob, trustedRun, project, runnerObject)
+	if err != nil {
+		t.Fatal(err)
+	}
+	trustedContainer := trustedJob.Spec.Template.Spec.Containers[0]
+	if !slices.Contains(trustedContainer.Args, "--secrets-directory="+jobContextMountPath+"/secrets") ||
+		!slices.Contains(trustedContainer.VolumeMounts, corev1.VolumeMount{Name: jobSecretsVolume, MountPath: jobContextMountPath + "/secrets", ReadOnly: true}) {
+		t.Fatalf("runner omitted explicitly enabled Project secrets: args %#v, mounts %#v", trustedContainer.Args, trustedContainer.VolumeMounts)
+	}
+}
+
 func TestRunnerBuildsJobWithArtifactCredential(t *testing.T) {
 	scheme := runnerTestScheme(t)
 	reconciler := &RunnerReconciler{
@@ -1435,11 +1477,18 @@ func testExecuteWorkflowJobMintsPlannedTokenPermissions(t *testing.T, steps []ru
 		TypeMeta:   metav1.TypeMeta{APIVersion: actionsv1alpha1.GroupVersion.String(), Kind: "WorkflowRun"},
 		ObjectMeta: metav1.ObjectMeta{Name: "ci", Namespace: "default", UID: types.UID("run-uid")},
 		Spec: actionsv1alpha1.WorkflowRunSpec{
-			ProjectRef: corev1.LocalObjectReference{Name: project.Name},
+			ProjectRef:      corev1.LocalObjectReference{Name: project.Name},
+			ForkPullRequest: &actionsv1alpha1.WorkflowRunForkPullRequest{SendSecrets: true, SendWriteTokens: true},
 			Source: actionsv1alpha1.WorkflowRunSource{Type: actionsv1alpha1.SourceTypeGitHub, GitHub: &actionsv1alpha1.GitHubWorkflowRunSource{
 				Repository: actionsv1alpha1.GitHubRepository{ID: 1, Owner: "acme", Name: "example"},
-				Event:      actionsv1alpha1.GitHubEvent{Name: actionsv1alpha1.GitHubEventNamePush, DeliveryID: "delivery"},
-				Revision:   actionsv1alpha1.GitRevision{SHA: strings.Repeat("a", 40), Ref: "refs/heads/main"},
+				Event: actionsv1alpha1.GitHubEvent{Name: actionsv1alpha1.GitHubEventNamePullRequest, DeliveryID: "delivery", PullRequest: &actionsv1alpha1.GitHubPullRequest{
+					Number: 7, HeadRepository: actionsv1alpha1.GitHubRepository{ID: 2, Owner: "contributor", Name: "example"},
+					HeadRef: "feature", HeadSHA: strings.Repeat("b", 40), BaseRef: "main",
+				}},
+				Revision: actionsv1alpha1.GitRevision{
+					SHA: strings.Repeat("a", 40), Ref: "refs/pull/7/merge", HeadRef: "feature", BaseRef: "main",
+					HeadSHA: strings.Repeat("b", 40), BaseSHA: strings.Repeat("c", 40), MergeBaseSHA: strings.Repeat("d", 40),
+				},
 			}},
 		},
 	}
@@ -1496,6 +1545,62 @@ func testExecuteWorkflowJobMintsPlannedTokenPermissions(t *testing.T, steps []ru
 	}
 	if string(auth.Data[jobTokenSecretKey]) != "job-token" || string(auth.Data[actionTokenSecretKey]) != wantActionTokenValue {
 		t.Fatalf("authentication Secret data = %#v", auth.Data)
+	}
+
+	forkRun := run.DeepCopy()
+	forkRun.Name = "fork-ci"
+	forkRun.UID = types.UID("fork-run-uid")
+	forkRun.ResourceVersion = ""
+	forkRun.Spec.ForkPullRequest = &actionsv1alpha1.WorkflowRunForkPullRequest{}
+	forkJob := workflowJob.DeepCopy()
+	forkJob.Name = "fork-build"
+	forkJob.UID = types.UID("fork-job-uid")
+	forkJob.ResourceVersion = ""
+	forkJob.OwnerReferences = nil
+	forkJob.Spec.WorkflowRunRef.Name = forkRun.Name
+	forkJob.Labels[actionsv1alpha1.LabelWorkflowRunUID] = string(forkRun.UID)
+	forkJob.Status = actionsv1alpha1.WorkflowJobStatus{RunnerRef: &corev1.LocalObjectReference{Name: runnerObject.Name}}
+	if err := controllerutil.SetControllerReference(forkRun, forkJob, scheme); err != nil {
+		t.Fatal(err)
+	}
+	forkPlan := plan.DeepCopy()
+	forkPlan.Name = childName(forkJob.Name, "plan")
+	forkPlan.ResourceVersion = ""
+	forkPlan.OwnerReferences = nil
+	if err := controllerutil.SetControllerReference(forkJob, forkPlan, scheme); err != nil {
+		t.Fatal(err)
+	}
+	for _, object := range []client.Object{forkRun, forkJob, forkPlan} {
+		if err := clusterClient.Create(context.Background(), object); err != nil {
+			t.Fatal(err)
+		}
+	}
+	forkRequestIndex := len(requests)
+	terminal, err = reconciler.executeWorkflowJob(context.Background(), runnerObject, forkJob, project)
+	if err != nil || terminal {
+		t.Fatalf("fork executeWorkflowJob() = terminal %v, error %v", terminal, err)
+	}
+	wantForkRequests := forkRequestIndex + 1
+	if wantActionToken {
+		wantForkRequests++
+	}
+	if len(requests) != wantForkRequests || !slices.Equal(requests[forkRequestIndex].Repositories, []string{"example"}) {
+		t.Fatalf("fork installation token requests = %#v", requests)
+	}
+	if wantActionToken && (!slices.Equal(requests[forkRequestIndex+1].Repositories, []string{"example"}) ||
+		!maps.Equal(requests[forkRequestIndex+1].Permissions, map[string]string{"contents": "read"})) {
+		t.Fatalf("fork action installation token request = %#v", requests[forkRequestIndex+1])
+	}
+	forkAuth := &corev1.Secret{}
+	if err := clusterClient.Get(context.Background(), client.ObjectKey{Namespace: "default", Name: childName(forkJob.Name, "auth")}, forkAuth); err != nil {
+		t.Fatal(err)
+	}
+	wantForkActionToken := ""
+	if wantActionToken {
+		wantForkActionToken = "job-token"
+	}
+	if string(forkAuth.Data[jobTokenSecretKey]) != "job-token" || string(forkAuth.Data[actionTokenSecretKey]) != wantForkActionToken {
+		t.Fatalf("fork authentication Secret data = %#v", forkAuth.Data)
 	}
 }
 

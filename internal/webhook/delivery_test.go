@@ -612,6 +612,20 @@ func TestMatchingWorkflowRunAcceptsMissingHeadSHA(t *testing.T) {
 	}
 }
 
+func TestMatchingWorkflowRunIgnoresForkApprovalState(t *testing.T) {
+	desired := &actionsv1alpha1.WorkflowRun{
+		ObjectMeta: metav1.ObjectMeta{Name: "ci", Namespace: "default"},
+		Spec: actionsv1alpha1.WorkflowRunSpec{
+			ForkPullRequest: &actionsv1alpha1.WorkflowRunForkPullRequest{RequireApproval: true},
+		},
+	}
+	existing := desired.DeepCopy()
+	existing.Spec.ForkPullRequest.Approved = true
+	if err := matchingWorkflowRun(existing, desired); err != nil {
+		t.Fatalf("approved WorkflowRun did not match its delivery replay: %v", err)
+	}
+}
+
 func TestInvalidWorkflowRunCreationIsTerminal(t *testing.T) {
 	err := apierrors.NewInvalid(actionsv1alpha1.GroupVersion.WithKind("WorkflowRun").GroupKind(), "ci", nil)
 	if !terminalWorkflowRunCreationError(err) {
@@ -658,10 +672,57 @@ func TestCreateWorkflowRunReplayUsesLiveReader(t *testing.T) {
 	}
 }
 
+func TestForkPullRequestPolicySnapshotsSecureDefaultsAndPrivateRepositorySettings(t *testing.T) {
+	falseValue := false
+	for _, test := range []struct {
+		name          string
+		configuration *actionsv1alpha1.GitHubForkPullRequestPolicy
+		dependabot    bool
+		wantEnabled   bool
+		want          actionsv1alpha1.WorkflowRunForkPullRequest
+	}{
+		{
+			name: "public repository secure defaults", wantEnabled: true,
+			want: actionsv1alpha1.WorkflowRunForkPullRequest{RequireApproval: true},
+		},
+		{
+			name: "private repository trusted forks",
+			configuration: &actionsv1alpha1.GitHubForkPullRequestPolicy{
+				RequireApproval: &falseValue, SendWriteTokens: true, SendSecrets: true,
+			},
+			wantEnabled: true,
+			want:        actionsv1alpha1.WorkflowRunForkPullRequest{SendWriteTokens: true, SendSecrets: true},
+		},
+		{
+			name:          "private repository forks disabled",
+			configuration: &actionsv1alpha1.GitHubForkPullRequestPolicy{Enabled: &falseValue},
+			want:          actionsv1alpha1.WorkflowRunForkPullRequest{RequireApproval: true},
+		},
+		{
+			name: "Dependabot keeps restricted credentials",
+			configuration: &actionsv1alpha1.GitHubForkPullRequestPolicy{
+				RequireApproval: &falseValue, SendWriteTokens: true, SendSecrets: true,
+			},
+			dependabot: true, wantEnabled: true,
+			want: actionsv1alpha1.WorkflowRunForkPullRequest{},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			project := &actionsv1alpha1.Project{Spec: actionsv1alpha1.ProjectSpec{Source: actionsv1alpha1.ProjectSource{
+				GitHub: &actionsv1alpha1.GitHubAppConfiguration{ForkPullRequests: test.configuration},
+			}}}
+			enabled, policy := forkPullRequestPolicy(project, test.dependabot)
+			if enabled != test.wantEnabled || policy == nil || *policy != test.want {
+				t.Fatalf("policy = enabled %t, %#v", enabled, policy)
+			}
+		})
+	}
+}
+
 func TestDeliveryBuildsPullRequestRevisionFromPinnedCommits(t *testing.T) {
 	now := time.Date(2026, 8, 9, 23, 0, 0, 0, time.UTC)
 	workflowData := []byte("name: CI\non: pull_request\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: make test\n")
-	gitRoot, revision := testPullRequestGitRepository(t, workflowData, false)
+	gitRoot, revision := testPullRequestGitRepository(t, workflowData, nil, false)
 	compareCalls := 0
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		switch request.URL.Path {
@@ -708,12 +769,102 @@ func TestDeliveryBuildsPullRequestRevisionFromPinnedCommits(t *testing.T) {
 	if got.SHA != stored.Data[deliveryRevisionKey] || got.HeadSHA != revision.HeadSHA || got.BaseSHA != revision.BaseSHA || got.MergeBaseSHA != revision.MergeBaseSHA || got.BaseRef != "main" {
 		t.Fatalf("WorkflowRun revision = %#v", got)
 	}
+	policy := runs.Items[0].Spec.ForkPullRequest
+	if policy == nil || !policy.RequireApproval || policy.Approved || policy.SendWriteTokens || policy.SendSecrets {
+		t.Fatalf("fork pull request policy = %#v", policy)
+	}
+}
+
+func TestInvalidForkWorkflowDoesNotSuppressPullRequestTarget(t *testing.T) {
+	now := time.Date(2026, 8, 23, 14, 0, 0, 0, time.UTC)
+	baseWorkflowData := []byte("name: Trusted\non: pull_request_target\njobs:\n  check:\n    runs-on: ubuntu-latest\n    steps:\n      - run: make check\n")
+	gitRoot, revision := testPullRequestGitRepository(t, baseWorkflowData, []byte("not a workflow\n"), false)
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/app/installations/2/access_tokens":
+			fmt.Fprint(writer, `{"token":"installation-token"}`)
+		case "/repos/acme/example/compare/" + revision.BaseSHA + "..." + revision.HeadSHA:
+			fmt.Fprintf(writer, `{"merge_base_commit":{"sha":%q}}`, revision.MergeBaseSHA)
+		case "/repos/acme/example/contents/.open-actions/workflows":
+			fmt.Fprint(writer, `[{"name":"ci.yaml","path":".open-actions/workflows/ci.yaml","type":"file"}]`)
+		case "/repos/acme/example/contents/.open-actions/workflows/ci.yaml":
+			fmt.Fprintf(writer, `{"encoding":"base64","content":%q}`, base64.StdEncoding.EncodeToString(baseWorkflowData))
+		default:
+			http.NotFound(writer, request)
+		}
+	}))
+	defer server.Close()
+	clusterClient, reconciler, handler, project := newPullRequestDeliveryTest(t, server, now)
+	reconciler.GitRepository, _ = gitrepository.NewClient(gitRoot)
+	deliveryKey := enqueuePullRequestDelivery(t, handler, clusterClient, project, now, revision.BaseSHA, revision.HeadSHA, []byte(`{"delivery":"invalid-fork-workflow"}`))
+
+	if _, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: deliveryKey}); err != nil {
+		t.Fatal(err)
+	}
+	stored := &corev1.ConfigMap{}
+	if err := clusterClient.Get(context.Background(), deliveryKey, stored); err != nil {
+		t.Fatal(err)
+	}
+	if stored.Data[deliveryStateKey] != deliveryStateCompleted || stored.Data[deliveryRunCountKey] != "1" {
+		t.Fatalf("delivery data = %#v", stored.Data)
+	}
+	runs := &actionsv1alpha1.WorkflowRunList{}
+	if err := clusterClient.List(context.Background(), runs); err != nil {
+		t.Fatal(err)
+	}
+	if len(runs.Items) != 1 || runs.Items[0].Spec.Source.GitHub.Event.Name != actionsv1alpha1.GitHubEventNamePullRequestTarget {
+		t.Fatalf("WorkflowRuns = %#v", runs.Items)
+	}
+}
+
+func TestDisabledForkPolicyCreatesOnlyPullRequestTargetRun(t *testing.T) {
+	now := time.Date(2026, 8, 23, 14, 30, 0, 0, time.UTC)
+	workflowData := []byte("name: CI\non:\n  pull_request: {}\n  pull_request_target: {}\njobs:\n  check:\n    runs-on: ubuntu-latest\n    steps:\n      - run: make check\n")
+	gitRoot, revision := testPullRequestGitRepository(t, workflowData, nil, false)
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/app/installations/2/access_tokens":
+			fmt.Fprint(writer, `{"token":"installation-token"}`)
+		case "/repos/acme/example/compare/" + revision.BaseSHA + "..." + revision.HeadSHA:
+			fmt.Fprintf(writer, `{"merge_base_commit":{"sha":%q}}`, revision.MergeBaseSHA)
+		case "/repos/acme/example/contents/.open-actions/workflows":
+			fmt.Fprint(writer, `[{"name":"ci.yaml","path":".open-actions/workflows/ci.yaml","type":"file"}]`)
+		case "/repos/acme/example/contents/.open-actions/workflows/ci.yaml":
+			fmt.Fprintf(writer, `{"encoding":"base64","content":%q}`, base64.StdEncoding.EncodeToString(workflowData))
+		default:
+			http.NotFound(writer, request)
+		}
+	}))
+	defer server.Close()
+	clusterClient, reconciler, handler, project := newPullRequestDeliveryTest(t, server, now)
+	reconciler.GitRepository, _ = gitrepository.NewClient(gitRoot)
+	storedProject := &actionsv1alpha1.Project{}
+	if err := clusterClient.Get(context.Background(), client.ObjectKeyFromObject(project), storedProject); err != nil {
+		t.Fatal(err)
+	}
+	falseValue := false
+	storedProject.Spec.Source.GitHub.ForkPullRequests = &actionsv1alpha1.GitHubForkPullRequestPolicy{Enabled: &falseValue}
+	if err := clusterClient.Update(context.Background(), storedProject); err != nil {
+		t.Fatal(err)
+	}
+	deliveryKey := enqueuePullRequestDelivery(t, handler, clusterClient, storedProject, now, revision.BaseSHA, revision.HeadSHA, []byte(`{"delivery":"forks-disabled"}`))
+
+	if _, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: deliveryKey}); err != nil {
+		t.Fatal(err)
+	}
+	runs := &actionsv1alpha1.WorkflowRunList{}
+	if err := clusterClient.List(context.Background(), runs); err != nil {
+		t.Fatal(err)
+	}
+	if len(runs.Items) != 1 || runs.Items[0].Spec.Source.GitHub.Event.Name != actionsv1alpha1.GitHubEventNamePullRequestTarget || runs.Items[0].Spec.ForkPullRequest != nil {
+		t.Fatalf("WorkflowRuns = %#v", runs.Items)
+	}
 }
 
 func TestDeliverySkipsConflictingPullRequestRevision(t *testing.T) {
 	now := time.Date(2026, 8, 9, 23, 0, 0, 0, time.UTC)
 	workflowData := []byte("name: Trusted\non: pull_request_target\njobs:\n  check:\n    runs-on: ubuntu-latest\n    steps:\n      - run: make check\n")
-	gitRoot, revision := testPullRequestGitRepository(t, workflowData, true)
+	gitRoot, revision := testPullRequestGitRepository(t, workflowData, nil, true)
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		switch request.URL.Path {
 		case "/app/installations/2/access_tokens":
@@ -747,7 +898,7 @@ func TestDeliverySkipsConflictingPullRequestRevision(t *testing.T) {
 	if err := clusterClient.List(context.Background(), runs); err != nil {
 		t.Fatal(err)
 	}
-	if len(runs.Items) != 1 || runs.Items[0].Spec.Source.GitHub.Event.Name != actionsv1alpha1.GitHubEventNamePullRequestTarget || runs.Items[0].Spec.Source.GitHub.Revision.SHA != revision.BaseSHA {
+	if len(runs.Items) != 1 || runs.Items[0].Spec.Source.GitHub.Event.Name != actionsv1alpha1.GitHubEventNamePullRequestTarget || runs.Items[0].Spec.Source.GitHub.Revision.SHA != revision.BaseSHA || runs.Items[0].Spec.ForkPullRequest != nil {
 		t.Fatalf("trusted target runs = %#v", runs.Items)
 	}
 }
@@ -1033,12 +1184,12 @@ func enqueuePullRequestDelivery(t *testing.T, handler *GitHubHandler, clusterCli
 	event.Repository.DefaultBranch = "main"
 	event.Repository.Owner.Login = "acme"
 	normalized := normalizedEvent{
-		Name: "pull_request", Action: "synchronize", Ref: "refs/pull/9/merge",
+		Name: "pull_request", Action: "synchronize", Ref: "refs/pull/9/merge", Fork: true,
 		HeadRef: "feature", BaseRef: "main", HeadSHA: headSHA, MergeRevision: true,
 		PullRequest: &normalizedPullRequest{
 			Number: 9, Body: "Pull request body", HTMLURL: "https://github.com/acme/example/pull/9",
 			HeadRef: "feature", HeadSHA: headSHA, BaseRef: "main", BaseSHA: baseSHA,
-			HeadRepository: normalizedRepository{ID: 1, Owner: "acme", Name: "example"},
+			HeadRepository: normalizedRepository{ID: 2, Owner: "contributor", Name: "example"},
 		},
 	}
 	if err := handler.enqueueDelivery(context.Background(), project, event, normalized, "delivery", body); err != nil {
@@ -1056,7 +1207,7 @@ func enqueuePullRequestDelivery(t *testing.T, handler *GitHubHandler, clusterCli
 	return key
 }
 
-func testPullRequestGitRepository(t *testing.T, workflowData []byte, conflict bool) (string, gitrepository.Revision) {
+func testPullRequestGitRepository(t *testing.T, baseWorkflowData, headWorkflowData []byte, conflict bool) (string, gitrepository.Revision) {
 	t.Helper()
 	root := t.TempDir()
 	work := filepath.Join(root, "work")
@@ -1073,7 +1224,7 @@ func testPullRequestGitRepository(t *testing.T, workflowData []byte, conflict bo
 	mergeBaseSHA := strings.TrimSpace(runTestGit(t, work, "rev-parse", "HEAD"))
 
 	runTestGit(t, work, "switch", "--quiet", "-c", "base")
-	writeTestFile(t, work, ".open-actions/workflows/ci.yaml", string(workflowData))
+	writeTestFile(t, work, ".open-actions/workflows/ci.yaml", string(baseWorkflowData))
 	if conflict {
 		writeTestFile(t, work, "shared.txt", "base\n")
 	}
@@ -1082,6 +1233,9 @@ func testPullRequestGitRepository(t *testing.T, workflowData []byte, conflict bo
 	baseSHA := strings.TrimSpace(runTestGit(t, work, "rev-parse", "HEAD"))
 
 	runTestGit(t, work, "switch", "--quiet", "-c", "head", mergeBaseSHA)
+	if headWorkflowData != nil {
+		writeTestFile(t, work, ".open-actions/workflows/ci.yaml", string(headWorkflowData))
+	}
 	if conflict {
 		writeTestFile(t, work, "shared.txt", "head\n")
 	} else {

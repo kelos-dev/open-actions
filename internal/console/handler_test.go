@@ -441,6 +441,58 @@ func TestConsoleCancelsActiveWorkflow(t *testing.T) {
 	}
 }
 
+func TestConsoleApprovesForkPullRequestRevision(t *testing.T) {
+	handler := newTestHandler(t, false)
+	run := &actionsv1alpha1.WorkflowRun{}
+	key := client.ObjectKey{Namespace: "default", Name: "ci"}
+	if err := handler.client.Get(context.Background(), key, run); err != nil {
+		t.Fatal(err)
+	}
+	run.Spec.ForkPullRequest = &actionsv1alpha1.WorkflowRunForkPullRequest{RequireApproval: true}
+	run.Spec.Source.GitHub.Event.Name = actionsv1alpha1.GitHubEventNamePullRequest
+	run.Spec.Source.GitHub.Event.Action = "synchronize"
+	run.Spec.Source.GitHub.Event.PullRequest = &actionsv1alpha1.GitHubPullRequest{
+		Number: 7, Body: "Pull request body", HTMLURL: "https://github.com/acme/example/pull/7",
+		HeadRepository: actionsv1alpha1.GitHubRepository{ID: 456, Owner: "contributor", Name: "example"},
+		HeadRef:        "feature", HeadSHA: strings.Repeat("b", 40), BaseRef: "main",
+	}
+	if err := handler.client.Update(context.Background(), run); err != nil {
+		t.Fatal(err)
+	}
+	runURL := "/runs/default/ci"
+	approveURL := runURL + "/approve"
+
+	page := httptest.NewRecorder()
+	handler.ServeHTTP(page, httptest.NewRequest(http.MethodGet, runURL, nil))
+	if page.Code != http.StatusOK || !strings.Contains(page.Body.String(), "Sign in to approve") || strings.Contains(page.Body.String(), handler.csrfToken) {
+		t.Fatalf("unauthenticated run page = %d, %q", page.Code, page.Body.String())
+	}
+
+	authenticatedPageRequest := httptest.NewRequest(http.MethodGet, runURL, nil)
+	authenticatedPageRequest.Header.Set("Authorization", "Bearer "+testConsoleToken)
+	authenticatedPage := httptest.NewRecorder()
+	handler.ServeHTTP(authenticatedPage, authenticatedPageRequest)
+	if authenticatedPage.Code != http.StatusOK || !strings.Contains(authenticatedPage.Body.String(), `action="`+approveURL+`"`) || !strings.Contains(authenticatedPage.Body.String(), "Approve workflow") {
+		t.Fatalf("authenticated run page = %d, %q", authenticatedPage.Code, authenticatedPage.Body.String())
+	}
+
+	form := url.Values{"csrf": {handler.csrfToken}}
+	request := httptest.NewRequest(http.MethodPost, approveURL, strings.NewReader(form.Encode()))
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.Header.Set("Authorization", "Bearer "+testConsoleToken)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusSeeOther || response.Header().Get("Location") != runURL {
+		t.Fatalf("approval response = %d, %q", response.Code, response.Header().Get("Location"))
+	}
+	if err := handler.client.Get(context.Background(), key, run); err != nil {
+		t.Fatal(err)
+	}
+	if run.Spec.ForkPullRequest == nil || !run.Spec.ForkPullRequest.Approved {
+		t.Fatalf("fork pull request policy = %#v", run.Spec.ForkPullRequest)
+	}
+}
+
 func TestConsoleRejectsCancellationAfterWorkflowCompletes(t *testing.T) {
 	handler := newTestHandler(t, false)
 	run := &actionsv1alpha1.WorkflowRun{}

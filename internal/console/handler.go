@@ -192,10 +192,12 @@ type dispatchInputPageData struct {
 
 type runPageData struct {
 	RunURL         string
+	ApproveURL     string
 	CancelURL      string
 	RerunURL       string
 	LoginURL       string
 	CSRFToken      string
+	CanApprove     bool
 	CanCancel      bool
 	CanRerun       bool
 	CanRerunFailed bool
@@ -353,6 +355,15 @@ func (h *Handler) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 			return
 		}
 		h.cancelWorkflow(writer, request, parts[1], parts[2])
+		return
+	}
+	if request.Method == http.MethodPost && len(parts) == 4 && parts[0] == "runs" && parts[3] == "approve" {
+		next := "/runs/" + url.PathEscape(parts[1]) + "/" + url.PathEscape(parts[2])
+		if !h.authenticated(request) {
+			http.Redirect(writer, request, "/login?next="+url.QueryEscape(next), http.StatusFound)
+			return
+		}
+		h.approveWorkflow(writer, request, parts[1], parts[2])
 		return
 	}
 	if request.Method == http.MethodPost && len(parts) == 4 && parts[0] == "runs" && parts[3] == "rerun" {
@@ -1105,6 +1116,15 @@ func (h *Handler) runDetails(writer http.ResponseWriter, request *http.Request, 
 		return
 	}
 	authenticated := h.authenticated(request)
+	if policy := run.Spec.ForkPullRequest; policy != nil && policy.RequireApproval && !policy.Approved && !workflowrun.Terminal(run) && !run.Spec.CancelRequested {
+		data.ApproveURL = runPath(run) + "/approve"
+		if authenticated {
+			data.CanApprove = true
+			data.CSRFToken = h.csrfToken
+		} else {
+			data.LoginURL = "/login?next=" + url.QueryEscape(runPath(run))
+		}
+	}
 	if !workflowrun.Terminal(run) && !run.Spec.CancelRequested {
 		data.CancelURL = runPath(run) + "/cancel"
 		if authenticated {
@@ -1128,6 +1148,60 @@ func (h *Handler) runDetails(writer http.ResponseWriter, request *http.Request, 
 		}
 	}
 	h.writeHTML(writer, h.runPage, data)
+}
+
+func (h *Handler) approveWorkflow(writer http.ResponseWriter, request *http.Request, namespace, name string) {
+	request.Body = http.MaxBytesReader(writer, request.Body, adminRequestSize)
+	if err := request.ParseForm(); err != nil {
+		http.Error(writer, "invalid approval request", http.StatusBadRequest)
+		return
+	}
+	if !h.validCSRF(request.PostForm.Get("csrf")) {
+		http.Error(writer, "invalid CSRF token", http.StatusForbidden)
+		return
+	}
+	alreadyApproved := false
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		alreadyApproved = false
+		run, err := h.resolveRun(request.Context(), namespace, name)
+		if err != nil {
+			return err
+		}
+		policy := run.Spec.ForkPullRequest
+		if policy == nil || !policy.RequireApproval {
+			return &workflowApprovalConflictError{message: fmt.Sprintf("WorkflowRun %q does not require approval", name)}
+		}
+		if workflowrun.Terminal(run) || run.Spec.CancelRequested {
+			return &workflowApprovalConflictError{message: fmt.Sprintf("WorkflowRun %q can no longer be approved", name)}
+		}
+		if policy.Approved {
+			alreadyApproved = true
+			return nil
+		}
+		policy.Approved = true
+		return h.client.Update(request.Context(), run)
+	})
+	if err != nil {
+		var conflict *workflowApprovalConflictError
+		if errors.As(err, &conflict) {
+			http.Error(writer, conflict.Error(), http.StatusConflict)
+			return
+		}
+		h.writeResolutionError(writer, request, fmt.Errorf("approve WorkflowRun %q: %w", name, err))
+		return
+	}
+	if !alreadyApproved {
+		h.logger.Info("approved fork pull request workflow run", "namespace", namespace, "workflow_run", name)
+	}
+	http.Redirect(writer, request, "/runs/"+url.PathEscape(namespace)+"/"+url.PathEscape(name), http.StatusSeeOther)
+}
+
+type workflowApprovalConflictError struct {
+	message string
+}
+
+func (e *workflowApprovalConflictError) Error() string {
+	return e.message
 }
 
 func (h *Handler) cancelWorkflow(writer http.ResponseWriter, request *http.Request, namespace, name string) {
@@ -1568,6 +1642,9 @@ func (h *Handler) waitForPod(ctx context.Context, job *actionsv1alpha1.WorkflowJ
 func statusClass(status string) string {
 	if status == "Cancelling" {
 		return "running"
+	}
+	if status == "Awaiting approval" {
+		return "queued"
 	}
 	if status == "Timed out" {
 		return "failed"

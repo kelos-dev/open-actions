@@ -62,7 +62,7 @@ spec:
           spec:
             description: |-
               WorkflowRunSpec describes one workflow execution. ProjectRef, Source,
-              WorkflowPath, and Rerun are immutable.
+              WorkflowPath, the fork pull request policy, and Rerun are immutable.
               Set CancelRequested to request graceful cancellation. Deleting a WorkflowRun
               force-cancels and removes its child resources.
             properties:
@@ -72,6 +72,38 @@ spec:
                   jobs whose conditions handle cancellation to finish. Once set, it cannot be
                   cleared.
                 type: boolean
+              forkPullRequest:
+                description: |-
+                  ForkPullRequest snapshots the security policy for an ordinary pull_request
+                  workflow whose code is treated as untrusted fork content. Dependabot pull
+                  requests use the same policy.
+                properties:
+                  approved:
+                    description: |-
+                      Approved authorizes this exact WorkflowRun revision to proceed. It may be
+                      set from false to true and cannot be cleared.
+                    type: boolean
+                  requireApproval:
+                    description: RequireApproval determines whether approval is required
+                      before planning.
+                    type: boolean
+                  sendSecrets:
+                    description: SendSecrets makes the Project Secret available to
+                      this workflow.
+                    type: boolean
+                  sendWriteTokens:
+                    description: SendWriteTokens preserves write permissions requested
+                      by the workflow.
+                    type: boolean
+                required:
+                - approved
+                - requireApproval
+                - sendSecrets
+                - sendWriteTokens
+                type: object
+                x-kubernetes-validations:
+                - message: approved may be true only when requireApproval is true
+                  rule: self.requireApproval || !self.approved
               projectRef:
                 description: ProjectRef identifies a Project in the same namespace.
                 properties:
@@ -732,6 +764,19 @@ spec:
             - message: projectRef, source, and workflowPath are immutable
               rule: self.projectRef == oldSelf.projectRef && self.source == oldSelf.source
                 && self.workflowPath == oldSelf.workflowPath
+            - message: forkPullRequest may be specified only for GitHub pull_request
+                events with pull request metadata
+              rule: '!has(self.forkPullRequest) || (self.source.type == ''GitHub''
+                && has(self.source.github) && self.source.github.event.name == ''pull_request''
+                && has(self.source.github.event.pullRequest))'
+            - message: forkPullRequest policy is immutable
+              rule: has(self.forkPullRequest) == has(oldSelf.forkPullRequest) && (!has(self.forkPullRequest)
+                || (self.forkPullRequest.requireApproval == oldSelf.forkPullRequest.requireApproval
+                && self.forkPullRequest.sendWriteTokens == oldSelf.forkPullRequest.sendWriteTokens
+                && self.forkPullRequest.sendSecrets == oldSelf.forkPullRequest.sendSecrets))
+            - message: forkPullRequest approval cannot be revoked
+              rule: '!has(oldSelf.forkPullRequest) || !oldSelf.forkPullRequest.approved
+                || self.forkPullRequest.approved'
             - message: cancelRequested cannot be cleared
               rule: '!has(oldSelf.cancelRequested) || !oldSelf.cancelRequested ||
                 (has(self.cancelRequested) && self.cancelRequested)'
@@ -779,8 +824,8 @@ spec:
                 type: string
               conditions:
                 description: |-
-                  Conditions describe planning and the terminal result.
-                  Known condition types are Planned and Succeeded.
+                  Conditions describe approval, planning, and the terminal result.
+                  Known condition types are Approved, Planned, and Succeeded.
                 items:
                   description: Condition contains details for one aspect of the current
                     state of this API Resource.

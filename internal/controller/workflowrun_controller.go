@@ -33,8 +33,13 @@ import (
 	"k8s.io/client-go/tools/events"
 	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/event"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
 const (
@@ -384,6 +389,26 @@ func (r *WorkflowRunReconciler) reconcileWorkflowRun(ctx context.Context, run *a
 			return r.observeWorkflowJobs(ctx, run, run.Status.WorkflowName, run.Status.Jobs.Total)
 		}
 	}
+	if policy := run.Spec.ForkPullRequest; policy != nil {
+		if run.Spec.CancelRequested {
+			return r.completeUnplannedWorkflowRun(ctx, run, "JobCancelled", "Workflow cancellation was requested before jobs were created")
+		}
+		if policy.RequireApproval && !policy.Approved {
+			superseding, err := r.supersedingForkPullRequestRevision(ctx, run)
+			if err != nil {
+				return ctrl.Result{}, err
+			}
+			if superseding != nil {
+				message := fmt.Sprintf("Pull request head %s superseded unapproved WorkflowRun revision %s", superseding.Spec.Source.GitHub.Event.PullRequest.HeadSHA, run.Spec.Source.GitHub.Event.PullRequest.HeadSHA)
+				return r.completeUnplannedWorkflowRun(ctx, run, "RevisionSuperseded", message)
+			}
+			return r.waitingForApproval(ctx, run)
+		}
+		approved := meta.FindStatusCondition(run.Status.Conditions, actionsv1alpha1.WorkflowRunConditionApproved)
+		if !policy.RequireApproval && (approved == nil || approved.Status != metav1.ConditionTrue || approved.ObservedGeneration != run.Generation) {
+			return r.recordApproval(ctx, run, "ApprovalNotRequired", "The fork pull request policy does not require approval")
+		}
+	}
 
 	project := &actionsv1alpha1.Project{}
 	if err := r.APIReader.Get(ctx, client.ObjectKey{Namespace: run.Namespace, Name: run.Spec.ProjectRef.Name}, project); err != nil {
@@ -411,6 +436,24 @@ func (r *WorkflowRunReconciler) reconcileWorkflowRun(ctx context.Context, run *a
 	installation, err := r.GitHub.CachedInstallation(ctx, githubConfig.AppID, githubConfig.InstallationID, privateKey, githubSource.Repository.Name, githubclient.InstallationPermissions{"contents": "read"})
 	if err != nil {
 		return r.planningFailed(ctx, run, "GitHubAuthenticationFailed", err, planningFailureRetry)
+	}
+	if policy := run.Spec.ForkPullRequest; policy != nil && policy.RequireApproval {
+		pullRequest := githubSource.Event.PullRequest
+		if pullRequest == nil {
+			return r.planningFailed(ctx, run, "ApprovalValidationFailed", fmt.Errorf("WorkflowRun %q has no pull request metadata", run.Name), planningFailureTerminal)
+		}
+		currentHead, resolveErr := installation.ResolveRevision(ctx, githubSource.Repository.Owner, githubSource.Repository.Name, fmt.Sprintf("refs/pull/%d/head", pullRequest.Number))
+		if resolveErr != nil {
+			return r.planningFailed(ctx, run, "ApprovalValidationFailed", fmt.Errorf("validate approved pull request head for WorkflowRun %q: %w", run.Name, resolveErr), planningFailureRetry)
+		}
+		if currentHead != pullRequest.HeadSHA {
+			message := fmt.Sprintf("Pull request head %s superseded approved WorkflowRun revision %s", currentHead, pullRequest.HeadSHA)
+			return r.completeUnplannedWorkflowRun(ctx, run, "RevisionSuperseded", message)
+		}
+		approved := meta.FindStatusCondition(run.Status.Conditions, actionsv1alpha1.WorkflowRunConditionApproved)
+		if approved == nil || approved.Status != metav1.ConditionTrue || approved.ObservedGeneration != run.Generation {
+			return r.recordApproval(ctx, run, "ApprovalGranted", "An administrator approved this fork pull request revision")
+		}
 	}
 	var workflowData []byte
 	if githubSource.Revision.BaseSHA != "" {
@@ -793,6 +836,9 @@ func workflowRunCheckReport(run *actionsv1alpha1.WorkflowRun) checkRunReport {
 			Summary: "The workflow is queued.",
 		},
 	}
+	if policy := run.Spec.ForkPullRequest; policy != nil && policy.RequireApproval && !policy.Approved {
+		report.Output.Summary = "The workflow is waiting for approval before jobs are created."
+	}
 	succeeded := meta.FindStatusCondition(run.Status.Conditions, actionsv1alpha1.WorkflowRunConditionSucceeded)
 	switch {
 	case succeeded != nil && succeeded.Status == metav1.ConditionTrue:
@@ -802,7 +848,7 @@ func workflowRunCheckReport(run *actionsv1alpha1.WorkflowRun) checkRunReport {
 	case succeeded != nil && succeeded.Status == metav1.ConditionFalse:
 		report.Status = "completed"
 		switch succeeded.Reason {
-		case "JobCancelled":
+		case "JobCancelled", "RevisionSuperseded":
 			report.Conclusion = "cancelled"
 		case "JobTimedOut":
 			report.Conclusion = "timed_out"
@@ -1914,7 +1960,9 @@ func (r *WorkflowRunReconciler) jobPlan(run *actionsv1alpha1.WorkflowRun, workfl
 func githubTokenPermissions(run *actionsv1alpha1.WorkflowRun, permissions workflow.Permissions) map[string]string {
 	restrictWrites := false
 	githubSource := run.Spec.Source.GitHub
-	if pullRequest := githubSource.Event.PullRequest; pullRequest != nil && githubSource.Event.Name != actionsv1alpha1.GitHubEventNamePullRequestTarget {
+	if policy := run.Spec.ForkPullRequest; policy != nil {
+		restrictWrites = !policy.SendWriteTokens
+	} else if pullRequest := githubSource.Event.PullRequest; pullRequest != nil && githubSource.Event.Name != actionsv1alpha1.GitHubEventNamePullRequestTarget {
 		restrictWrites = pullRequest.HeadRepository.ID != githubSource.Repository.ID
 	}
 	result := make(map[string]string, len(permissions))
@@ -1925,6 +1973,103 @@ func githubTokenPermissions(run *actionsv1alpha1.WorkflowRun, permissions workfl
 		result[strings.ReplaceAll(name, "-", "_")] = level
 	}
 	return result
+}
+
+func (r *WorkflowRunReconciler) waitingForApproval(ctx context.Context, run *actionsv1alpha1.WorkflowRun) (ctrl.Result, error) {
+	before := run.Status.DeepCopy()
+	run.Status.ObservedGeneration = run.Generation
+	meta.SetStatusCondition(&run.Status.Conditions, metav1.Condition{
+		Type: actionsv1alpha1.WorkflowRunConditionApproved, Status: metav1.ConditionFalse,
+		ObservedGeneration: run.Generation, Reason: "ApprovalRequired", Message: "An administrator must approve this fork pull request revision",
+	})
+	meta.SetStatusCondition(&run.Status.Conditions, metav1.Condition{
+		Type: actionsv1alpha1.WorkflowRunConditionPlanned, Status: metav1.ConditionUnknown,
+		ObservedGeneration: run.Generation, Reason: "ApprovalRequired", Message: "The workflow is waiting for approval before jobs are created",
+	})
+	if apiEquality.Semantic.DeepEqual(before, &run.Status) {
+		return ctrl.Result{}, nil
+	}
+	return ctrl.Result{}, r.Status().Update(ctx, run)
+}
+
+func (r *WorkflowRunReconciler) supersedingForkPullRequestRevision(ctx context.Context, run *actionsv1alpha1.WorkflowRun) (*actionsv1alpha1.WorkflowRun, error) {
+	runs := &actionsv1alpha1.WorkflowRunList{}
+	if err := r.APIReader.List(ctx, runs, client.InNamespace(run.Namespace)); err != nil {
+		return nil, err
+	}
+	var superseding *actionsv1alpha1.WorkflowRun
+	for index := range runs.Items {
+		candidate := &runs.Items[index]
+		if !candidate.CreationTimestamp.After(run.CreationTimestamp.Time) || !sameForkPullRequest(run, candidate) || forkPullRequestHeadSHA(run) == forkPullRequestHeadSHA(candidate) {
+			continue
+		}
+		if superseding == nil || candidate.CreationTimestamp.After(superseding.CreationTimestamp.Time) {
+			superseding = candidate
+		}
+	}
+	return superseding, nil
+}
+
+func sameForkPullRequest(left, right *actionsv1alpha1.WorkflowRun) bool {
+	leftSource := left.Spec.Source.GitHub
+	rightSource := right.Spec.Source.GitHub
+	if left.Spec.ForkPullRequest == nil || right.Spec.ForkPullRequest == nil || leftSource == nil || rightSource == nil || leftSource.Event.PullRequest == nil || rightSource.Event.PullRequest == nil {
+		return false
+	}
+	return left.Spec.ProjectRef.Name == right.Spec.ProjectRef.Name &&
+		leftSource.Repository.ID == rightSource.Repository.ID &&
+		leftSource.Event.PullRequest.Number == rightSource.Event.PullRequest.Number
+}
+
+func forkPullRequestHeadSHA(run *actionsv1alpha1.WorkflowRun) string {
+	if run.Spec.Source.GitHub == nil || run.Spec.Source.GitHub.Event.PullRequest == nil {
+		return ""
+	}
+	return run.Spec.Source.GitHub.Event.PullRequest.HeadSHA
+}
+
+func (r *WorkflowRunReconciler) recordApproval(ctx context.Context, run *actionsv1alpha1.WorkflowRun, reason, message string) (ctrl.Result, error) {
+	before := run.Status.DeepCopy()
+	run.Status.ObservedGeneration = run.Generation
+	meta.SetStatusCondition(&run.Status.Conditions, metav1.Condition{
+		Type: actionsv1alpha1.WorkflowRunConditionApproved, Status: metav1.ConditionTrue,
+		ObservedGeneration: run.Generation, Reason: reason, Message: message,
+	})
+	if !apiEquality.Semantic.DeepEqual(before, &run.Status) {
+		if err := r.Status().Update(ctx, run); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
+	return ctrl.Result{Requeue: true}, nil
+}
+
+func (r *WorkflowRunReconciler) completeUnplannedWorkflowRun(ctx context.Context, run *actionsv1alpha1.WorkflowRun, reason, message string) (ctrl.Result, error) {
+	before := run.Status.DeepCopy()
+	now := metav1.Now()
+	run.Status.ObservedGeneration = run.Generation
+	run.Status.CompletionTime = &now
+	if run.Spec.ForkPullRequest != nil {
+		meta.SetStatusCondition(&run.Status.Conditions, metav1.Condition{
+			Type: actionsv1alpha1.WorkflowRunConditionApproved, Status: metav1.ConditionFalse,
+			ObservedGeneration: run.Generation, Reason: reason, Message: message,
+		})
+	}
+	meta.SetStatusCondition(&run.Status.Conditions, metav1.Condition{
+		Type: actionsv1alpha1.WorkflowRunConditionPlanned, Status: metav1.ConditionFalse,
+		ObservedGeneration: run.Generation, Reason: reason, Message: message,
+	})
+	meta.SetStatusCondition(&run.Status.Conditions, metav1.Condition{
+		Type: actionsv1alpha1.WorkflowRunConditionSucceeded, Status: metav1.ConditionFalse,
+		ObservedGeneration: run.Generation, Reason: reason, Message: message,
+	})
+	if apiEquality.Semantic.DeepEqual(before, &run.Status) {
+		return ctrl.Result{}, nil
+	}
+	if err := r.Status().Update(ctx, run); err != nil {
+		return ctrl.Result{}, err
+	}
+	recordConditionWarning(r.Recorder, run, before.Conditions, run.Status.Conditions, actionsv1alpha1.WorkflowRunConditionSucceeded)
+	return ctrl.Result{}, nil
 }
 
 func runnerPullRequest(pullRequest *actionsv1alpha1.GitHubPullRequest) *runner.PullRequest {
@@ -3366,8 +3511,37 @@ func (r *WorkflowRunReconciler) SetupWithManager(manager ctrl.Manager) error {
 	}
 	return ctrl.NewControllerManagedBy(manager).
 		For(&actionsv1alpha1.WorkflowRun{}).
+		Watches(&actionsv1alpha1.WorkflowRun{}, handler.EnqueueRequestsFromMapFunc(r.workflowRunsSupersededByForkPullRequestRevision), builder.WithPredicates(predicate.Funcs{
+			CreateFunc:  func(event.CreateEvent) bool { return true },
+			UpdateFunc:  func(event.UpdateEvent) bool { return false },
+			DeleteFunc:  func(event.DeleteEvent) bool { return false },
+			GenericFunc: func(event.GenericEvent) bool { return false },
+		})).
 		Owns(&actionsv1alpha1.WorkflowJob{}).
 		Complete(r)
+}
+
+func (r *WorkflowRunReconciler) workflowRunsSupersededByForkPullRequestRevision(ctx context.Context, object client.Object) []reconcile.Request {
+	run, ok := object.(*actionsv1alpha1.WorkflowRun)
+	if !ok || run.Spec.ForkPullRequest == nil {
+		return nil
+	}
+	runs := &actionsv1alpha1.WorkflowRunList{}
+	if err := r.APIReader.List(ctx, runs, client.InNamespace(run.Namespace)); err != nil {
+		ctrl.LoggerFrom(ctx).Error(err, "List WorkflowRuns for fork pull request revision", "workflow_run", run.Name)
+		return nil
+	}
+	requests := make([]reconcile.Request, 0)
+	for index := range runs.Items {
+		candidate := &runs.Items[index]
+		policy := candidate.Spec.ForkPullRequest
+		if policy == nil || !policy.RequireApproval || policy.Approved || terminalRun(candidate) ||
+			!run.CreationTimestamp.After(candidate.CreationTimestamp.Time) || !sameForkPullRequest(candidate, run) || forkPullRequestHeadSHA(candidate) == forkPullRequestHeadSHA(run) {
+			continue
+		}
+		requests = append(requests, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(candidate)})
+	}
+	return requests
 }
 
 func terminalRun(run *actionsv1alpha1.WorkflowRun) bool {

@@ -77,6 +77,12 @@ cancellation-aware reporting and cleanup jobs may finish. A requested run is
 shown as `Cancelling` until it reaches a terminal result. Cancellation requests
 are idempotent and are unavailable for completed attempts.
 
+An approval-required fork pull request run also presents an **Approve
+workflow** action. Approval updates its policy snapshot only from
+`approved: false` to `approved: true`; the controller validates the current
+pull request head before creating jobs. Approval is unavailable after
+cancellation or completion.
+
 An administrator can also rerun all jobs from the latest completed attempt in
 a workflow lineage. When
 the attempt failed because one or more jobs failed, the administrator can
@@ -208,6 +214,61 @@ available after controller restarts and Pod deletion.
 reason `JobTimedOut`; those jobs retain `failure` as their `status.result` for
 dependency evaluation.
 
+### Fork pull request policy
+
+`spec.source.github.forkPullRequests` controls ordinary `pull_request`
+workflows whose code comes from a fork. Dependabot pull requests use this
+policy even when their head repository is the base repository. The policy does
+not apply to `pull_request_target`, which continues to load and execute the
+trusted base-branch workflow.
+
+```yaml
+spec:
+  source:
+    type: GitHub
+    github:
+      forkPullRequests:
+        enabled: true
+        requireApproval: true
+        sendWriteTokens: false
+        sendSecrets: false
+```
+
+Omitting `forkPullRequests`, `enabled`, or `requireApproval` uses the secure
+defaults shown above. The fields correspond to GitHub's fork workflow settings
+as follows:
+
+| Project field | GitHub repository setting | Behavior |
+| --- | --- | --- |
+| `enabled` | **Run workflows from fork pull requests** | Creates ordinary fork `pull_request` runs when true. |
+| `requireApproval` | **Require approval for fork pull request workflows** | Creates the run but no WorkflowJobs until an authenticated Console user approves it. Open Actions applies this requirement to every fork run rather than evaluating contributor history. |
+| `sendWriteTokens` | **Send write tokens to workflows from pull requests** | Preserves requested write permissions when true; otherwise requested writes are reduced to reads. |
+| `sendSecrets` | **Send secrets and variables to workflows from pull requests** | Makes the Project Secret available when true. Project variables are non-sensitive and remain available independently of this setting. |
+
+GitHub exposes the four settings for private repositories and exposes
+contributor-based approval policies for public repositories. Because a Project
+may cover both and Open Actions does not query contributor trust, the Project
+policy is explicit and applies consistently to every repository in the
+installation. Keep the defaults for GitHub-compatible public-fork credential
+boundaries. For a private repository, copy the equivalent repository settings
+into this policy; enable secrets or write tokens only when fork code is within
+the installation's trust boundary. See GitHub's
+[repository Actions settings](https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/enabling-features-for-your-repository/managing-github-actions-settings-for-a-repository)
+for the corresponding controls.
+
+Dependabot runs honor `enabled` and `requireApproval`, but always use read-only
+tokens and withhold Project secrets. Setting `sendWriteTokens` or `sendSecrets`
+does not relax GitHub's Dependabot credential boundary.
+
+The effective policy is copied to the immutable
+`WorkflowRun.spec.forkPullRequest` snapshot when the webhook is processed, so a
+later Project update cannot grant more access to an existing run. An approval
+authorizes only that run's signed head SHA. Immediately before planning jobs,
+the controller resolves `refs/pull/<number>/head`; if it no longer matches, the
+run finishes as cancelled with reason `RevisionSuperseded`. A newer
+`synchronize` delivery creates its own run and approval decision, and completes
+older approval-pending runs for the same pull request as `RevisionSuperseded`.
+
 ### Project secrets and variables
 
 A Project selects one namespace-local Secret through
@@ -249,6 +310,8 @@ and unpadded Base64, JSON-string, percent-encoded, XML-escaped, and common
 shell-escaped forms. Project variables are non-sensitive and are not
 masked. Missing names in either context evaluate to an empty string.
 
+For fork pull request runs, the Project Secret is mounted only when the run's
+policy snapshot has `sendSecrets: true`. Project variables remain available.
 The job-scoped GitHub App installation token is available as both
 `github.token` and `secrets.GITHUB_TOKEN`. It is not added to the step
 environment unless the workflow assigns one of those expressions to an
@@ -294,8 +357,8 @@ Immediately before creating a job Pod, the controller requests a GitHub App
 installation token selected to the Project repository and narrowed to the
 effective permissions. A request that exceeds the permissions granted to the
 configured App immediately fails the WorkflowJob before the Pod starts and
-reports the requested permission set. For pull request events from a fork,
-requested writes are reduced to reads;
+reports the requested permission set. For fork pull request runs whose policy
+snapshot has `sendWriteTokens: false`, requested writes are reduced to reads;
 `pull_request_target` keeps the permissions declared by its trusted base
 workflow.
 
@@ -314,14 +377,17 @@ suppression that GitHub applies to its native Actions `GITHUB_TOKEN`.
 ### External actions
 
 External action repositories on the configured GitHub server are downloaded
-with a short-lived token granting Contents read access to repositories
-granted to the Project's GitHub App installation. Install the App on each
-action repository used by a workflow. The token is used only for the exact
-action repository URL and is not placed in workflow expressions, action inputs,
-or workflow step environments. Runner and workflow processes share a container
-security boundary, so every workflow using an installation must be trusted to
-read every repository granted to it. Limit the installation to repositories
-within that trust boundary. No GitHub credential is sent when
+with a short-lived token granting Contents read access. Ordinarily the token
+covers repositories granted to the Project's GitHub App installation, so the
+App must be installed on each private action repository used by a workflow.
+When a fork pull request policy withholds secrets, the token is restricted to
+the base repository; private actions from other repositories are unavailable
+to that run. The token is used only for the exact action repository URL and is
+not placed in workflow expressions, action inputs, or workflow step
+environments. Runner and workflow processes share a container security
+boundary, so every workflow receiving an installation-wide action token must
+be trusted to read every repository granted to it. Limit the installation to
+repositories within that trust boundary. No GitHub credential is sent when
 `--action-clone-base-url` has a different scheme or host from
 `--github-server-url`, and jobs using such a clone endpoint do not request an
 action-download token.
@@ -480,12 +546,14 @@ The resources expose these condition contracts:
 | `Runner` | `Busy` | `True` | `JobAssigned` |
 | `RunnerSet` | `Ready` | `True` | `RunnersReady` |
 | `RunnerSet` | `Ready` | `False` | `ReplicaCountMismatch`, `RunnersTerminating`, `RunnersNotReady` |
+| `WorkflowRun` | `Approved` | `True` | `ApprovalGranted`, `ApprovalNotRequired` |
+| `WorkflowRun` | `Approved` | `False` | `ApprovalRequired`, `RevisionSuperseded`, `JobCancelled` |
 | `WorkflowRun` | `Planned` | `True` | `JobsPlanned` |
-| `WorkflowRun` | `Planned` | `Unknown` | `WaitingForPriorRunPlanning`, `WaitingForConcurrency`, `WaitingForConcurrencyCancellation`, `ProjectUnavailable`, `CredentialsUnavailable`, `ProjectValuesUnavailable`, `GitHubAuthenticationFailed`, `WorkflowFetchFailed`, `ChildCreationFailed`, `ConcurrencyCheckFailed` |
-| `WorkflowRun` | `Planned` | `False` | `ProjectUnavailable`, `WorkflowFetchFailed`, `WorkflowInvalid`, `TriggerInvalid`, `RerunInvalid`, `ChildCreationFailed`, `ExecutionStateLost` |
+| `WorkflowRun` | `Planned` | `Unknown` | `ApprovalRequired`, `ApprovalValidationFailed`, `WaitingForPriorRunPlanning`, `WaitingForConcurrency`, `WaitingForConcurrencyCancellation`, `ProjectUnavailable`, `CredentialsUnavailable`, `ProjectValuesUnavailable`, `GitHubAuthenticationFailed`, `WorkflowFetchFailed`, `ChildCreationFailed`, `ConcurrencyCheckFailed` |
+| `WorkflowRun` | `Planned` | `False` | `ProjectUnavailable`, `WorkflowFetchFailed`, `WorkflowInvalid`, `TriggerInvalid`, `RerunInvalid`, `ChildCreationFailed`, `RevisionSuperseded`, `JobCancelled`, `ExecutionStateLost` |
 | `WorkflowRun` | `Succeeded` | `Unknown` | `JobsWaiting`, `JobsQueued`, `JobsRunning` |
 | `WorkflowRun` | `Succeeded` | `True` | `JobsSucceeded` |
-| `WorkflowRun` | `Succeeded` | `False` | `ProjectUnavailable`, `WorkflowFetchFailed`, `WorkflowInvalid`, `TriggerInvalid`, `RerunInvalid`, `ChildCreationFailed`, `JobFailed`, `JobTimedOut`, `JobCancelled`, `ExecutionStateLost` |
+| `WorkflowRun` | `Succeeded` | `False` | `ProjectUnavailable`, `WorkflowFetchFailed`, `WorkflowInvalid`, `TriggerInvalid`, `RerunInvalid`, `ChildCreationFailed`, `JobFailed`, `JobTimedOut`, `JobCancelled`, `RevisionSuperseded`, `ExecutionStateLost` |
 | `WorkflowJob` | `Ready` | `Unknown` | `DependenciesPending`, `WaitingForConcurrency` |
 | `WorkflowJob` | `Ready` | `True` | `ConditionPassed`, `ConcurrencyAcquired` |
 | `WorkflowJob` | `Ready` | `False` | `ConditionFalse`, `ConditionEvaluationFailed`, `MatrixEvaluationFailed`, `ConcurrencyEvaluationFailed`, `ConcurrencySuperseded`, `ConcurrencyCancelled`, `CancellationRequested`, `MatrixFailFast` |
@@ -889,6 +957,12 @@ events are reported on the trusted default-branch revision,
 and ordinary `pull_request` checks are reported on the pull request head
 revision.
 
+Ordinary fork and Dependabot pull requests follow the Project's fork pull
+request policy. Their workflow definition comes from the pull request head and
+their execution revision is the same deterministic base/head integration used
+for same-repository pull requests. Approval, when required, gates job planning
+and is tied to the signed head SHA.
+
 For an ordinary open `pull_request`, `github.sha` identifies the locally
 constructed integration commit. `github.event.pull_request.merge_commit_sha`
 retains the value received from GitHub, while
@@ -925,12 +999,11 @@ metadata.
 #### Trusted fork checkout
 
 Treat every value under `github.event.pull_request.head` and all content fetched
-from `refs/pull/<number>/merge` as untrusted. Each `synchronize`
-delivery records its own immutable head SHA and creates a distinct WorkflowRun,
-so an approval system must bind approval to that SHA or to the exact
-WorkflowJob. An approval attached to an earlier delivery must not authorize a
-later fork update. Open Actions does not infer approval from labels, comments,
-or the existence of a pull request.
+from `refs/pull/<number>/merge` as untrusted. Ordinary `pull_request` fork runs
+use the integration checkout described above and the built-in approval gate.
+Each `synchronize` delivery records its own immutable head SHA and creates a
+distinct WorkflowRun. Open Actions does not infer approval from labels,
+comments, or the existence of a pull request.
 
 Current releases of `actions/checkout` refuse an explicit fork head or merge-ref
 checkout from `pull_request_target` unless the trusted workflow sets
@@ -939,7 +1012,8 @@ this guard. The opt-in only makes the checkout explicit; it does not make the
 checked-out code trusted. Follow the
 [GitHub `pull_request_target` security guidance](https://docs.github.com/en/actions/reference/security/securely-using-pull_request_target),
 use an isolated runner, and do not expose secrets until an approval tied to the
-current head SHA has passed.
+current head SHA has passed. The ordinary fork policy does not authorize an
+unsafe checkout in a `pull_request_target` workflow.
 
 When an approved workflow must test the base repository's merge ref, disable
 persisted credentials and verify the checked-out merge commit before executing
@@ -1226,10 +1300,14 @@ event names return HTTP 202 with `{"accepted":true,"queued":false}`. For an
 ordinary open pull request, the controller resolves the merge base and
 constructs a deterministic integration commit from the base and head SHAs in
 the signed webhook. It uses that commit to discover and plan workflows without
-waiting for GitHub's mutable pull request merge ref. Fork and conflicting pull
-requests are skipped. Eligible `pull_request_target` workflows are discovered
-independently and load only from the pull request's base branch in the base
-repository.
+waiting for GitHub's mutable pull request merge ref. Ordinary fork pull
+requests are accepted according to the Project's fork pull request policy;
+conflicting pull requests without an integration revision are skipped.
+Eligible `pull_request_target` workflows are discovered independently and load
+only from the pull request's base branch in the base repository.
+Invalid fork-controlled workflow definitions and fork candidate fan-out limit
+violations skip the ordinary `pull_request` candidate without suppressing
+independently discovered `pull_request_target` runs.
 
 For a Check Run created by Open Actions, GitHub's **Re-run** action sends a
 `check_run.rerequested` delivery. Open Actions authenticates the delivery,

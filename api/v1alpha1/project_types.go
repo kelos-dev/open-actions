@@ -114,6 +114,36 @@ type GitHubAppConfiguration struct {
 	// deliveries.
 	// +required
 	WebhookSecretRef corev1.SecretKeySelector `json:"webhookSecretRef"`
+
+	// ForkPullRequests controls ordinary pull_request workflows whose code comes
+	// from a fork or Dependabot. Omit it to enable workflows with approval
+	// required, read-only token permissions, and Project secrets withheld.
+	// +optional
+	ForkPullRequests *GitHubForkPullRequestPolicy `json:"forkPullRequests,omitempty"`
+}
+
+// GitHubForkPullRequestPolicy controls execution of untrusted ordinary pull
+// request workflows. These settings do not apply to pull_request_target.
+type GitHubForkPullRequestPolicy struct {
+	// Enabled controls whether ordinary fork pull request workflows are created.
+	// +kubebuilder:default=true
+	// +optional
+	Enabled *bool `json:"enabled,omitempty"`
+
+	// RequireApproval prevents job creation until an administrator approves the
+	// WorkflowRun for its pinned pull request head revision.
+	// +kubebuilder:default=true
+	// +optional
+	RequireApproval *bool `json:"requireApproval,omitempty"`
+
+	// SendWriteTokens preserves write permissions requested by the workflow.
+	// When false, requested write permissions are reduced to read.
+	// +optional
+	SendWriteTokens bool `json:"sendWriteTokens,omitempty"`
+
+	// SendSecrets makes the Project Secret available to fork pull request jobs.
+	// +optional
+	SendSecrets bool `json:"sendSecrets,omitempty"`
 }
 
 // ProjectStatus contains observations made by the project controller.

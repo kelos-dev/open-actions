@@ -115,6 +115,7 @@ func TestGitHubTokenPermissionsRestrictsForkWrites(t *testing.T) {
 		name      string
 		eventName actionsv1alpha1.GitHubEventName
 		headID    int64
+		policy    *actionsv1alpha1.WorkflowRunForkPullRequest
 		want      map[string]string
 	}{
 		{
@@ -129,18 +130,219 @@ func TestGitHubTokenPermissionsRestrictsForkWrites(t *testing.T) {
 			name: "pull request target", eventName: actionsv1alpha1.GitHubEventNamePullRequestTarget, headID: 2,
 			want: map[string]string{"contents": "write", "issues": "read", "pull_requests": "write", "statuses": "write"},
 		},
+		{
+			name: "Dependabot policy", eventName: actionsv1alpha1.GitHubEventNamePullRequest, headID: 1,
+			policy: &actionsv1alpha1.WorkflowRunForkPullRequest{},
+			want:   map[string]string{"contents": "read", "issues": "read", "pull_requests": "read", "statuses": "read"},
+		},
+		{
+			name: "configured write tokens", eventName: actionsv1alpha1.GitHubEventNamePullRequest, headID: 2,
+			policy: &actionsv1alpha1.WorkflowRunForkPullRequest{SendWriteTokens: true},
+			want:   map[string]string{"contents": "write", "issues": "read", "pull_requests": "write", "statuses": "write"},
+		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			run := &actionsv1alpha1.WorkflowRun{Spec: actionsv1alpha1.WorkflowRunSpec{Source: actionsv1alpha1.WorkflowRunSource{GitHub: &actionsv1alpha1.GitHubWorkflowRunSource{
-				Repository: actionsv1alpha1.GitHubRepository{ID: 1},
-				Event: actionsv1alpha1.GitHubEvent{Name: tt.eventName, PullRequest: &actionsv1alpha1.GitHubPullRequest{
-					HeadRepository: actionsv1alpha1.GitHubRepository{ID: tt.headID},
+			run := &actionsv1alpha1.WorkflowRun{Spec: actionsv1alpha1.WorkflowRunSpec{
+				ForkPullRequest: tt.policy,
+				Source: actionsv1alpha1.WorkflowRunSource{GitHub: &actionsv1alpha1.GitHubWorkflowRunSource{
+					Repository: actionsv1alpha1.GitHubRepository{ID: 1},
+					Event: actionsv1alpha1.GitHubEvent{Name: tt.eventName, PullRequest: &actionsv1alpha1.GitHubPullRequest{
+						HeadRepository: actionsv1alpha1.GitHubRepository{ID: tt.headID},
+					}},
 				}},
-			}}}}
+			}}
 			if got := githubTokenPermissions(run, requested); !maps.Equal(got, tt.want) {
 				t.Fatalf("permissions = %#v, want %#v", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestForkPullRequestWaitsForApprovalWithoutCreatingJobs(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := actionsv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	run := forkApprovalTestRun(false)
+	clusterClient := fake.NewClientBuilder().WithScheme(scheme).
+		WithStatusSubresource(&actionsv1alpha1.WorkflowRun{}).
+		WithObjects(run).Build()
+	reconciler := &WorkflowRunReconciler{Client: clusterClient, APIReader: clusterClient}
+	if result, err := reconciler.reconcileWorkflowRun(context.Background(), run); err != nil || result.Requeue || result.RequeueAfter != 0 {
+		t.Fatalf("reconcileWorkflowRun() = %#v, %v", result, err)
+	}
+	stored := &actionsv1alpha1.WorkflowRun{}
+	if err := clusterClient.Get(context.Background(), client.ObjectKeyFromObject(run), stored); err != nil {
+		t.Fatal(err)
+	}
+	approved := meta.FindStatusCondition(stored.Status.Conditions, actionsv1alpha1.WorkflowRunConditionApproved)
+	planned := meta.FindStatusCondition(stored.Status.Conditions, actionsv1alpha1.WorkflowRunConditionPlanned)
+	if approved == nil || approved.Status != metav1.ConditionFalse || approved.Reason != "ApprovalRequired" || planned == nil || planned.Status != metav1.ConditionUnknown || planned.Reason != "ApprovalRequired" {
+		t.Fatalf("approval conditions = %#v", stored.Status.Conditions)
+	}
+	jobs := &actionsv1alpha1.WorkflowJobList{}
+	if err := clusterClient.List(context.Background(), jobs); err != nil {
+		t.Fatal(err)
+	}
+	if len(jobs.Items) != 0 {
+		t.Fatalf("WorkflowJobs = %#v", jobs.Items)
+	}
+}
+
+func TestNewForkPullRequestRevisionSupersedesUnapprovedRun(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := actionsv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	oldRun := forkApprovalTestRun(false)
+	oldRun.CreationTimestamp = metav1.NewTime(time.Unix(1, 0))
+	clusterClient := fake.NewClientBuilder().WithScheme(scheme).
+		WithStatusSubresource(&actionsv1alpha1.WorkflowRun{}).
+		WithObjects(oldRun).Build()
+	reconciler := &WorkflowRunReconciler{Client: clusterClient, APIReader: clusterClient}
+	if _, err := reconciler.reconcileWorkflowRun(context.Background(), oldRun); err != nil {
+		t.Fatal(err)
+	}
+
+	newRun := forkApprovalTestRun(false)
+	newRun.Name = "ci-new-head"
+	newRun.UID = "new-run-uid"
+	newRun.CreationTimestamp = metav1.NewTime(time.Unix(2, 0))
+	newRun.Spec.Source.GitHub.Event.PullRequest.HeadSHA = strings.Repeat("c", 40)
+	newRun.Spec.Source.GitHub.Revision.HeadSHA = strings.Repeat("c", 40)
+	if err := clusterClient.Create(context.Background(), newRun); err != nil {
+		t.Fatal(err)
+	}
+	requests := reconciler.workflowRunsSupersededByForkPullRequestRevision(context.Background(), newRun)
+	if len(requests) != 1 || requests[0].NamespacedName != client.ObjectKeyFromObject(oldRun) {
+		t.Fatalf("superseded requests = %#v", requests)
+	}
+	stored := &actionsv1alpha1.WorkflowRun{}
+	if err := clusterClient.Get(context.Background(), client.ObjectKeyFromObject(oldRun), stored); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reconciler.reconcileWorkflowRun(context.Background(), stored); err != nil {
+		t.Fatal(err)
+	}
+	if err := clusterClient.Get(context.Background(), client.ObjectKeyFromObject(oldRun), stored); err != nil {
+		t.Fatal(err)
+	}
+	approved := meta.FindStatusCondition(stored.Status.Conditions, actionsv1alpha1.WorkflowRunConditionApproved)
+	succeeded := meta.FindStatusCondition(stored.Status.Conditions, actionsv1alpha1.WorkflowRunConditionSucceeded)
+	if approved == nil || approved.Status != metav1.ConditionFalse || approved.Reason != "RevisionSuperseded" || succeeded == nil || succeeded.Status != metav1.ConditionFalse || succeeded.Reason != "RevisionSuperseded" {
+		t.Fatalf("superseded status = %#v", stored.Status)
+	}
+}
+
+func TestForkPullRequestApprovalValidatesCurrentHead(t *testing.T) {
+	approvedHead := strings.Repeat("b", 40)
+	for _, test := range []struct {
+		name        string
+		currentHead string
+		wantReason  string
+		wantRequeue bool
+	}{
+		{name: "current revision", currentHead: approvedHead, wantReason: "ApprovalGranted", wantRequeue: true},
+		{name: "superseded revision", currentHead: strings.Repeat("c", 40), wantReason: "RevisionSuperseded"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
+			if err != nil {
+				t.Fatal(err)
+			}
+			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+				switch request.URL.Path {
+				case "/app/installations/2/access_tokens":
+					fmt.Fprint(writer, `{"token":"installation-token"}`)
+				case "/repos/acme/example/commits":
+					if request.URL.Query().Get("sha") != "refs/pull/7/head" {
+						http.Error(writer, "unexpected pull request ref", http.StatusBadRequest)
+						return
+					}
+					fmt.Fprintf(writer, `[{"sha":%q}]`, test.currentHead)
+				default:
+					http.NotFound(writer, request)
+				}
+			}))
+			defer server.Close()
+			github, err := githubclient.NewClient(server.URL, server.Client())
+			if err != nil {
+				t.Fatal(err)
+			}
+			scheme := runtime.NewScheme()
+			if err := actionsv1alpha1.AddToScheme(scheme); err != nil {
+				t.Fatal(err)
+			}
+			if err := corev1.AddToScheme(scheme); err != nil {
+				t.Fatal(err)
+			}
+			project := &actionsv1alpha1.Project{
+				ObjectMeta: metav1.ObjectMeta{Name: "project", Namespace: "default"},
+				Spec: actionsv1alpha1.ProjectSpec{Source: actionsv1alpha1.ProjectSource{Type: actionsv1alpha1.SourceTypeGitHub, GitHub: &actionsv1alpha1.GitHubAppConfiguration{
+					AppID: 1, InstallationID: 2,
+					PrivateKeySecretRef: corev1.SecretKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: "github"}, Key: "private-key"},
+				}}},
+			}
+			secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "github", Namespace: "default"}, Data: map[string][]byte{
+				"private-key": pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(privateKey)}),
+			}}
+			run := forkApprovalTestRun(true)
+			clusterClient := fake.NewClientBuilder().WithScheme(scheme).
+				WithStatusSubresource(&actionsv1alpha1.WorkflowRun{}).
+				WithObjects(project, secret, run).Build()
+			reconciler := &WorkflowRunReconciler{Client: clusterClient, APIReader: clusterClient, GitHub: github}
+			result, err := reconciler.reconcileWorkflowRun(context.Background(), run)
+			if err != nil || result.Requeue != test.wantRequeue {
+				t.Fatalf("reconcileWorkflowRun() = %#v, %v", result, err)
+			}
+			stored := &actionsv1alpha1.WorkflowRun{}
+			if err := clusterClient.Get(context.Background(), client.ObjectKeyFromObject(run), stored); err != nil {
+				t.Fatal(err)
+			}
+			approved := meta.FindStatusCondition(stored.Status.Conditions, actionsv1alpha1.WorkflowRunConditionApproved)
+			if approved == nil || approved.Reason != test.wantReason {
+				t.Fatalf("Approved condition = %#v", approved)
+			}
+			if test.wantRequeue {
+				if approved.Status != metav1.ConditionTrue || terminalRun(stored) {
+					t.Fatalf("current revision status = %#v", stored.Status)
+				}
+			} else {
+				succeeded := meta.FindStatusCondition(stored.Status.Conditions, actionsv1alpha1.WorkflowRunConditionSucceeded)
+				if approved.Status != metav1.ConditionFalse || succeeded == nil || succeeded.Status != metav1.ConditionFalse || succeeded.Reason != "RevisionSuperseded" {
+					t.Fatalf("superseded revision status = %#v", stored.Status)
+				}
+			}
+			jobs := &actionsv1alpha1.WorkflowJobList{}
+			if err := clusterClient.List(context.Background(), jobs); err != nil {
+				t.Fatal(err)
+			}
+			if len(jobs.Items) != 0 {
+				t.Fatalf("WorkflowJobs = %#v", jobs.Items)
+			}
+		})
+	}
+}
+
+func forkApprovalTestRun(approved bool) *actionsv1alpha1.WorkflowRun {
+	headSHA := strings.Repeat("b", 40)
+	return &actionsv1alpha1.WorkflowRun{
+		ObjectMeta: metav1.ObjectMeta{Name: "ci", Namespace: "default", UID: "run-uid"},
+		Spec: actionsv1alpha1.WorkflowRunSpec{
+			ProjectRef: corev1.LocalObjectReference{Name: "project"},
+			Source: actionsv1alpha1.WorkflowRunSource{Type: actionsv1alpha1.SourceTypeGitHub, GitHub: &actionsv1alpha1.GitHubWorkflowRunSource{
+				Repository: actionsv1alpha1.GitHubRepository{ID: 1, Owner: "acme", Name: "example"},
+				Event: actionsv1alpha1.GitHubEvent{Name: actionsv1alpha1.GitHubEventNamePullRequest, Action: "synchronize", DeliveryID: "delivery", PullRequest: &actionsv1alpha1.GitHubPullRequest{
+					Number: 7, Body: "Pull request body", HTMLURL: "https://github.com/acme/example/pull/7",
+					HeadRepository: actionsv1alpha1.GitHubRepository{ID: 2, Owner: "contributor", Name: "example"}, HeadRef: "feature", HeadSHA: headSHA, BaseRef: "main",
+				}},
+				Revision: actionsv1alpha1.GitRevision{SHA: strings.Repeat("a", 40), HeadSHA: headSHA, BaseSHA: strings.Repeat("9", 40), MergeBaseSHA: strings.Repeat("8", 40), Ref: "refs/pull/7/merge", HeadRef: "feature", BaseRef: "main"},
+			}},
+			WorkflowPath: ".open-actions/workflows/ci.yaml",
+			ForkPullRequest: &actionsv1alpha1.WorkflowRunForkPullRequest{
+				RequireApproval: true, Approved: approved,
+			},
+		},
 	}
 }
 
@@ -1838,6 +2040,11 @@ func TestWorkflowRunCheckReportMapsLifecycle(t *testing.T) {
 	if report := workflowRunCheckReport(run); report.Status != "queued" || report.Conclusion != "" {
 		t.Fatalf("queued report = %#v", report)
 	}
+	run.Spec.ForkPullRequest = &actionsv1alpha1.WorkflowRunForkPullRequest{RequireApproval: true}
+	if report := workflowRunCheckReport(run); report.Status != "queued" || report.Output.Summary != "The workflow is waiting for approval before jobs are created." {
+		t.Fatalf("approval report = %#v", report)
+	}
+	run.Spec.ForkPullRequest.Approved = true
 	start := metav1.Now()
 	run.Status.StartTime = &start
 	if report := workflowRunCheckReport(run); report.Status != "in_progress" || report.StartedAt == "" {
@@ -1852,6 +2059,10 @@ func TestWorkflowRunCheckReportMapsLifecycle(t *testing.T) {
 	meta.SetStatusCondition(&run.Status.Conditions, metav1.Condition{Type: actionsv1alpha1.WorkflowRunConditionSucceeded, Status: metav1.ConditionFalse, Reason: "JobCancelled", Message: "A job was cancelled", LastTransitionTime: completion})
 	if report := workflowRunCheckReport(run); report.Status != "completed" || report.Conclusion != "cancelled" {
 		t.Fatalf("cancelled report = %#v", report)
+	}
+	meta.SetStatusCondition(&run.Status.Conditions, metav1.Condition{Type: actionsv1alpha1.WorkflowRunConditionSucceeded, Status: metav1.ConditionFalse, Reason: "RevisionSuperseded", Message: "The approved revision was superseded", LastTransitionTime: completion})
+	if report := workflowRunCheckReport(run); report.Status != "completed" || report.Conclusion != "cancelled" {
+		t.Fatalf("superseded report = %#v", report)
 	}
 	meta.SetStatusCondition(&run.Status.Conditions, metav1.Condition{Type: actionsv1alpha1.WorkflowRunConditionSucceeded, Status: metav1.ConditionFalse, Reason: "JobTimedOut", Message: "A job timed out", LastTransitionTime: completion})
 	if report := workflowRunCheckReport(run); report.Status != "completed" || report.Conclusion != "timed_out" {

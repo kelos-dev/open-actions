@@ -379,7 +379,14 @@ func (r *DeliveryReconciler) Reconcile(ctx context.Context, request ctrl.Request
 	selections := make([]workflowSelection, 0)
 	seenFiles := map[string]struct{}{}
 	workflowJobs := 0
+candidateLoop:
 	for _, candidate := range events {
+		if candidate.Name == "pull_request" && candidate.Fork {
+			enabled, _ := forkPullRequestPolicy(project, candidate.Dependabot)
+			if !enabled {
+				continue
+			}
+		}
 		var mergedRepository *gitrepository.Repository
 		if candidate.Name == "pull_request" && candidate.HeadSHA != "" {
 			if candidate.PullRequest == nil {
@@ -434,8 +441,17 @@ func (r *DeliveryReconciler) Reconcile(ctx context.Context, request ctrl.Request
 		if err != nil {
 			return ctrl.Result{}, err
 		}
-		workflowFileCount := recordWorkflowFiles(seenFiles, workflowFiles)
-		if err := validateDeliveryFanOut(workflowFileCount, workflowJobs); err != nil {
+		candidateSeenFiles := make(map[string]struct{}, len(seenFiles)+len(workflowFiles))
+		for path := range seenFiles {
+			candidateSeenFiles[path] = struct{}{}
+		}
+		workflowFileCount := recordWorkflowFiles(candidateSeenFiles, workflowFiles)
+		candidateWorkflowJobs := workflowJobs
+		candidateSelections := make([]workflowSelection, 0)
+		if err := validateDeliveryFanOut(workflowFileCount, candidateWorkflowJobs); err != nil {
+			if r.skipForkPullRequestDiscovery(candidate, &delivery, err.Error()) {
+				continue
+			}
 			return ctrl.Result{}, r.finish(ctx, object, deliveryStateFailed, 0, err.Error())
 		}
 		for _, workflowPath := range workflowFiles {
@@ -450,8 +466,12 @@ func (r *DeliveryReconciler) Reconcile(ctx context.Context, request ctrl.Request
 			}
 			definition, err := workflow.Parse(data)
 			if err != nil {
+				message := fmt.Sprintf("invalid workflow %q: %v", workflowPath, err)
+				if r.skipForkPullRequestDiscovery(candidate, &delivery, message) {
+					continue candidateLoop
+				}
 				r.Logger.Warn("rejected invalid workflow", "path", workflowPath, "error", err)
-				return ctrl.Result{}, r.finish(ctx, object, deliveryStateFailed, 0, fmt.Sprintf("invalid workflow %q: %v", workflowPath, err))
+				return ctrl.Result{}, r.finish(ctx, object, deliveryStateFailed, 0, message)
 			}
 			_, matched, err := workflow.Match(definition.On, workflow.Event{
 				Name: candidate.Name, Action: candidate.Action, Ref: candidate.Ref,
@@ -459,16 +479,26 @@ func (r *DeliveryReconciler) Reconcile(ctx context.Context, request ctrl.Request
 				BaseRef: candidate.BaseRef, WorkflowName: candidate.WorkflowName,
 			})
 			if err != nil {
-				return ctrl.Result{}, r.finish(ctx, object, deliveryStateFailed, 0, fmt.Sprintf("workflow %q does not accept the event: %v", workflowPath, err))
+				message := fmt.Sprintf("workflow %q does not accept the event: %v", workflowPath, err)
+				if r.skipForkPullRequestDiscovery(candidate, &delivery, message) {
+					continue candidateLoop
+				}
+				return ctrl.Result{}, r.finish(ctx, object, deliveryStateFailed, 0, message)
 			}
 			if matched {
-				workflowJobs += len(definition.Jobs)
-				if err := validateDeliveryFanOut(workflowFileCount, workflowJobs); err != nil {
+				candidateWorkflowJobs += len(definition.Jobs)
+				if err := validateDeliveryFanOut(workflowFileCount, candidateWorkflowJobs); err != nil {
+					if r.skipForkPullRequestDiscovery(candidate, &delivery, err.Error()) {
+						continue candidateLoop
+					}
 					return ctrl.Result{}, r.finish(ctx, object, deliveryStateFailed, 0, err.Error())
 				}
-				selections = append(selections, workflowSelection{Path: workflowPath, Event: candidate})
+				candidateSelections = append(candidateSelections, workflowSelection{Path: workflowPath, Event: candidate})
 			}
 		}
+		seenFiles = candidateSeenFiles
+		workflowJobs = candidateWorkflowJobs
+		selections = append(selections, candidateSelections...)
 	}
 	for _, selection := range selections {
 		if err := r.createWorkflowRun(ctx, project, &delivery, selection); err != nil {
@@ -490,15 +520,23 @@ func recordWorkflowFiles(seen map[string]struct{}, paths []string) int {
 	return len(seen)
 }
 
+func (r *DeliveryReconciler) skipForkPullRequestDiscovery(candidate normalizedEvent, delivery *queuedDelivery, message string) bool {
+	if candidate.Name != "pull_request" || !candidate.Fork {
+		return false
+	}
+	r.Logger.Warn("skipped fork pull request workflow discovery", "delivery_id", delivery.DeliveryID, "reason", message)
+	return true
+}
+
 func deliveryEvents(event normalizedEvent) []normalizedEvent {
 	if event.Name != "pull_request" {
 		return []normalizedEvent{event}
 	}
 	events := make([]normalizedEvent, 0, 2)
-	if !event.Fork && event.MergeRevision {
-		events = append(events, event)
-	}
 	if event.PullRequest == nil {
+		if event.MergeRevision {
+			events = append(events, event)
+		}
 		return events
 	}
 	target := event
@@ -511,7 +549,15 @@ func deliveryEvents(event normalizedEvent) []normalizedEvent {
 	}
 	target.HeadSHA = ""
 	target.MergeBaseSHA = ""
-	events = append(events, target)
+	if event.Fork {
+		events = append(events, target)
+	}
+	if event.MergeRevision {
+		events = append(events, event)
+	}
+	if !event.Fork {
+		events = append(events, target)
+	}
 	return events
 }
 
@@ -751,6 +797,10 @@ func (r *DeliveryReconciler) createWorkflowRun(ctx context.Context, project *act
 	if delivery.EventSnapshot != "" {
 		annotations[eventsnapshot.Annotation] = delivery.EventSnapshot
 	}
+	var forkPullRequest *actionsv1alpha1.WorkflowRunForkPullRequest
+	if selection.Event.Name == "pull_request" && selection.Event.Fork {
+		_, forkPullRequest = forkPullRequestPolicy(project, selection.Event.Dependabot)
+	}
 	desired := &actionsv1alpha1.WorkflowRun{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: name, Namespace: project.Namespace,
@@ -759,6 +809,7 @@ func (r *DeliveryReconciler) createWorkflowRun(ctx context.Context, project *act
 		Spec: actionsv1alpha1.WorkflowRunSpec{
 			ProjectRef:              corev1.LocalObjectReference{Name: project.Name},
 			TTLSecondsAfterFinished: r.WorkflowRunTTLSecondsAfterFinished,
+			ForkPullRequest:         forkPullRequest,
 			Source: actionsv1alpha1.WorkflowRunSource{
 				Type: actionsv1alpha1.SourceTypeGitHub,
 				GitHub: &actionsv1alpha1.GitHubWorkflowRunSource{
@@ -795,6 +846,26 @@ func (r *DeliveryReconciler) createWorkflowRun(ctx context.Context, project *act
 		return r.ensureEventSnapshotOwner(ctx, existing)
 	}
 	return r.ensureEventSnapshotOwner(ctx, desired)
+}
+
+func forkPullRequestPolicy(project *actionsv1alpha1.Project, dependabot bool) (bool, *actionsv1alpha1.WorkflowRunForkPullRequest) {
+	enabled := true
+	requireApproval := true
+	policy := project.Spec.Source.GitHub.ForkPullRequests
+	if policy != nil {
+		if policy.Enabled != nil {
+			enabled = *policy.Enabled
+		}
+		if policy.RequireApproval != nil {
+			requireApproval = *policy.RequireApproval
+		}
+	}
+	result := &actionsv1alpha1.WorkflowRunForkPullRequest{RequireApproval: requireApproval}
+	if policy != nil && !dependabot {
+		result.SendWriteTokens = policy.SendWriteTokens
+		result.SendSecrets = policy.SendSecrets
+	}
+	return enabled, result
 }
 
 func (r *DeliveryReconciler) ensureEventSnapshotOwner(ctx context.Context, run *actionsv1alpha1.WorkflowRun) error {
@@ -883,6 +954,9 @@ func matchingWorkflowRun(existing, desired *actionsv1alpha1.WorkflowRun) error {
 	desiredSpec := desired.Spec.DeepCopy()
 	existingSpec.TTLSecondsAfterFinished = nil
 	desiredSpec.TTLSecondsAfterFinished = nil
+	if existingSpec.ForkPullRequest != nil && desiredSpec.ForkPullRequest != nil {
+		existingSpec.ForkPullRequest.Approved = desiredSpec.ForkPullRequest.Approved
+	}
 	if existingGitHub, desiredGitHub := existingSpec.Source.GitHub, desiredSpec.Source.GitHub; existingGitHub != nil && desiredGitHub != nil && existingGitHub.Revision.HeadSHA == "" {
 		// Missing HeadSHA is compatible because the API defines SHA as its reporting fallback.
 		existingGitHub.Revision.HeadSHA = desiredGitHub.Revision.HeadSHA

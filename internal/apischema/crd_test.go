@@ -96,6 +96,56 @@ func TestWorkflowRunCancellationRequestIsMonotonic(t *testing.T) {
 	}
 }
 
+func TestWorkflowRunForkPullRequestApprovalContract(t *testing.T) {
+	crd, _ := loadCRD(t, "actions.kelos.dev_workflowruns.yaml")
+	newObject := func() map[string]any {
+		object := loadSample(t, "actions_v1alpha1_workflowrun.yaml")
+		normalizeWorkflowRunCELIntegers(object)
+		workflowRunGitHub(object)["event"].(map[string]any)["pullRequest"] = pullRequestEventMetadata()
+		object["spec"].(map[string]any)["forkPullRequest"] = map[string]any{
+			"requireApproval": true,
+			"approved":        false,
+			"sendWriteTokens": false,
+			"sendSecrets":     false,
+		}
+		return object
+	}
+	original := newObject()
+	if errs := validateObject(t, crd, original, nil); len(errs) > 0 {
+		t.Fatalf("valid fork pull request policy was rejected: %v", errs.ToAggregate())
+	}
+	approved := newObject()
+	approved["spec"].(map[string]any)["forkPullRequest"].(map[string]any)["approved"] = true
+	if errs := validateObject(t, crd, approved, original); len(errs) > 0 {
+		t.Fatalf("fork pull request approval was rejected: %v", errs.ToAggregate())
+	}
+	if errs := validateObject(t, crd, original, approved); len(errs) == 0 {
+		t.Fatal("fork pull request approval was revoked")
+	}
+	changedPolicy := newObject()
+	changedPolicy["spec"].(map[string]any)["forkPullRequest"].(map[string]any)["sendSecrets"] = true
+	if errs := validateObject(t, crd, changedPolicy, original); len(errs) == 0 {
+		t.Fatal("fork pull request policy update passed validation")
+	}
+	withoutApproval := newObject()
+	delete(withoutApproval["spec"].(map[string]any), "forkPullRequest")
+	if errs := validateObject(t, crd, withoutApproval, original); len(errs) == 0 {
+		t.Fatal("fork pull request policy removal passed validation")
+	}
+	wrongEvent := newObject()
+	setBranchEvent(workflowRunGitHub(wrongEvent), "push", "")
+	if errs := validateObject(t, crd, wrongEvent, nil); len(errs) == 0 {
+		t.Fatal("fork pull request policy on a push event passed validation")
+	}
+	unnecessaryApproval := newObject()
+	policy := unnecessaryApproval["spec"].(map[string]any)["forkPullRequest"].(map[string]any)
+	policy["requireApproval"] = false
+	policy["approved"] = true
+	if errs := validateObject(t, crd, unnecessaryApproval, nil); len(errs) == 0 {
+		t.Fatal("approval without an approval requirement passed validation")
+	}
+}
+
 func TestWorkflowJobConcurrencyCancellationUnion(t *testing.T) {
 	crd, _ := loadCRD(t, "actions.kelos.dev_workflowjobs.yaml")
 	for _, test := range []struct {
