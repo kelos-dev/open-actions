@@ -509,8 +509,10 @@ func (r *RunnerReconciler) executeWorkflowJob(ctx context.Context, runnerObject 
 	if err := r.validateEventSnapshot(ctx, run); err != nil {
 		return false, err
 	}
-	if err := validateProjectSecretValues(ctx, r.APIReader, project); err != nil {
-		return false, err
+	if workflowRunUsesProjectSecrets(run) {
+		if err := validateProjectSecretValues(ctx, r.APIReader, project); err != nil {
+			return false, err
+		}
 	}
 	if err := validateProjectVariableValues(ctx, r.APIReader, project); err != nil {
 		return false, err
@@ -531,7 +533,11 @@ func (r *RunnerReconciler) executeWorkflowJob(ctx context.Context, runnerObject 
 	}
 	var actionInstallation *githubclient.InstallationClient
 	if runner.ActionTokenRequired(decodedPlan) {
-		actionInstallation, err = r.GitHub.InstallationForAllRepositories(ctx, githubConfig.AppID, githubConfig.InstallationID, privateKey, githubclient.InstallationPermissions{"contents": "read"})
+		if run.Spec.ForkPullRequest != nil && !run.Spec.ForkPullRequest.SendSecrets {
+			actionInstallation, err = r.GitHub.Installation(ctx, githubConfig.AppID, githubConfig.InstallationID, privateKey, githubSource.Repository.Name, githubclient.InstallationPermissions{"contents": "read"})
+		} else {
+			actionInstallation, err = r.GitHub.InstallationForAllRepositories(ctx, githubConfig.AppID, githubConfig.InstallationID, privateKey, githubclient.InstallationPermissions{"contents": "read"})
+		}
 		if err != nil {
 			_ = jobInstallation.Revoke(ctx)
 			return false, fmt.Errorf("create action download token for WorkflowJob %q: %w", workflowJob.Name, err)
@@ -1000,7 +1006,7 @@ func (r *RunnerReconciler) buildJob(workflowJob *actionsv1alpha1.WorkflowJob, ru
 		container.VolumeMounts = append(container.VolumeMounts, corev1.VolumeMount{Name: jobNeedsVolume, MountPath: jobNeedsMountPath, ReadOnly: true})
 		container.Args = append(container.Args, "--needs-file="+jobNeedsMountPath+"/"+jobNeedsKey)
 	}
-	configureProjectValues(&podTemplate.Spec, &podTemplate.Spec.Containers[0], project)
+	configureProjectValues(&podTemplate.Spec, &podTemplate.Spec.Containers[0], run, project)
 	if r.ArtifactResultsURL != "" {
 		container := &podTemplate.Spec.Containers[0]
 		container.Env = append(container.Env,
@@ -1057,9 +1063,9 @@ func (r *RunnerReconciler) validateEventSnapshot(ctx context.Context, run *actio
 	return nil
 }
 
-func configureProjectValues(pod *corev1.PodSpec, container *corev1.Container, project *actionsv1alpha1.Project) {
+func configureProjectValues(pod *corev1.PodSpec, container *corev1.Container, run *actionsv1alpha1.WorkflowRun, project *actionsv1alpha1.Project) {
 	mode := int32(0o440)
-	if project.Spec.Secrets != nil {
+	if workflowRunUsesProjectSecrets(run) && project.Spec.Secrets != nil {
 		pod.Volumes = append(pod.Volumes, corev1.Volume{
 			Name: jobSecretsVolume,
 			VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{
@@ -1081,6 +1087,10 @@ func configureProjectValues(pod *corev1.PodSpec, container *corev1.Container, pr
 		container.VolumeMounts = append(container.VolumeMounts, corev1.VolumeMount{Name: jobVariablesVolume, MountPath: jobContextMountPath + "/variables", ReadOnly: true})
 		container.Args = append(container.Args, "--variables-directory="+jobContextMountPath+"/variables")
 	}
+}
+
+func workflowRunUsesProjectSecrets(run *actionsv1alpha1.WorkflowRun) bool {
+	return run.Spec.ForkPullRequest == nil || run.Spec.ForkPullRequest.SendSecrets
 }
 
 func configureDockerExecution(pod *corev1.PodSpec, runnerContainer *corev1.Container, dockerSpec *actionsv1alpha1.RunnerDockerSpec) {

@@ -70,7 +70,10 @@ type payload struct {
 		State          string `json:"state"`
 		Merged         bool   `json:"merged"`
 		Mergeable      *bool  `json:"mergeable"`
-		Head           struct {
+		User           struct {
+			Login string `json:"login"`
+		} `json:"user"`
+		Head struct {
 			Ref        string            `json:"ref"`
 			SHA        string            `json:"sha"`
 			Repository payloadRepository `json:"repo"`
@@ -162,6 +165,7 @@ type normalizedEvent struct {
 	HeadSHA       string                 `json:"headSHA,omitempty"`
 	MergeBaseSHA  string                 `json:"mergeBaseSHA,omitempty"`
 	Fork          bool                   `json:"fork,omitempty"`
+	Dependabot    bool                   `json:"dependabot,omitempty"`
 	MergeRevision bool                   `json:"mergeRevision,omitempty"`
 	WorkflowName  string                 `json:"workflowName,omitempty"`
 	PullRequest   *normalizedPullRequest `json:"pullRequest,omitempty"`
@@ -328,7 +332,8 @@ func normalize(eventName string, event *payload) (normalizedEvent, bool, error) 
 		}
 		mergeRef := "refs/pull/" + strconv.FormatInt(pullRequest.Number, 10) + "/merge"
 		result.PullRequest = metadata
-		result.Fork = pullRequest.Head.Repository.ID != event.Repository.ID
+		result.Dependabot = strings.EqualFold(pullRequest.User.Login, "dependabot[bot]")
+		result.Fork = pullRequest.Head.Repository.ID != event.Repository.ID || result.Dependabot
 		if pullRequest.Merged {
 			if pullRequest.MergeCommitSHA == "" {
 				return normalizedEvent{}, false, errors.New("GitHub merged pull request event does not identify a revision")
@@ -338,7 +343,7 @@ func normalize(eventName string, event *payload) (normalizedEvent, bool, error) 
 			result.MergeRevision = true
 		} else {
 			result.Ref = mergeRef
-			if pullRequest.State == "open" && !result.Fork && (pullRequest.Mergeable == nil || *pullRequest.Mergeable) {
+			if pullRequest.State == "open" && (pullRequest.Mergeable == nil || *pullRequest.Mergeable) {
 				result.HeadSHA = pullRequest.Head.SHA
 				result.MergeRevision = true
 			} else if pullRequest.State == "closed" && pullRequest.MergeCommitSHA != "" {

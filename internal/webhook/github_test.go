@@ -527,52 +527,68 @@ func TestNormalizePullRequestReviewEventsUseDefaultBranch(t *testing.T) {
 
 func TestDeliveryEventsUsePullRequestBaseBranch(t *testing.T) {
 	baseSHA := strings.Repeat("b", 40)
+	headSHA := strings.Repeat("a", 40)
 	event := normalizedEvent{
-		Name: "pull_request", Action: "synchronize", Fork: true,
+		Name: "pull_request", Action: "synchronize", Fork: true, MergeRevision: true, HeadSHA: headSHA,
 		Ref: "refs/pull/42/merge", HeadRef: "feature", BaseRef: "release",
 		PullRequest: &normalizedPullRequest{
 			Number: 42, Body: "Pull request body", HTMLURL: "https://github.com/contributor/example/pull/42",
-			HeadRef: "feature", HeadSHA: strings.Repeat("a", 40), BaseRef: "release", BaseSHA: baseSHA,
+			HeadRef: "feature", HeadSHA: headSHA, BaseRef: "release", BaseSHA: baseSHA,
 			HeadRepository: normalizedRepository{ID: 2, Owner: "contributor", Name: "example"},
 		},
 	}
 	events := deliveryEvents(event)
-	if len(events) != 1 || events[0].Name != "pull_request_target" || events[0].SHA != baseSHA || events[0].ResolveRef != "" || events[0].Ref != "refs/heads/release" || events[0].HeadRef != "feature" || events[0].PullRequest != event.PullRequest {
-		t.Fatalf("delivery events = %#v", events)
+	if len(events) != 2 || events[0].Name != "pull_request_target" || events[0].SHA != baseSHA || events[0].ResolveRef != "" || events[0].Ref != "refs/heads/release" || events[0].HeadRef != "feature" || events[0].PullRequest != event.PullRequest {
+		t.Fatalf("pull request target event = %#v", events)
+	}
+	if events[1].Name != "pull_request" || events[1].HeadSHA != headSHA || events[1].Ref != "refs/pull/42/merge" {
+		t.Fatalf("ordinary pull request event = %#v", events)
 	}
 }
 
-func TestNormalizeRetainsForkPullRequestsForTrustedBaseWorkflows(t *testing.T) {
+func TestNormalizeRetainsUntrustedPullRequestIntegrationRevisions(t *testing.T) {
 	mergeable := true
 	for _, tt := range []struct {
+		name             string
 		headRepositoryID int64
+		author           string
 		wantSupported    bool
+		wantFork         bool
+		wantDependabot   bool
 	}{
-		{headRepositoryID: 0},
-		{headRepositoryID: 2, wantSupported: true},
+		{name: "deleted head repository"},
+		{name: "fork", headRepositoryID: 2, wantSupported: true, wantFork: true},
+		{name: "Dependabot", headRepositoryID: 1, author: "dependabot[bot]", wantSupported: true, wantFork: true, wantDependabot: true},
+		{name: "same repository", headRepositoryID: 1, author: "contributor", wantSupported: true},
 	} {
-		event := &payload{Action: "synchronize"}
-		event.Repository.ID = 1
-		event.PullRequest.Number = 42
-		event.PullRequest.HTMLURL = "https://github.com/acme/example/pull/42"
-		event.PullRequest.State = "open"
-		event.PullRequest.Mergeable = &mergeable
-		event.PullRequest.MergeCommitSHA = strings.Repeat("a", 40)
-		event.PullRequest.Head.Ref = "feature"
-		event.PullRequest.Head.SHA = strings.Repeat("b", 40)
-		event.PullRequest.Head.Repository.ID = tt.headRepositoryID
-		event.PullRequest.Head.Repository.Owner.Login = "contributor"
-		event.PullRequest.Head.Repository.Name = "example"
-		event.PullRequest.Base.Ref = "main"
-		event.PullRequest.Base.SHA = strings.Repeat("9", 40)
+		t.Run(tt.name, func(t *testing.T) {
+			event := &payload{Action: "synchronize"}
+			event.Repository.ID = 1
+			event.PullRequest.Number = 42
+			event.PullRequest.HTMLURL = "https://github.com/acme/example/pull/42"
+			event.PullRequest.State = "open"
+			event.PullRequest.Mergeable = &mergeable
+			event.PullRequest.MergeCommitSHA = strings.Repeat("a", 40)
+			event.PullRequest.User.Login = tt.author
+			event.PullRequest.Head.Ref = "feature"
+			event.PullRequest.Head.SHA = strings.Repeat("b", 40)
+			event.PullRequest.Head.Repository.ID = tt.headRepositoryID
+			event.PullRequest.Head.Repository.Owner.Login = "contributor"
+			event.PullRequest.Head.Repository.Name = "example"
+			event.PullRequest.Base.Ref = "main"
+			event.PullRequest.Base.SHA = strings.Repeat("9", 40)
 
-		normalized, supported, err := normalize("pull_request", event)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if supported != tt.wantSupported || supported && !normalized.Fork {
-			t.Fatalf("normalized event = %#v, supported = %v", normalized, supported)
-		}
+			normalized, supported, err := normalize("pull_request", event)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if supported != tt.wantSupported || normalized.Fork != tt.wantFork || normalized.Dependabot != tt.wantDependabot {
+				t.Fatalf("normalized event = %#v, supported = %v", normalized, supported)
+			}
+			if supported && (!normalized.MergeRevision || normalized.HeadSHA != event.PullRequest.Head.SHA) {
+				t.Fatalf("integration revision = %#v", normalized)
+			}
+		})
 	}
 }
 

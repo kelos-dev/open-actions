@@ -7,6 +7,7 @@ import (
 )
 
 const (
+	WorkflowRunConditionApproved  = "Approved"
 	WorkflowRunConditionPlanned   = "Planned"
 	WorkflowRunConditionSucceeded = "Succeeded"
 
@@ -29,10 +30,13 @@ const (
 type GitHubEventName string
 
 // WorkflowRunSpec describes one workflow execution. ProjectRef, Source,
-// WorkflowPath, and Rerun are immutable.
+// WorkflowPath, the fork pull request policy, and Rerun are immutable.
 // Set CancelRequested to request graceful cancellation. Deleting a WorkflowRun
 // force-cancels and removes its child resources.
 // +kubebuilder:validation:XValidation:rule="self.projectRef == oldSelf.projectRef && self.source == oldSelf.source && self.workflowPath == oldSelf.workflowPath",message="projectRef, source, and workflowPath are immutable"
+// +kubebuilder:validation:XValidation:rule="!has(self.forkPullRequest) || (self.source.type == 'GitHub' && has(self.source.github) && self.source.github.event.name == 'pull_request' && has(self.source.github.event.pullRequest))",message="forkPullRequest may be specified only for GitHub pull_request events with pull request metadata"
+// +kubebuilder:validation:XValidation:rule="has(self.forkPullRequest) == has(oldSelf.forkPullRequest) && (!has(self.forkPullRequest) || (self.forkPullRequest.requireApproval == oldSelf.forkPullRequest.requireApproval && self.forkPullRequest.sendWriteTokens == oldSelf.forkPullRequest.sendWriteTokens && self.forkPullRequest.sendSecrets == oldSelf.forkPullRequest.sendSecrets))",message="forkPullRequest policy is immutable"
+// +kubebuilder:validation:XValidation:rule="!has(oldSelf.forkPullRequest) || !oldSelf.forkPullRequest.approved || self.forkPullRequest.approved",message="forkPullRequest approval cannot be revoked"
 // +kubebuilder:validation:XValidation:rule="!has(oldSelf.cancelRequested) || !oldSelf.cancelRequested || (has(self.cancelRequested) && self.cancelRequested)",message="cancelRequested cannot be cleared"
 // +kubebuilder:validation:XValidation:rule="has(self.rerun) == has(oldSelf.rerun) && (!has(self.rerun) || self.rerun == oldSelf.rerun)",message="rerun is immutable"
 // +kubebuilder:validation:XValidation:rule="size(self.projectRef.name) > 0",message="`projectRef.name` must be specified"
@@ -56,6 +60,12 @@ type WorkflowRunSpec struct {
 	// +required
 	WorkflowPath string `json:"workflowPath"`
 
+	// ForkPullRequest snapshots the security policy for an ordinary pull_request
+	// workflow whose code is treated as untrusted fork content. Dependabot pull
+	// requests use the same policy.
+	// +optional
+	ForkPullRequest *WorkflowRunForkPullRequest `json:"forkPullRequest,omitempty"`
+
 	// CancelRequested asks the controller to cancel ordinary jobs while allowing
 	// jobs whose conditions handle cancellation to finish. Once set, it cannot be
 	// cleared.
@@ -78,6 +88,28 @@ type WorkflowRunSpec struct {
 	// +kubebuilder:validation:Maximum=2147483647
 	// +optional
 	TTLSecondsAfterFinished *int32 `json:"ttlSecondsAfterFinished,omitempty"`
+}
+
+// WorkflowRunForkPullRequest snapshots the security decision for one untrusted
+// ordinary pull request workflow.
+// +kubebuilder:validation:XValidation:rule="self.requireApproval || !self.approved",message="approved may be true only when requireApproval is true"
+type WorkflowRunForkPullRequest struct {
+	// RequireApproval determines whether approval is required before planning.
+	// +required
+	RequireApproval bool `json:"requireApproval"`
+
+	// Approved authorizes this exact WorkflowRun revision to proceed. It may be
+	// set from false to true and cannot be cleared.
+	// +required
+	Approved bool `json:"approved"`
+
+	// SendWriteTokens preserves write permissions requested by the workflow.
+	// +required
+	SendWriteTokens bool `json:"sendWriteTokens"`
+
+	// SendSecrets makes the Project Secret available to this workflow.
+	// +required
+	SendSecrets bool `json:"sendSecrets"`
 }
 
 // WorkflowRunRerun identifies the lineage and selected jobs for a repeated
@@ -628,8 +660,8 @@ type WorkflowRunStatus struct {
 	// +optional
 	Source *WorkflowRunSourceStatus `json:"source,omitempty"`
 
-	// Conditions describe planning and the terminal result.
-	// Known condition types are Planned and Succeeded.
+	// Conditions describe approval, planning, and the terminal result.
+	// Known condition types are Approved, Planned, and Succeeded.
 	// +listType=map
 	// +listMapKey=type
 	// +kubebuilder:validation:MaxItems=16

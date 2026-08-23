@@ -16,6 +16,7 @@ const (
 	cancelled  = "Cancelled"
 	timedOut   = "Timed out"
 	waiting    = "Waiting"
+	approval   = "Awaiting approval"
 )
 
 // Run returns the user-facing status derived from a WorkflowRun's conditions.
@@ -25,13 +26,17 @@ func Run(run *actionsv1alpha1.WorkflowRun) string {
 		return cancelling
 	}
 	if condition == nil {
+		approved := meta.FindStatusCondition(run.Status.Conditions, actionsv1alpha1.WorkflowRunConditionApproved)
+		if approved != nil && approved.Status == metav1.ConditionFalse && approved.Reason == "ApprovalRequired" {
+			return approval
+		}
 		return queued
 	}
 	switch condition.Status {
 	case metav1.ConditionTrue:
 		return succeeded
 	case metav1.ConditionFalse:
-		if condition.Reason == "JobCancelled" {
+		if condition.Reason == "JobCancelled" || condition.Reason == "RevisionSuperseded" {
 			return cancelled
 		}
 		if condition.Reason == "JobTimedOut" {
