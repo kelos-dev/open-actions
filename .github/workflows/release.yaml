@@ -38,6 +38,7 @@ jobs:
   build-images:
     needs: determine-version
     strategy:
+      max-parallel: 1
       matrix:
         arch: [amd64, arm64]
     runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
@@ -54,20 +55,11 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build images
+      - name: Build and push images
         env:
           ARCH: ${{ matrix.arch }}
           REVISION: ${{ needs.determine-version.outputs.revision }}
-        run: make image VERSION="${REVISION}-${ARCH}"
-
-      - name: Push images
-        env:
-          ARCH: ${{ matrix.arch }}
-          REVISION: ${{ needs.determine-version.outputs.revision }}
-        run: |
-          for image in open-actions-controller open-actions-artifact-server open-actions-console open-actions-runner; do
-            docker push "ghcr.io/kelos-dev/${image}:${REVISION}-${ARCH}"
-          done
+        run: make image PUSH=true VERSION="${REVISION}-${ARCH}"
 
   merge-manifests:
     needs: [determine-version, build-images]
@@ -76,6 +68,11 @@ jobs:
       contents: read
       packages: write
     steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
       - name: Login to GHCR
         uses: docker/login-action@v3
         with:
@@ -86,13 +83,7 @@ jobs:
       - name: Create and push immutable manifests
         env:
           REVISION: ${{ needs.determine-version.outputs.revision }}
-        run: |
-          for image in open-actions-controller open-actions-artifact-server open-actions-console open-actions-runner; do
-            docker buildx imagetools create \
-              -t "ghcr.io/kelos-dev/${image}:${REVISION}" \
-              "ghcr.io/kelos-dev/${image}:${REVISION}-amd64" \
-              "ghcr.io/kelos-dev/${image}:${REVISION}-arm64"
-          done
+        run: make manifest IMAGE_PLATFORMS=linux/amd64,linux/arm64 SOURCE_VERSION="$REVISION" VERSION="$REVISION"
 
       - name: Create and push version manifests
         env:
@@ -116,12 +107,7 @@ jobs:
             exit 0
           fi
 
-          for image in open-actions-controller open-actions-artifact-server open-actions-console open-actions-runner; do
-            docker buildx imagetools create \
-              -t "ghcr.io/kelos-dev/${image}:${VERSION}" \
-              "ghcr.io/kelos-dev/${image}:${REVISION}-amd64" \
-              "ghcr.io/kelos-dev/${image}:${REVISION}-arm64"
-          done
+          make manifest IMAGE_PLATFORMS=linux/amd64,linux/arm64 SOURCE_VERSION="$REVISION" VERSION="$VERSION"
 
       - name: Create and push latest manifests
         if: github.ref_type == 'tag'
@@ -152,9 +138,84 @@ jobs:
             exit 0
           fi
 
-          for image in open-actions-controller open-actions-artifact-server open-actions-console open-actions-runner; do
-            docker buildx imagetools create \
-              -t "ghcr.io/kelos-dev/${image}:latest" \
-              "ghcr.io/kelos-dev/${image}:${REVISION}-amd64" \
-              "ghcr.io/kelos-dev/${image}:${REVISION}-arm64"
-          done
+          make manifest IMAGE_PLATFORMS=linux/amd64,linux/arm64 SOURCE_VERSION="$REVISION" VERSION=latest
+
+  release-artifacts:
+    needs: [determine-version, merge-manifests]
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    outputs:
+      release: ${{ steps.release.outputs.release }}
+    permissions:
+      contents: write
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build CLI binaries
+        run: make release-binaries
+
+      - name: Generate release notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.determine-version.outputs.version }}
+        run: go run ./hack/release-notes "$VERSION" > "${RUNNER_TEMP}/release-notes.md"
+
+      - name: Upload CLI binaries to GitHub release
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.determine-version.outputs.version }}
+        run: |
+          if ! CURRENT_SHA=$(gh api \
+            "repos/${GITHUB_REPOSITORY}/commits/${VERSION}" \
+            --jq '.sha' 2>/dev/null); then
+            echo "release=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Skipping release because ${VERSION} no longer exists"
+            exit 0
+          fi
+          if [ "${GITHUB_SHA}" != "${CURRENT_SHA}" ]; then
+            echo "release=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Skipping release because ${VERSION} no longer points to ${GITHUB_SHA}"
+            exit 0
+          fi
+
+          echo "release=true" >> "$GITHUB_OUTPUT"
+          if ! gh release view "$VERSION" >/dev/null 2>&1; then
+            gh release create "$VERSION" --verify-tag --draft --title "$VERSION" --notes-file "${RUNNER_TEMP}/release-notes.md"
+          fi
+          gh release upload "$VERSION" --clobber \
+            bin/open-actions-* \
+            bin/checksums.txt
+
+  publish-helm-chart:
+    needs: release-artifacts
+    if: needs.release-artifacts.outputs.release == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: 3.20.1
+
+      - name: Login to GHCR
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | helm registry login ghcr.io \
+            --username "${{ github.actor }}" \
+            --password-stdin
+
+      - name: Package and push Helm chart
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: make publish-chart HELM=helm VERSION="$VERSION"
