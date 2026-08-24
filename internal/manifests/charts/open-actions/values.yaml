@@ -8,6 +8,13 @@ controller:
   actionCloneBaseURL: ""
   maxJobTimeout: 6h
   workflowRunTTLSecondsAfterFinished: null
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: "1"
+      memory: 256Mi
 
 artifacts:
   enabled: true
@@ -22,6 +29,13 @@ artifacts:
   maxFileBytes: 1073741824
   maxArtifactBytes: 2147483648
   maxRunBytes: 10737418240
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: "1"
+      memory: 256Mi
   persistence:
     enabled: true
     existingClaim: ""
@@ -39,6 +53,13 @@ console:
     repository: ghcr.io/kelos-dev/open-actions-console
     tag: latest
     pullPolicy: IfNotPresent
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: "1"
+      memory: 256Mi
   service:
     type: ClusterIP
     nodePort: null

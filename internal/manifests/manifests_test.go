@@ -2,13 +2,59 @@ package manifests
 
 import (
 	"bytes"
+	"errors"
+	"fmt"
 	"io/fs"
+	"strconv"
+	"strings"
 	"testing"
 	"text/template"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	"sigs.k8s.io/yaml"
 )
+
+func TestWorkloadTemplatesUseConfiguredResources(t *testing.T) {
+	chart := Chart()
+	valuesData, err := fs.ReadFile(chart, "values.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		name      string
+		component string
+		path      string
+	}{
+		{name: "controller", component: "controller", path: "templates/deployment.yaml"},
+		{name: "artifacts", component: "artifacts", path: "templates/artifact-statefulset.yaml"},
+		{name: "console", component: "console", path: "templates/console-deployment.yaml"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var values map[string]any
+			if err := yaml.Unmarshal(valuesData, &values); err != nil {
+				t.Fatalf("parse values: %v", err)
+			}
+			component := values[test.component].(map[string]any)
+			component["resources"] = map[string]any{
+				"requests": map[string]any{"cpu": "125m", "memory": "96Mi"},
+				"limits":   map[string]any{"cpu": "2", "example.com/accelerator": "1"},
+			}
+
+			podSpec := renderWorkloadPodSpec(t, chart, test.path, values)
+			if len(podSpec.Containers) != 1 {
+				t.Fatalf("containers = %d, want 1", len(podSpec.Containers))
+			}
+			resources := podSpec.Containers[0].Resources
+			assertQuantityEqual(t, resources.Requests[corev1.ResourceCPU], "125m")
+			assertQuantityEqual(t, resources.Requests[corev1.ResourceMemory], "96Mi")
+			assertQuantityEqual(t, resources.Limits[corev1.ResourceCPU], "2")
+			assertQuantityEqual(t, resources.Limits[corev1.ResourceName("example.com/accelerator")], "1")
+		})
+	}
+}
 
 func TestServiceTemplate(t *testing.T) {
 	chart := Chart()
@@ -128,4 +174,73 @@ func renderService(t *testing.T, chart fs.FS, path string, values map[string]any
 		t.Fatalf("service ports = %d, want 1", len(service.Spec.Ports))
 	}
 	return service
+}
+
+func renderWorkloadPodSpec(t *testing.T, chart fs.FS, path string, values map[string]any) corev1.PodSpec {
+	t.Helper()
+	data, err := fs.ReadFile(chart, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	functions := template.FuncMap{
+		"default": func(fallback, value any) any {
+			if value == nil || value == "" {
+				return fallback
+			}
+			return value
+		},
+		"fail":      func(message string) (string, error) { return "", errors.New(message) },
+		"hasPrefix": func(prefix, value string) bool { return strings.HasPrefix(value, prefix) },
+		"int64": func(value any) int64 {
+			switch typed := value.(type) {
+			case int:
+				return int64(typed)
+			case int64:
+				return typed
+			case float64:
+				return int64(typed)
+			default:
+				panic(fmt.Sprintf("unsupported integer type %T", value))
+			}
+		},
+		"nindent": func(spaces int, value string) string {
+			indent := strings.Repeat(" ", spaces)
+			return "\n" + indent + strings.ReplaceAll(value, "\n", "\n"+indent)
+		},
+		"quote": func(value any) string { return strconv.Quote(fmt.Sprint(value)) },
+		"toYaml": func(value any) (string, error) {
+			data, err := yaml.Marshal(value)
+			return strings.TrimSuffix(string(data), "\n"), err
+		},
+	}
+	tmpl, err := template.New("workload").Option("missingkey=error").Funcs(functions).Parse(string(data))
+	if err != nil {
+		t.Fatalf("parse workload template: %v", err)
+	}
+	var output bytes.Buffer
+	if err := tmpl.Execute(&output, map[string]any{
+		"Release": map[string]any{"Namespace": "open-actions-system"},
+		"Values":  values,
+	}); err != nil {
+		t.Fatalf("render workload template: %v", err)
+	}
+	var workload struct {
+		Spec struct {
+			Template struct {
+				Spec corev1.PodSpec `json:"spec"`
+			} `json:"template"`
+		} `json:"spec"`
+	}
+	if err := yaml.Unmarshal(output.Bytes(), &workload); err != nil {
+		t.Fatalf("parse rendered workload: %v\n%s", err, output.String())
+	}
+	return workload.Spec.Template.Spec
+}
+
+func assertQuantityEqual(t *testing.T, got resource.Quantity, want string) {
+	t.Helper()
+	wantQuantity := resource.MustParse(want)
+	if !got.Equal(wantQuantity) {
+		t.Errorf("resource quantity = %s, want %s", got.String(), want)
+	}
 }
