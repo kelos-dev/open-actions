@@ -61,7 +61,7 @@ jobs:
         with:
           cluster_name: kind
       - name: Build images
-        run: make image WHAT="cmd/open-actions-controller cmd/open-actions-artifact-server cmd/open-actions-console cmd/open-actions-runner test/fixture/github" VERSION=e2e
+        run: make image WHAT="cmd/open-actions-controller cmd/open-actions-artifact-server cmd/open-actions-console cmd/open-actions-runner examples/runner test/fixture/github" VERSION=e2e
       - name: Load images
         run: |
           kind load docker-image ghcr.io/kelos-dev/open-actions-controller:e2e
