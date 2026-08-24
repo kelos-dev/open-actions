@@ -7,6 +7,11 @@ RUNNER_IMAGE ?= $(REGISTRY)/open-actions-runner:$(VERSION)
 EXAMPLE_RUNNER_IMAGE ?= $(REGISTRY)/open-actions-runner-example:$(VERSION)
 FIXTURE_IMAGE ?= $(REGISTRY)/open-actions-fixture:$(VERSION)
 IMAGE_DIRS ?= cmd/open-actions-controller cmd/open-actions-artifact-server cmd/open-actions-console cmd/open-actions-runner
+LOCAL_ARCH ?= $(shell go env GOARCH)
+IMAGE_PLATFORMS ?= linux/$(LOCAL_ARCH)
+IMAGE_ARCHES = $(shell echo "$(IMAGE_PLATFORMS)" | tr ',' '\n' | cut -d'/' -f2 | tr '\n' ' ')
+PUSH ?= false
+SOURCE_VERSION ?= $(VERSION)
 TEST_FLAGS ?=
 E2E_PROCS ?= 1
 
@@ -19,8 +24,10 @@ HELM_VERSION ?= v3.20.1
 HELM := go run helm.sh/helm/v3/cmd/helm@$(HELM_VERSION)
 CHART_DIR := internal/manifests/charts/open-actions
 CHART_CRD_DIR := $(CHART_DIR)/templates/crds
+CHART_REGISTRY ?= oci://ghcr.io/kelos-dev/charts
+RELEASE_PLATFORMS ?= linux/amd64 linux/arm64 darwin/amd64 darwin/arm64
 
-.PHONY: all build fmt generate manifests update verify test image test-e2e ginkgo
+.PHONY: all build fmt generate manifests update verify test image manifest release-binaries release-chart publish-chart test-e2e ginkgo
 
 all: build
 
@@ -28,7 +35,7 @@ build: $(LOCALBIN)
 	CGO_ENABLED=0 go build -trimpath -o $(LOCALBIN)/ ./$(or $(WHAT),cmd/...)
 
 fmt:
-	gofmt -w $$(find api cmd internal test -name '*.go' -type f)
+	gofmt -w $$(find api cmd hack internal test -name '*.go' -type f)
 
 generate:
 	$(CONTROLLER_GEN) object paths=./api/...
@@ -42,7 +49,7 @@ update: fmt generate manifests
 	go mod tidy
 
 verify:
-	@test -z "$$(gofmt -l $$(find api cmd internal test -name '*.go' -type f))"
+	@test -z "$$(gofmt -l $$(find api cmd hack internal test -name '*.go' -type f))"
 	go mod tidy
 	git diff --exit-code -- go.mod go.sum
 	$(CONTROLLER_GEN) object paths=./api/...
@@ -100,7 +107,46 @@ image:
 			*) echo "unsupported image path: $$dir" >&2; exit 1 ;; \
 		esac; \
 		docker build "$$@" -f "$${dir#./}/Dockerfile" -t "$$image" .; \
+		if [ "$(PUSH)" = true ]; then docker push "$$image"; fi; \
 	done
+
+manifest:
+	@set -e; for dir in $(or $(WHAT),$(IMAGE_DIRS)); do \
+		name=$$(basename "$$dir"); \
+		sources=""; \
+		for arch in $(IMAGE_ARCHES); do \
+			sources="$$sources $(REGISTRY)/$$name:$(SOURCE_VERSION)-$$arch"; \
+		done; \
+		docker buildx imagetools create \
+			-t "$(REGISTRY)/$$name:$(VERSION)" $$sources; \
+	done
+
+release-binaries: $(LOCALBIN)
+	@set -e; artifacts=""; for platform in $(RELEASE_PLATFORMS); do \
+		os=$${platform%/*}; \
+		arch=$${platform#*/}; \
+		GOOS=$$os GOARCH=$$arch $(MAKE) build WHAT=cmd/open-actions; \
+		mv $(LOCALBIN)/open-actions "$(LOCALBIN)/open-actions-$$os-$$arch"; \
+		artifacts="$$artifacts open-actions-$$os-$$arch"; \
+	done; \
+	cd $(LOCALBIN) && shasum -a 256 $$artifacts > checksums.txt
+
+release-chart: $(LOCALBIN)
+	@set -e; \
+		chart_version=$(patsubst v%,%,$(VERSION)); \
+		stage=$$(mktemp -d); \
+		trap 'rm -rf "$$stage"' EXIT; \
+		cp -R $(CHART_DIR) "$$stage/open-actions"; \
+		test "$$(grep -c 'tag: latest' "$$stage/open-actions/values.yaml")" -eq 3; \
+		perl -pi -e 's/tag: latest/tag: $(VERSION)/g' "$$stage/open-actions/values.yaml"; \
+		test "$$(grep -c 'tag: $(VERSION)' "$$stage/open-actions/values.yaml")" -eq 3; \
+		$(HELM) package "$$stage/open-actions" \
+			--version "$$chart_version" \
+			--app-version "$(VERSION)" \
+			--destination $(LOCALBIN)
+
+publish-chart: release-chart
+	$(HELM) push "$(LOCALBIN)/open-actions-$(patsubst v%,%,$(VERSION)).tgz" $(CHART_REGISTRY)
 
 test-e2e: ginkgo ## Run e2e tests against an installed control plane.
 	$(GINKGO) -v --tags=e2e --timeout 30m --procs=$(E2E_PROCS) ./test/e2e/...
