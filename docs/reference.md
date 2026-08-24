@@ -423,6 +423,39 @@ Runner labels are canonical lowercase ASCII in Kubernetes resources. Workflow
 execution slot and accepts one queued `WorkflowJob` from its `spec.projectRef`
 whose `runs-on` labels are all present in `spec.labels`.
 
+The standard `ghcr.io/kelos-dev/open-actions-runner` image is based on Ubuntu
+24.04. A custom runner image can add tools by extending the standard image:
+
+```dockerfile
+ARG OPEN_ACTIONS_RUNNER_IMAGE=ghcr.io/kelos-dev/open-actions-runner:latest
+FROM ${OPEN_ACTIONS_RUNNER_IMAGE}
+
+USER root
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends jq \
+    && rm -rf /var/lib/apt/lists/*
+USER 65532:65532
+```
+
+Build and publish the example with the base image pinned to the controller's
+release:
+
+```console
+docker build \
+  --file examples/runner/Dockerfile \
+  --build-arg 'OPEN_ACTIONS_RUNNER_IMAGE=ghcr.io/kelos-dev/open-actions-runner:<release-tag>' \
+  --tag registry.example/custom-runner:latest \
+  .
+docker push registry.example/custom-runner:latest
+```
+
+Set `spec.execution.image` on a Runner or
+`spec.template.spec.execution.image` on a RunnerSet to the published address.
+Using the same Open Actions release for the controller and base runner keeps
+their job-plan versions compatible. Preserve the inherited entrypoint and
+numeric non-root user. The complete Dockerfile is available at
+[`examples/runner/Dockerfile`](../examples/runner/Dockerfile).
+
 A RunnerSet creates and owns homogeneous Runner resources from
 `spec.template.spec`. `spec.replicas` defaults to one and may be zero. Template
 changes update non-terminating managed Runners and affect only WorkflowJobs
@@ -453,12 +486,14 @@ sidecar does not receive the job plan or authentication Secret volume, and the
 Pod does not mount the node's Docker socket or a Kubernetes service-account
 token.
 
-The standard runner image includes the Docker CLI, Bash, curl, and the other
-tools needed by the default `helm/kind-action` workflow. A custom runner image
-used with `spec.execution.docker` must provide a compatible `docker` executable
-on `PATH`. The runner remains non-root; action options that invoke `sudo`, such
-as `helm/kind-action`'s local-registry and cloud-provider setup, are not
-supported by the standard image.
+The standard Ubuntu runner image has a focused tool set: Bash, curl, Git, Go,
+Make, Node 20 and 24, their package managers, and the Docker CLI. It does not
+replicate the larger software inventory of a GitHub-hosted runner. Install
+additional compilers and command-line tools in a custom runner image. A custom
+runner image used with `spec.execution.docker` must provide a compatible
+`docker` executable on `PATH`. The runner remains non-root; action options that
+invoke `sudo`, such as `helm/kind-action`'s local-registry and cloud-provider
+setup, are not supported by the standard image.
 
 Docker execution is disabled when `spec.execution.docker` is omitted. Enabling
 it changes the WorkflowJob Pod's security posture because the daemon sidecar is

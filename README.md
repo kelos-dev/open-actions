@@ -93,7 +93,10 @@ kubectl apply -f config/samples/actions_v1alpha1_runnerset.yaml
 
 Each RunnerSet maintains the number of Runner execution slots configured by
 `spec.replicas`. Each Runner executes one job at a time, and its labels must
-include every label in the job's `runs-on` value. Use the [Docker Runner
+include every label in the job's `runs-on` value. The standard runner image is
+based on Ubuntu 24.04. To add tools, build a [custom runner
+image](examples/runner/Dockerfile) from the standard image and set
+`spec.template.spec.execution.image` to its address. Use the [Docker Runner
 sample](config/samples/actions_v1alpha1_docker_runner.yaml) for jobs that need
 Docker by copying its `spec` into the RunnerSet's `spec.template.spec`.
 

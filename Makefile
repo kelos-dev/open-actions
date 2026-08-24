@@ -4,6 +4,7 @@ CONTROLLER_IMAGE ?= $(REGISTRY)/open-actions-controller:$(VERSION)
 ARTIFACT_SERVER_IMAGE ?= $(REGISTRY)/open-actions-artifact-server:$(VERSION)
 CONSOLE_IMAGE ?= $(REGISTRY)/open-actions-console:$(VERSION)
 RUNNER_IMAGE ?= $(REGISTRY)/open-actions-runner:$(VERSION)
+EXAMPLE_RUNNER_IMAGE ?= $(REGISTRY)/open-actions-runner-example:$(VERSION)
 FIXTURE_IMAGE ?= $(REGISTRY)/open-actions-fixture:$(VERSION)
 IMAGE_DIRS ?= cmd/open-actions-controller cmd/open-actions-artifact-server cmd/open-actions-console cmd/open-actions-runner
 TEST_FLAGS ?=
@@ -88,15 +89,17 @@ test:
 
 image:
 	@set -e; for dir in $(or $(WHAT),$(IMAGE_DIRS)); do \
+		set --; \
 		case "$${dir#./}" in \
 			cmd/open-actions-controller) image="$(CONTROLLER_IMAGE)" ;; \
 			cmd/open-actions-artifact-server) image="$(ARTIFACT_SERVER_IMAGE)" ;; \
 			cmd/open-actions-console) image="$(CONSOLE_IMAGE)" ;; \
 			cmd/open-actions-runner) image="$(RUNNER_IMAGE)" ;; \
+			examples/runner) image="$(EXAMPLE_RUNNER_IMAGE)"; set -- --build-arg "OPEN_ACTIONS_RUNNER_IMAGE=$(RUNNER_IMAGE)" ;; \
 			test/fixture/github) image="$(FIXTURE_IMAGE)" ;; \
 			*) echo "unsupported image path: $$dir" >&2; exit 1 ;; \
 		esac; \
-		docker build -f "$${dir#./}/Dockerfile" -t "$$image" .; \
+		docker build "$$@" -f "$${dir#./}/Dockerfile" -t "$$image" .; \
 	done
 
 test-e2e: ginkgo ## Run e2e tests against an installed control plane.
