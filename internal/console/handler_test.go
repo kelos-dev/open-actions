@@ -17,6 +17,7 @@ import (
 	actionsv1alpha1 "github.com/kelos-dev/open-actions/api/v1alpha1"
 	"github.com/kelos-dev/open-actions/internal/projectvalue"
 	"github.com/kelos-dev/open-actions/internal/workflowrun"
+	"github.com/kelos-dev/open-actions/internal/workflowsnapshot"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -69,7 +70,8 @@ func TestConsoleServesWorkflowRunsAndLogsWithoutAuthentication(t *testing.T) {
 
 	runResponse := httptest.NewRecorder()
 	handler.ServeHTTP(runResponse, httptest.NewRequest(http.MethodGet, runURL, nil))
-	if runResponse.Code != http.StatusOK || !strings.Contains(runResponse.Body.String(), "CI") || !strings.Contains(runResponse.Body.String(), "build") || !strings.Contains(runResponse.Body.String(), "Workflow run Queued") {
+	runBody := runResponse.Body.String()
+	if runResponse.Code != http.StatusOK || !strings.Contains(runBody, "CI") || !strings.Contains(runBody, "build") || !strings.Contains(runBody, "Workflow run Queued") || !strings.Contains(runBody, "name: CI\non: push") || !strings.Contains(runBody, "&lt;script&gt;alert(&#39;unsafe&#39;)&lt;/script&gt;") || strings.Contains(runBody, "<script>alert('unsafe')</script>") {
 		t.Fatalf("run page = %d, %q", runResponse.Code, runResponse.Body.String())
 	}
 
@@ -83,6 +85,66 @@ func TestConsoleServesWorkflowRunsAndLogsWithoutAuthentication(t *testing.T) {
 	handler.ServeHTTP(streamResponse, httptest.NewRequest(http.MethodGet, runURL+"/jobs/build/stream", nil))
 	if streamResponse.Code != http.StatusOK || !strings.Contains(streamResponse.Body.String(), "id: 1\nevent: log") || !strings.Contains(streamResponse.Body.String(), "build output") {
 		t.Fatalf("log stream = %d, %q", streamResponse.Code, streamResponse.Body.String())
+	}
+}
+
+func TestConsoleReportsUnavailableWorkflowFile(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		setup func(*testing.T, *Handler)
+	}{
+		{name: "missing annotation", setup: func(t *testing.T, handler *Handler) {
+			run := &actionsv1alpha1.WorkflowRun{}
+			key := client.ObjectKey{Namespace: "default", Name: "ci"}
+			if err := handler.client.Get(context.Background(), key, run); err != nil {
+				t.Fatal(err)
+			}
+			delete(run.Annotations, actionsv1alpha1.AnnotationWorkflowFile)
+			if err := handler.client.Update(context.Background(), run); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "missing ConfigMap", setup: func(t *testing.T, handler *Handler) {
+			configMap := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: "ci-workflow-file", Namespace: "default"}}
+			if err := handler.client.Delete(context.Background(), configMap); err != nil {
+				t.Fatal(err)
+			}
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			handler := newTestHandler(t, false)
+			test.setup(t, handler)
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/runs/default/ci", nil))
+			if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), "The workflow file is not available for this run.") {
+				t.Fatalf("run page = %d, %q", response.Code, response.Body.String())
+			}
+		})
+	}
+}
+
+func TestConsoleRejectsWorkflowFileNotOwnedByRun(t *testing.T) {
+	handler := newTestHandler(t, false)
+	configMap := &corev1.ConfigMap{}
+	key := client.ObjectKey{Namespace: "default", Name: "ci-workflow-file"}
+	if err := handler.client.Get(context.Background(), key, configMap); err != nil {
+		t.Fatal(err)
+	}
+	configMap.OwnerReferences = nil
+	if err := handler.client.Update(context.Background(), configMap); err != nil {
+		t.Fatal(err)
+	}
+	run := &actionsv1alpha1.WorkflowRun{}
+	if err := handler.client.Get(context.Background(), client.ObjectKey{Namespace: "default", Name: "ci"}, run); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := handler.loadWorkflowFile(context.Background(), run); err == nil || !strings.Contains(err.Error(), `ConfigMap "ci-workflow-file"`) || !strings.Contains(err.Error(), `WorkflowRun "ci"`) {
+		t.Fatalf("loadWorkflowFile() error = %v", err)
+	}
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/runs/default/ci/jobs/build", nil))
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `body data-stream-url="/runs/default/ci/jobs/build/stream"`) {
+		t.Fatalf("job log page = %d, %q", response.Code, response.Body.String())
 	}
 }
 
@@ -1244,11 +1306,24 @@ func newTestHandler(t *testing.T, secureCookie bool) *Handler {
 	if err := controllerutil.SetControllerReference(run, job, scheme); err != nil {
 		t.Fatal(err)
 	}
+	workflowFileName := "ci-workflow-file"
+	immutable := true
+	workflowFile := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: workflowFileName, Namespace: run.Namespace},
+		Immutable:  &immutable,
+		Data: map[string]string{
+			workflowsnapshot.DataKey: "name: CI\non: push\n# <script>alert('unsafe')</script>\njobs: {}\n",
+		},
+	}
+	if err := controllerutil.SetControllerReference(run, workflowFile, scheme); err != nil {
+		t.Fatal(err)
+	}
 	newerRun := run.DeepCopy()
 	newerRun.Name = "lint"
 	newerRun.UID = "lint-run-uid"
 	newerRun.CreationTimestamp = metav1.NewTime(time.Date(2026, 8, 10, 13, 0, 0, 0, time.UTC))
 	newerRun.Status.WorkflowName = "Lint"
+	run.Annotations = map[string]string{actionsv1alpha1.AnnotationWorkflowFile: workflowFileName}
 	project := &actionsv1alpha1.Project{
 		ObjectMeta: metav1.ObjectMeta{Name: "project", Namespace: "default", Generation: 1},
 		Spec: actionsv1alpha1.ProjectSpec{
@@ -1261,7 +1336,7 @@ func newTestHandler(t *testing.T, secureCookie bool) *Handler {
 	}
 	secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "project-secrets", Namespace: "default"}, Data: map[string][]byte{"DEPLOY_TOKEN": []byte("existing-secret-value")}}
 	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "build", Namespace: "default", Labels: map[string]string{actionsv1alpha1.LabelWorkflowJobUID: string(job.UID)}}}
-	clusterClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(run, newerRun, job, project, secret).Build()
+	clusterClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(run, newerRun, job, workflowFile, project, secret).Build()
 	workflowRunTTLSecondsAfterFinished := int32(604800)
 	handler, err := New(Config{
 		Client: clusterClient, Logs: &testLogSource{pod: pod, logs: "build output\n"}, Token: testConsoleToken,
