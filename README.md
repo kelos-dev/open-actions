@@ -31,15 +31,8 @@ domain and its GitHub App integration.
 Kubernetes 1.29 or newer, Helm, and a public HTTPS endpoint for GitHub webhooks
 are required.
 
-Tagged [GitHub releases](https://github.com/kelos-dev/open-actions/releases)
-provide `open-actions` CLI binaries for Linux and macOS on amd64 and arm64,
-along with `checksums.txt`. Download the binary for the target platform, verify
-it against the checksums file, and install it as `open-actions`. The CLI can
-also be installed directly from source:
-
 ```console
-go install github.com/kelos-dev/open-actions/cmd/open-actions@latest
-open-actions install
+curl -fsSL https://raw.githubusercontent.com/kelos-dev/open-actions/main/hack/install.sh | bash
 ```
 
 Each tagged release also publishes the chart at
