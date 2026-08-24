@@ -2111,20 +2111,257 @@ func TestRerunWorkflowJobSelectionAndCheckIdentity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(selected) != 3 || selected[0].id != "setup" || selected[1].id != "integration" || selected[2].id != "unit-matrix-2" {
+	if len(selected) != 2 || selected[0].id != "integration" || selected[1].id != "unit-matrix-2" {
 		t.Fatalf("selected jobs = %#v", selected)
 	}
 	if externalID := workflowRunCheckExternalID(run); externalID != "original-uid" {
 		t.Fatalf("check external ID = %q", externalID)
 	}
 	report := workflowRunCheckReport(run)
-	if report.Output.Title != ".open-actions/workflows/ci.yaml (attempt 2)" || !strings.Contains(report.Output.Text, "2 requested jobs plus required dependencies") {
+	if report.Output.Title != ".open-actions/workflows/ci.yaml (attempt 2)" || !strings.Contains(report.Output.Text, "2 requested jobs") {
 		t.Fatalf("rerun check report = %#v", report)
 	}
 
 	run.Spec.Rerun.JobIDs = []string{"missing"}
 	if _, err := selectRerunWorkflowJobs(run, planned); err == nil || !strings.Contains(err.Error(), "missing") {
 		t.Fatalf("missing job selection error = %v", err)
+	}
+}
+
+func TestRerunDependencyWorkflowJobsUsesLatestResultsAcrossAttempts(t *testing.T) {
+	scheme := runnerTestScheme(t)
+	root := &actionsv1alpha1.WorkflowRun{ObjectMeta: metav1.ObjectMeta{Name: "ci", Namespace: "default", UID: "root-uid"}}
+	attemptTwo := &actionsv1alpha1.WorkflowRun{
+		ObjectMeta: metav1.ObjectMeta{Name: "ci-attempt-2", Namespace: root.Namespace, UID: "attempt-2-uid"},
+		Spec: actionsv1alpha1.WorkflowRunSpec{Rerun: &actionsv1alpha1.WorkflowRunRerun{
+			OriginalRunRef: actionsv1alpha1.WorkflowRunReference{Name: root.Name, UID: root.UID},
+			PreviousRunRef: actionsv1alpha1.WorkflowRunReference{Name: root.Name, UID: root.UID},
+			Attempt:        2,
+		}},
+	}
+	attemptThree := &actionsv1alpha1.WorkflowRun{
+		ObjectMeta: metav1.ObjectMeta{Name: "ci-attempt-3", Namespace: root.Namespace, UID: "attempt-3-uid"},
+		Spec: actionsv1alpha1.WorkflowRunSpec{Rerun: &actionsv1alpha1.WorkflowRunRerun{
+			OriginalRunRef: actionsv1alpha1.WorkflowRunReference{Name: root.Name, UID: root.UID},
+			PreviousRunRef: actionsv1alpha1.WorkflowRunReference{Name: attemptTwo.Name, UID: attemptTwo.UID},
+			Attempt:        3,
+			JobIDs:         []string{"report"},
+		}},
+	}
+	setup := &actionsv1alpha1.WorkflowJob{
+		ObjectMeta: metav1.ObjectMeta{Name: "setup", Namespace: root.Namespace, Labels: map[string]string{actionsv1alpha1.LabelWorkflowRunUID: string(root.UID)}},
+		Spec:       actionsv1alpha1.WorkflowJobSpec{JobID: "setup"},
+		Status:     actionsv1alpha1.WorkflowJobStatus{Result: actionsv1alpha1.WorkflowJobResultSuccess, Outputs: map[string]string{"seed": "root"}},
+	}
+	build := &actionsv1alpha1.WorkflowJob{
+		ObjectMeta: metav1.ObjectMeta{Name: "build-attempt-2", Namespace: root.Namespace, Labels: map[string]string{actionsv1alpha1.LabelWorkflowRunUID: string(attemptTwo.UID)}},
+		Spec:       actionsv1alpha1.WorkflowJobSpec{JobID: "build", Needs: []string{"setup"}},
+		Status:     actionsv1alpha1.WorkflowJobStatus{Result: actionsv1alpha1.WorkflowJobResultSuccess, Outputs: map[string]string{"artifact": "ready"}},
+	}
+	report := actionsv1alpha1.WorkflowJob{
+		ObjectMeta: metav1.ObjectMeta{Name: "report-attempt-3", Namespace: root.Namespace, UID: "report-uid", Labels: map[string]string{actionsv1alpha1.LabelWorkflowRunUID: string(attemptThree.UID)}},
+		Spec: actionsv1alpha1.WorkflowJobSpec{
+			WorkflowRunRef: corev1.LocalObjectReference{Name: attemptThree.Name},
+			JobID:          "report",
+			Needs:          []string{"build"},
+		},
+	}
+	clusterClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&actionsv1alpha1.WorkflowJob{}).
+		WithObjects(root, attemptTwo, setup, build, &report).
+		Build()
+	reconciler := &WorkflowRunReconciler{Client: clusterClient, APIReader: clusterClient}
+
+	dependencies, err := reconciler.rerunDependencyWorkflowJobs(context.Background(), attemptThree, []actionsv1alpha1.WorkflowJob{report})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(dependencies) != 2 || dependencies[0].Spec.JobID != "build" || dependencies[1].Spec.JobID != "setup" {
+		t.Fatalf("rerun dependencies = %#v", dependencies)
+	}
+	if dependencies[0].Status.Outputs["artifact"] != "ready" || dependencies[1].Status.Outputs["seed"] != "root" {
+		t.Fatalf("rerun dependency outputs = %#v", dependencies)
+	}
+	if err := reconciler.reconcileWorkflowJobGraphWithDependencies(context.Background(), attemptThree, "CI", nil, nil, nil, []actionsv1alpha1.WorkflowJob{report}, dependencies); err != nil {
+		t.Fatal(err)
+	}
+	stored := &actionsv1alpha1.WorkflowJob{}
+	if err := clusterClient.Get(context.Background(), client.ObjectKeyFromObject(&report), stored); err != nil {
+		t.Fatal(err)
+	}
+	ready := meta.FindStatusCondition(stored.Status.Conditions, actionsv1alpha1.WorkflowJobConditionReady)
+	if ready == nil || ready.Status != metav1.ConditionTrue {
+		t.Fatalf("report ready condition = %#v", ready)
+	}
+	needsConfigMap := &corev1.ConfigMap{}
+	if err := clusterClient.Get(context.Background(), client.ObjectKey{Namespace: report.Namespace, Name: childName(report.Name, "needs")}, needsConfigMap); err != nil {
+		t.Fatal(err)
+	}
+	needs, err := runner.DecodeNeedsContext([]byte(needsConfigMap.Data[jobNeedsKey]))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(needs) != 1 || needs["build"].Result != "success" || needs["build"].Outputs["artifact"] != "ready" {
+		t.Fatalf("report needs = %#v", needs)
+	}
+}
+
+func TestRerunDependencyWorkflowJobsCombinesMatrixAttempts(t *testing.T) {
+	scheme := runnerTestScheme(t)
+	root := &actionsv1alpha1.WorkflowRun{ObjectMeta: metav1.ObjectMeta{Name: "release", Namespace: "default", UID: "root-uid"}}
+	rerun := &actionsv1alpha1.WorkflowRun{
+		ObjectMeta: metav1.ObjectMeta{Name: "release-attempt-2", Namespace: root.Namespace, UID: "attempt-2-uid"},
+		Spec: actionsv1alpha1.WorkflowRunSpec{Rerun: &actionsv1alpha1.WorkflowRunRerun{
+			OriginalRunRef: actionsv1alpha1.WorkflowRunReference{Name: root.Name, UID: root.UID},
+			PreviousRunRef: actionsv1alpha1.WorkflowRunReference{Name: root.Name, UID: root.UID},
+			Attempt:        2,
+			JobIDs:         []string{"build-matrix-2", "report"},
+		}},
+	}
+	matrixJob := func(name, id, runUID, arch string, result actionsv1alpha1.WorkflowJobResult) actionsv1alpha1.WorkflowJob {
+		return actionsv1alpha1.WorkflowJob{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: root.Namespace, Labels: map[string]string{actionsv1alpha1.LabelWorkflowRunUID: runUID}},
+			Spec: actionsv1alpha1.WorkflowJobSpec{JobID: id, Matrix: &actionsv1alpha1.WorkflowJobMatrix{
+				LogicalJobID: "build", Values: map[string]string{"arch": arch}, JobTotal: 2,
+			}},
+			Status: actionsv1alpha1.WorkflowJobStatus{Result: result, Outputs: map[string]string{"artifact": arch}},
+		}
+	}
+	amd64 := matrixJob("build-amd64", "build-matrix-1", string(root.UID), "amd64", actionsv1alpha1.WorkflowJobResultSuccess)
+	failedArm64 := matrixJob("build-arm64", "build-matrix-2", string(root.UID), "arm64", actionsv1alpha1.WorkflowJobResultFailure)
+	rerunArm64 := matrixJob("build-arm64-attempt-2", "build-matrix-2", string(rerun.UID), "arm64", actionsv1alpha1.WorkflowJobResultSuccess)
+	report := actionsv1alpha1.WorkflowJob{
+		ObjectMeta: metav1.ObjectMeta{Name: "report-attempt-2", Namespace: root.Namespace, UID: "report-uid", Labels: map[string]string{actionsv1alpha1.LabelWorkflowRunUID: string(rerun.UID)}},
+		Spec: actionsv1alpha1.WorkflowJobSpec{
+			WorkflowRunRef: corev1.LocalObjectReference{Name: rerun.Name}, JobID: "report", Needs: []string{"build"},
+		},
+	}
+	clusterClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&actionsv1alpha1.WorkflowJob{}).
+		WithObjects(root, &amd64, &failedArm64, &rerunArm64, &report).
+		Build()
+	reconciler := &WorkflowRunReconciler{Client: clusterClient, APIReader: clusterClient}
+	current := []actionsv1alpha1.WorkflowJob{rerunArm64, report}
+	dependencies, err := reconciler.rerunDependencyWorkflowJobs(context.Background(), rerun, current)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(dependencies) != 1 || dependencies[0].Spec.JobID != "build-matrix-1" {
+		t.Fatalf("matrix rerun dependencies = %#v", dependencies)
+	}
+	if err := reconciler.reconcileWorkflowJobGraphWithDependencies(context.Background(), rerun, "Release", nil, nil, nil, current, dependencies); err != nil {
+		t.Fatal(err)
+	}
+	stored := &actionsv1alpha1.WorkflowJob{}
+	if err := clusterClient.Get(context.Background(), client.ObjectKeyFromObject(&report), stored); err != nil {
+		t.Fatal(err)
+	}
+	ready := meta.FindStatusCondition(stored.Status.Conditions, actionsv1alpha1.WorkflowJobConditionReady)
+	if ready == nil || ready.Status != metav1.ConditionTrue {
+		t.Fatalf("matrix report ready condition = %#v", ready)
+	}
+	needsConfigMap := &corev1.ConfigMap{}
+	if err := clusterClient.Get(context.Background(), client.ObjectKey{Namespace: report.Namespace, Name: childName(report.Name, "needs")}, needsConfigMap); err != nil {
+		t.Fatal(err)
+	}
+	needs, err := runner.DecodeNeedsContext([]byte(needsConfigMap.Data[jobNeedsKey]))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(needs) != 1 || needs["build"].Result != "success" || needs["build"].Outputs["artifact"] != "arm64" {
+		t.Fatalf("matrix report needs = %#v", needs)
+	}
+}
+
+func TestSelectiveRerunObservesOnlyExecutedJobs(t *testing.T) {
+	scheme := runnerTestScheme(t)
+	root := &actionsv1alpha1.WorkflowRun{ObjectMeta: metav1.ObjectMeta{Name: "ci", Namespace: "default", UID: "root-uid"}}
+	rerun := &actionsv1alpha1.WorkflowRun{
+		ObjectMeta: metav1.ObjectMeta{Name: "ci-attempt-2", Namespace: root.Namespace, UID: "attempt-2-uid"},
+		Spec: actionsv1alpha1.WorkflowRunSpec{Rerun: &actionsv1alpha1.WorkflowRunRerun{
+			OriginalRunRef: actionsv1alpha1.WorkflowRunReference{Name: root.Name, UID: root.UID},
+			PreviousRunRef: actionsv1alpha1.WorkflowRunReference{Name: root.Name, UID: root.UID},
+			Attempt:        2,
+			JobIDs:         []string{"build"},
+		}},
+	}
+	setup := &actionsv1alpha1.WorkflowJob{
+		ObjectMeta: metav1.ObjectMeta{Name: "setup", Namespace: root.Namespace, Labels: map[string]string{actionsv1alpha1.LabelWorkflowRunUID: string(root.UID)}},
+		Spec:       actionsv1alpha1.WorkflowJobSpec{WorkflowRunRef: corev1.LocalObjectReference{Name: root.Name}, JobID: "setup"},
+		Status:     actionsv1alpha1.WorkflowJobStatus{Result: actionsv1alpha1.WorkflowJobResultSuccess, Outputs: map[string]string{"artifact": "ready"}},
+	}
+	build := &actionsv1alpha1.WorkflowJob{
+		ObjectMeta: metav1.ObjectMeta{Name: "build-attempt-2", Namespace: root.Namespace, UID: "build-uid", Labels: map[string]string{actionsv1alpha1.LabelWorkflowRunUID: string(rerun.UID)}},
+		Spec: actionsv1alpha1.WorkflowJobSpec{
+			WorkflowRunRef: corev1.LocalObjectReference{Name: rerun.Name}, JobID: "build", Needs: []string{"setup"}, RunsOn: []string{"ubuntu-latest"},
+		},
+	}
+	if err := controllerutil.SetControllerReference(rerun, build, scheme); err != nil {
+		t.Fatal(err)
+	}
+	plan := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: childName(build.Name, "plan"), Namespace: build.Namespace}}
+	if err := controllerutil.SetControllerReference(build, plan, scheme); err != nil {
+		t.Fatal(err)
+	}
+	clusterClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&actionsv1alpha1.WorkflowRun{}, &actionsv1alpha1.WorkflowJob{}).
+		WithObjects(root, rerun, setup, build, plan).
+		Build()
+	reconciler := &WorkflowRunReconciler{Client: clusterClient, APIReader: clusterClient}
+
+	if _, err := reconciler.observeWorkflowJobs(context.Background(), rerun, "CI", 1); err != nil {
+		t.Fatal(err)
+	}
+	storedRun := &actionsv1alpha1.WorkflowRun{}
+	if err := clusterClient.Get(context.Background(), client.ObjectKeyFromObject(rerun), storedRun); err != nil {
+		t.Fatal(err)
+	}
+	if storedRun.Status.Jobs == nil || storedRun.Status.Jobs.Total != 1 || storedRun.Status.Jobs.Queued != 1 || storedRun.Status.Jobs.Succeeded != 0 {
+		t.Fatalf("selective rerun job summary = %#v", storedRun.Status.Jobs)
+	}
+	currentJobs := &actionsv1alpha1.WorkflowJobList{}
+	if err := clusterClient.List(context.Background(), currentJobs, client.InNamespace(rerun.Namespace), client.MatchingLabels{actionsv1alpha1.LabelWorkflowRunUID: string(rerun.UID)}); err != nil {
+		t.Fatal(err)
+	}
+	if len(currentJobs.Items) != 1 || currentJobs.Items[0].Spec.JobID != "build" {
+		t.Fatalf("selective rerun WorkflowJobs = %#v", currentJobs.Items)
+	}
+	needsConfigMap := &corev1.ConfigMap{}
+	if err := clusterClient.Get(context.Background(), client.ObjectKey{Namespace: build.Namespace, Name: childName(build.Name, "needs")}, needsConfigMap); err != nil {
+		t.Fatal(err)
+	}
+	needs, err := runner.DecodeNeedsContext([]byte(needsConfigMap.Data[jobNeedsKey]))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(needs) != 1 || needs["setup"].Result != "success" || needs["setup"].Outputs["artifact"] != "ready" {
+		t.Fatalf("selective rerun needs = %#v", needs)
+	}
+}
+
+func TestCompletedRerunJobDoesNotReloadInheritedDependencyJobs(t *testing.T) {
+	run := &actionsv1alpha1.WorkflowRun{
+		ObjectMeta: metav1.ObjectMeta{Name: "ci-attempt-2", Namespace: "default"},
+		Spec: actionsv1alpha1.WorkflowRunSpec{Rerun: &actionsv1alpha1.WorkflowRunRerun{
+			PreviousRunRef: actionsv1alpha1.WorkflowRunReference{Name: "deleted", UID: "deleted-uid"},
+			Attempt:        2,
+			JobIDs:         []string{"build"},
+		}},
+	}
+	job := actionsv1alpha1.WorkflowJob{
+		Spec:   actionsv1alpha1.WorkflowJobSpec{JobID: "build", Needs: []string{"setup"}},
+		Status: actionsv1alpha1.WorkflowJobStatus{Result: actionsv1alpha1.WorkflowJobResultSuccess},
+	}
+	reconciler := &WorkflowRunReconciler{}
+	dependencies, err := reconciler.rerunDependencyWorkflowJobs(context.Background(), run, []actionsv1alpha1.WorkflowJob{job})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(dependencies) != 0 {
+		t.Fatalf("completed job dependencies = %#v", dependencies)
 	}
 }
 

@@ -138,9 +138,9 @@ type WorkflowRunRerun struct {
 	// +optional
 	RequestID string `json:"requestID,omitempty"`
 
-	// JobIDs selects expanded WorkflowJob IDs to rerun. The controller also
-	// includes their prerequisite jobs so the dependency graph is complete.
-	// Omit it to execute every job in the workflow.
+	// JobIDs selects expanded WorkflowJob IDs to rerun. Selected jobs reuse the
+	// latest available results and outputs of prerequisite jobs from earlier
+	// attempts. Omit it to execute every job in the workflow.
 	// +listType=set
 	// +kubebuilder:validation:MaxItems=1000
 	// +kubebuilder:validation:items:MinLength=1

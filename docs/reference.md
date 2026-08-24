@@ -91,8 +91,11 @@ cancellation or completion.
 An administrator can also rerun all jobs from the latest completed attempt in
 a workflow lineage. When
 the attempt failed because one or more jobs failed, the administrator can
-instead rerun the failed expanded job IDs and their transitive dependents; the
-controller also includes the prerequisite jobs needed by that selected graph.
+instead rerun the failed expanded job IDs, matrix combinations cancelled by
+fail-fast, and their transitive dependents.
+Jobs in the new attempt reuse the latest results and outputs of prerequisites
+that completed in earlier attempts instead of executing those prerequisites
+again.
 The Console creates a new immutable WorkflowRun attempt with the same project,
 source, workflow path, and retention setting, clears any prior cancellation
 request, and redirects to the new run. Rerun actions are unavailable while the
@@ -415,8 +418,9 @@ attempt, and `attempt` starts at 2. Both references include the WorkflowRun UID
 to reject names that were deleted and recreated. `requestID` is an optional
 idempotency identity and contains the webhook delivery ID for GitHub
 rerequests. `jobIDs` is an optional set of expanded WorkflowJob IDs; the
-controller also includes their prerequisite jobs so the dependency graph is
-complete. Omitting `jobIDs` reruns every job. The rerun fields are immutable.
+selected jobs reuse the latest available results and outputs of prerequisites
+from earlier attempts. Omitting `jobIDs` reruns every job. The rerun fields are
+immutable.
 The controller also requires the project, source, workflow path, lineage, and
 attempt number to match the previous run before it executes a rerun. Workflows
 with output-derived dynamic matrices currently require a full rerun with
@@ -1333,9 +1337,10 @@ never interpreted as literal values.
 Native Jobs and their Pod logs are deleted one hour after completion. Completed
 WorkflowRuns are retained indefinitely unless `spec.ttlSecondsAfterFinished` is
 set. When that TTL expires, the WorkflowRun and any remaining owned resources
-are deleted. GitHub reruns require the original and latest WorkflowRuns, and
-failed-job reruns also require the latest run's WorkflowJobs, to remain
-available. Open Actions does not archive logs.
+are deleted. GitHub reruns require the original and latest WorkflowRuns to
+remain available. Failed-job reruns also require the WorkflowJobs that provide
+the selected jobs' latest prerequisite results and outputs. Open Actions does
+not archive logs.
 
 ## Webhook API
 
@@ -1359,11 +1364,12 @@ For a Check Run created by Open Actions, GitHub's **Re-run** action sends a
 `check_run.rerequested` delivery. Open Actions authenticates the delivery,
 verifies the App, repository, check ID, external ID, and reported commit, and
 creates a new immutable WorkflowRun attempt. A run that failed because one or
-more jobs failed reruns the failed expanded job IDs, their transitive
-dependents, and the prerequisite jobs needed to make that selected dependency
-graph complete. Matrix failures select the failed combinations until a
-dependent needs the logical matrix job, in which case every combination is a
-required prerequisite. A successful or cancelled run, or a run that failed
+more jobs failed reruns the failed expanded job IDs, matrix combinations
+cancelled by fail-fast, and their transitive dependents. The new attempt reuses
+the latest results and outputs of prerequisite jobs from earlier attempts.
+Static matrix failures rerun failed and fail-fast-cancelled combinations; a
+dependent of the logical matrix job evaluates the combined results of rerun and
+retained combinations. A successful or cancelled run, or a run that failed
 before job results were available, reruns every job. The new attempt clears any
 prior cancellation request, updates the original GitHub Check Run instead of
 creating another check, and points its details URL to the new attempt. Open

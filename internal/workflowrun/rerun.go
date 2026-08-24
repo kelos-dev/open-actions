@@ -13,7 +13,10 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-const resourceNameMaxLength = 63
+const (
+	resourceNameMaxLength = 63
+	matrixFailFastReason  = "MatrixFailFast"
+)
 
 var digestEncoding = base32.StdEncoding.WithPadding(base32.NoPadding)
 
@@ -70,7 +73,8 @@ func FailedJobIDs(run *actionsv1alpha1.WorkflowRun, jobs []actionsv1alpha1.Workf
 	for index := range jobs {
 		job := &jobs[index]
 		succeeded := meta.FindStatusCondition(job.Status.Conditions, actionsv1alpha1.WorkflowJobConditionSucceeded)
-		if job.Status.Result == actionsv1alpha1.WorkflowJobResultFailure || (job.Status.Result == "" && succeeded != nil && succeeded.Status == metav1.ConditionFalse) {
+		failed := job.Status.Result == actionsv1alpha1.WorkflowJobResultFailure || (job.Status.Result == "" && succeeded != nil && succeeded.Status == metav1.ConditionFalse)
+		if failed || matrixFailFastCancelled(job) {
 			selected[job.Spec.JobID] = struct{}{}
 			selectedLogicalIDs[logicalJobID(job)] = struct{}{}
 		}
@@ -96,6 +100,18 @@ func FailedJobIDs(run *actionsv1alpha1.WorkflowRun, jobs []actionsv1alpha1.Workf
 	}
 	sort.Strings(jobIDs)
 	return jobIDs, nil
+}
+
+func matrixFailFastCancelled(job *actionsv1alpha1.WorkflowJob) bool {
+	if job.Spec.Matrix == nil || job.Status.Result != actionsv1alpha1.WorkflowJobResultCancelled {
+		return false
+	}
+	for _, condition := range job.Status.Conditions {
+		if condition.Reason == matrixFailFastReason {
+			return true
+		}
+	}
+	return false
 }
 
 // NewRerun creates the immutable object for the next WorkflowRun attempt.
