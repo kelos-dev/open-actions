@@ -28,6 +28,7 @@ import (
 	"github.com/kelos-dev/open-actions/internal/gitrepository"
 	"github.com/kelos-dev/open-actions/internal/runner"
 	"github.com/kelos-dev/open-actions/internal/workflow"
+	"github.com/kelos-dev/open-actions/internal/workflowsnapshot"
 	batchv1 "k8s.io/api/batch/v1"
 	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -521,6 +522,7 @@ func TestWorkflowRunPlansFromLocalPullRequestIntegration(t *testing.T) {
 			}},
 		},
 	}
+	setTestWorkflowRunIdentity(run)
 	clusterClient := fake.NewClientBuilder().WithScheme(scheme).
 		WithStatusSubresource(&actionsv1alpha1.WorkflowRun{}, &actionsv1alpha1.WorkflowJob{}).
 		WithObjects(project, secret, run).
@@ -529,7 +531,6 @@ func TestWorkflowRunPlansFromLocalPullRequestIntegration(t *testing.T) {
 		Client: clusterClient, APIReader: clusterClient, GitHub: github, GitRepository: gitRepository,
 		GitHubAPIBase: server.URL, GitHubServerURL: "https://github.example", ActionCloneBaseURL: "https://github.example",
 	}
-	setTestWorkflowRunIdentity(run)
 	if _, err := reconciler.reconcileWorkflowRun(context.Background(), run); err != nil {
 		t.Fatal(err)
 	}
@@ -545,15 +546,29 @@ func TestWorkflowRunPlansFromLocalPullRequestIntegration(t *testing.T) {
 	if err := clusterClient.List(context.Background(), plans, client.MatchingLabels{actionsv1alpha1.LabelWorkflowRunUID: string(run.UID)}); err != nil {
 		t.Fatal(err)
 	}
-	if len(plans.Items) != 1 {
-		t.Fatalf("plan ConfigMaps = %d", len(plans.Items))
+	if len(plans.Items) != 2 {
+		t.Fatalf("WorkflowRun ConfigMaps = %d, want 2", len(plans.Items))
+	}
+	var planData string
+	var workflowFile *corev1.ConfigMap
+	for index := range plans.Items {
+		configMap := &plans.Items[index]
+		if value, found := configMap.Data[jobPlanKey]; found {
+			planData = value
+		}
+		if _, found := configMap.Data[workflowsnapshot.DataKey]; found {
+			workflowFile = configMap
+		}
 	}
 	plan := &runner.Plan{}
-	if err := json.Unmarshal([]byte(plans.Items[0].Data[jobPlanKey]), plan); err != nil {
+	if err := json.Unmarshal([]byte(planData), plan); err != nil {
 		t.Fatal(err)
 	}
 	if plan.Revision.SHA != integrationSHA || plan.Revision.BaseSHA != baseSHA || plan.Revision.HeadSHA != headSHA || plan.Revision.MergeBaseSHA != mergeBaseSHA {
 		t.Fatalf("plan revision = %#v", plan.Revision)
+	}
+	if workflowFile == nil || workflowFile.Immutable == nil || !*workflowFile.Immutable || !metav1.IsControlledBy(workflowFile, run) || run.Annotations[actionsv1alpha1.AnnotationWorkflowFile] != workflowFile.Name || !strings.Contains(workflowFile.Data[workflowsnapshot.DataKey], "name: CI\n") {
+		t.Fatalf("workflow file snapshot = %#v, annotation = %q", workflowFile, run.Annotations[actionsv1alpha1.AnnotationWorkflowFile])
 	}
 }
 

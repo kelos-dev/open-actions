@@ -26,6 +26,7 @@ import (
 	actionsv1alpha1 "github.com/kelos-dev/open-actions/api/v1alpha1"
 	"github.com/kelos-dev/open-actions/internal/projectvalue"
 	"github.com/kelos-dev/open-actions/internal/workflowrun"
+	"github.com/kelos-dev/open-actions/internal/workflowsnapshot"
 	"github.com/kelos-dev/open-actions/internal/workflowstatus"
 	corev1 "k8s.io/api/core/v1"
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
@@ -191,28 +192,30 @@ type dispatchInputPageData struct {
 }
 
 type runPageData struct {
-	RunURL         string
-	ApproveURL     string
-	CancelURL      string
-	RerunURL       string
-	LoginURL       string
-	CSRFToken      string
-	CanApprove     bool
-	CanCancel      bool
-	CanRerun       bool
-	CanRerunFailed bool
-	Repository     string
-	WorkflowName   string
-	WorkflowPath   string
-	Revision       string
-	ShortRevision  string
-	RefName        string
-	Status         string
-	StatusClass    string
-	Started        string
-	Duration       string
-	DispatchURL    string
-	Jobs           []jobPageData
+	RunURL          string
+	ApproveURL      string
+	CancelURL       string
+	RerunURL        string
+	LoginURL        string
+	CSRFToken       string
+	CanApprove      bool
+	CanCancel       bool
+	CanRerun        bool
+	CanRerunFailed  bool
+	Repository      string
+	WorkflowName    string
+	WorkflowPath    string
+	WorkflowFile    string
+	HasWorkflowFile bool
+	Revision        string
+	ShortRevision   string
+	RefName         string
+	Status          string
+	StatusClass     string
+	Started         string
+	Duration        string
+	DispatchURL     string
+	Jobs            []jobPageData
 }
 
 type runIdentityResponse struct {
@@ -1115,6 +1118,11 @@ func (h *Handler) runDetails(writer http.ResponseWriter, request *http.Request, 
 		h.writeResolutionError(writer, request, err)
 		return
 	}
+	data.WorkflowFile, data.HasWorkflowFile, err = h.loadWorkflowFile(request.Context(), run)
+	if err != nil {
+		h.writeResolutionError(writer, request, err)
+		return
+	}
 	authenticated := h.authenticated(request)
 	if policy := run.Spec.ForkPullRequest; policy != nil && policy.RequireApproval && !policy.Approved && !workflowrun.Terminal(run) && !run.Spec.CancelRequested {
 		data.ApproveURL = runPath(run) + "/approve"
@@ -1394,6 +1402,26 @@ func (h *Handler) loadRunPageData(ctx context.Context, run *actionsv1alpha1.Work
 		data.Jobs = append(data.Jobs, item)
 	}
 	return data, nil
+}
+
+func (h *Handler) loadWorkflowFile(ctx context.Context, run *actionsv1alpha1.WorkflowRun) (string, bool, error) {
+	name := run.Annotations[actionsv1alpha1.AnnotationWorkflowFile]
+	if name == "" {
+		return "", false, nil
+	}
+	configMap := &corev1.ConfigMap{}
+	if err := h.client.Get(ctx, client.ObjectKey{Namespace: run.Namespace, Name: name}, configMap); err != nil {
+		if apierrors.IsNotFound(err) {
+			h.logger.Warn("Workflow file snapshot is unavailable", "namespace", run.Namespace, "workflow_run", run.Name, "config_map", name)
+			return "", false, nil
+		}
+		return "", false, fmt.Errorf("load workflow file ConfigMap %q for WorkflowRun %q: %w", name, run.Name, err)
+	}
+	data, found := configMap.Data[workflowsnapshot.DataKey]
+	if !metav1.IsControlledBy(configMap, run) || configMap.Immutable == nil || !*configMap.Immutable || !found {
+		return "", false, fmt.Errorf("workflow file ConfigMap %q is not an immutable snapshot owned by WorkflowRun %q", name, run.Name)
+	}
+	return data, true, nil
 }
 
 func (h *Handler) jobLogs(writer http.ResponseWriter, request *http.Request, run *actionsv1alpha1.WorkflowRun, jobName string) {

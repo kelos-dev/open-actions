@@ -13,8 +13,9 @@ release does not delete Open Actions resources.
 The default Console URL supports access through `kubectl port-forward
 service/open-actions-console 8080:80 --namespace open-actions-system`. Set
 `console.publicURL` to the public HTTPS origin when exposing the Service. The
-Console serves Project and workflow metadata and runner Pod logs without
-authentication, so expose it only to the intended audience. The chart creates
+Console serves Project and workflow metadata, workflow file snapshots, and
+runner Pod logs without authentication, so expose it only to the intended
+audience. The chart creates
 and preserves an administrator token in the `open-actions-console-auth` Secret.
 Retrieve the `token` key and enter it on the Console login page to manage
 Project Secrets in the release namespace and initiate manual workflow runs.

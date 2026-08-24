@@ -43,7 +43,8 @@ and defaults to `6h`. It must be a positive whole number of minutes. The Helm
 chart configures it through `controller.maxJobTimeout`.
 The Console serves HTTP on `--bind-address` (default
 `:8080`) and serves its read-only views without authentication. Anyone who can
-reach the Console can read Project and workflow metadata and runner logs. The
+reach the Console can read Project and workflow metadata, the exact workflow
+file retained after it is fetched and validated for a run, and runner logs. The
 required `--token-file` authenticates workflow dispatches, cancellation,
 reruns, and Project Secret management. Set
 `--secure-cookie` when the Console is served through HTTPS. The Helm chart
@@ -57,7 +58,11 @@ to retain those runs indefinitely. The Helm chart passes
 `controller.workflowRunTTLSecondsAfterFinished` to both components.
 
 The Console landing page lists up to 100 WorkflowRuns across all namespaces,
-newest first, and links to each run's details and jobs. The Console presents
+newest first, and links to each run's details and jobs. A run page renders the
+immutable workflow file snapshot retained by the controller with that
+WorkflowRun. Runs created before snapshot support or whose workflow has not
+yet been fetched and validated report that the file is unavailable. The
+Console presents
 runner output as line-oriented GitHub Actions logs. It
 supports `group` and `endgroup`, debug and annotation commands, command lines,
 escaped command data and properties, and `stop-commands` markers. It also shows
@@ -617,6 +622,12 @@ reference; the payload is not embedded in the WorkflowRun or WorkflowJob API.
 One snapshot is shared by all workflows selected from the delivery and by their
 reruns. Kubernetes garbage collection removes it after the delivery record and
 all referencing WorkflowRuns have been deleted.
+
+After a workflow file is fetched and validated, its WorkflowRun carries an
+`actions.kelos.dev/workflow-file` annotation naming the immutable ConfigMap that
+holds the exact file in its `workflow.yaml` key. The ConfigMap is owned by the
+WorkflowRun and is garbage-collected with it. The Console reports the workflow
+file as unavailable when the annotation or ConfigMap is missing.
 
 ## Workflow API
 

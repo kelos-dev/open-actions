@@ -22,6 +22,7 @@ import (
 	"github.com/kelos-dev/open-actions/internal/projectvalue"
 	"github.com/kelos-dev/open-actions/internal/runner"
 	"github.com/kelos-dev/open-actions/internal/workflow"
+	"github.com/kelos-dev/open-actions/internal/workflowsnapshot"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	apiEquality "k8s.io/apimachinery/pkg/api/equality"
@@ -493,6 +494,9 @@ func (r *WorkflowRunReconciler) reconcileWorkflowRun(ctx context.Context, run *a
 	definition, err := workflow.Parse(workflowData)
 	if err != nil {
 		return r.planningFailed(ctx, run, "WorkflowInvalid", err, planningFailureTerminal)
+	}
+	if err := r.ensureWorkflowFileSnapshot(ctx, run, workflowData); err != nil {
+		return r.planningFailed(ctx, run, "ChildCreationFailed", err, childCreationFailureDisposition(err))
 	}
 	planningRun, planningEvent, err := resolvePlanningEvent(run, definition, eventPayload)
 	if err != nil {
@@ -1760,6 +1764,45 @@ func (r *WorkflowRunReconciler) ensureNeedsContextConfigMap(ctx context.Context,
 		if existing.Immutable == nil || !*existing.Immutable || existing.Data[jobNeedsKey] != string(data) {
 			return &terminalNeedsContextError{cause: fmt.Errorf("needs context ConfigMap %q does not contain the expected immutable snapshot", existing.Name)}
 		}
+	}
+	return nil
+}
+
+func (r *WorkflowRunReconciler) ensureWorkflowFileSnapshot(ctx context.Context, run *actionsv1alpha1.WorkflowRun, data []byte) error {
+	configMap := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      childName(run.Name, "workflow-file"),
+			Namespace: run.Namespace,
+			Labels:    map[string]string{actionsv1alpha1.LabelWorkflowRunUID: string(run.UID)},
+		},
+		Immutable: pointerTo(true),
+		Data:      map[string]string{workflowsnapshot.DataKey: string(data)},
+	}
+	if err := controllerutil.SetControllerReference(run, configMap, r.Scheme()); err != nil {
+		return &terminalPlanningError{cause: fmt.Errorf("set WorkflowRun %q as owner of workflow file ConfigMap %q: %w", run.Name, configMap.Name, err)}
+	}
+	if err := r.Create(ctx, configMap); err != nil {
+		if !apierrors.IsAlreadyExists(err) {
+			return fmt.Errorf("create workflow file ConfigMap %q for WorkflowRun %q: %w", configMap.Name, run.Name, err)
+		}
+		existing := &corev1.ConfigMap{}
+		if err := r.APIReader.Get(ctx, client.ObjectKeyFromObject(configMap), existing); err != nil {
+			return fmt.Errorf("get workflow file ConfigMap %q for WorkflowRun %q: %w", configMap.Name, run.Name, err)
+		}
+		if !metav1.IsControlledBy(existing, run) || existing.Immutable == nil || !*existing.Immutable || existing.Data[workflowsnapshot.DataKey] != string(data) {
+			return &terminalPlanningError{cause: fmt.Errorf("workflow file ConfigMap %q does not contain the expected immutable snapshot for WorkflowRun %q", existing.Name, run.Name)}
+		}
+	}
+	if run.Annotations[actionsv1alpha1.AnnotationWorkflowFile] == configMap.Name {
+		return nil
+	}
+	before := run.DeepCopy()
+	if run.Annotations == nil {
+		run.Annotations = map[string]string{}
+	}
+	run.Annotations[actionsv1alpha1.AnnotationWorkflowFile] = configMap.Name
+	if err := r.Patch(ctx, run, client.MergeFrom(before)); err != nil {
+		return fmt.Errorf("record workflow file ConfigMap %q on WorkflowRun %q: %w", configMap.Name, run.Name, err)
 	}
 	return nil
 }

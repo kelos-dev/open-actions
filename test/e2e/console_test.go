@@ -132,6 +132,8 @@ var _ = Describe("Console", func() {
 		runPage := getConsolePage(webClient, consoleURL+runPath, http.StatusOK)
 		Expect(runPage).To(ContainSubstring("Fixture CI"))
 		Expect(runPage).To(ContainSubstring("acme/example"))
+		Expect(runPage).To(ContainSubstring(`<pre class="workflow-source"><code>name: Fixture CI`))
+		Expect(runPage).To(ContainSubstring("open actions e2e works"))
 		Expect(runPage).To(ContainSubstring(">test</span>"))
 		Expect(runPage).To(ContainSubstring(">Succeeded</span>"))
 		Expect(runPage).To(ContainSubstring(">runner-1</span>"))
