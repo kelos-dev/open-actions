@@ -63,6 +63,22 @@ That setting is suitable for disposable test clusters only because an artifact
 Pod replacement loses every artifact. `artifacts.enabled=false` omits the
 artifact Service and does not issue artifact runtime credentials to jobs.
 
+Set each component's `resources.requests` and `resources.limits` in the values
+file passed to `open-actions install`. Resource lists accept Kubernetes resource
+names, including extended resources. Resource quantities must be strings; quote
+integer values such as `cpu: "2"`:
+
+```yaml
+controller:
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: "2"
+      memory: 512Mi
+```
+
 ## Values
 
 | Value | Default | Description |
@@ -75,6 +91,7 @@ artifact Service and does not issue artifact runtime credentials to jobs.
 | `controller.actionCloneBaseURL` | `""` | Base URL used to clone external action repositories; defaults to `controller.githubServerURL` when empty |
 | `controller.maxJobTimeout` | `6h` | Maximum execution timeout available to workflow jobs, expressed in whole hours and minutes such as `1h30m`; longer `timeout-minutes` values are capped |
 | `controller.workflowRunTTLSecondsAfterFinished` | `null` | Default `spec.ttlSecondsAfterFinished` for generated WorkflowRuns; `null` retains them indefinitely |
+| `controller.resources` | CPU `50m`/`1`, memory `64Mi`/`256Mi` | Kubernetes resource requests and limits for the controller container |
 | `artifacts.enabled` | `true` | Deploy the internal artifact service and issue job-scoped runtime credentials |
 | `artifacts.image.repository` | `ghcr.io/kelos-dev/open-actions-artifact-server` | Artifact service image repository |
 | `artifacts.image.tag` | `latest` | Artifact service image tag |
@@ -86,6 +103,7 @@ artifact Service and does not issue artifact runtime credentials to jobs.
 | `artifacts.maxFileBytes` | `1073741824` | Maximum uncompressed size of one file |
 | `artifacts.maxArtifactBytes` | `2147483648` | Maximum stored and total uncompressed size of one artifact |
 | `artifacts.maxRunBytes` | `10737418240` | Maximum stored artifact bytes in one WorkflowRun attempt |
+| `artifacts.resources` | CPU `50m`/`1`, memory `64Mi`/`256Mi` | Kubernetes resource requests and limits for the artifact server container |
 | `artifacts.persistence.enabled` | `true` | Use StatefulSet-managed persistent storage instead of an ephemeral `emptyDir` |
 | `artifacts.persistence.existingClaim` | `""` | Existing claim to mount instead of creating one from the StatefulSet volume claim template |
 | `artifacts.persistence.storageClass` | `null` | Storage class for the StatefulSet-managed claim; `null` uses the cluster default |
@@ -99,6 +117,7 @@ artifact Service and does not issue artifact runtime credentials to jobs.
 | `console.image.repository` | `ghcr.io/kelos-dev/open-actions-console` | Console image repository |
 | `console.image.tag` | `latest` | Console image tag |
 | `console.image.pullPolicy` | `IfNotPresent` | Console image pull policy |
+| `console.resources` | CPU `50m`/`1`, memory `64Mi`/`256Mi` | Kubernetes resource requests and limits for the Console container |
 | `console.service.type` | `ClusterIP` | Console Service type (`ClusterIP`, `NodePort`, or `LoadBalancer`) |
 | `console.service.nodePort` | `null` | Fixed Console node port for a `NodePort` or `LoadBalancer` Service |
 | `service.type` | `ClusterIP` | Webhook Service type (`ClusterIP`, `NodePort`, or `LoadBalancer`) |

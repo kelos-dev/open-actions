@@ -3,11 +3,30 @@
   "type": "object",
   "additionalProperties": false,
   "required": ["controller", "artifacts", "console", "service"],
+  "definitions": {
+    "containerResources": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["requests", "limits"],
+      "properties": {
+        "requests": {"$ref": "#/definitions/resourceList"},
+        "limits": {"$ref": "#/definitions/resourceList"}
+      }
+    },
+    "resourceList": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 64
+      }
+    }
+  },
   "properties": {
     "controller": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["image", "githubAPIURL", "githubServerURL", "actionCloneBaseURL", "maxJobTimeout", "workflowRunTTLSecondsAfterFinished"],
+      "required": ["image", "githubAPIURL", "githubServerURL", "actionCloneBaseURL", "maxJobTimeout", "workflowRunTTLSecondsAfterFinished", "resources"],
       "properties": {
         "image": {
           "type": "object",
@@ -26,13 +45,14 @@
         "githubServerURL": {"type": "string", "minLength": 1, "maxLength": 2048},
         "actionCloneBaseURL": {"type": "string", "maxLength": 2048},
         "maxJobTimeout": {"type": "string", "minLength": 2, "maxLength": 32, "pattern": "^([1-9][0-9]*h([0-9]+m)?|(0h)?[1-9][0-9]*m)$"},
-        "workflowRunTTLSecondsAfterFinished": {"type": ["integer", "null"], "minimum": 0, "maximum": 2147483647}
+        "workflowRunTTLSecondsAfterFinished": {"type": ["integer", "null"], "minimum": 0, "maximum": 2147483647},
+        "resources": {"$ref": "#/definitions/containerResources"}
       }
     },
     "artifacts": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["enabled", "image", "signingKeySecretName", "signingKeyKey", "defaultRetentionDays", "maxRetentionDays", "maxFileBytes", "maxArtifactBytes", "maxRunBytes", "persistence"],
+      "required": ["enabled", "image", "signingKeySecretName", "signingKeyKey", "defaultRetentionDays", "maxRetentionDays", "maxFileBytes", "maxArtifactBytes", "maxRunBytes", "resources", "persistence"],
       "properties": {
         "enabled": {"type": "boolean"},
         "image": {
@@ -64,6 +84,7 @@
         "maxFileBytes": {"type": "integer", "minimum": 1},
         "maxArtifactBytes": {"type": "integer", "minimum": 1},
         "maxRunBytes": {"type": "integer", "minimum": 1},
+        "resources": {"$ref": "#/definitions/containerResources"},
         "persistence": {
           "type": "object",
           "additionalProperties": false,
@@ -91,7 +112,7 @@
     "console": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["enabled", "replicas", "publicURL", "secretName", "tokenKey", "image", "service"],
+      "required": ["enabled", "replicas", "publicURL", "secretName", "tokenKey", "image", "resources", "service"],
       "allOf": [
         {
           "if": {"properties": {"enabled": {"const": true}}},
@@ -126,6 +147,7 @@
             }
           }
         },
+        "resources": {"$ref": "#/definitions/containerResources"},
         "service": {
           "type": "object",
           "additionalProperties": false,

@@ -50,6 +50,11 @@ verify:
 	$(HELM) lint $(CHART_DIR)
 	$(HELM) template open-actions $(CHART_DIR) --namespace open-actions-system >/dev/null
 	$(HELM) template open-actions $(CHART_DIR) --namespace open-actions-system --values config/e2e/values.yaml >/dev/null
+	$(HELM) template open-actions $(CHART_DIR) --namespace open-actions-system --set-string controller.resources.requests.cpu=125m --set-string artifacts.resources.limits.memory=512Mi --set-string console.resources.limits.cpu=2 >/dev/null
+	@if $(HELM) template open-actions $(CHART_DIR) --namespace open-actions-system --set console.resources.limits.cpu=2 >/dev/null 2>&1; then \
+		echo "Helm accepted a non-string container resource quantity" >&2; \
+		exit 1; \
+	fi
 	$(HELM) template open-actions $(CHART_DIR) --namespace open-actions-system --set console.publicURL=https://actions.example >/dev/null
 	$(HELM) template open-actions $(CHART_DIR) --namespace open-actions-system --set controller.maxJobTimeout=1h30m >/dev/null
 	@if $(HELM) template open-actions $(CHART_DIR) --namespace open-actions-system --set controller.maxJobTimeout=90s >/dev/null 2>&1; then \
