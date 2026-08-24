@@ -24,6 +24,7 @@ const artifactWorkflowPath = ".open-actions/workflows/artifacts.yaml"
 const tokenPermissionsWorkflowPath = ".open-actions/workflows/token-permissions.yaml"
 const jobConcurrencyWorkflowPath = ".open-actions/workflows/job-concurrency.yaml"
 const concurrencyConflictWorkflowPath = ".open-actions/workflows/concurrency-conflict.yaml"
+const selectiveRerunWorkflowPath = ".open-actions/workflows/selective-rerun.yaml"
 const fixtureJobToken = "fixture-job-token"
 const fixtureActionToken = "fixture-action-token"
 
@@ -211,6 +212,27 @@ jobs:
       cancel-in-progress: ${{ true }}
     steps:
       - run: echo unreachable
+`
+
+const selectiveRerunWorkflowData = `name: Selective rerun
+on: push
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      marker: ${{ steps.marker.outputs.value }}
+    steps:
+      - id: marker
+        run: printf 'value=attempt-%s\n' "$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
+  verify:
+    needs: prepare
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify inherited dependency
+        run: |
+          test '${{ needs.prepare.outputs.marker }}' = attempt-1
+          test "$GITHUB_RUN_ATTEMPT" = 2
+          printf 'selective rerun dependency reuse works\n'
 `
 
 const pullRequestWorkflowPath = ".open-actions/workflows/pull-request.yaml"
@@ -811,6 +833,9 @@ func main() {
 	})
 	mux.HandleFunc("/repos/acme/example/contents/"+concurrencyConflictWorkflowPath, func(writer http.ResponseWriter, _ *http.Request) {
 		writeJSON(writer, map[string]string{"encoding": "base64", "content": base64.StdEncoding.EncodeToString([]byte(concurrencyConflictWorkflowData))})
+	})
+	mux.HandleFunc("/repos/acme/example/contents/"+selectiveRerunWorkflowPath, func(writer http.ResponseWriter, _ *http.Request) {
+		writeJSON(writer, map[string]string{"encoding": "base64", "content": base64.StdEncoding.EncodeToString([]byte(selectiveRerunWorkflowData))})
 	})
 	checkRunMutex := sync.RWMutex{}
 	checkRuns := map[string]map[string]any{}

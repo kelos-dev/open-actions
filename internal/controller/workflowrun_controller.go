@@ -529,6 +529,16 @@ func (r *WorkflowRunReconciler) reconcileWorkflowRun(ctx context.Context, run *a
 	if err != nil {
 		return r.planningFailed(ctx, run, "RerunInvalid", err, planningFailureTerminal)
 	}
+	if run.Spec.Rerun != nil && len(run.Spec.Rerun.JobIDs) > 0 {
+		if _, err := r.rerunDependencyWorkflowJobs(ctx, run, plannedWorkflowJobsForDependencyGraph(plannedJobs)); err != nil {
+			disposition := planningFailureRetry
+			terminal := &terminalPlanningError{}
+			if errors.As(err, &terminal) {
+				disposition = planningFailureTerminal
+			}
+			return r.planningFailed(ctx, run, "RerunInvalid", err, disposition)
+		}
+	}
 	jobCount := int32(len(plannedJobs) + len(deferredMatrices))
 	run.Status.WorkflowName = definition.Name
 	run.Status.Jobs = &actionsv1alpha1.WorkflowRunJobStatus{Total: jobCount}
@@ -891,7 +901,7 @@ func workflowRunCheckReport(run *actionsv1alpha1.WorkflowRun) checkRunReport {
 		report.Output.Title = fmt.Sprintf("%s (attempt %d)", title, run.Spec.Rerun.Attempt)
 		selection := "all jobs"
 		if count := len(run.Spec.Rerun.JobIDs); count > 0 {
-			selection = fmt.Sprintf("%d requested jobs plus required dependencies", count)
+			selection = fmt.Sprintf("%d requested jobs", count)
 		}
 		attempt := fmt.Sprintf("Attempt %d reruns %s.", run.Spec.Rerun.Attempt, selection)
 		if report.Output.Text == "" {
@@ -987,15 +997,9 @@ func selectRerunWorkflowJobs(run *actionsv1alpha1.WorkflowRun, plannedJobs []pla
 		selectedIDs[id] = struct{}{}
 	}
 	plannedByID := make(map[string]*plannedWorkflowJob, len(plannedJobs))
-	plannedByLogicalID := make(map[string][]*plannedWorkflowJob)
 	for index := range plannedJobs {
 		job := &plannedJobs[index]
 		plannedByID[job.id] = job
-		logicalID := job.id
-		if job.matrix != nil {
-			logicalID = job.matrix.LogicalJobID
-		}
-		plannedByLogicalID[logicalID] = append(plannedByLogicalID[logicalID], job)
 	}
 	missing := make([]string, 0)
 	for id := range selectedIDs {
@@ -1008,25 +1012,6 @@ func selectRerunWorkflowJobs(run *actionsv1alpha1.WorkflowRun, plannedJobs []pla
 		return nil, fmt.Errorf("selected jobs are not present in the workflow: %s", strings.Join(missing, ", "))
 	}
 
-	for changed := true; changed; {
-		changed = false
-		for id := range selectedIDs {
-			for _, dependency := range plannedByID[id].needs {
-				needed := plannedByLogicalID[dependency]
-				if len(needed) == 0 {
-					return nil, fmt.Errorf("selected job %q needs missing job %q", id, dependency)
-				}
-				for _, job := range needed {
-					if _, found := selectedIDs[job.id]; found {
-						continue
-					}
-					selectedIDs[job.id] = struct{}{}
-					changed = true
-				}
-			}
-		}
-	}
-
 	selected := make([]plannedWorkflowJob, 0, len(selectedIDs))
 	for _, job := range plannedJobs {
 		if _, found := selectedIDs[job.id]; found {
@@ -1034,6 +1019,182 @@ func selectRerunWorkflowJobs(run *actionsv1alpha1.WorkflowRun, plannedJobs []pla
 		}
 	}
 	return selected, nil
+}
+
+func plannedWorkflowJobsForDependencyGraph(plannedJobs []plannedWorkflowJob) []actionsv1alpha1.WorkflowJob {
+	jobs := make([]actionsv1alpha1.WorkflowJob, 0, len(plannedJobs))
+	for _, planned := range plannedJobs {
+		jobs = append(jobs, actionsv1alpha1.WorkflowJob{Spec: actionsv1alpha1.WorkflowJobSpec{
+			JobID:  planned.id,
+			Needs:  append([]string(nil), planned.needs...),
+			Matrix: planned.matrix.DeepCopy(),
+		}})
+	}
+	return jobs
+}
+
+func (r *WorkflowRunReconciler) rerunDependencyWorkflowJobs(ctx context.Context, run *actionsv1alpha1.WorkflowRun, currentJobs []actionsv1alpha1.WorkflowJob) ([]actionsv1alpha1.WorkflowJob, error) {
+	if run.Spec.Rerun == nil || len(run.Spec.Rerun.JobIDs) == 0 {
+		return nil, nil
+	}
+
+	historicalByID := make(map[string]actionsv1alpha1.WorkflowJob)
+	dependencies, dependencyErr := resolvedRerunDependencyWorkflowJobs(currentJobs, historicalByID)
+	if dependencyErr == nil {
+		return dependencies, nil
+	}
+
+	ref := run.Spec.Rerun.PreviousRunRef
+	visited := make(map[types.UID]struct{})
+	for {
+		previous := &actionsv1alpha1.WorkflowRun{}
+		key := client.ObjectKey{Namespace: run.Namespace, Name: ref.Name}
+		if err := r.APIReader.Get(ctx, key, previous); err != nil {
+			if apierrors.IsNotFound(err) {
+				return nil, &terminalPlanningError{cause: fmt.Errorf("WorkflowRun %q cannot resolve rerun dependencies because WorkflowRun %q is unavailable: %w", run.Name, ref.Name, dependencyErr)}
+			}
+			return nil, fmt.Errorf("get dependency WorkflowRun %q for WorkflowRun %q: %w", ref.Name, run.Name, err)
+		}
+		if previous.UID != ref.UID {
+			return nil, &terminalPlanningError{cause: fmt.Errorf("WorkflowRun %q cannot resolve rerun dependencies because WorkflowRun %q has a different UID", run.Name, previous.Name)}
+		}
+		if _, found := visited[previous.UID]; found {
+			return nil, &terminalPlanningError{cause: fmt.Errorf("WorkflowRun %q rerun lineage contains a cycle at WorkflowRun %q", run.Name, previous.Name)}
+		}
+		visited[previous.UID] = struct{}{}
+
+		jobs := &actionsv1alpha1.WorkflowJobList{}
+		if err := r.APIReader.List(ctx, jobs, client.InNamespace(run.Namespace), client.MatchingLabels{actionsv1alpha1.LabelWorkflowRunUID: string(previous.UID)}); err != nil {
+			return nil, fmt.Errorf("list dependency WorkflowJobs for WorkflowRun %q: %w", previous.Name, err)
+		}
+		for index := range jobs.Items {
+			job := jobs.Items[index]
+			if _, found := historicalByID[job.Spec.JobID]; !found {
+				historicalByID[job.Spec.JobID] = job
+			}
+		}
+		dependencies, dependencyErr = resolvedRerunDependencyWorkflowJobs(currentJobs, historicalByID)
+		if dependencyErr == nil {
+			return dependencies, nil
+		}
+		if previous.Spec.Rerun == nil {
+			break
+		}
+		if previous.Spec.Rerun.OriginalRunRef != run.Spec.Rerun.OriginalRunRef {
+			return nil, &terminalPlanningError{cause: fmt.Errorf("WorkflowRun %q dependency lineage does not match WorkflowRun %q", previous.Name, run.Name)}
+		}
+		ref = previous.Spec.Rerun.PreviousRunRef
+	}
+
+	return nil, &terminalPlanningError{cause: fmt.Errorf("WorkflowRun %q cannot resolve rerun dependencies: %w", run.Name, dependencyErr)}
+}
+
+func resolvedRerunDependencyWorkflowJobs(currentJobs []actionsv1alpha1.WorkflowJob, historicalByID map[string]actionsv1alpha1.WorkflowJob) ([]actionsv1alpha1.WorkflowJob, error) {
+	effectiveByID := make(map[string]*actionsv1alpha1.WorkflowJob, len(historicalByID)+len(currentJobs))
+	for id, historical := range historicalByID {
+		effectiveByID[id] = historical.DeepCopy()
+	}
+	currentIDs := make(map[string]struct{}, len(currentJobs))
+	for index := range currentJobs {
+		job := &currentJobs[index]
+		if _, found := currentIDs[job.Spec.JobID]; found {
+			return nil, fmt.Errorf("rerun contains multiple jobs with ID %q", job.Spec.JobID)
+		}
+		currentIDs[job.Spec.JobID] = struct{}{}
+		effectiveByID[job.Spec.JobID] = job
+	}
+
+	jobsByLogicalID := make(map[string][]*actionsv1alpha1.WorkflowJob)
+	for _, job := range effectiveByID {
+		logicalID := job.Spec.JobID
+		if job.Spec.Matrix != nil {
+			logicalID = job.Spec.Matrix.LogicalJobID
+		}
+		jobsByLogicalID[logicalID] = append(jobsByLogicalID[logicalID], job)
+	}
+	for logicalID := range jobsByLogicalID {
+		sort.Slice(jobsByLogicalID[logicalID], func(left, right int) bool {
+			return jobsByLogicalID[logicalID][left].Spec.JobID < jobsByLogicalID[logicalID][right].Spec.JobID
+		})
+	}
+
+	requiredHistorical := make(map[string]struct{})
+	visited := make(map[string]struct{})
+	visiting := make(map[string]struct{})
+	var visit func(*actionsv1alpha1.WorkflowJob) error
+	visit = func(job *actionsv1alpha1.WorkflowJob) error {
+		if _, found := visited[job.Spec.JobID]; found {
+			return nil
+		}
+		if _, found := visiting[job.Spec.JobID]; found {
+			return fmt.Errorf("job %q has a cyclic dependency", job.Spec.JobID)
+		}
+		visiting[job.Spec.JobID] = struct{}{}
+		defer delete(visiting, job.Spec.JobID)
+
+		for _, dependencyID := range job.Spec.Needs {
+			dependencyJobs := jobsByLogicalID[dependencyID]
+			if err := validateRerunDependencyGroup(dependencyID, dependencyJobs); err != nil {
+				return fmt.Errorf("job %q: %w", job.Spec.JobID, err)
+			}
+			for _, dependencyJob := range dependencyJobs {
+				if _, current := currentIDs[dependencyJob.Spec.JobID]; !current {
+					if !workflowJobTerminal(dependencyJob) {
+						return fmt.Errorf("dependency job %q has no terminal result", dependencyJob.Spec.JobID)
+					}
+					requiredHistorical[dependencyJob.Spec.JobID] = struct{}{}
+				}
+				if err := visit(dependencyJob); err != nil {
+					return err
+				}
+			}
+		}
+		visited[job.Spec.JobID] = struct{}{}
+		return nil
+	}
+	for index := range currentJobs {
+		if workflowJobTerminal(&currentJobs[index]) {
+			continue
+		}
+		if err := visit(&currentJobs[index]); err != nil {
+			return nil, err
+		}
+	}
+
+	dependencies := make([]actionsv1alpha1.WorkflowJob, 0, len(requiredHistorical))
+	for id := range requiredHistorical {
+		dependencies = append(dependencies, historicalByID[id])
+	}
+	sort.Slice(dependencies, func(left, right int) bool {
+		return dependencies[left].Spec.JobID < dependencies[right].Spec.JobID
+	})
+	return dependencies, nil
+}
+
+func validateRerunDependencyGroup(logicalID string, jobs []*actionsv1alpha1.WorkflowJob) error {
+	if len(jobs) == 0 {
+		return fmt.Errorf("needs missing job %q", logicalID)
+	}
+	first := jobs[0]
+	if first.Spec.Matrix == nil {
+		if len(jobs) != 1 {
+			return fmt.Errorf("dependency %q has %d non-matrix jobs", logicalID, len(jobs))
+		}
+		return nil
+	}
+	expected := first.Spec.Matrix.JobTotal
+	if expected < 1 {
+		return fmt.Errorf("matrix dependency %q has no job total", logicalID)
+	}
+	for _, job := range jobs {
+		if job.Spec.Matrix == nil || job.Spec.Matrix.LogicalJobID != logicalID || job.Spec.Matrix.JobTotal != expected {
+			return fmt.Errorf("matrix dependency %q has inconsistent expansion metadata", logicalID)
+		}
+	}
+	if len(jobs) != int(expected) {
+		return fmt.Errorf("matrix dependency %q requires %d expanded jobs, found %d", logicalID, expected, len(jobs))
+	}
+	return nil
 }
 
 func (r *WorkflowRunReconciler) ensureWorkflowJobs(ctx context.Context, run *actionsv1alpha1.WorkflowRun, project *actionsv1alpha1.Project, plannedJobs []plannedWorkflowJob) error {
@@ -2457,21 +2618,31 @@ func (r *WorkflowRunReconciler) observeWorkflowJobs(ctx context.Context, run *ac
 		}
 	}
 	if len(jobs.Items) == expectedObjects {
-		var inputValues map[string]any
-		var eventPayload map[string]any
-		if workflowJobGraphNeedsExpressionContext(run, jobs.Items) {
-			inputValues, err = r.workflowJobGraphInputValues(ctx, jobs.Items)
-			if err != nil {
-				return ctrl.Result{}, err
+		dependencyJobs, dependencyErr := r.rerunDependencyWorkflowJobs(ctx, run, jobs.Items)
+		if dependencyErr != nil {
+			terminal := &terminalPlanningError{}
+			if !errors.As(dependencyErr, &terminal) {
+				return ctrl.Result{}, dependencyErr
 			}
-			eventPayload, err = r.githubEventSnapshot(ctx, run)
-			if err != nil {
-				return ctrl.Result{}, err
-			}
+			lostState = dependencyErr.Error()
 		}
-		variables := r.workflowRunVariableContext(ctx, run)
-		if err := r.reconcileWorkflowJobGraph(ctx, run, workflowName, inputValues, variables, eventPayload, jobs.Items, pendingMatrices); err != nil {
-			return ctrl.Result{}, err
+		if lostState == "" {
+			var inputValues map[string]any
+			var eventPayload map[string]any
+			if workflowJobGraphNeedsExpressionContext(run, jobs.Items) {
+				inputValues, err = r.workflowJobGraphInputValues(ctx, jobs.Items)
+				if err != nil {
+					return ctrl.Result{}, err
+				}
+				eventPayload, err = r.githubEventSnapshot(ctx, run)
+				if err != nil {
+					return ctrl.Result{}, err
+				}
+			}
+			variables := r.workflowRunVariableContext(ctx, run)
+			if err := r.reconcileWorkflowJobGraphWithDependencies(ctx, run, workflowName, inputValues, variables, eventPayload, jobs.Items, dependencyJobs, pendingMatrices); err != nil {
+				return ctrl.Result{}, err
+			}
 		}
 	}
 	concurrencyPending := false
@@ -2703,18 +2874,33 @@ func (r *WorkflowRunReconciler) workflowJobGraphInputValues(ctx context.Context,
 }
 
 func (r *WorkflowRunReconciler) reconcileWorkflowJobGraph(ctx context.Context, run *actionsv1alpha1.WorkflowRun, workflowName string, inputValues map[string]any, variables any, eventPayload map[string]any, jobs []actionsv1alpha1.WorkflowJob, pendingMatrixSets ...map[string]struct{}) error {
+	return r.reconcileWorkflowJobGraphWithDependencies(ctx, run, workflowName, inputValues, variables, eventPayload, jobs, nil, pendingMatrixSets...)
+}
+
+func (r *WorkflowRunReconciler) reconcileWorkflowJobGraphWithDependencies(ctx context.Context, run *actionsv1alpha1.WorkflowRun, workflowName string, inputValues map[string]any, variables any, eventPayload map[string]any, jobs, dependencyJobs []actionsv1alpha1.WorkflowJob, pendingMatrixSets ...map[string]struct{}) error {
 	pendingMatrices := map[string]struct{}{}
 	if len(pendingMatrixSets) > 0 {
 		pendingMatrices = pendingMatrixSets[0]
 	}
-	jobsByID := make(map[string]*actionsv1alpha1.WorkflowJob, len(jobs))
-	jobsByLogicalID := make(map[string][]*actionsv1alpha1.WorkflowJob, len(jobs))
-	for index := range jobs {
-		job := &jobs[index]
+	jobsByID := make(map[string]*actionsv1alpha1.WorkflowJob, len(jobs)+len(dependencyJobs))
+	for index := range dependencyJobs {
+		job := &dependencyJobs[index]
 		if existing := jobsByID[job.Spec.JobID]; existing != nil {
-			return fmt.Errorf("WorkflowJobs %q and %q both represent job %q in WorkflowRun %q", existing.Name, job.Name, job.Spec.JobID, run.Name)
+			return fmt.Errorf("WorkflowJobs %q and %q both represent inherited job %q in WorkflowRun %q", existing.Name, job.Name, job.Spec.JobID, run.Name)
 		}
 		jobsByID[job.Spec.JobID] = job
+	}
+	currentByID := make(map[string]*actionsv1alpha1.WorkflowJob, len(jobs))
+	for index := range jobs {
+		job := &jobs[index]
+		if existing := currentByID[job.Spec.JobID]; existing != nil {
+			return fmt.Errorf("WorkflowJobs %q and %q both represent job %q in WorkflowRun %q", existing.Name, job.Name, job.Spec.JobID, run.Name)
+		}
+		currentByID[job.Spec.JobID] = job
+		jobsByID[job.Spec.JobID] = job
+	}
+	jobsByLogicalID := make(map[string][]*actionsv1alpha1.WorkflowJob, len(jobsByID))
+	for _, job := range jobsByID {
 		logicalID := job.Spec.JobID
 		if job.Spec.Matrix != nil {
 			logicalID = job.Spec.Matrix.LogicalJobID

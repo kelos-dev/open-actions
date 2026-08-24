@@ -43,6 +43,7 @@ const (
 	artifactWorkflowPath            = ".open-actions/workflows/artifacts.yaml"
 	jobConcurrencyWorkflowPath      = ".open-actions/workflows/job-concurrency.yaml"
 	concurrencyConflictWorkflowPath = ".open-actions/workflows/concurrency-conflict.yaml"
+	selectiveRerunWorkflowPath      = ".open-actions/workflows/selective-rerun.yaml"
 	pullRequestWorkflowPath         = ".open-actions/workflows/pull-request.yaml"
 	dockerImage                     = "docker:29.7.2-dind@sha256:12e683a161823b2a839aeea999b9d960e6e1f9a97b1679ad6b441982e2d9cf07"
 )
