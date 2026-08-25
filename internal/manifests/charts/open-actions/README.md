@@ -30,8 +30,9 @@ retained indefinitely. Set `controller.workflowRunTTLSecondsAfterFinished` to
 populate that field on new runs. For example, `604800` retains each new run for
 seven days after completion; `0` makes a run eligible for deletion immediately
 after completion. Changing the chart value does not alter existing runs.
-Deleting an expired WorkflowRun also deletes its owned WorkflowJobs and execution
-resources.
+Completed native Jobs and runner Pods are retained with their WorkflowRun so
+their logs remain available. Deleting an expired WorkflowRun also deletes its
+owned WorkflowJobs and execution resources.
 
 The chart enables the internal artifact service as a standalone, one-replica
 StatefulSet. By default, its volume claim template provisions persistent

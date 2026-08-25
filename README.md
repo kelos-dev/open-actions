@@ -146,8 +146,8 @@ open-actions run logs RUN --job JOB --follow --namespace team-ci
 `JOB` may be the workflow-local job ID shown by `run view` or the WorkflowJob
 resource name. An exact resource-name match takes precedence over a job ID.
 `--job` may be omitted when the run contains exactly one job.
-Completed runner logs remain available until the native Kubernetes Job is
-deleted by its retention policy.
+Completed native Jobs and runner Pods are retained with their WorkflowRun, so
+runner logs remain available until that run is deleted.
 
 ## API reference
 
