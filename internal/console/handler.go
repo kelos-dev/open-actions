@@ -24,6 +24,7 @@ import (
 	"unicode/utf8"
 
 	actionsv1alpha1 "github.com/kelos-dev/open-actions/api/v1alpha1"
+	githubclient "github.com/kelos-dev/open-actions/internal/github"
 	"github.com/kelos-dev/open-actions/internal/projectvalue"
 	"github.com/kelos-dev/open-actions/internal/workflowrun"
 	"github.com/kelos-dev/open-actions/internal/workflowsnapshot"
@@ -79,6 +80,7 @@ func (e *secretCountLimitError) Error() string {
 type Config struct {
 	Client                             client.Client
 	Logs                               LogSource
+	Repositories                       RepositoryResolver
 	Token                              string
 	SecretManagementNamespace          string
 	WorkflowRunTTLSecondsAfterFinished *int32
@@ -90,6 +92,7 @@ type Config struct {
 type Handler struct {
 	client                             client.Client
 	logs                               LogSource
+	repositories                       RepositoryResolver
 	tokenDigest                        [sha256.Size]byte
 	sessionValue                       string
 	csrfToken                          string
@@ -168,7 +171,6 @@ type projectPageData struct {
 type dispatchPageData struct {
 	Projects        []dispatchProjectOption
 	SelectedProject string
-	RepositoryID    string
 	RepositoryOwner string
 	RepositoryName  string
 	RefType         string
@@ -266,7 +268,7 @@ type logRead struct {
 
 // New creates a Console handler.
 func New(config Config) (*Handler, error) {
-	if config.Client == nil || config.Logs == nil {
+	if config.Client == nil || config.Logs == nil || config.Repositories == nil {
 		return nil, errors.New("Console clients are required")
 	}
 	if strings.TrimSpace(config.Token) == "" {
@@ -313,7 +315,7 @@ func New(config Config) (*Handler, error) {
 		workflowRunTTLSecondsAfterFinished = &value
 	}
 	return &Handler{
-		client: config.Client, logs: config.Logs, tokenDigest: tokenDigest,
+		client: config.Client, logs: config.Logs, repositories: config.Repositories, tokenDigest: tokenDigest,
 		sessionValue: sessionValue(config.Token), csrfToken: csrfValue(config.Token), secretManagementNamespace: config.SecretManagementNamespace,
 		workflowRunTTLSecondsAfterFinished: workflowRunTTLSecondsAfterFinished,
 		secureCookie:                       config.SecureCookie, logger: config.Logger,
@@ -750,7 +752,6 @@ func (h *Handler) loadDispatchPageData(ctx context.Context, query url.Values) (d
 		}
 		githubSource := run.Spec.Source.GitHub
 		data.SelectedProject = namespacedValue(run.Namespace, run.Spec.ProjectRef.Name)
-		data.RepositoryID = strconv.FormatInt(githubSource.Repository.ID, 10)
 		data.RepositoryOwner = githubSource.Repository.Owner
 		data.RepositoryName = githubSource.Repository.Name
 		data.Revision = githubSource.Revision.SHA
@@ -831,11 +832,6 @@ func (h *Handler) createWorkflowDispatch(writer http.ResponseWriter, request *ht
 		http.Error(writer, fmt.Sprintf("Project %q source is not supported", project.Name), http.StatusConflict)
 		return
 	}
-	repositoryID, err := strconv.ParseInt(strings.TrimSpace(request.PostForm.Get("repository-id")), 10, 64)
-	if err != nil || repositoryID < 1 || repositoryID > 9_007_199_254_740_991 {
-		http.Error(writer, "invalid GitHub repository ID", http.StatusBadRequest)
-		return
-	}
 	repositoryOwner := strings.TrimSpace(request.PostForm.Get("repository-owner"))
 	if len(repositoryOwner) > 100 || !repositoryOwnerPattern.MatchString(repositoryOwner) {
 		http.Error(writer, "invalid GitHub repository owner", http.StatusBadRequest)
@@ -875,13 +871,24 @@ func (h *Handler) createWorkflowDispatch(writer http.ResponseWriter, request *ht
 		http.Error(writer, err.Error(), http.StatusBadRequest)
 		return
 	}
+	repository, err := h.repositories.Resolve(request.Context(), project, repositoryOwner, repositoryName)
+	if err != nil {
+		var apiError *githubclient.APIError
+		if errors.As(err, &apiError) && (apiError.StatusCode == http.StatusNotFound || apiError.StatusCode == http.StatusUnprocessableEntity) {
+			h.logger.Warn("Unable to access workflow dispatch repository", "project", project.Name, "repository", repositoryOwner+"/"+repositoryName, "error", err)
+			http.Error(writer, fmt.Sprintf("GitHub repository %q is not accessible to Project %q", repositoryOwner+"/"+repositoryName, project.Name), http.StatusBadRequest)
+			return
+		}
+		h.writeResolutionError(writer, request, fmt.Errorf("resolve workflow dispatch repository %s/%s: %w", repositoryOwner, repositoryName, err))
+		return
+	}
 	desired := &actionsv1alpha1.WorkflowRun{
 		ObjectMeta: metav1.ObjectMeta{Name: "dispatch-" + requestID, Namespace: project.Namespace},
 		Spec: actionsv1alpha1.WorkflowRunSpec{
 			ProjectRef:              corev1.LocalObjectReference{Name: project.Name},
 			TTLSecondsAfterFinished: h.workflowRunTTLSecondsAfterFinished,
 			Source: actionsv1alpha1.WorkflowRunSource{Type: actionsv1alpha1.SourceTypeGitHub, GitHub: &actionsv1alpha1.GitHubWorkflowRunSource{
-				Repository: actionsv1alpha1.GitHubRepository{ID: repositoryID, Owner: repositoryOwner, Name: repositoryName},
+				Repository: repository,
 				Event:      actionsv1alpha1.GitHubEvent{Name: actionsv1alpha1.GitHubEventNameWorkflowDispatch, Inputs: inputs},
 				Revision:   actionsv1alpha1.GitRevision{SHA: revision, Ref: ref},
 			}},

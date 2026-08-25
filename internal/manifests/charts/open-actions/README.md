@@ -20,7 +20,9 @@ and preserves an administrator token in the `open-actions-console-auth` Secret.
 Retrieve the `token` key and enter it on the Console login page to manage
 Project Secrets in the release namespace and initiate manual workflow runs.
 The Console uses its own Deployment and ServiceAccount with read access to
-workflow resources and create access to WorkflowRuns. Set
+workflow resources and create access to WorkflowRuns. It can read Secrets so it
+can use each selected Project's GitHub App private key to resolve repository
+identity before creating a manual run. Set
 `console.enabled=false` to omit the Console. Set `console.secretName` to mount
 an externally managed Secret from the release namespace instead;
 `console.tokenKey` selects its token key.

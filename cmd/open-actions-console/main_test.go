@@ -19,6 +19,13 @@ func TestRunConsoleRejectsInvalidWorkflowRunTTL(t *testing.T) {
 	}
 }
 
+func TestRunConsoleRejectsInvalidGitHubAPIURL(t *testing.T) {
+	err := runConsole(context.Background(), []string{"--github-api-url=https://user:password@github.example"})
+	if err == nil || !strings.Contains(err.Error(), "GitHub API URL must not include user information") {
+		t.Fatalf("runConsole() error = %v", err)
+	}
+}
+
 func TestReadTokenRejectsInvalidConfiguration(t *testing.T) {
 	emptyPath := filepath.Join(t.TempDir(), "empty-token")
 	if err := os.WriteFile(emptyPath, nil, 0o600); err != nil {

@@ -42,7 +42,8 @@ and supplies workflow run and stale-query URLs to job contexts.
 and defaults to `6h`. It must be a positive whole number of minutes. The Helm
 chart configures it through `controller.maxJobTimeout`.
 The Console serves HTTP on `--bind-address` (default
-`:8080`) and serves its read-only views without authentication. Anyone who can
+`:8080`) and uses `--github-api-url` to resolve repositories for manual
+dispatches. It serves its read-only views without authentication. Anyone who can
 reach the Console can read Project and workflow metadata, the exact workflow
 file retained after it is fetched and validated for a run, and runner logs. The
 required `--token-file` authenticates workflow dispatches, cancellation,
@@ -105,6 +106,8 @@ latest attempt is still active. The Helm chart grants the Console `create` and
 An administrator can use **Run workflow** to create a `workflow_dispatch`
 WorkflowRun in any configured Project namespace. The form accepts a repository,
 workflow path, branch or tag, pinned commit SHA, and declared workflow inputs.
+The Console authenticates through the selected Project's GitHub App installation
+and records the repository ID and canonical owner and name returned by GitHub.
 Starting from an existing branch- or tag-backed run prepopulates its Project,
 repository, workflow, and revision. Each form instance carries a request ID, so
 resubmitting the same dispatch is idempotent and redirects to the existing run.
@@ -114,9 +117,11 @@ detail page lists the names, but never the values, of keys in its referenced
 workflow Secret. An administrator can sign in with the Console token to add,
 replace, and delete those keys only when the Project is in the Console's
 `--secret-management-namespace`. The Helm chart sets that namespace to its
-release namespace and grants the Console `get`, `create`, and `update` access to
-Secrets only there. Direct Kubernetes clients and external secret controllers
-can manage the same Secret.
+release namespace and grants the Console `create` and `update` access to Secrets
+only there. The Console has cluster-wide `get` access so it can read each
+Project's GitHub App private key when resolving repositories for manual
+dispatches. Direct Kubernetes clients and external secret controllers can manage
+the same Secret.
 
 The runner accepts `::command::` and bracket-form `##[command]` syntax, with
 the property delimiters and escape rules defined for each form. It consumes
@@ -162,6 +167,7 @@ open-actions-artifact-server \
   --signing-key-file=/var/run/secrets/open-actions-artifacts/signing-key
 
 open-actions-console \
+  --github-api-url=https://github.example/api/v3 \
   --token-file=/var/run/secrets/open-actions-console/token \
   --secure-cookie
 ```
