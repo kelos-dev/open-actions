@@ -315,8 +315,11 @@ Secret values never enter job-plan ConfigMaps, custom-resource specs or status,
 controller logs, or Console records. The runner marks values derived from the
 `secrets` context as sensitive and masks configured secrets in raw, standard
 and unpadded Base64, JSON-string, percent-encoded, XML-escaped, and common
-shell-escaped forms. Project variables are non-sensitive and are not
-masked. Missing names in either context evaluate to an empty string.
+shell-escaped forms. Secrets named `ACTIONS_STEP_DEBUG` or
+`ACTIONS_RUNNER_DEBUG` are exempt from masking, matched without regard to case,
+to match GitHub's debug-secret whitelist; their values can therefore appear in
+logs and outputs. Project variables are non-sensitive and are not masked.
+Missing names in either context evaluate to an empty string.
 
 For fork pull request runs, the Project Secret is mounted only when the run's
 policy snapshot has `sendSecrets: true`. Project variables remain available.
@@ -325,6 +328,12 @@ The job-scoped GitHub App installation token is available as both
 environment unless the workflow assigns one of those expressions to an
 environment variable or action input. Token permission selection is described
 separately from Project value sources.
+
+`ACTIONS_STEP_DEBUG` is a special Project secret or variable. A value of
+`true`, after trimming surrounding whitespace and matched without regard to
+case, enables the runner debug indicator for new jobs. The Secret value takes
+precedence when the name exists in both sources. Other values leave the
+indicator disabled.
 
 ### Job token permissions
 
@@ -698,8 +707,9 @@ Open Actions supplies the following runner-owned names:
   `GITHUB_WORKFLOW`, `GITHUB_WORKSPACE`.
 - Command files: `GITHUB_ENV`, `GITHUB_OUTPUT`, `GITHUB_PATH`, `GITHUB_STATE`,
   `GITHUB_STEP_SUMMARY`.
-- Runner identity and paths: `RUNNER_ARCH`, `RUNNER_OS`, `RUNNER_TEMP`,
-  `RUNNER_TOOL_CACHE`.
+- Runner identity and paths: `RUNNER_ARCH`, `RUNNER_ENVIRONMENT`, `RUNNER_NAME`,
+  `RUNNER_OS`, `RUNNER_TEMP`, `RUNNER_TOOL_CACHE`, and the conditional
+  `RUNNER_DEBUG`.
 
 Environment names are case-sensitive, matching GitHub Actions on Linux.
 Workflow, job, step, and composite-action maps may assign runner-owned names,
@@ -769,7 +779,19 @@ evaluation when the corresponding execution feature has not supplied it.
 | Job outputs | Workflow step contexts without `hashFiles` | `github`, `open_actions`, direct dependency results and outputs, `matrix`, `runner`, `env`, `vars`, `secrets`, `inputs`, `steps` |
 | Composite step fields and outputs | `github`, `open_actions`, `runner`, `env`, `inputs`, `steps`, and `hashFiles` | All listed contexts and functions |
 | Composite step condition | Composite contexts, status functions, and `hashFiles` | All listed contexts and functions |
-| Action input default | `github`, `open_actions` | All listed contexts |
+| Action input default | `github`, `open_actions`, `runner` | All listed contexts; a default is evaluated only when the workflow does not supply that input |
+
+The runner context supplies `name`, `os`, `arch`, `temp`, `tool_cache`, and
+`environment` during job execution. `runner.name` and `RUNNER_NAME` identify
+the assigned Runner resource. `runner.environment` and `RUNNER_ENVIRONMENT`
+are `self-hosted`, because Open Actions runners execute on user-managed
+infrastructure. When `ACTIONS_STEP_DEBUG` enables the runner debug indicator,
+`runner.debug` and `RUNNER_DEBUG` have the string value `1`; otherwise the
+property and environment variable are absent. Action metadata input defaults
+receive the same runner context, including the expression used by
+`actions/github-script`: `${{ runner.debug == '1' }}`.
+Every action input default is syntax- and context-validated when the action
+metadata loads, including defaults for supplied inputs and skipped steps.
 
 Values derived from `github.token` or the `secrets` context are marked sensitive
 through interpolation and function calls, and evaluation diagnostics do not

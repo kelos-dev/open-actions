@@ -285,18 +285,45 @@ func loadActionDefinition(directory string) (actionDefinition, error) {
 	if err := yaml.Unmarshal(data, &definition); err != nil {
 		return actionDefinition{}, fmt.Errorf("decode action metadata: %w", err)
 	}
+	for name, input := range definition.Inputs {
+		if input.Default == nil {
+			continue
+		}
+		value, err := inputString(input.Default)
+		if err != nil {
+			return actionDefinition{}, fmt.Errorf("input %q default: %w", name, err)
+		}
+		if err := validateActionDefaultExpression(value); err != nil {
+			return actionDefinition{}, fmt.Errorf("input %q default: %w", name, err)
+		}
+	}
 	return definition, nil
 }
 
 func actionInputs(definitions map[string]actionInput, supplied map[string]string, plan *Plan, environment []string, token string) (map[string]string, error) {
 	result := make(map[string]string, len(definitions)+len(supplied))
 	definitionNames := make(map[string]string, len(definitions))
-	for name, definition := range definitions {
+	for name := range definitions {
 		canonicalName := strings.ToLower(name)
 		if existing, found := definitionNames[canonicalName]; found && existing != name {
 			return nil, fmt.Errorf("action defines input names %q and %q that differ only by case", existing, name)
 		}
 		definitionNames[canonicalName] = name
+	}
+	suppliedNames := make(map[string]string, len(supplied))
+	for name, value := range supplied {
+		canonicalName := strings.ToLower(name)
+		if existing, found := suppliedNames[canonicalName]; found && existing != name {
+			return nil, fmt.Errorf("workflow supplies input names %q and %q that differ only by case", existing, name)
+		}
+		suppliedNames[canonicalName] = name
+		result[canonicalName] = value
+	}
+	for name, definition := range definitions {
+		canonicalName := strings.ToLower(name)
+		if _, found := suppliedNames[canonicalName]; found {
+			continue
+		}
 		if definition.Default != nil {
 			value, err := inputString(definition.Default)
 			if err != nil {
@@ -308,15 +335,6 @@ func actionInputs(definitions map[string]actionInput, supplied map[string]string
 			}
 			result[canonicalName] = resolved
 		}
-	}
-	suppliedNames := make(map[string]string, len(supplied))
-	for name, value := range supplied {
-		canonicalName := strings.ToLower(name)
-		if existing, found := suppliedNames[canonicalName]; found && existing != name {
-			return nil, fmt.Errorf("workflow supplies input names %q and %q that differ only by case", existing, name)
-		}
-		suppliedNames[canonicalName] = name
-		result[canonicalName] = value
 	}
 	return result, nil
 }

@@ -83,9 +83,10 @@ func TestRunnerBuildsOwnedJob(t *testing.T) {
 	if container.TerminationMessagePath != jobResultPath || container.TerminationMessagePolicy != corev1.TerminationMessageReadFile {
 		t.Errorf("termination message = %q, policy = %q", container.TerminationMessagePath, container.TerminationMessagePolicy)
 	}
-	if len(container.Env) != 2 || container.Env[0].Name != runner.GitHubTokenEnvVar || container.Env[0].ValueFrom.SecretKeyRef.Key != jobTokenSecretKey ||
-		container.Env[1].Name != runner.ActionTokenEnvVar || container.Env[1].ValueFrom.SecretKeyRef.Key != actionTokenSecretKey {
-		t.Fatalf("runner credential environment = %#v", container.Env)
+	if len(container.Env) != 3 || container.Env[0].Name != runner.RunnerNameEnvVar || container.Env[0].Value != runnerObject.Name ||
+		container.Env[1].Name != runner.GitHubTokenEnvVar || container.Env[1].ValueFrom.SecretKeyRef.Key != jobTokenSecretKey ||
+		container.Env[2].Name != runner.ActionTokenEnvVar || container.Env[2].ValueFrom.SecretKeyRef.Key != actionTokenSecretKey {
+		t.Fatalf("runner environment = %#v", container.Env)
 	}
 	workspaceMount := ""
 	for _, mount := range container.VolumeMounts {

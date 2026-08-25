@@ -32,6 +32,10 @@ func TestRunWritesWorkflowJobResult(t *testing.T) {
 		Steps: []runner.Step{{
 			ID: "producer", Run: `test -z "$OPEN_ACTIONS_GITHUB_TOKEN"
 test -z "$OPEN_ACTIONS_ACTION_TOKEN"
+test "$RUNNER_NAME" = runner-1
+test "$RUNNER_ENVIRONMENT" = self-hosted
+test "${{ runner.name }}" = runner-1
+test "${{ runner.environment }}" = self-hosted
 echo 'value=ready' >> "$GITHUB_OUTPUT"`,
 		}},
 	}
@@ -46,6 +50,7 @@ echo 'value=ready' >> "$GITHUB_OUTPUT"`,
 	resultPath := filepath.Join(directory, "result.json")
 	t.Setenv(runner.GitHubTokenEnvVar, "installation-token")
 	t.Setenv(runner.ActionTokenEnvVar, "action-installation-token")
+	t.Setenv(runner.RunnerNameEnvVar, "runner-1")
 	if err := run(context.Background(), []string{"--job-file=" + planPath, "--result-file=" + resultPath, "--workspace=" + filepath.Join(directory, "workspace")}); err != nil {
 		t.Fatal(err)
 	}
@@ -101,6 +106,7 @@ func TestRunLoadsNeedsContext(t *testing.T) {
 	}
 	t.Setenv(runner.GitHubTokenEnvVar, "installation-token")
 	t.Setenv(runner.ActionTokenEnvVar, "action-installation-token")
+	t.Setenv(runner.RunnerNameEnvVar, "runner-1")
 	resultPath := filepath.Join(directory, "result.json")
 	if err := run(context.Background(), []string{
 		"--job-file=" + planPath,
@@ -131,12 +137,16 @@ func TestWithoutEnvironmentVariables(t *testing.T) {
 		"OPEN_ACTIONS_GITHUB_TOKEN_BACKUP=preserved",
 		"OPEN_ACTIONS_ACTION_TOKEN=secret",
 		"OPEN_ACTIONS_ACTION_TOKEN_BACKUP=preserved",
-	}, runner.GitHubTokenEnvVar, runner.ActionTokenEnvVar)
+		"RUNNER_NAME=runner-1",
+	}, runner.GitHubTokenEnvVar, runner.ActionTokenEnvVar, runner.RunnerNameEnvVar)
 	if slices.Contains(environment, "OPEN_ACTIONS_GITHUB_TOKEN=secret") {
 		t.Fatal("filtered environment contains the GitHub token")
 	}
 	if slices.Contains(environment, "OPEN_ACTIONS_ACTION_TOKEN=secret") {
 		t.Fatal("filtered environment contains the action token")
+	}
+	if slices.Contains(environment, "RUNNER_NAME=runner-1") {
+		t.Fatal("filtered environment contains the runner name")
 	}
 	if !slices.Contains(environment, "PATH=/usr/bin") || !slices.Contains(environment, "ACTIONS_RUNTIME_TOKEN=artifact-token") || !slices.Contains(environment, "OPEN_ACTIONS_GITHUB_TOKEN_BACKUP=preserved") || !slices.Contains(environment, "OPEN_ACTIONS_ACTION_TOKEN_BACKUP=preserved") {
 		t.Fatalf("filtered environment = %#v", environment)
