@@ -491,6 +491,16 @@ func (c *InstallationClient) ListRepositories(ctx context.Context, limit int) ([
 	}
 }
 
+// GetRepository returns the repository identified by its owner and name.
+func (c *InstallationClient) GetRepository(ctx context.Context, owner, repository string) (Repository, error) {
+	result := Repository{}
+	requestPath := "repos/" + owner + "/" + repository
+	if err := c.doJSONWithQuery(ctx, http.MethodGet, requestPath, nil, &result); err != nil {
+		return Repository{}, fmt.Errorf("get repository %s/%s: %w", owner, repository, err)
+	}
+	return result, nil
+}
+
 func (c *InstallationClient) ListDirectory(ctx context.Context, owner, repository, directory, revision string) ([]Content, error) {
 	requestPath := repositoryContentPath(owner, repository, directory)
 	contents := []Content{}

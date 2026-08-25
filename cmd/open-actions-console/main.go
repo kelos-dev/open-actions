@@ -14,6 +14,7 @@ import (
 
 	actionsv1alpha1 "github.com/kelos-dev/open-actions/api/v1alpha1"
 	"github.com/kelos-dev/open-actions/internal/console"
+	githubclient "github.com/kelos-dev/open-actions/internal/github"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
@@ -31,6 +32,7 @@ func main() {
 func runConsole(ctx context.Context, arguments []string) error {
 	flags := flag.NewFlagSet("open-actions-console", flag.ContinueOnError)
 	bindAddress := flags.String("bind-address", ":8080", "Address used by the Console HTTP server")
+	githubAPIURL := flags.String("github-api-url", "https://api.github.com/", "Base URL for the GitHub API")
 	tokenFile := flags.String("token-file", "", "File containing the Console administrator token")
 	secretManagementNamespace := flags.String("secret-management-namespace", "", "Namespace in which Console administrators may manage Project Secrets")
 	var workflowRunTTLSecondsAfterFinished *int32
@@ -45,6 +47,10 @@ func runConsole(ctx context.Context, arguments []string) error {
 	})
 	secureCookie := flags.Bool("secure-cookie", false, "Restrict the Console session cookie to HTTPS")
 	if err := flags.Parse(arguments); err != nil {
+		return err
+	}
+	normalizedGitHubAPIURL, err := githubclient.NormalizeAPIURL(*githubAPIURL)
+	if err != nil {
 		return err
 	}
 	token, err := readToken(*tokenFile)
@@ -72,8 +78,16 @@ func runConsole(ctx context.Context, arguments []string) error {
 	if err != nil {
 		return fmt.Errorf("create Kubernetes clientset: %w", err)
 	}
+	github, err := githubclient.NewClient(normalizedGitHubAPIURL, nil)
+	if err != nil {
+		return err
+	}
+	repositories, err := console.NewGitHubRepositoryResolver(kubernetesClient, github)
+	if err != nil {
+		return fmt.Errorf("configure GitHub repository resolver: %w", err)
+	}
 	handler, err := console.New(console.Config{
-		Client: kubernetesClient, Logs: console.NewKubernetesLogSource(clientset),
+		Client: kubernetesClient, Logs: console.NewKubernetesLogSource(clientset), Repositories: repositories,
 		Token: token, SecretManagementNamespace: *secretManagementNamespace, WorkflowRunTTLSecondsAfterFinished: workflowRunTTLSecondsAfterFinished,
 		SecureCookie: *secureCookie, Logger: logger,
 	})

@@ -15,10 +15,12 @@ import (
 	"time"
 
 	actionsv1alpha1 "github.com/kelos-dev/open-actions/api/v1alpha1"
+	githubclient "github.com/kelos-dev/open-actions/internal/github"
 	"github.com/kelos-dev/open-actions/internal/projectvalue"
 	"github.com/kelos-dev/open-actions/internal/workflowrun"
 	"github.com/kelos-dev/open-actions/internal/workflowsnapshot"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -32,6 +34,21 @@ const testConsoleToken = "test-console-token"
 type testLogSource struct {
 	pod  *corev1.Pod
 	logs string
+}
+
+type testRepositoryResolver struct {
+	repository actionsv1alpha1.GitHubRepository
+	err        error
+}
+
+func (r *testRepositoryResolver) Resolve(_ context.Context, _ *actionsv1alpha1.Project, owner, name string) (actionsv1alpha1.GitHubRepository, error) {
+	if r.err != nil {
+		return actionsv1alpha1.GitHubRepository{}, r.err
+	}
+	if r.repository.ID != 0 {
+		return r.repository, nil
+	}
+	return actionsv1alpha1.GitHubRepository{ID: 123, Owner: owner, Name: name}, nil
 }
 
 func TestConsoleTopbarsUseConsistentSpacing(t *testing.T) {
@@ -786,6 +803,7 @@ func TestConsoleShowsRerunWhenOriginalWorkflowRunIsGone(t *testing.T) {
 
 func TestConsoleCreatesWorkflowDispatch(t *testing.T) {
 	handler := newTestHandler(t, false)
+	handler.repositories = &testRepositoryResolver{repository: actionsv1alpha1.GitHubRepository{ID: 456, Owner: "canonical-acme", Name: "canonical-example"}}
 
 	unauthenticated := httptest.NewRecorder()
 	handler.ServeHTTP(unauthenticated, httptest.NewRequest(http.MethodGet, "/dispatch?source=default%2Fci", nil))
@@ -805,10 +823,13 @@ func TestConsoleCreatesWorkflowDispatch(t *testing.T) {
 	page := httptest.NewRecorder()
 	handler.ServeHTTP(page, pageRequest)
 	pageBody := page.Body.String()
-	for _, expected := range []string{`value="default/project" selected`, `value="123"`, `value="acme"`, `value="example"`, `value="main"`, `value="` + strings.Repeat("a", 40) + `"`, `value=".open-actions/workflows/ci.yaml"`} {
+	for _, expected := range []string{`value="default/project" selected`, `value="acme"`, `value="example"`, `value="main"`, `value="` + strings.Repeat("a", 40) + `"`, `value=".open-actions/workflows/ci.yaml"`} {
 		if page.Code != http.StatusOK || !strings.Contains(pageBody, expected) {
 			t.Fatalf("dispatch page does not contain %q: %d, %s", expected, page.Code, pageBody)
 		}
+	}
+	if strings.Contains(pageBody, `name="repository-id"`) {
+		t.Fatalf("dispatch page asks for a repository ID: %s", pageBody)
 	}
 
 	requestID := "0123456789abcdefabcd"
@@ -816,7 +837,6 @@ func TestConsoleCreatesWorkflowDispatch(t *testing.T) {
 		"csrf":             {handler.csrfToken},
 		"request-id":       {requestID},
 		"project":          {"default/project"},
-		"repository-id":    {"123"},
 		"repository-owner": {"acme"},
 		"repository-name":  {"example"},
 		"ref-type":         {"branch"},
@@ -845,7 +865,7 @@ func TestConsoleCreatesWorkflowDispatch(t *testing.T) {
 	}
 	github := created.Spec.Source.GitHub
 	if created.Spec.ProjectRef.Name != "project" || created.Spec.WorkflowPath != ".open-actions/workflows/deploy.yaml" || created.Spec.TTLSecondsAfterFinished == nil || *created.Spec.TTLSecondsAfterFinished != 604800 || github == nil ||
-		github.Repository.ID != 123 || github.Repository.Owner != "acme" || github.Repository.Name != "example" ||
+		github.Repository.ID != 456 || github.Repository.Owner != "canonical-acme" || github.Repository.Name != "canonical-example" ||
 		github.Event.Name != actionsv1alpha1.GitHubEventNameWorkflowDispatch || github.Event.DeliveryID != "" || github.Event.Inputs["environment"] != "staging" || github.Event.Inputs["retries"] != "2" ||
 		github.Revision.Ref != "refs/heads/main" || github.Revision.SHA != strings.Repeat("b", 40) {
 		t.Fatalf("created WorkflowRun = %#v", created)
@@ -934,6 +954,35 @@ func TestWorkflowDispatchValidation(t *testing.T) {
 				t.Fatalf("validGitSHA(%q) = %t, want %t", test.value, got, test.valid)
 			}
 		})
+	}
+}
+
+func TestConsoleDoesNotCreateWorkflowDispatchWhenRepositoryResolutionFails(t *testing.T) {
+	handler := newTestHandler(t, false)
+	handler.repositories = &testRepositoryResolver{err: fmt.Errorf("resolve repository: %w", &githubclient.APIError{StatusCode: http.StatusNotFound})}
+	form := url.Values{
+		"csrf":             {handler.csrfToken},
+		"request-id":       {"0123456789abcdefabcd"},
+		"project":          {"default/project"},
+		"repository-owner": {"acme"},
+		"repository-name":  {"missing"},
+		"ref-type":         {"branch"},
+		"ref-name":         {"main"},
+		"revision":         {strings.Repeat("b", 40)},
+		"workflow-path":    {".open-actions/workflows/deploy.yaml"},
+	}
+	request := httptest.NewRequest(http.MethodPost, "/dispatch", strings.NewReader(form.Encode()))
+	request.Header.Set("Authorization", "Bearer "+testConsoleToken)
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusBadRequest || !strings.Contains(response.Body.String(), `GitHub repository "acme/missing" is not accessible to Project "project"`) {
+		t.Fatalf("workflow dispatch response = %d, %q", response.Code, response.Body.String())
+	}
+	run := &actionsv1alpha1.WorkflowRun{}
+	err := handler.client.Get(context.Background(), client.ObjectKey{Namespace: "default", Name: "dispatch-0123456789abcdefabcd"}, run)
+	if !apierrors.IsNotFound(err) {
+		t.Fatalf("WorkflowRun exists after repository resolution failure: %#v, %v", run, err)
 	}
 }
 
@@ -1235,7 +1284,7 @@ func TestNewRequiresToken(t *testing.T) {
 	scheme := runtime.NewScheme()
 	handler, err := New(Config{
 		Client: fake.NewClientBuilder().WithScheme(scheme).Build(),
-		Logs:   &testLogSource{pod: &corev1.Pod{}},
+		Logs:   &testLogSource{pod: &corev1.Pod{}}, Repositories: &testRepositoryResolver{},
 		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
 	})
 	if err == nil || handler != nil || !strings.Contains(err.Error(), "token is required") {
@@ -1248,7 +1297,7 @@ func TestNewRejectsNegativeWorkflowRunTTL(t *testing.T) {
 	negative := int32(-1)
 	handler, err := New(Config{
 		Client: fake.NewClientBuilder().WithScheme(scheme).Build(),
-		Logs:   &testLogSource{pod: &corev1.Pod{}}, Token: testConsoleToken,
+		Logs:   &testLogSource{pod: &corev1.Pod{}}, Repositories: &testRepositoryResolver{}, Token: testConsoleToken,
 		WorkflowRunTTLSecondsAfterFinished: &negative,
 		Logger:                             slog.New(slog.NewTextHandler(io.Discard, nil)),
 	})
@@ -1339,7 +1388,7 @@ func newTestHandler(t *testing.T, secureCookie bool) *Handler {
 	clusterClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(run, newerRun, job, workflowFile, project, secret).Build()
 	workflowRunTTLSecondsAfterFinished := int32(604800)
 	handler, err := New(Config{
-		Client: clusterClient, Logs: &testLogSource{pod: pod, logs: "build output\n"}, Token: testConsoleToken,
+		Client: clusterClient, Logs: &testLogSource{pod: pod, logs: "build output\n"}, Repositories: &testRepositoryResolver{}, Token: testConsoleToken,
 		SecretManagementNamespace: "default", WorkflowRunTTLSecondsAfterFinished: &workflowRunTTLSecondsAfterFinished,
 		SecureCookie: secureCookie, Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
 	})
