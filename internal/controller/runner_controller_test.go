@@ -46,8 +46,9 @@ func TestRunnerBuildsOwnedJob(t *testing.T) {
 	runnerObject := &actionsv1alpha1.Runner{
 		ObjectMeta: metav1.ObjectMeta{Name: "runner-1", Namespace: "default", UID: types.UID("runner-uid")},
 		Spec: actionsv1alpha1.RunnerSpec{Execution: actionsv1alpha1.RunnerExecutionSpec{
-			Image:           "runner:test",
-			ImagePullPolicy: corev1.PullAlways,
+			Image:            "runner:test",
+			ImagePullSecrets: []actionsv1alpha1.RunnerImagePullSecretReference{{Name: "registry-credentials"}},
+			ImagePullPolicy:  corev1.PullAlways,
 			Resources: &actionsv1alpha1.RunnerResources{Requests: actionsv1alpha1.RunnerResourceList{
 				corev1.ResourceCPU: resource.MustParse("1"),
 			}},
@@ -73,6 +74,9 @@ func TestRunnerBuildsOwnedJob(t *testing.T) {
 	}
 	if container.ImagePullPolicy != corev1.PullAlways {
 		t.Errorf("image pull policy = %q", container.ImagePullPolicy)
+	}
+	if !slices.Equal(job.Spec.Template.Spec.ImagePullSecrets, []corev1.LocalObjectReference{{Name: "registry-credentials"}}) {
+		t.Errorf("image pull secrets = %#v", job.Spec.Template.Spec.ImagePullSecrets)
 	}
 	if container.Resources.Requests.Cpu().String() != "1" {
 		t.Errorf("cpu request = %s", container.Resources.Requests.Cpu().String())

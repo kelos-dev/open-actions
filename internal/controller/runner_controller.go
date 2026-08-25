@@ -899,11 +899,16 @@ func (r *RunnerReconciler) buildJob(workflowJob *actionsv1alpha1.WorkflowJob, ru
 	if configured := runnerObject.Spec.Execution.TerminationGracePeriodSeconds; configured != nil {
 		terminationGracePeriodSeconds = pointerTo(*configured)
 	}
+	imagePullSecrets := make([]corev1.LocalObjectReference, len(runnerObject.Spec.Execution.ImagePullSecrets))
+	for index, secret := range runnerObject.Spec.Execution.ImagePullSecrets {
+		imagePullSecrets[index].Name = secret.Name
+	}
 	podTemplate := corev1.PodTemplateSpec{
 		ObjectMeta: metav1.ObjectMeta{Labels: labels, Annotations: annotations},
 		Spec: corev1.PodSpec{
 			TerminationGracePeriodSeconds: terminationGracePeriodSeconds,
 			AutomountServiceAccountToken:  pointerTo(false),
+			ImagePullSecrets:              imagePullSecrets,
 			RestartPolicy:                 corev1.RestartPolicyNever,
 			SecurityContext: &corev1.PodSecurityContext{
 				FSGroup:      pointerTo(int64(65532)),

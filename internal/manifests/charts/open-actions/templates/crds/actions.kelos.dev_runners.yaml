@@ -171,6 +171,29 @@ spec:
                     - Never
                     - IfNotPresent
                     type: string
+                  imagePullSecrets:
+                    description: |-
+                      ImagePullSecrets identifies Secrets in the Runner's namespace that
+                      Kubernetes uses to pull images for the workflow Pod.
+                    items:
+                      description: |-
+                        RunnerImagePullSecretReference identifies an image pull Secret in the
+                        Runner's namespace.
+                      properties:
+                        name:
+                          description: Name is the name of the Secret.
+                          maxLength: 253
+                          minLength: 1
+                          pattern: ^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?([.][a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?)*$
+                          type: string
+                      required:
+                      - name
+                      type: object
+                    maxItems: 32
+                    type: array
+                    x-kubernetes-list-map-keys:
+                    - name
+                    x-kubernetes-list-type: map
                   resources:
                     description: Resources describes the compute resources available
                       to the runner.

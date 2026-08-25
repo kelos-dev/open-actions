@@ -2,6 +2,7 @@ package apischema
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
@@ -13,6 +14,7 @@ import (
 	apiextensionsvalidation "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/validation"
 	structuralschema "k8s.io/apiextensions-apiserver/pkg/apiserver/schema"
 	celvalidation "k8s.io/apiextensions-apiserver/pkg/apiserver/schema/cel"
+	structurallisttype "k8s.io/apiextensions-apiserver/pkg/apiserver/schema/listtype"
 	customresourcevalidation "k8s.io/apiextensions-apiserver/pkg/apiserver/validation"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/validation/field"
@@ -733,6 +735,38 @@ func TestRunnerImagePullPolicyContract(t *testing.T) {
 	execution["imagePullPolicy"] = "Sometimes"
 	if errs := validateObject(t, crd, object, nil); len(errs) == 0 {
 		t.Fatal("invalid image pull policy passed validation")
+	}
+}
+
+func TestRunnerImagePullSecretsContract(t *testing.T) {
+	crd, _ := loadCRD(t, "actions.kelos.dev_runners.yaml")
+	object := loadSample(t, "actions_v1alpha1_runner.yaml")
+	execution := object["spec"].(map[string]any)["execution"].(map[string]any)
+	execution["imagePullSecrets"] = []any{map[string]any{"name": "registry-credentials"}}
+	if errs := validateObject(t, crd, object, nil); len(errs) > 0 {
+		t.Fatalf("valid image pull secret was rejected: %v", errs.ToAggregate())
+	}
+
+	execution["imagePullSecrets"] = []any{map[string]any{"name": "invalid/name"}}
+	if errs := validateObject(t, crd, object, nil); len(errs) == 0 {
+		t.Fatal("invalid image pull secret passed validation")
+	}
+
+	imagePullSecrets := make([]any, 33)
+	for index := range imagePullSecrets {
+		imagePullSecrets[index] = map[string]any{"name": fmt.Sprintf("registry-credentials-%d", index)}
+	}
+	execution["imagePullSecrets"] = imagePullSecrets
+	if errs := validateObject(t, crd, object, nil); len(errs) == 0 {
+		t.Fatal("more than 32 image pull secrets passed validation")
+	}
+
+	execution["imagePullSecrets"] = []any{
+		map[string]any{"name": "registry-credentials"},
+		map[string]any{"name": "registry-credentials"},
+	}
+	if errs := validateObject(t, crd, object, nil); len(errs) == 0 {
+		t.Fatal("duplicate image pull secrets passed validation")
 	}
 }
 
@@ -1488,6 +1522,7 @@ func validateObject(t *testing.T, crd *apiextensionsv1.CustomResourceDefinition,
 	if err != nil {
 		t.Fatalf("create structural schema: %v", err)
 	}
+	errs = append(errs, structurallisttype.ValidateListSetsAndMaps(field.NewPath("resource"), structural, object)...)
 	celValidator := celvalidation.NewValidator(structural, true, celconfig.PerCallLimit)
 	if celValidator != nil {
 		celErrors, _ := celValidator.Validate(context.Background(), field.NewPath("resource"), structural, object, oldObject, celconfig.RuntimeCELCostBudget)
