@@ -184,6 +184,7 @@ func TestExecuteContinuesAfterCoveredRunStepFailure(t *testing.T) {
 	var logs bytes.Buffer
 	executor, err := NewExecutor(ExecutorConfig{
 		Logger:      slog.New(slog.NewJSONHandler(&logs, nil)),
+		RunnerName:  "runner-1",
 		GitHubToken: "installation-token",
 		ActionToken: "action-installation-token",
 		Environment: os.Environ(),
@@ -452,6 +453,7 @@ func TestExecuteResolvesAndMasksRepositoryValues(t *testing.T) {
 	var output bytes.Buffer
 	executor, err := NewExecutor(ExecutorConfig{
 		Logger:        slog.New(slog.NewTextHandler(&output, nil)),
+		RunnerName:    "runner-1",
 		GitHubToken:   "installation-token",
 		ActionToken:   "action-installation-token",
 		ArtifactToken: "artifact-runtime-token",
@@ -476,6 +478,42 @@ func TestExecuteResolvesAndMasksRepositoryValues(t *testing.T) {
 	}
 	if !strings.Contains(output.String(), "production") || !strings.Contains(output.String(), "***") {
 		t.Fatalf("runner output = %q", output.String())
+	}
+}
+
+func TestExecuteDoesNotMaskDebugSecrets(t *testing.T) {
+	for _, secretName := range []string{actionsStepDebugName, actionsRunnerDebugName} {
+		t.Run(secretName, func(t *testing.T) {
+			plan := testPlan()
+			plan.Outputs = map[string]string{"enabled": "${{ steps.debug.outputs.enabled }}"}
+			plan.Steps = []Step{{
+				ID:  "debug",
+				Run: `printf 'enabled=true\n' >> "$GITHUB_OUTPUT"; printf 'true\n'`,
+			}}
+			var output bytes.Buffer
+			executor, err := NewExecutor(ExecutorConfig{
+				Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+				RunnerName:  "runner-1",
+				GitHubToken: "installation-token",
+				Secrets:     map[string]string{strings.ToLower(secretName): "true"},
+				Environment: os.Environ(),
+				Stdout:      &output,
+				Stderr:      &output,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			result, err := executor.ExecuteResult(context.Background(), plan, t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if output.String() != "true\n" {
+				t.Fatalf("output = %q", output.String())
+			}
+			if result.Outputs["enabled"] != "true" {
+				t.Fatalf("job outputs = %#v", result.Outputs)
+			}
+		})
 	}
 }
 
@@ -1083,6 +1121,7 @@ func TestLoadPlanRejectsIncompatibleSchemas(t *testing.T) {
 func TestNewExecutorRequiresGitHubToken(t *testing.T) {
 	_, err := NewExecutor(ExecutorConfig{
 		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+		RunnerName:  "runner-1",
 		ActionToken: "action-installation-token",
 		Environment: os.Environ(),
 		Stdout:      io.Discard,
@@ -1093,9 +1132,23 @@ func TestNewExecutorRequiresGitHubToken(t *testing.T) {
 	}
 }
 
+func TestNewExecutorRequiresRunnerName(t *testing.T) {
+	_, err := NewExecutor(ExecutorConfig{
+		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+		GitHubToken: "installation-token",
+		Environment: os.Environ(),
+		Stdout:      io.Discard,
+		Stderr:      io.Discard,
+	})
+	if err == nil {
+		t.Fatal("NewExecutor() accepted an empty runner name")
+	}
+}
+
 func TestNewExecutorAllowsEmptyActionToken(t *testing.T) {
 	if _, err := NewExecutor(ExecutorConfig{
 		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+		RunnerName:  "runner-1",
 		GitHubToken: "installation-token",
 		Environment: os.Environ(),
 		Stdout:      io.Discard,
@@ -1319,6 +1372,88 @@ func TestWithinDirectoryRejectsTraversal(t *testing.T) {
 	}
 }
 
+func TestExecuteGitHubScriptDebugDefault(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git is not installed")
+	}
+	if _, err := exec.LookPath("node"); err != nil {
+		t.Skip("node is not installed")
+	}
+	repositories := t.TempDir()
+	createActionRepository(t, repositories, "actions", "github-script", "v7", map[string]string{
+		"action.yml": `name: GitHub Script
+inputs:
+  script:
+    required: true
+  github-token:
+    default: ${{ github.token }}
+  debug:
+    default: ${{ runner.debug == '1' }}
+  user-agent:
+    default: actions/github-script
+  previews:
+  result-encoding:
+    default: json
+  retries:
+    default: "0"
+  retry-exempt-status-codes:
+    default: 400,401,403,404,422
+  base-url:
+runs:
+  using: node20
+  main: main.js
+`,
+		"main.js": `const expectedDebug = process.env.INPUT_SCRIPT;
+const expectedRunnerDebug = expectedDebug === 'true' ? '1' : undefined;
+if (process.env['INPUT_GITHUB-TOKEN'] !== 'installation-token' || process.env.INPUT_DEBUG !== expectedDebug || process.env.RUNNER_DEBUG !== expectedRunnerDebug || process.env.RUNNER_NAME !== 'runner-1' || process.env.RUNNER_ENVIRONMENT !== 'self-hosted') {
+  throw new Error('github-script inputs do not match runner debug mode');
+}
+`,
+	})
+	for name, test := range map[string]struct {
+		secrets   map[string]string
+		variables map[string]string
+		wantDebug string
+	}{
+		"disabled":                     {wantDebug: "false"},
+		"variable enables debug":       {variables: map[string]string{"ACTIONS_STEP_DEBUG": "true"}, wantDebug: "true"},
+		"secret enables debug":         {secrets: map[string]string{"ACTIONS_STEP_DEBUG": "true"}, variables: map[string]string{"ACTIONS_STEP_DEBUG": "false"}, wantDebug: "true"},
+		"secret disables variable":     {secrets: map[string]string{"ACTIONS_STEP_DEBUG": "false"}, variables: map[string]string{"ACTIONS_STEP_DEBUG": "true"}, wantDebug: "false"},
+		"invalid value disables debug": {variables: map[string]string{"ACTIONS_STEP_DEBUG": "1"}, wantDebug: "false"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			plan := testPlan()
+			plan.Repository.ActionCloneBaseURL = "file://" + repositories
+			plan.Steps = []Step{{Uses: "actions/github-script@v7", With: map[string]string{"script": test.wantDebug}}}
+			environment := os.Environ()
+			for variable, value := range map[string]string{
+				"RUNNER_DEBUG":       "untrusted",
+				"RUNNER_ENVIRONMENT": "github-hosted",
+				RunnerNameEnvVar:     "untrusted",
+			} {
+				environment = setEnvironment(environment, variable, value)
+			}
+			executor, err := NewExecutor(ExecutorConfig{
+				Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+				RunnerName:  "runner-1",
+				GitHubToken: "installation-token",
+				ActionToken: "action-installation-token",
+				Secrets:     test.secrets,
+				Variables:   test.variables,
+				Environment: environment,
+				Stdout:      io.Discard,
+				Stderr:      io.Discard,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := executor.Execute(context.Background(), plan, t.TempDir()); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
 func TestExecuteExternalJavaScriptAction(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git is not installed")
@@ -1388,6 +1523,7 @@ console.log('external post ran');
 			var output bytes.Buffer
 			executor, err := NewExecutor(ExecutorConfig{
 				Logger:      slog.New(slog.NewJSONHandler(&output, nil)),
+				RunnerName:  "runner-1",
 				GitHubToken: "installation-token",
 				ActionToken: "action-installation-token",
 				Variables:   map[string]string{"ACTION_MESSAGE": "external action ran"},
@@ -1786,6 +1922,25 @@ func TestCompositeActionRejectsExcessiveNesting(t *testing.T) {
 	}
 }
 
+func TestLoadActionDefinitionRejectsUnavailableInputDefaultContext(t *testing.T) {
+	directory := t.TempDir()
+	metadata := `name: Invalid input default fixture
+inputs:
+  debug:
+    default: ${{ secrets.TOKEN }}
+runs:
+  using: node20
+  main: main.js
+`
+	if err := os.WriteFile(filepath.Join(directory, "action.yml"), []byte(metadata), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err := loadActionDefinition(directory)
+	if err == nil || !strings.Contains(err.Error(), `input "debug" default: context "secrets" is unavailable`) {
+		t.Fatalf("loadActionDefinition() error = %v", err)
+	}
+}
+
 func TestActionInputsResolveGitHubDefaults(t *testing.T) {
 	plan := testPlan()
 	environment := []string{"GITHUB_WORKSPACE=/workspace"}
@@ -1802,6 +1957,34 @@ func TestActionInputsResolveGitHubDefaults(t *testing.T) {
 	}
 }
 
+func TestActionInputsResolveRunnerDefaults(t *testing.T) {
+	definitions := map[string]actionInput{
+		"debug":       {Default: "${{ runner.debug == '1' }}"},
+		"name":        {Default: "${{ runner.name }}"},
+		"environment": {Default: "${{ runner.environment }}"},
+	}
+	for name, test := range map[string]struct {
+		environment []string
+		want        string
+	}{
+		"debug disabled": {environment: []string{"RUNNER_NAME=runner-1", "RUNNER_ENVIRONMENT=self-hosted"}, want: "false"},
+		"debug enabled":  {environment: []string{"RUNNER_NAME=runner-1", "RUNNER_ENVIRONMENT=self-hosted", "RUNNER_DEBUG=1"}, want: "true"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			inputs, err := actionInputs(definitions, nil, testPlan(), test.environment, "installation-token")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if inputs["debug"] != test.want {
+				t.Fatalf("debug input = %q, want %q", inputs["debug"], test.want)
+			}
+			if inputs["name"] != "runner-1" || inputs["environment"] != "self-hosted" {
+				t.Fatalf("runner inputs = %#v", inputs)
+			}
+		})
+	}
+}
+
 func TestActionInputsMergeCaseInsensitively(t *testing.T) {
 	inputs, err := actionInputs(
 		map[string]actionInput{"message": {Default: "default"}},
@@ -1815,6 +1998,26 @@ func TestActionInputsMergeCaseInsensitively(t *testing.T) {
 	}
 	if len(inputs) != 1 || inputs["message"] != "supplied" {
 		t.Fatalf("inputs = %#v", inputs)
+	}
+}
+
+func TestActionInputsDoNotEvaluateSuppliedDefaults(t *testing.T) {
+	defaultValue := "${{ fromJSON(github.ref) }}"
+	if err := validateActionDefaultExpression(defaultValue); err != nil {
+		t.Fatalf("default validation: %v", err)
+	}
+	inputs, err := actionInputs(
+		map[string]actionInput{"debug": {Default: defaultValue}},
+		map[string]string{"debug": "false"},
+		testPlan(),
+		nil,
+		"installation-token",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if inputs["debug"] != "false" {
+		t.Fatalf("debug input = %q", inputs["debug"])
 	}
 }
 
@@ -2218,6 +2421,7 @@ func TestExecutorSeparatesUnterminatedChildOutputFromRunnerRecords(t *testing.T)
 	var output bytes.Buffer
 	executor, err := NewExecutor(ExecutorConfig{
 		Logger:      slog.New(slog.NewJSONHandler(&output, nil)),
+		RunnerName:  "runner-1",
 		GitHubToken: "installation-token",
 		ActionToken: "action-installation-token",
 		Environment: os.Environ(),
@@ -2254,6 +2458,7 @@ func TestExecutorLogsFailedWorkflowStep(t *testing.T) {
 	var output bytes.Buffer
 	executor, err := NewExecutor(ExecutorConfig{
 		Logger:      slog.New(slog.NewJSONHandler(&output, nil)),
+		RunnerName:  "runner-1",
 		GitHubToken: "installation-token",
 		ActionToken: "action-installation-token",
 		Environment: os.Environ(),
@@ -2278,6 +2483,7 @@ func TestExecutorLogsCancelledWorkflowStep(t *testing.T) {
 	var output bytes.Buffer
 	executor, err := NewExecutor(ExecutorConfig{
 		Logger:      slog.New(slog.NewJSONHandler(&output, nil)),
+		RunnerName:  "runner-1",
 		GitHubToken: "installation-token",
 		ActionToken: "action-installation-token",
 		Environment: os.Environ(),
@@ -2420,6 +2626,7 @@ func TestExecutorDoesNotLogCommandValues(t *testing.T) {
 	var logs bytes.Buffer
 	executor, err := NewExecutor(ExecutorConfig{
 		Logger:      slog.New(slog.NewJSONHandler(&logs, nil)),
+		RunnerName:  "runner-1",
 		GitHubToken: "installation-token",
 		ActionToken: "action-installation-token",
 		Environment: os.Environ(),
@@ -2439,6 +2646,7 @@ func TestExecutorMasksContinueOnErrorWarnings(t *testing.T) {
 	var logs bytes.Buffer
 	executor, err := NewExecutor(ExecutorConfig{
 		Logger:      slog.New(slog.NewJSONHandler(&logs, nil)),
+		RunnerName:  "runner-1",
 		GitHubToken: "installation-token",
 		ActionToken: "action-installation-token",
 		Environment: os.Environ(),
@@ -2582,6 +2790,7 @@ func testExecutorWithEnvironment(t *testing.T, environment []string, stdout, std
 	t.Helper()
 	executor, err := NewExecutor(ExecutorConfig{
 		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+		RunnerName:  "runner-1",
 		GitHubToken: "installation-token",
 		ActionToken: "action-installation-token",
 		Environment: environment,

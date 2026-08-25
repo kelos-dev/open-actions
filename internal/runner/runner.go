@@ -28,11 +28,14 @@ const (
 	minimumPlanVersion       = 1
 	PlanVersion              = 8
 	ContainerName            = "runner"
+	RunnerNameEnvVar         = "RUNNER_NAME"
 	GitHubTokenEnvVar        = "OPEN_ACTIONS_GITHUB_TOKEN"
 	ActionTokenEnvVar        = "OPEN_ACTIONS_ACTION_TOKEN"
 	ArtifactTokenEnvVar      = "ACTIONS_RUNTIME_TOKEN"
 	ArtifactResultsURLEnvVar = "ACTIONS_RESULTS_URL"
 	CleanupTimeout           = 5 * time.Minute
+	actionsRunnerDebugName   = "ACTIONS_RUNNER_DEBUG"
+	actionsStepDebugName     = "ACTIONS_STEP_DEBUG"
 )
 
 const runnerLogMarker = "open_actions_runner"
@@ -147,6 +150,7 @@ type Step struct {
 
 type ExecutorConfig struct {
 	Logger        *slog.Logger
+	RunnerName    string
 	GitHubToken   string
 	ActionToken   string
 	ArtifactToken string
@@ -159,6 +163,7 @@ type ExecutorConfig struct {
 
 type Executor struct {
 	logger      *slog.Logger
+	runnerName  string
 	githubToken string
 	actionToken string
 	secrets     map[string]string
@@ -224,7 +229,7 @@ func (s *executionState) commandContext(ctx context.Context) context.Context {
 }
 
 func NewExecutor(config ExecutorConfig) (*Executor, error) {
-	if config.Logger == nil || config.GitHubToken == "" || config.Environment == nil || config.Stdout == nil || config.Stderr == nil {
+	if config.Logger == nil || config.RunnerName == "" || config.GitHubToken == "" || config.Environment == nil || config.Stdout == nil || config.Stderr == nil {
 		return nil, errors.New("runner executor configuration is incomplete")
 	}
 	masker := newOutputMasker()
@@ -235,11 +240,15 @@ func NewExecutor(config ExecutorConfig) (*Executor, error) {
 	if config.ArtifactToken != "" {
 		addCredentialMasks(masker, config.ArtifactToken)
 	}
-	for _, secret := range config.Secrets {
+	for name, secret := range config.Secrets {
+		if strings.EqualFold(name, actionsStepDebugName) || strings.EqualFold(name, actionsRunnerDebugName) {
+			continue
+		}
 		masker.addSecret(secret)
 	}
 	return &Executor{
 		logger:      config.Logger.With(runnerLogMarker, true),
+		runnerName:  config.RunnerName,
 		githubToken: config.GitHubToken,
 		actionToken: config.ActionToken,
 		secrets:     cloneStringMap(config.Secrets),
@@ -429,7 +438,11 @@ func (e *Executor) executePlan(ctx context.Context, plan *Plan, workspace string
 		}
 	}
 
-	environment := append(append([]string(nil), e.environment...),
+	environment := append([]string(nil), e.environment...)
+	for _, name := range []string{"RUNNER_DEBUG", RunnerNameEnvVar, "RUNNER_ENVIRONMENT"} {
+		environment = unsetEnvironment(environment, name)
+	}
+	environment = append(environment,
 		"CI=true",
 		"GITHUB_ACTIONS=true",
 		"GITHUB_API_URL="+strings.TrimSuffix(plan.Repository.APIURL, "/"),
@@ -453,10 +466,15 @@ func (e *Executor) executePlan(ctx context.Context, plan *Plan, workspace string
 		"OPEN_ACTIONS_RUN_QUERY_URL="+plan.Run.QueryURL,
 		"OPEN_ACTIONS_RUN_URL="+plan.Run.URL,
 		"RUNNER_ARCH="+runnerArchitecture(),
+		RunnerNameEnvVar+"="+e.runnerName,
+		"RUNNER_ENVIRONMENT=self-hosted",
 		"RUNNER_OS=Linux",
 		"RUNNER_TEMP="+filepath.Join(temporaryDirectory, "temp"),
 		"RUNNER_TOOL_CACHE="+filepath.Join(temporaryDirectory, "tool-cache"),
 	)
+	if stepDebugEnabled(e.secrets, e.variables) {
+		environment = append(environment, "RUNNER_DEBUG=1")
+	}
 	jobEnvironment, err := resolveJobEnvironment(plan.Env, plan, environment, e.githubToken, e.secrets, e.variables)
 	if err != nil {
 		return emptyResult, fmt.Errorf("resolve job environment: %w", err)
@@ -897,6 +915,17 @@ func setEnvironment(environment []string, name, value string) []string {
 	return append(result, prefix+value)
 }
 
+func unsetEnvironment(environment []string, name string) []string {
+	prefix := name + "="
+	result := make([]string, 0, len(environment))
+	for _, entry := range environment {
+		if !strings.HasPrefix(entry, prefix) {
+			result = append(result, entry)
+		}
+	}
+	return result
+}
+
 func environmentValue(environment []string, name string) string {
 	prefix := name + "="
 	for index := len(environment) - 1; index >= 0; index-- {
@@ -905,6 +934,17 @@ func environmentValue(environment []string, name string) string {
 		}
 	}
 	return ""
+}
+
+func stepDebugEnabled(secrets, variables map[string]string) bool {
+	value, found := stringMapValue(secrets, actionsStepDebugName)
+	if !found {
+		value, found = stringMapValue(variables, actionsStepDebugName)
+	}
+	if !found {
+		return false
+	}
+	return strings.EqualFold(strings.TrimSpace(value), "true")
 }
 
 func runnerArchitecture() string {

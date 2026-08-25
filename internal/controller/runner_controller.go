@@ -932,6 +932,7 @@ func (r *RunnerReconciler) buildJob(workflowJob *actionsv1alpha1.WorkflowJob, ru
 				TerminationMessagePath:   jobResultPath,
 				TerminationMessagePolicy: corev1.TerminationMessageReadFile,
 				Env: []corev1.EnvVar{
+					{Name: runner.RunnerNameEnvVar, Value: runnerObject.Name},
 					{
 						Name: runner.GitHubTokenEnvVar,
 						ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{

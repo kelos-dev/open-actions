@@ -61,9 +61,11 @@ func run(ctx context.Context, arguments []string) error {
 	githubToken := os.Getenv(runner.GitHubTokenEnvVar)
 	actionToken := os.Getenv(runner.ActionTokenEnvVar)
 	artifactToken := os.Getenv(runner.ArtifactTokenEnvVar)
-	environment := withoutEnvironmentVariables(os.Environ(), runner.GitHubTokenEnvVar, runner.ActionTokenEnvVar)
+	runnerName := os.Getenv(runner.RunnerNameEnvVar)
+	environment := withoutEnvironmentVariables(os.Environ(), runner.GitHubTokenEnvVar, runner.ActionTokenEnvVar, runner.RunnerNameEnvVar)
 	executor, err := runner.NewExecutor(runner.ExecutorConfig{
 		Logger:        slog.New(slog.NewJSONHandler(os.Stdout, nil)),
+		RunnerName:    runnerName,
 		GitHubToken:   githubToken,
 		ActionToken:   actionToken,
 		ArtifactToken: artifactToken,

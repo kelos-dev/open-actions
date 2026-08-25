@@ -12,7 +12,7 @@ import (
 
 var (
 	runnerJobAvailability          = workflowexpression.NewAvailability("github", "open_actions", "matrix", "needs", "vars", "secrets", "inputs")
-	actionDefaultAvailability      = workflowexpression.NewAvailability("github", "open_actions")
+	actionDefaultAvailability      = workflowexpression.NewAvailability("github", "open_actions", "runner")
 	runnerStepAvailability         = workflowexpression.NewAvailability("github", "open_actions", "matrix", "needs", "runner", "env", "vars", "secrets", "inputs", "steps").WithHashFiles()
 	runnerConditionAvailability    = workflowexpression.NewAvailability("github", "open_actions", "matrix", "needs", "runner", "env", "vars", "inputs", "steps").WithStatusFunctions().WithHashFiles()
 	compositeAvailability          = workflowexpression.NewAvailability("github", "open_actions", "runner", "env", "inputs", "steps").WithHashFiles()
@@ -26,6 +26,14 @@ func resolveJobEnvironment(values map[string]string, plan *Plan, environment []s
 func resolveActionDefaultExpression(input string, plan *Plan, environment []string, token string) (string, error) {
 	context := expressionContext(plan, environment, "", nil, actionDefaultAvailability, nil, token, nil, nil)
 	return resolveExpressionString(input, context)
+}
+
+func validateActionDefaultExpression(input string) error {
+	program, err := workflowexpression.Parse(input)
+	if err != nil {
+		return err
+	}
+	return program.Validate(actionDefaultAvailability)
 }
 
 func resolveWorkflowStepEnvironment(step Step, state *executionState) (map[string]string, error) {
@@ -178,18 +186,28 @@ func expressionContext(plan *Plan, environment []string, actionPath string, extr
 		"needs":   plan.Needs.ExpressionValues(),
 		"secrets": secretContext(token, secrets),
 		"vars":    variables,
-		"runner": map[string]any{
-			"os":         environmentValue(environment, "RUNNER_OS"),
-			"arch":       environmentValue(environment, "RUNNER_ARCH"),
-			"temp":       environmentValue(environment, "RUNNER_TEMP"),
-			"tool_cache": environmentValue(environment, "RUNNER_TOOL_CACHE"),
-		},
-		"env": environmentContext(environment),
+		"runner":  runnerExpressionValues(environment),
+		"env":     environmentContext(environment),
 	}
 	for name, value := range extra {
 		values[name] = value
 	}
 	return workflowexpression.Context{Availability: availability, Values: values, Status: status}
+}
+
+func runnerExpressionValues(environment []string) map[string]any {
+	values := map[string]any{
+		"name":        environmentValue(environment, RunnerNameEnvVar),
+		"os":          environmentValue(environment, "RUNNER_OS"),
+		"arch":        environmentValue(environment, "RUNNER_ARCH"),
+		"temp":        environmentValue(environment, "RUNNER_TEMP"),
+		"tool_cache":  environmentValue(environment, "RUNNER_TOOL_CACHE"),
+		"environment": environmentValue(environment, "RUNNER_ENVIRONMENT"),
+	}
+	if debug := environmentValue(environment, "RUNNER_DEBUG"); debug != "" {
+		values["debug"] = debug
+	}
+	return values
 }
 
 func secretContext(token string, secrets map[string]string) map[string]any {
