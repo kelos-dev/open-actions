@@ -53,6 +53,14 @@ type RunnerExecutionSpec struct {
 	// +required
 	Image string `json:"image"`
 
+	// ImagePullSecrets identifies Secrets in the Runner's namespace that
+	// Kubernetes uses to pull images for the workflow Pod.
+	// +listType=map
+	// +listMapKey=name
+	// +kubebuilder:validation:MaxItems=32
+	// +optional
+	ImagePullSecrets []RunnerImagePullSecretReference `json:"imagePullSecrets,omitempty"`
+
 	// ImagePullPolicy controls when Kubernetes pulls the runner image. Omit it
 	// to use Kubernetes image pull policy defaulting.
 	// +kubebuilder:validation:Enum=Always;Never;IfNotPresent
@@ -75,6 +83,17 @@ type RunnerExecutionSpec struct {
 	// privileged sidecar and is available to workflow steps through DOCKER_HOST.
 	// +optional
 	Docker *RunnerDockerSpec `json:"docker,omitempty"`
+}
+
+// RunnerImagePullSecretReference identifies an image pull Secret in the
+// Runner's namespace.
+type RunnerImagePullSecretReference struct {
+	// Name is the name of the Secret.
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=253
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?([.][a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?)*$`
+	// +required
+	Name string `json:"name"`
 }
 
 // RunnerDockerSpec describes the Docker daemon available to runner execution.

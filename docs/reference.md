@@ -196,7 +196,9 @@ WorkflowRun force-cancels and removes its child resources. A Runner's
 `spec.projectRef` is immutable, and changes to `spec.execution` apply only to
 Kubernetes Jobs created afterward. `spec.execution.imagePullPolicy` controls
 when Kubernetes pulls the runner image and accepts `Always`, `IfNotPresent`, or
-`Never`; omitting it uses Kubernetes defaulting.
+`Never`; omitting it uses Kubernetes defaulting. `spec.execution.imagePullSecrets`
+accepts up to 32 unique Secret references in the Runner's namespace that
+Kubernetes uses when pulling the runner image and the optional Docker image.
 `spec.execution.terminationGracePeriodSeconds` sets how long Kubernetes waits
 for a workflow Pod's containers to stop after termination is requested. Omitting
 it leaves the generated Pod field unset so Kubernetes applies its 30-second
