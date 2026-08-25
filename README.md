@@ -24,95 +24,178 @@ standalone artifact service for workflow artifact uploads and downloads. The
 Console shows runs, jobs, and live logs. Each `Project` defines an execution
 domain and its GitHub App integration.
 
-## Migrate from GitHub Actions
+## Quickstart
 
-### 1. Deploy Open Actions
+This path installs the latest release, connects one GitHub App installation,
+and creates one Linux runner. Before starting, you need:
 
-Kubernetes 1.29 or newer, Helm, and a public HTTPS endpoint for GitHub webhooks
-are required.
+- a Kubernetes 1.29 or newer cluster selected by your current kubeconfig
+  context
+- `curl`, Bash, `kubectl`, and Helm 3
+- a default StorageClass; the artifact service requests a 20 Gi persistent
+  volume by default
+- Linux or macOS on AMD64 or ARM64 for the Open Actions CLI
+- a stable public HTTPS URL that can route GitHub webhooks to the cluster
+- permission to create a GitHub App and install it on the target repositories
+
+### 1. Install the CLI and control plane
+
+The installer downloads the latest CLI to `~/.local/bin` and verifies its
+checksum:
 
 ```console
 curl -fsSL https://raw.githubusercontent.com/kelos-dev/open-actions/main/hack/install.sh | bash
+export PATH="${HOME}/.local/bin:${PATH}"
 ```
 
-Each tagged release also publishes the chart at
-`oci://ghcr.io/kelos-dev/charts/open-actions`. The chart version omits the tag's
-`v` prefix; for example, release `v0.1.0` is installed as chart version `0.1.0`
-and uses `v0.1.0` for its controller, artifact server, and Console images:
+The CLI deploys the controller, artifact service, Console, and CRDs to the
+current Kubernetes cluster through Helm:
 
 ```console
-helm upgrade --install open-actions \
-  oci://ghcr.io/kelos-dev/charts/open-actions \
-  --version 0.1.0 \
-  --namespace open-actions-system \
-  --create-namespace
+kubectl config current-context
+open-actions install
+
+kubectl rollout status deployment/open-actions-controller \
+  --namespace open-actions-system --timeout=5m
+kubectl rollout status statefulset/open-actions-artifacts \
+  --namespace open-actions-system --timeout=5m
+kubectl rollout status deployment/open-actions-console \
+  --namespace open-actions-system --timeout=5m
 ```
 
-Expose `open-actions-webhook.open-actions-system:80` through HTTPS. The Console
-is available locally with:
+The Helm release is named `open-actions`; the control-plane namespace is
+`open-actions-system`.
+
+### 2. Expose the webhook endpoint
+
+Route your public HTTPS URL to the `open-actions-webhook` Service on port 80 in
+the `open-actions-system` namespace. TLS must terminate at your ingress, load
+balancer, or tunnel; the chart does not create an ingress or certificate.
+
+A `GET` request should reach Open Actions and return `405 Method Not Allowed`;
+the endpoint accepts signed GitHub `POST` requests only:
 
 ```console
-kubectl port-forward --namespace open-actions-system \
-  service/open-actions-console 8080:80
+curl -i https://open-actions.example.com/
 ```
 
-See the [chart values](internal/manifests/charts/open-actions) to expose the
-Console or customize the installation.
-
-### 2. Install the GitHub App
+### 3. Create and install the GitHub App
 
 [Create a GitHub App](https://docs.github.com/en/apps/creating-github-apps/registering-a-github-app/registering-a-github-app)
-with the public webhook URL and a webhook secret. Configure it with:
+with the HTTPS URL from the previous step as its webhook URL. Enable the
+webhook, set a strong webhook secret, and grant:
 
-- repository permissions: Actions, Checks, Contents, Issues, Packages, Pull
-  requests, and Commit statuses read and write, plus Merge queues read
-- events: Push, Pull request, Merge group, Workflow run, Issues, Issue comment,
-  Pull request review comment, Pull request review, Release, and Check run
+- read and write access to Actions, Checks, Contents, Issues, Packages, Pull
+  requests, and Commit statuses
+- read access to Merge queues
+- subscriptions to Push, Pull request, Merge group, Workflow run, Issues,
+  Issue comment, Pull request review comment, Pull request review, Release, and
+  Check run events
 
-Trusted fork workflows load definitions and `refs/pull/<number>/merge` from the
-base repository with Contents read permission. The App does not need to be
-installed on a public fork for that path. Checks read and write reports run
-state; no GitHub App permission by itself makes fork code safe to execute.
-Each job token is narrowed to the permissions requested by its workflow and
-cannot exceed these App permissions.
+Generate a private key, then [install the
+App](https://docs.github.com/en/apps/using-github-apps/installing-your-own-github-app)
+on every repository whose workflows or private actions Open Actions will use.
+Record the numeric App ID and installation ID. The installation ID is the
+number after `/installations/` in the installation settings URL.
 
-Generate a private key, [install the App](https://docs.github.com/en/apps/using-github-apps/installing-your-own-github-app)
-on every repository whose workflows or actions Open Actions runs, and record
-the App ID and installation ID. The job token is limited to its Project
-repository, while action downloads use a separate short-lived token for the
-repositories granted to the installation. See
-[External actions](docs/reference.md#external-actions).
+Each workflow job receives a token narrowed to the permissions requested by
+its workflow and to its Project repository. External actions use a separate
+short-lived token for repositories granted to the installation. See [External
+actions](docs/reference.md#external-actions). Keep the default fork policy
+unless fork code belongs to the installation's trust boundary.
 
-Create the Kubernetes Secret, replacing `WEBHOOK_SECRET` with the secret from
-GitHub:
+### 4. Create a Project and runner
+
+Set these values for the GitHub App you just installed:
 
 ```console
-kubectl create namespace open-actions
+export OPEN_ACTIONS_NAMESPACE=open-actions
+export GITHUB_APP_ID=12345
+export GITHUB_APP_INSTALLATION_ID=67890
+export GITHUB_APP_PRIVATE_KEY=/absolute/path/to/private-key.pem
+printf 'GitHub webhook secret: '
+read -rs GITHUB_WEBHOOK_SECRET
+printf '\n'
+```
+
+Create a namespace for workflow resources and store the App credentials in
+it. The Secret must be in the same namespace as the Project:
+
+```console
+kubectl create namespace "${OPEN_ACTIONS_NAMESPACE}" \
+  --dry-run=client -o yaml | kubectl apply -f -
 kubectl create secret generic open-actions-github-app \
-  --namespace open-actions \
-  --from-file=private-key.pem=/path/to/private-key.pem \
-  --from-literal=webhook-secret='<WEBHOOK_SECRET>'
+  --namespace "${OPEN_ACTIONS_NAMESPACE}" \
+  --from-file=private-key.pem="${GITHUB_APP_PRIVATE_KEY}" \
+  --from-literal=webhook-secret="${GITHUB_WEBHOOK_SECRET}" \
+  --dry-run=client -o yaml | kubectl apply -f -
+unset GITHUB_WEBHOOK_SECRET
 ```
 
-Put the App and installation IDs in the [Project
-sample](config/samples/actions_v1alpha1_project.yaml), then create the Project
-and a RunnerSet:
+Create the Project and one runner:
 
 ```console
-kubectl apply -f config/samples/actions_v1alpha1_project.yaml
-kubectl apply -f config/samples/actions_v1alpha1_runnerset.yaml
+kubectl apply -f - <<EOF
+apiVersion: actions.kelos.dev/v1alpha1
+kind: Project
+metadata:
+  name: default
+  namespace: ${OPEN_ACTIONS_NAMESPACE}
+spec:
+  source:
+    type: GitHub
+    github:
+      appID: ${GITHUB_APP_ID}
+      installationID: ${GITHUB_APP_INSTALLATION_ID}
+      privateKeySecretRef:
+        name: open-actions-github-app
+        key: private-key.pem
+      webhookSecretRef:
+        name: open-actions-github-app
+        key: webhook-secret
+  workflowDirectory: .open-actions/workflows
+---
+apiVersion: actions.kelos.dev/v1alpha1
+kind: RunnerSet
+metadata:
+  name: linux
+  namespace: ${OPEN_ACTIONS_NAMESPACE}
+spec:
+  replicas: 1
+  template:
+    spec:
+      projectRef:
+        name: default
+      execution:
+        image: ghcr.io/kelos-dev/open-actions-runner:latest
+        resources:
+          requests:
+            cpu: "1"
+            memory: 1Gi
+          limits:
+            cpu: "2"
+            memory: 2Gi
+      labels:
+        - self-hosted
+        - linux
+        - x64
+        - ubuntu-latest
+EOF
+
+kubectl wait --for=condition=Configured project/default \
+  --namespace "${OPEN_ACTIONS_NAMESPACE}" --timeout=2m
+kubectl wait --for=condition=Ready runnerset/linux \
+  --namespace "${OPEN_ACTIONS_NAMESPACE}" --timeout=2m
 ```
 
-Each RunnerSet maintains the number of Runner execution slots configured by
-`spec.replicas`. Each Runner executes one job at a time, and its labels must
-include every label in the job's `runs-on` value. The standard runner image is
-based on Ubuntu 24.04. To add tools, build a [custom runner
-image](examples/runner/Dockerfile) from the standard image and set
-`spec.template.spec.execution.image` to its address. Use the [Docker Runner
+Each Runner executes one job at a time, and its labels must include every label
+in the job's `runs-on` value. The standard runner image is based on Ubuntu
+24.04. To add tools, build a [custom runner image](examples/runner/Dockerfile)
+from the standard image. Use the [Docker Runner
 sample](config/samples/actions_v1alpha1_docker_runner.yaml) for jobs that need
-Docker by copying its `spec` into the RunnerSet's `spec.template.spec`.
+Docker.
 
-### 3. Migrate a workflow
+### 5. Migrate a workflow
 
 Open Actions supports a [subset of the GitHub Actions workflow
 API](docs/reference.md#workflow-api). Check compatibility first, then copy one
@@ -123,11 +206,40 @@ mkdir -p .open-actions/workflows
 cp .github/workflows/ci.yaml .open-actions/workflows/ci.yaml
 ```
 
-Push the copy from a branch in the installed repository and confirm its
-`Open Actions / .open-actions/workflows/ci.yaml` check passes. GitHub Actions
-and Open Actions will run in parallel while both files exist. Then update any
-required checks and delete `.github/workflows/ci.yaml`. Restore that file to
-roll back.
+Push the copy from a branch in a repository where the App is installed and
+confirm its `Open Actions / .open-actions/workflows/ci.yaml` check passes.
+GitHub Actions and Open Actions will run in parallel while both files exist.
+Then update any required checks and delete `.github/workflows/ci.yaml`. Restore
+that file to roll back.
+
+To inspect runs in the Console, forward its Service and open
+<http://localhost:8080>:
+
+```console
+kubectl port-forward --namespace open-actions-system \
+  service/open-actions-console 8080:80
+```
+
+### Version-pinned installation
+
+For a repeatable production or GitOps installation, select a version from
+[Releases](https://github.com/kelos-dev/open-actions/releases) and install the
+matching OCI chart directly. The chart version omits the release tag's `v`
+prefix:
+
+```console
+export OPEN_ACTIONS_VERSION=v0.1.0
+helm upgrade --install open-actions \
+  oci://ghcr.io/kelos-dev/charts/open-actions \
+  --version "${OPEN_ACTIONS_VERSION#v}" \
+  --namespace open-actions-system \
+  --create-namespace
+```
+
+Use that same release tag for each RunnerSet's runner image instead of
+`latest`. See the [Helm
+values](internal/manifests/charts/open-actions/README.md#values) to configure
+storage, resources, image pull policies, or an externally exposed Console.
 
 ## Inspecting workflow runs
 
@@ -137,10 +249,10 @@ active kubeconfig context. It defaults to that context's namespace; use
 runs.
 
 ```console
-open-actions run list --namespace team-ci
-open-actions run view RUN --namespace team-ci
-open-actions run logs RUN --job JOB --namespace team-ci
-open-actions run logs RUN --job JOB --follow --namespace team-ci
+open-actions run list --namespace open-actions
+open-actions run view RUN --namespace open-actions
+open-actions run logs RUN --job JOB --namespace open-actions
+open-actions run logs RUN --job JOB --follow --namespace open-actions
 ```
 
 `JOB` may be the workflow-local job ID shown by `run view` or the WorkflowJob
