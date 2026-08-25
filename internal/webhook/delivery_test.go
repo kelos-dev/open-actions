@@ -775,6 +775,165 @@ func TestDeliveryBuildsPullRequestRevisionFromPinnedCommits(t *testing.T) {
 	}
 }
 
+func TestDeliveryCachesPullRequestMergeRevision(t *testing.T) {
+	now := time.Date(2026, 8, 25, 13, 0, 0, 0, time.UTC)
+	workflowData := []byte("name: CI\non: pull_request\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: make test\n")
+	gitRoot, revision := testPullRequestGitRepository(t, workflowData, nil, false)
+	gitPath, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	commandDirectory := t.TempDir()
+	commandLog := filepath.Join(commandDirectory, "commands.log")
+	gitWrapper := filepath.Join(commandDirectory, "git")
+	wrapperData := fmt.Sprintf("#!/bin/sh\nif [ \"$1\" = \"ls-tree\" ] || [ \"$1\" = \"show\" ]; then\n  printf '%%s\\n' \"$1\" >> \"$OPEN_ACTIONS_TEST_GIT_LOG\"\nfi\nexec %q \"$@\"\n", gitPath)
+	if err := os.WriteFile(gitWrapper, []byte(wrapperData), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("OPEN_ACTIONS_TEST_GIT_LOG", commandLog)
+	t.Setenv("PATH", commandDirectory+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	compareCalls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/app/installations/2/access_tokens":
+			fmt.Fprint(writer, `{"token":"installation-token"}`)
+		case "/repos/acme/example/compare/" + revision.BaseSHA + "..." + revision.HeadSHA:
+			compareCalls++
+			fmt.Fprintf(writer, `{"merge_base_commit":{"sha":%q}}`, revision.MergeBaseSHA)
+		case "/repos/acme/example/contents/.open-actions/workflows":
+			fmt.Fprint(writer, `[{"name":"ci.yaml","path":".open-actions/workflows/ci.yaml","type":"file"}]`)
+		case "/repos/acme/example/contents/.open-actions/workflows/ci.yaml":
+			fmt.Fprintf(writer, `{"encoding":"base64","content":%q}`, base64.StdEncoding.EncodeToString(workflowData))
+		default:
+			http.NotFound(writer, request)
+		}
+	}))
+	defer server.Close()
+	clusterClient, reconciler, handler, project := newPullRequestDeliveryTest(t, server, now)
+	reconciler.GitRepository, _ = gitrepository.NewClient(gitRoot)
+	reconcile := func(body []byte) {
+		t.Helper()
+		key := enqueuePullRequestDelivery(t, handler, clusterClient, project, now, revision.BaseSHA, revision.HeadSHA, body)
+		if _, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: key}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	reconcile([]byte(`{"delivery":"first-merge"}`))
+	firstCommands, err := os.ReadFile(commandLog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Fields(string(firstCommands)); !slices.Equal(got, []string{"ls-tree", "show"}) {
+		t.Fatalf("first merge workflow discovery commands = %v", got)
+	}
+	reconcile([]byte(`{"delivery":"second-merge"}`))
+	secondCommands, err := os.ReadFile(commandLog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(firstCommands, secondCommands) {
+		t.Fatalf("cached merge workflow discovery commands = %q, want %q", secondCommands, firstCommands)
+	}
+	if compareCalls != 2 {
+		t.Fatalf("merge base calls = %d, want 2", compareCalls)
+	}
+	runs := &actionsv1alpha1.WorkflowRunList{}
+	if err := clusterClient.List(context.Background(), runs); err != nil {
+		t.Fatal(err)
+	}
+	if len(runs.Items) != 2 {
+		t.Fatalf("WorkflowRuns = %d, want 2", len(runs.Items))
+	}
+}
+
+func TestDeliveryCachesWorkflowsAcrossEventsAtAnImmutableRevision(t *testing.T) {
+	revisionA := strings.Repeat("a", 40)
+	revisionB := strings.Repeat("b", 40)
+	workflowData := []byte("name: Deploy\non:\n  push:\n    branches: [main]\n  workflow_run:\n    workflows: [Release]\n    types: [completed]\n    branches: [main]\njobs:\n  deploy:\n    runs-on: ubuntu-latest\n    steps:\n      - run: make deploy\n")
+	revisionCalls := 0
+	directoryCalls := 0
+	fileCalls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/app/installations/2/access_tokens":
+			expiresAt := time.Now().Add(time.Hour).UTC().Format(time.RFC3339)
+			fmt.Fprintf(writer, `{"token":"installation-token","expires_at":%q}`, expiresAt)
+		case "/repos/acme/example/commits":
+			revisionCalls++
+			revision := revisionA
+			if revisionCalls > 2 {
+				revision = revisionB
+			}
+			fmt.Fprintf(writer, `[{"sha":%q}]`, revision)
+		case "/repos/acme/example/contents/.open-actions/workflows":
+			directoryCalls++
+			fmt.Fprint(writer, `[{"name":"deploy.yaml","path":".open-actions/workflows/deploy.yaml","type":"file"}]`)
+		case "/repos/acme/example/contents/.open-actions/workflows/deploy.yaml":
+			fileCalls++
+			fmt.Fprintf(writer, `{"encoding":"base64","content":%q}`, base64.StdEncoding.EncodeToString(workflowData))
+		default:
+			http.NotFound(writer, request)
+		}
+	}))
+	defer server.Close()
+
+	now := time.Date(2026, 8, 25, 12, 0, 0, 0, time.UTC)
+	clusterClient, reconciler, handler, project := newPullRequestDeliveryTest(t, server, now)
+	enqueue := func(name string, normalized normalizedEvent) client.ObjectKey {
+		t.Helper()
+		event := &payload{}
+		event.Repository.ID = 1
+		event.Repository.Name = "example"
+		event.Repository.DefaultBranch = "main"
+		event.Repository.Owner.Login = "acme"
+		body := []byte(fmt.Sprintf(`{"delivery":%q}`, name))
+		if err := handler.enqueueDelivery(context.Background(), project, event, normalized, name, body); err != nil {
+			t.Fatal(err)
+		}
+		return client.ObjectKey{Namespace: project.Namespace, Name: webhookDeliveryName(body)}
+	}
+	reconcile := func(key client.ObjectKey) {
+		t.Helper()
+		if _, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: key}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	requested := normalizedEvent{
+		Name: "workflow_run", Action: "requested", Ref: "refs/heads/main", ResolveRef: "main", BaseRef: "main",
+		WorkflowName: "Release", WorkflowRun: &normalizedWorkflowRun{HeadSHA: strings.Repeat("c", 40)},
+	}
+	reconcile(enqueue("requested-workflow-run-a", requested))
+	runs := &actionsv1alpha1.WorkflowRunList{}
+	if err := clusterClient.List(context.Background(), runs); err != nil {
+		t.Fatal(err)
+	}
+	if len(runs.Items) != 0 {
+		t.Fatalf("requested event WorkflowRuns = %d, want 0", len(runs.Items))
+	}
+	push := normalizedEvent{Name: "push", Ref: "refs/heads/main", ResolveRef: "main"}
+	reconcile(enqueue("push-a", push))
+	completed := requested
+	completed.Action = "completed"
+	completed.WorkflowRun = &normalizedWorkflowRun{Conclusion: "success", HeadSHA: strings.Repeat("c", 40)}
+	reconcile(enqueue("completed-workflow-run-b", completed))
+
+	if err := clusterClient.List(context.Background(), runs); err != nil {
+		t.Fatal(err)
+	}
+	if len(runs.Items) != 2 {
+		t.Fatalf("matching event WorkflowRuns = %d, want 2", len(runs.Items))
+	}
+	if revisionCalls != 3 {
+		t.Fatalf("default branch resolution calls = %d, want 3", revisionCalls)
+	}
+	if directoryCalls != 2 || fileCalls != 2 {
+		t.Fatalf("workflow discovery calls = directory %d, file %d; want 2 each", directoryCalls, fileCalls)
+	}
+}
+
 func TestInvalidForkWorkflowDoesNotSuppressPullRequestTarget(t *testing.T) {
 	now := time.Date(2026, 8, 23, 14, 0, 0, 0, time.UTC)
 	baseWorkflowData := []byte("name: Trusted\non: pull_request_target\njobs:\n  check:\n    runs-on: ubuntu-latest\n    steps:\n      - run: make check\n")
