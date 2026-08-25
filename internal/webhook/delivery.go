@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	actionsv1alpha1 "github.com/kelos-dev/open-actions/api/v1alpha1"
@@ -28,6 +29,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 )
@@ -53,6 +55,7 @@ const (
 	resourceNameMaxLength     = 63
 	workflowRunDigestLength   = 20
 	deliveryRetention         = 24 * time.Hour
+	maxConcurrentDeliveries   = 4
 )
 
 type queuedDelivery struct {
@@ -115,6 +118,8 @@ type DeliveryReconciler struct {
 	Logger                             *slog.Logger
 	WorkflowRunTTLSecondsAfterFinished *int32
 	Now                                func() time.Time
+	workflowCacheOnce                  sync.Once
+	workflowCache                      *workflowRevisionCache
 }
 
 type workflowSelection struct {
@@ -437,15 +442,15 @@ candidateLoop:
 				return ctrl.Result{}, err
 			}
 		}
-		workflowFiles, err := workflowFilesAtRevision(ctx, installation, mergedRepository, &delivery, project.Spec.WorkflowDirectory, candidate.SHA)
+		cachedRevision, err := r.cachedWorkflowRevision(ctx, project, installation, mergedRepository, &delivery, candidate.SHA)
 		if err != nil {
 			return ctrl.Result{}, err
 		}
-		candidateSeenFiles := make(map[string]struct{}, len(seenFiles)+len(workflowFiles))
+		candidateSeenFiles := make(map[string]struct{}, len(seenFiles)+len(cachedRevision.Paths))
 		for path := range seenFiles {
 			candidateSeenFiles[path] = struct{}{}
 		}
-		workflowFileCount := recordWorkflowFiles(candidateSeenFiles, workflowFiles)
+		workflowFileCount := recordWorkflowFiles(candidateSeenFiles, cachedRevision.Paths)
 		candidateWorkflowJobs := workflowJobs
 		candidateSelections := make([]workflowSelection, 0)
 		if err := validateDeliveryFanOut(workflowFileCount, candidateWorkflowJobs); err != nil {
@@ -454,25 +459,9 @@ candidateLoop:
 			}
 			return ctrl.Result{}, r.finish(ctx, object, deliveryStateFailed, 0, err.Error())
 		}
-		for _, workflowPath := range workflowFiles {
-			var data []byte
-			if mergedRepository != nil {
-				data, err = mergedRepository.ReadFile(ctx, workflowPath)
-			} else {
-				data, err = installation.GetFile(ctx, delivery.Repository.Owner, delivery.Repository.Name, workflowPath, candidate.SHA)
-			}
-			if err != nil {
-				return ctrl.Result{}, err
-			}
-			definition, err := workflow.Parse(data)
-			if err != nil {
-				message := fmt.Sprintf("invalid workflow %q: %v", workflowPath, err)
-				if r.skipForkPullRequestDiscovery(candidate, &delivery, message) {
-					continue candidateLoop
-				}
-				r.Logger.Warn("rejected invalid workflow", "path", workflowPath, "error", err)
-				return ctrl.Result{}, r.finish(ctx, object, deliveryStateFailed, 0, message)
-			}
+		for _, cachedWorkflow := range cachedRevision.Workflows {
+			workflowPath := cachedWorkflow.Path
+			definition := cachedWorkflow.Definition
 			_, matched, err := workflow.Match(definition.On, workflow.Event{
 				Name: candidate.Name, Action: candidate.Action, Ref: candidate.Ref,
 				RefName: githubclient.RefName(candidate.Ref), HeadRef: candidate.HeadRef,
@@ -495,6 +484,14 @@ candidateLoop:
 				}
 				candidateSelections = append(candidateSelections, workflowSelection{Path: workflowPath, Event: candidate})
 			}
+		}
+		if cachedRevision.InvalidPath != "" {
+			message := fmt.Sprintf("invalid workflow %q: %s", cachedRevision.InvalidPath, cachedRevision.InvalidError)
+			if r.skipForkPullRequestDiscovery(candidate, &delivery, message) {
+				continue candidateLoop
+			}
+			r.Logger.Warn("rejected invalid workflow", "path", cachedRevision.InvalidPath, "error", cachedRevision.InvalidError)
+			return ctrl.Result{}, r.finish(ctx, object, deliveryStateFailed, 0, message)
 		}
 		seenFiles = candidateSeenFiles
 		workflowJobs = candidateWorkflowJobs
@@ -589,6 +586,52 @@ func workflowFilesAtRevision(ctx context.Context, installation *githubclient.Ins
 		}
 	}
 	return workflowFiles, nil
+}
+
+func (r *DeliveryReconciler) cachedWorkflowRevision(ctx context.Context, project *actionsv1alpha1.Project, installation *githubclient.InstallationClient, mergedRepository *gitrepository.Repository, delivery *queuedDelivery, revision string) (workflowRevision, error) {
+	r.workflowCacheOnce.Do(func() {
+		if r.workflowCache == nil {
+			r.workflowCache = newWorkflowRevisionCache(maxCachedWorkflowRevisions, maxCachedWorkflowBytes)
+		}
+	})
+	key := workflowRevisionKey{
+		ProjectUID: string(project.UID), RepositoryID: delivery.Repository.ID,
+		WorkflowDirectory: project.Spec.WorkflowDirectory, Revision: revision,
+	}
+	return r.workflowCache.load(ctx, key, func(ctx context.Context) (workflowRevision, error) {
+		paths, err := workflowFilesAtRevision(ctx, installation, mergedRepository, delivery, project.Spec.WorkflowDirectory, revision)
+		if err != nil {
+			return workflowRevision{}, err
+		}
+		result := workflowRevision{Paths: paths, Size: 1}
+		for _, path := range paths {
+			result.Size += len(path)
+		}
+		if len(paths) > maxWorkflowFiles {
+			return result, nil
+		}
+		result.Workflows = make([]revisionWorkflow, 0, len(paths))
+		for _, workflowPath := range paths {
+			var data []byte
+			if mergedRepository != nil {
+				data, err = mergedRepository.ReadFile(ctx, workflowPath)
+			} else {
+				data, err = installation.GetFile(ctx, delivery.Repository.Owner, delivery.Repository.Name, workflowPath, revision)
+			}
+			if err != nil {
+				return workflowRevision{}, err
+			}
+			result.Size += len(data)
+			definition, err := workflow.Parse(data)
+			if err != nil {
+				result.InvalidPath = workflowPath
+				result.InvalidError = err.Error()
+				return result, nil
+			}
+			result.Workflows = append(result.Workflows, revisionWorkflow{Path: workflowPath, Definition: definition})
+		}
+		return result, nil
+	})
 }
 
 func terminalWorkflowRunCreationError(err error) bool {
@@ -1050,6 +1093,7 @@ func (r *DeliveryReconciler) SetupWithManager(manager ctrl.Manager) error {
 	}
 	return ctrl.NewControllerManagedBy(manager).
 		For(&corev1.ConfigMap{}, builder.WithPredicates(predicate.NewPredicateFuncs(isWebhookDelivery))).
+		WithOptions(controller.Options{MaxConcurrentReconciles: maxConcurrentDeliveries}).
 		Complete(r)
 }
 
