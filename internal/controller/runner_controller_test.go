@@ -110,7 +110,7 @@ func TestRunnerBuildsOwnedJob(t *testing.T) {
 		t.Errorf("owner references = %#v", job.OwnerReferences)
 	}
 	if job.Spec.TTLSecondsAfterFinished != nil {
-		t.Error("job TTL must not start until the terminal result is recorded")
+		t.Errorf("native Job TTL = %v, want nil", job.Spec.TTLSecondsAfterFinished)
 	}
 	if job.Spec.ActiveDeadlineSeconds == nil || *job.Spec.ActiveDeadlineSeconds != 90*60 {
 		t.Errorf("active deadline = %v", job.Spec.ActiveDeadlineSeconds)
@@ -986,13 +986,6 @@ func TestTerminalWorkflowJobStatusIsDurableBeforeCredentialCleanup(t *testing.T)
 	}
 	if stored.Status.Outputs["artifact"] != "ready" {
 		t.Fatalf("WorkflowJob outputs = %#v", stored.Status.Outputs)
-	}
-	storedNativeJob := &batchv1.Job{}
-	if err := clusterClient.Get(context.Background(), client.ObjectKeyFromObject(nativeJob), storedNativeJob); err != nil {
-		t.Fatal(err)
-	}
-	if storedNativeJob.Spec.TTLSecondsAfterFinished != nil {
-		t.Fatal("native Job TTL started before credential cleanup completed")
 	}
 }
 
@@ -2105,7 +2098,7 @@ func runnerControllerPlanData(t *testing.T, permissions map[string]string, steps
 	return string(data)
 }
 
-func TestDeletingBusyRunnerFinalizesItsWorkflowJob(t *testing.T) {
+func TestDeletingBusyRunnerRetainsLogsAndCleansUpCredentials(t *testing.T) {
 	scheme := runnerTestScheme(t)
 	deletionTime := metav1.Now()
 	runnerObject := &actionsv1alpha1.Runner{
@@ -2126,10 +2119,14 @@ func TestDeletingBusyRunnerFinalizesItsWorkflowJob(t *testing.T) {
 	if err := controllerutil.SetControllerReference(workflowJob, nativeJob, scheme); err != nil {
 		t.Fatal(err)
 	}
+	authSecret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: childName(workflowJob.Name, "auth"), Namespace: workflowJob.Namespace}}
+	if err := controllerutil.SetControllerReference(workflowJob, authSecret, scheme); err != nil {
+		t.Fatal(err)
+	}
 	clusterClient := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithStatusSubresource(&actionsv1alpha1.Runner{}, &actionsv1alpha1.WorkflowJob{}, &batchv1.Job{}).
-		WithObjects(runnerObject, workflowJob, nativeJob).
+		WithObjects(runnerObject, workflowJob, nativeJob, authSecret).
 		Build()
 	reconciler := &RunnerReconciler{Client: clusterClient, APIReader: clusterClient}
 	if _, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(runnerObject)}); err != nil {
@@ -2139,8 +2136,11 @@ func TestDeletingBusyRunnerFinalizesItsWorkflowJob(t *testing.T) {
 	if err := clusterClient.Get(context.Background(), client.ObjectKeyFromObject(nativeJob), storedJob); err != nil {
 		t.Fatal(err)
 	}
-	if storedJob.Spec.TTLSecondsAfterFinished == nil {
-		t.Fatal("native Job was not finalized before Runner deletion")
+	if storedJob.Spec.TTLSecondsAfterFinished != nil {
+		t.Errorf("native Job TTL = %v, want nil", storedJob.Spec.TTLSecondsAfterFinished)
+	}
+	if err := clusterClient.Get(context.Background(), client.ObjectKeyFromObject(authSecret), &corev1.Secret{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("authentication Secret still exists after Runner deletion: %v", err)
 	}
 	storedRunner := &actionsv1alpha1.Runner{}
 	err := clusterClient.Get(context.Background(), client.ObjectKeyFromObject(runnerObject), storedRunner)

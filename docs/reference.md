@@ -216,8 +216,8 @@ key fallback. For matrix jobs, `spec.matrix.jobIndex` and
 `status.result` contains `success`, `failure`, `skipped`, or `cancelled` after
 completion. After execution, `status.outputs` contains the non-secret outputs
 declared by that workflow job. The controller copies these values from the
-completed runner Pod before allowing native Job cleanup, so they remain
-available after controller restarts and Pod deletion.
+completed runner Pod before removing job credentials and releasing the Runner,
+so they do not depend on Pod log retention.
 `WorkflowRun.status.jobs.timedOut` counts jobs whose `Succeeded` condition has
 reason `JobTimedOut`; those jobs retain `failure` as their `status.result` for
 dependency evaluation.
@@ -1334,13 +1334,14 @@ and caches are not supported. Expressions outside the documented
 fields and runtime contexts are rejected during planning or execution and are
 never interpreted as literal values.
 `WorkflowJob` resources are not retried or reassigned when a Runner is removed.
-Native Jobs and their Pod logs are deleted one hour after completion. Completed
+Completed native Jobs and runner Pods are retained with their WorkflowRun.
 WorkflowRuns are retained indefinitely unless `spec.ttlSecondsAfterFinished` is
-set. When that TTL expires, the WorkflowRun and any remaining owned resources
+set. When that TTL expires, the WorkflowRun, its Jobs and Pods, and their logs
 are deleted. GitHub reruns require the original and latest WorkflowRuns to
 remain available. Failed-job reruns also require the WorkflowJobs that provide
 the selected jobs' latest prerequisite results and outputs. Open Actions does
-not archive logs.
+not archive logs outside Kubernetes, so cluster-level log rotation and node
+retention policies still apply.
 
 ## Webhook API
 

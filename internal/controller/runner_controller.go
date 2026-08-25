@@ -56,7 +56,6 @@ const (
 	dockerStoragePath        = "/var/lib/docker"
 	// The repository lives below the volume root so the runner owns its Git worktree.
 	workspacePath               = workspaceVolumeMountPath + "/repository"
-	jobTTLSeconds               = int32(3600)
 	jobStartTimeout             = 5 * time.Minute
 	runnerFinalizer             = "actions.kelos.dev/runner-finalizer"
 	workflowJobQueuedIndex      = "actions.kelos.dev/workflow-job-queued"
@@ -260,7 +259,7 @@ func (r *RunnerReconciler) assignedWorkflowJob(ctx context.Context, runnerObject
 			return nil, err
 		}
 		if terminalWorkflowJob(workflowJob) {
-			if err := r.finalizeWorkflowJob(ctx, workflowJob); err != nil {
+			if err := r.cleanupAuthSecret(ctx, workflowJob); err != nil {
 				return nil, err
 			}
 			if err := r.updateRunnerStatus(ctx, runnerObject, metav1.ConditionTrue, "Ready", "Runner is operational", nil); err != nil {
@@ -720,7 +719,7 @@ func (r *RunnerReconciler) observeNativeJob(ctx context.Context, workflowJob *ac
 		return true, terminal, err
 	}
 	if terminal {
-		if err := r.finalizeWorkflowJob(ctx, workflowJob); err != nil {
+		if err := r.cleanupAuthSecret(ctx, workflowJob); err != nil {
 			return true, true, err
 		}
 	}
@@ -785,32 +784,6 @@ func (r *RunnerReconciler) activeWorkflowJobPods(ctx context.Context, workflowJo
 		}
 	}
 	return false, nil
-}
-
-func (r *RunnerReconciler) finalizeWorkflowJob(ctx context.Context, workflowJob *actionsv1alpha1.WorkflowJob) error {
-	if err := r.cleanupAuthSecret(ctx, workflowJob); err != nil {
-		return err
-	}
-	nativeJob := &batchv1.Job{}
-	nativeJobKey := client.ObjectKey{Namespace: workflowJob.Namespace, Name: workflowJob.Name}
-	nativeJobFound := true
-	if err := r.Get(ctx, nativeJobKey, nativeJob); err != nil {
-		if !apierrors.IsNotFound(err) {
-			return err
-		}
-		nativeJobFound = false
-	} else if !metav1.IsControlledBy(nativeJob, workflowJob) {
-		return fmt.Errorf("native Job %q is not controlled by WorkflowJob %q", nativeJob.Name, workflowJob.Name)
-	}
-
-	if nativeJobFound && nativeJob.Spec.TTLSecondsAfterFinished == nil {
-		before := nativeJob.DeepCopy()
-		nativeJob.Spec.TTLSecondsAfterFinished = pointerTo(jobTTLSeconds)
-		if err := r.Patch(ctx, nativeJob, client.MergeFrom(before)); err != nil {
-			return err
-		}
-	}
-	return nil
 }
 
 func (r *RunnerReconciler) cleanupAuthSecret(ctx context.Context, workflowJob *actionsv1alpha1.WorkflowJob) error {
