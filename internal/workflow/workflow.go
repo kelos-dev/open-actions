@@ -176,6 +176,16 @@ type WorkflowInput struct {
 	defaultSet  bool
 }
 
+// DefaultValue returns the declared default as a string and reports whether a
+// default is present.
+func (input WorkflowInput) DefaultValue() (string, bool) {
+	if !input.defaultSet {
+		return "", false
+	}
+	value, valid := scalarString(input.Default)
+	return value, valid
+}
+
 type Schedule struct {
 	Cron string `yaml:"cron"`
 }

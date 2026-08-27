@@ -88,7 +88,7 @@ func TestConsoleServesWorkflowRunsAndLogsWithoutAuthentication(t *testing.T) {
 	runResponse := httptest.NewRecorder()
 	handler.ServeHTTP(runResponse, httptest.NewRequest(http.MethodGet, runURL, nil))
 	runBody := runResponse.Body.String()
-	if runResponse.Code != http.StatusOK || !strings.Contains(runBody, "CI") || !strings.Contains(runBody, "build") || !strings.Contains(runBody, "Workflow run Queued") || !strings.Contains(runBody, "name: CI\non: push") || !strings.Contains(runBody, "&lt;script&gt;alert(&#39;unsafe&#39;)&lt;/script&gt;") || strings.Contains(runBody, "<script>alert('unsafe')</script>") {
+	if runResponse.Code != http.StatusOK || !strings.Contains(runBody, "CI") || !strings.Contains(runBody, "build") || !strings.Contains(runBody, "Workflow run Queued") || !strings.Contains(runBody, "name: CI\non:\n  push:") || !strings.Contains(runBody, "&lt;script&gt;alert(&#39;unsafe&#39;)&lt;/script&gt;") || strings.Contains(runBody, "<script>alert('unsafe')</script>") {
 		t.Fatalf("run page = %d, %q", runResponse.Code, runResponse.Body.String())
 	}
 
@@ -804,6 +804,19 @@ func TestConsoleShowsRerunWhenOriginalWorkflowRunIsGone(t *testing.T) {
 func TestConsoleCreatesWorkflowDispatch(t *testing.T) {
 	handler := newTestHandler(t, false)
 	handler.repositories = &testRepositoryResolver{repository: actionsv1alpha1.GitHubRepository{ID: 456, Owner: "canonical-acme", Name: "canonical-example"}}
+	sourceRun := &actionsv1alpha1.WorkflowRun{}
+	if err := handler.client.Get(context.Background(), client.ObjectKey{Namespace: "default", Name: "ci"}, sourceRun); err != nil {
+		t.Fatal(err)
+	}
+	sourceRun.Spec.Source.GitHub.Event = actionsv1alpha1.GitHubEvent{
+		Name: actionsv1alpha1.GitHubEventNameWorkflowDispatch,
+		Inputs: map[string]string{
+			"environment": "production",
+		},
+	}
+	if err := handler.client.Update(context.Background(), sourceRun); err != nil {
+		t.Fatal(err)
+	}
 
 	unauthenticated := httptest.NewRecorder()
 	handler.ServeHTTP(unauthenticated, httptest.NewRequest(http.MethodGet, "/dispatch?source=default%2Fci", nil))
@@ -830,6 +843,31 @@ func TestConsoleCreatesWorkflowDispatch(t *testing.T) {
 	}
 	if strings.Contains(pageBody, `name="repository-id"`) {
 		t.Fatalf("dispatch page asks for a repository ID: %s", pageBody)
+	}
+	for _, expected := range []string{
+		`<code>dry-run</code><span class="input-type">boolean</span>`,
+		`Dry run without applying changes`,
+		`<option value="false" selected>false</option>`,
+		`<code>environment</code><span class="input-type">choice</span><span aria-label="required">Required</span>`,
+		`<option value="staging">staging</option>`,
+		`<option value="production" selected>production</option>`,
+		`value="notes" data-input-field disabled`,
+	} {
+		if !strings.Contains(pageBody, expected) {
+			t.Fatalf("dispatch page does not contain declared input %q: %s", expected, pageBody)
+		}
+	}
+	if strings.Contains(pageBody, `id="add-input"`) {
+		t.Fatalf("dispatch page permits undeclared inputs: %s", pageBody)
+	}
+	dryRunStart := strings.Index(pageBody, `<code>dry-run</code>`)
+	environmentStart := strings.Index(pageBody, `<code>environment</code>`)
+	if dryRunStart == -1 || environmentStart <= dryRunStart {
+		t.Fatalf("dispatch page input order is invalid: %s", pageBody)
+	}
+	dryRunInput := pageBody[dryRunStart:environmentStart]
+	if !strings.Contains(dryRunInput, `data-input-toggle checked`) || !strings.Contains(dryRunInput, `value="dry-run" data-input-field>`) {
+		t.Fatalf("defaulted optional input is not included: %s", dryRunInput)
 	}
 
 	requestID := "0123456789abcdefabcd"
@@ -1361,7 +1399,31 @@ func newTestHandler(t *testing.T, secureCookie bool) *Handler {
 		ObjectMeta: metav1.ObjectMeta{Name: workflowFileName, Namespace: run.Namespace},
 		Immutable:  &immutable,
 		Data: map[string]string{
-			workflowsnapshot.DataKey: "name: CI\non: push\n# <script>alert('unsafe')</script>\njobs: {}\n",
+			workflowsnapshot.DataKey: `name: CI
+on:
+  push:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Deployment environment
+        required: true
+        type: choice
+        default: staging
+        options: [staging, production]
+      dry-run:
+        description: Dry run without applying changes
+        type: boolean
+        default: false
+      notes:
+        description: Optional release notes
+        type: string
+# <script>alert('unsafe')</script>
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: make test
+`,
 		},
 	}
 	if err := controllerutil.SetControllerReference(run, workflowFile, scheme); err != nil {

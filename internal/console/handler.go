@@ -26,6 +26,7 @@ import (
 	actionsv1alpha1 "github.com/kelos-dev/open-actions/api/v1alpha1"
 	githubclient "github.com/kelos-dev/open-actions/internal/github"
 	"github.com/kelos-dev/open-actions/internal/projectvalue"
+	"github.com/kelos-dev/open-actions/internal/workflow"
 	"github.com/kelos-dev/open-actions/internal/workflowrun"
 	"github.com/kelos-dev/open-actions/internal/workflowsnapshot"
 	"github.com/kelos-dev/open-actions/internal/workflowstatus"
@@ -169,17 +170,18 @@ type projectPageData struct {
 }
 
 type dispatchPageData struct {
-	Projects        []dispatchProjectOption
-	SelectedProject string
-	RepositoryOwner string
-	RepositoryName  string
-	RefType         string
-	RefName         string
-	Revision        string
-	WorkflowPath    string
-	Inputs          []dispatchInputPageData
-	CSRFToken       string
-	RequestID       string
+	Projects           []dispatchProjectOption
+	SelectedProject    string
+	RepositoryOwner    string
+	RepositoryName     string
+	RefType            string
+	RefName            string
+	Revision           string
+	WorkflowPath       string
+	Inputs             []dispatchInputPageData
+	InputsFromWorkflow bool
+	CSRFToken          string
+	RequestID          string
 }
 
 type dispatchProjectOption struct {
@@ -189,8 +191,13 @@ type dispatchProjectOption struct {
 }
 
 type dispatchInputPageData struct {
-	Name  string
-	Value string
+	Name        string
+	Description string
+	Type        string
+	Options     []string
+	Value       string
+	Required    bool
+	Included    bool
 }
 
 type runPageData struct {
@@ -763,13 +770,29 @@ func (h *Handler) loadDispatchPageData(ctx context.Context, query url.Values) (d
 			data.RefType = "tag"
 			data.RefName = strings.TrimPrefix(githubSource.Revision.Ref, "refs/tags/")
 		}
-		inputNames := make([]string, 0, len(githubSource.Event.Inputs))
-		for name := range githubSource.Event.Inputs {
-			inputNames = append(inputNames, name)
+		workflowFile, available, err := h.loadWorkflowFile(ctx, run)
+		if err != nil {
+			return dispatchPageData{}, err
 		}
-		sort.Strings(inputNames)
-		for _, name := range inputNames {
-			data.Inputs = append(data.Inputs, dispatchInputPageData{Name: name, Value: githubSource.Event.Inputs[name]})
+		if available {
+			definition, err := workflow.Parse([]byte(workflowFile))
+			if err != nil {
+				return dispatchPageData{}, fmt.Errorf("parse workflow file for WorkflowRun %q: %w", run.Name, err)
+			}
+			if trigger, found := definition.On.Events[string(actionsv1alpha1.GitHubEventNameWorkflowDispatch)]; found {
+				data.InputsFromWorkflow = true
+				data.Inputs = declaredDispatchInputs(trigger.Inputs, githubSource.Event.Inputs)
+			}
+		}
+		if !data.InputsFromWorkflow {
+			inputNames := make([]string, 0, len(githubSource.Event.Inputs))
+			for name := range githubSource.Event.Inputs {
+				inputNames = append(inputNames, name)
+			}
+			sort.Strings(inputNames)
+			for _, name := range inputNames {
+				data.Inputs = append(data.Inputs, dispatchInputPageData{Name: name, Value: githubSource.Event.Inputs[name]})
+			}
 		}
 	}
 	for index := range projects.Items {
@@ -796,6 +819,39 @@ func (h *Handler) loadDispatchPageData(ctx context.Context, query url.Values) (d
 		data.Projects[0].Selected = true
 	}
 	return data, nil
+}
+
+func declaredDispatchInputs(definitions map[string]workflow.WorkflowInput, supplied map[string]string) []dispatchInputPageData {
+	names := make([]string, 0, len(definitions))
+	for name := range definitions {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	inputs := make([]dispatchInputPageData, 0, len(names))
+	for _, name := range names {
+		definition := definitions[name]
+		inputType := definition.Type
+		if inputType == "" {
+			inputType = "string"
+		}
+		value, included := supplied[name]
+		if !included {
+			value, included = definition.DefaultValue()
+		}
+		if !included {
+			switch inputType {
+			case "boolean":
+				value = "false"
+			case "choice":
+				value = definition.Options[0]
+			}
+		}
+		inputs = append(inputs, dispatchInputPageData{
+			Name: name, Description: definition.Description, Type: inputType, Options: definition.Options,
+			Value: value, Required: definition.Required, Included: included || definition.Required,
+		})
+	}
+	return inputs
 }
 
 func (h *Handler) createWorkflowDispatch(writer http.ResponseWriter, request *http.Request) {

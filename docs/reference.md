@@ -109,7 +109,8 @@ workflow path, branch or tag, pinned commit SHA, and declared workflow inputs.
 The Console authenticates through the selected Project's GitHub App installation
 and records the repository ID and canonical owner and name returned by GitHub.
 Starting from an existing branch- or tag-backed run prepopulates its Project,
-repository, workflow, and revision. Each form instance carries a request ID, so
+repository, workflow, revision, and the typed inputs declared by the run's
+immutable workflow file snapshot. Each form instance carries a request ID, so
 resubmitting the same dispatch is idempotent and redirects to the existing run.
 
 The Projects page lists Project configuration across all namespaces. A Project
