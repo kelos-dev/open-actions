@@ -994,6 +994,54 @@ func TestTerminalWorkflowJobStatusIsDurableBeforeCredentialCleanup(t *testing.T)
 	}
 }
 
+func TestObserveNativeJobUsesLiveReader(t *testing.T) {
+	scheme := runnerTestScheme(t)
+	workflowJob := &actionsv1alpha1.WorkflowJob{
+		TypeMeta:   metav1.TypeMeta{APIVersion: actionsv1alpha1.GroupVersion.String(), Kind: "WorkflowJob"},
+		ObjectMeta: metav1.ObjectMeta{Name: "build", Namespace: "default", UID: types.UID("workflow-job-uid")},
+		Status:     actionsv1alpha1.WorkflowJobStatus{RunnerRef: &corev1.LocalObjectReference{Name: "runner"}},
+	}
+	nativeJob := &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: workflowJob.Name, Namespace: workflowJob.Namespace}}
+	if err := controllerutil.SetControllerReference(workflowJob, nativeJob, scheme); err != nil {
+		t.Fatal(err)
+	}
+	cachedClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&actionsv1alpha1.WorkflowJob{}).WithObjects(workflowJob).Build()
+	liveReader := fake.NewClientBuilder().WithScheme(scheme).WithObjects(nativeJob).Build()
+	reconciler := &RunnerReconciler{Client: cachedClient, APIReader: liveReader}
+
+	found, terminal, err := reconciler.observeNativeJob(context.Background(), workflowJob)
+	if err != nil || !found || terminal {
+		t.Fatalf("observeNativeJob() = found %t, terminal %t, error %v", found, terminal, err)
+	}
+}
+
+func TestObserveNativeJobUsesCache(t *testing.T) {
+	scheme := runnerTestScheme(t)
+	workflowJob := &actionsv1alpha1.WorkflowJob{
+		TypeMeta:   metav1.TypeMeta{APIVersion: actionsv1alpha1.GroupVersion.String(), Kind: "WorkflowJob"},
+		ObjectMeta: metav1.ObjectMeta{Name: "build", Namespace: "default", UID: types.UID("workflow-job-uid")},
+		Status:     actionsv1alpha1.WorkflowJobStatus{RunnerRef: &corev1.LocalObjectReference{Name: "runner"}},
+	}
+	nativeJob := &batchv1.Job{ObjectMeta: metav1.ObjectMeta{
+		Name: workflowJob.Name, Namespace: workflowJob.Namespace,
+		Labels: map[string]string{actionsv1alpha1.LabelWorkflowJobUID: string(workflowJob.UID)},
+	}}
+	if err := controllerutil.SetControllerReference(workflowJob, nativeJob, scheme); err != nil {
+		t.Fatal(err)
+	}
+	cachedClient := fake.NewClientBuilder().WithScheme(scheme).
+		WithStatusSubresource(&actionsv1alpha1.WorkflowJob{}).
+		WithObjects(workflowJob, nativeJob).
+		Build()
+	liveReader := fake.NewClientBuilder().WithScheme(scheme).Build()
+	reconciler := &RunnerReconciler{Client: cachedClient, APIReader: liveReader}
+
+	found, terminal, err := reconciler.observeNativeJob(context.Background(), workflowJob)
+	if err != nil || !found || terminal {
+		t.Fatalf("observeNativeJob() = found %t, terminal %t, error %v", found, terminal, err)
+	}
+}
+
 func TestSuccessfulNativeJobRequiresRunnerResult(t *testing.T) {
 	scheme := runnerTestScheme(t)
 	workflowJob := &actionsv1alpha1.WorkflowJob{

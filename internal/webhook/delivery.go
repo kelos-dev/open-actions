@@ -320,7 +320,7 @@ func (r *DeliveryReconciler) Reconcile(ctx context.Context, request ctrl.Request
 		}
 	}()
 	object := &corev1.ConfigMap{}
-	if err := r.Get(ctx, request.NamespacedName, object); err != nil {
+	if err := r.APIReader.Get(ctx, request.NamespacedName, object); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 	if object.Labels[deliveryLabel] != "true" {
@@ -1092,7 +1092,7 @@ func (r *DeliveryReconciler) SetupWithManager(manager ctrl.Manager) error {
 		return errors.New("Git repository client must be specified")
 	}
 	return ctrl.NewControllerManagedBy(manager).
-		For(&corev1.ConfigMap{}, builder.WithPredicates(predicate.NewPredicateFuncs(isWebhookDelivery))).
+		For(&corev1.ConfigMap{}, builder.OnlyMetadata, builder.WithPredicates(predicate.NewPredicateFuncs(isWebhookDelivery))).
 		WithOptions(controller.Options{MaxConcurrentReconciles: maxConcurrentDeliveries}).
 		Complete(r)
 }

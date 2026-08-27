@@ -20,10 +20,14 @@ import (
 	githubclient "github.com/kelos-dev/open-actions/internal/github"
 	"github.com/kelos-dev/open-actions/internal/gitrepository"
 	githubwebhook "github.com/kelos-dev/open-actions/internal/webhook"
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/selection"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
@@ -169,6 +173,7 @@ func runManager(arguments []string) error {
 	}
 	controllerManager, err := ctrl.NewManager(configuration, ctrl.Options{
 		Scheme: scheme,
+		Cache:  controllerCacheOptions(),
 		Client: client.Options{Cache: &client.CacheOptions{
 			DisableFor: []client.Object{&corev1.Secret{}},
 		}},
@@ -258,6 +263,19 @@ func runManager(arguments []string) error {
 	}
 	logger.Info("starting Open Actions controller")
 	return controllerManager.Start(ctrl.SetupSignalHandler())
+}
+
+func controllerCacheOptions() cache.Options {
+	managedJob, err := labels.NewRequirement(actionsv1alpha1.LabelWorkflowJobUID, selection.Exists, nil)
+	if err != nil {
+		panic(err)
+	}
+	return cache.Options{
+		ReaderFailOnMissingInformer: true,
+		ByObject: map[client.Object]cache.ByObject{
+			&batchv1.Job{}: {Label: labels.NewSelector().Add(*managedJob)},
+		},
+	}
 }
 
 func normalizeActionCloneBaseURL(value, githubServerURL string) (string, error) {

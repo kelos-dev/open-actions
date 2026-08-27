@@ -1546,7 +1546,7 @@ func TestTerminalDeliveryRetention(t *testing.T) {
 				deliveryStateKey: deliveryStateCompleted, deliveryFinishedKey: tt.finishedAt.Format(time.RFC3339),
 			}}
 			clusterClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(delivery).Build()
-			reconciler := &DeliveryReconciler{Client: clusterClient, Now: func() time.Time { return now }}
+			reconciler := &DeliveryReconciler{Client: clusterClient, APIReader: clusterClient, Now: func() time.Time { return now }}
 			result, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(delivery)})
 			if err != nil {
 				t.Fatal(err)
@@ -1562,6 +1562,27 @@ func TestTerminalDeliveryRetention(t *testing.T) {
 				t.Fatalf("recent delivery was deleted: %v", err)
 			}
 		})
+	}
+}
+
+func TestDeliveryReconcileUsesLiveReader(t *testing.T) {
+	now := time.Date(2026, 8, 8, 12, 0, 0, 0, time.UTC)
+	delivery := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{
+		Name: "delivery-test", Namespace: "default", Labels: map[string]string{deliveryLabel: "true"},
+	}, Data: map[string]string{
+		deliveryStateKey: deliveryStateCompleted, deliveryFinishedKey: now.Add(-12 * time.Hour).Format(time.RFC3339),
+	}}
+	scheme := deliveryTestScheme(t)
+	cachedClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+	liveReader := fake.NewClientBuilder().WithScheme(scheme).WithObjects(delivery).Build()
+	reconciler := &DeliveryReconciler{Client: cachedClient, APIReader: liveReader, Now: func() time.Time { return now }}
+
+	result, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(delivery)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.RequeueAfter != 12*time.Hour {
+		t.Fatalf("requeue after = %v, want %v", result.RequeueAfter, 12*time.Hour)
 	}
 }
 

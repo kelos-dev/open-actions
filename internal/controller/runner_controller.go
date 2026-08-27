@@ -669,7 +669,7 @@ func workflowJobCancellationCondition(workflowJob *actionsv1alpha1.WorkflowJob) 
 func (r *RunnerReconciler) cancelWorkflowJob(ctx context.Context, workflowJob *actionsv1alpha1.WorkflowJob, cancellation *workflowJobCancellation) error {
 	nativeJob := &batchv1.Job{}
 	key := client.ObjectKey{Namespace: workflowJob.Namespace, Name: workflowJob.Name}
-	if err := r.Get(ctx, key, nativeJob); err != nil {
+	if err := r.getNativeJob(ctx, key, nativeJob); err != nil {
 		if !apierrors.IsNotFound(err) {
 			return err
 		}
@@ -692,7 +692,7 @@ func (r *RunnerReconciler) cancelWorkflowJob(ctx context.Context, workflowJob *a
 func (r *RunnerReconciler) observeNativeJob(ctx context.Context, workflowJob *actionsv1alpha1.WorkflowJob) (bool, bool, error) {
 	nativeJob := &batchv1.Job{}
 	key := client.ObjectKey{Namespace: workflowJob.Namespace, Name: workflowJob.Name}
-	if err := r.Get(ctx, key, nativeJob); err != nil {
+	if err := r.getNativeJob(ctx, key, nativeJob); err != nil {
 		if apierrors.IsNotFound(err) {
 			return false, false, nil
 		}
@@ -724,6 +724,17 @@ func (r *RunnerReconciler) observeNativeJob(ctx context.Context, workflowJob *ac
 		}
 	}
 	return true, terminal, nil
+}
+
+func (r *RunnerReconciler) getNativeJob(ctx context.Context, key client.ObjectKey, job *batchv1.Job) error {
+	err := r.Get(ctx, key, job)
+	if err == nil {
+		return nil
+	}
+	if !apierrors.IsNotFound(err) {
+		return err
+	}
+	return r.APIReader.Get(ctx, key, job)
 }
 
 func runnerResultExpected(version string) bool {
