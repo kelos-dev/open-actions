@@ -10,6 +10,10 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	actionsv1alpha1 "github.com/kelos-dev/open-actions/api/v1alpha1"
+	batchv1 "k8s.io/api/batch/v1"
+	"k8s.io/apimachinery/pkg/labels"
 )
 
 func TestRunManagerRejectsInvalidEndpointURLs(t *testing.T) {
@@ -72,6 +76,27 @@ func TestNormalizeActionCloneBaseURL(t *testing.T) {
 				t.Fatalf("normalizeActionCloneBaseURL() = %q, want %q", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestControllerCacheOptions(t *testing.T) {
+	options := controllerCacheOptions()
+	if !options.ReaderFailOnMissingInformer {
+		t.Fatal("cache permits reads to create undeclared informers")
+	}
+	if len(options.ByObject) != 1 {
+		t.Fatalf("cache has %d object-specific configurations, want 1", len(options.ByObject))
+	}
+	for object, configuration := range options.ByObject {
+		if _, ok := object.(*batchv1.Job); !ok {
+			t.Fatalf("cache configures unexpected object type %T", object)
+		}
+		if !configuration.Label.Matches(labels.Set{actionsv1alpha1.LabelWorkflowJobUID: "workflow-job-uid"}) {
+			t.Fatal("cache excludes managed Jobs")
+		}
+		if configuration.Label.Matches(labels.Set{}) {
+			t.Fatal("cache includes unmanaged Jobs")
+		}
 	}
 }
 
