@@ -19,6 +19,7 @@ import (
 	workflowexpression "github.com/kelos-dev/open-actions/internal/expression"
 	githubclient "github.com/kelos-dev/open-actions/internal/github"
 	"github.com/kelos-dev/open-actions/internal/gitrepository"
+	actionmetrics "github.com/kelos-dev/open-actions/internal/metrics"
 	"github.com/kelos-dev/open-actions/internal/projectvalue"
 	"github.com/kelos-dev/open-actions/internal/runner"
 	"github.com/kelos-dev/open-actions/internal/workflow"
@@ -121,6 +122,7 @@ type WorkflowRunReconciler struct {
 	MaxJobTimeout      time.Duration
 	Now                func() time.Time
 	Recorder           events.EventRecorder
+	Metrics            actionmetrics.DurationRecorder
 }
 
 func (r *WorkflowRunReconciler) Reconcile(ctx context.Context, request ctrl.Request) (result ctrl.Result, reconcileErr error) {
@@ -2272,6 +2274,9 @@ func (r *WorkflowRunReconciler) completeUnplannedWorkflowRun(ctx context.Context
 	if err := r.Status().Update(ctx, run); err != nil {
 		return ctrl.Result{}, err
 	}
+	if r.Metrics != nil {
+		r.Metrics.WorkflowRunCompleted(before, run)
+	}
 	recordConditionWarning(r.Recorder, run, before.Conditions, run.Status.Conditions, actionsv1alpha1.WorkflowRunConditionSucceeded)
 	return ctrl.Result{}, nil
 }
@@ -2754,6 +2759,9 @@ func (r *WorkflowRunReconciler) observeWorkflowJobs(ctx context.Context, run *ac
 			if err := r.Status().Update(ctx, run); err != nil {
 				return ctrl.Result{}, err
 			}
+			if r.Metrics != nil {
+				r.Metrics.WorkflowRunCompleted(before, run)
+			}
 			recordConditionWarning(r.Recorder, run, before.Conditions, run.Status.Conditions, actionsv1alpha1.WorkflowRunConditionSucceeded)
 		}
 		return ctrl.Result{}, nil
@@ -2815,6 +2823,9 @@ func (r *WorkflowRunReconciler) observeWorkflowJobs(ctx context.Context, run *ac
 	if !apiEquality.Semantic.DeepEqual(before, &run.Status) {
 		if err := r.Status().Update(ctx, run); err != nil {
 			return ctrl.Result{}, err
+		}
+		if r.Metrics != nil {
+			r.Metrics.WorkflowRunCompleted(before, run)
 		}
 		if condition := meta.FindStatusCondition(run.Status.Conditions, actionsv1alpha1.WorkflowRunConditionSucceeded); condition != nil && condition.Status == metav1.ConditionFalse {
 			recordConditionWarning(r.Recorder, run, before.Conditions, run.Status.Conditions, actionsv1alpha1.WorkflowRunConditionSucceeded)
@@ -3319,6 +3330,9 @@ func (r *WorkflowRunReconciler) completeUnscheduledWorkflowJob(ctx context.Conte
 	if err := r.Status().Update(ctx, job); err != nil {
 		return err
 	}
+	if r.Metrics != nil {
+		r.Metrics.WorkflowJobUpdated(before, job)
+	}
 	if result == actionsv1alpha1.WorkflowJobResultFailure {
 		recordConditionWarning(r.Recorder, job, before.Conditions, job.Status.Conditions, actionsv1alpha1.WorkflowJobConditionSucceeded)
 	}
@@ -3704,6 +3718,9 @@ func (r *WorkflowRunReconciler) planningFailed(ctx context.Context, run *actions
 	if !apiEquality.Semantic.DeepEqual(before, &run.Status) {
 		if err := r.Status().Update(ctx, run); err != nil {
 			return ctrl.Result{}, err
+		}
+		if r.Metrics != nil {
+			r.Metrics.WorkflowRunCompleted(before, run)
 		}
 		recordConditionWarning(r.Recorder, run, before.Conditions, run.Status.Conditions, actionsv1alpha1.WorkflowRunConditionPlanned)
 	}

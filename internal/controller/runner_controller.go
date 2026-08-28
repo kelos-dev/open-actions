@@ -15,6 +15,7 @@ import (
 	"github.com/kelos-dev/open-actions/internal/artifact"
 	"github.com/kelos-dev/open-actions/internal/eventsnapshot"
 	githubclient "github.com/kelos-dev/open-actions/internal/github"
+	actionmetrics "github.com/kelos-dev/open-actions/internal/metrics"
 	"github.com/kelos-dev/open-actions/internal/runner"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -81,6 +82,7 @@ type RunnerReconciler struct {
 	ArtifactResultsURL       string
 	ArtifactMaxRetentionDays int
 	ArtifactTokens           *artifact.TokenCodec
+	Metrics                  actionmetrics.DurationRecorder
 }
 
 func (r *RunnerReconciler) Reconcile(ctx context.Context, request ctrl.Request) (result ctrl.Result, reconcileErr error) {
@@ -313,7 +315,7 @@ func (r *RunnerReconciler) claimWorkflowJob(ctx context.Context, runnerObject *a
 		}
 	}
 	candidates := make([]*actionsv1alpha1.WorkflowJob, 0)
-	plannedRuns := map[string]bool{}
+	plannedRuns := map[string]*metav1.Condition{}
 	loadedRuns := map[string]bool{}
 	for index := range jobs.Items {
 		workflowJob := &jobs.Items[index]
@@ -347,11 +349,13 @@ func (r *RunnerReconciler) claimWorkflowJob(ctx context.Context, runnerObject *a
 			}
 			if err == nil {
 				condition := meta.FindStatusCondition(run.Status.Conditions, actionsv1alpha1.WorkflowRunConditionPlanned)
-				plannedRuns[runName] = run.DeletionTimestamp.IsZero() && condition != nil && condition.Status == metav1.ConditionTrue
+				if run.DeletionTimestamp.IsZero() && condition != nil && condition.Status == metav1.ConditionTrue {
+					plannedRuns[runName] = condition
+				}
 			}
 			loadedRuns[runName] = true
 		}
-		if plannedRuns[runName] {
+		if plannedRuns[runName] != nil {
 			candidates = append(candidates, workflowJob)
 		}
 	}
@@ -387,7 +391,8 @@ func (r *RunnerReconciler) claimWorkflowJob(ctx context.Context, runnerObject *a
 	if err := r.updateRunnerStatus(ctx, currentRunner, metav1.ConditionTrue, "Ready", "Runner is operational", jobRef); err != nil {
 		return nil, err
 	}
-	if err := r.assignWorkflowJob(ctx, workflowJob, runnerObject.Name); err != nil {
+	queuedAt := workflowJobQueueStartedAt(workflowJob, plannedRuns[workflowJob.Spec.WorkflowRunRef.Name])
+	if err := r.assignWorkflowJob(ctx, workflowJob, runnerObject.Name, queuedAt); err != nil {
 		return nil, errors.Join(err, r.releaseRunnerClaim(ctx, currentRunner, workflowJob.Name))
 	}
 	return workflowJob, nil
@@ -1180,6 +1185,9 @@ func (r *RunnerReconciler) updateWorkflowJobStatus(ctx context.Context, workflow
 	if err := r.Status().Update(ctx, workflowJob); err != nil {
 		return err
 	}
+	if r.Metrics != nil {
+		r.Metrics.WorkflowJobUpdated(before, workflowJob)
+	}
 	if condition := meta.FindStatusCondition(workflowJob.Status.Conditions, actionsv1alpha1.WorkflowJobConditionSucceeded); condition != nil && condition.Status == metav1.ConditionFalse {
 		recordConditionWarning(r.Recorder, workflowJob, before.Conditions, workflowJob.Status.Conditions, actionsv1alpha1.WorkflowJobConditionSucceeded)
 	}
@@ -1228,6 +1236,9 @@ func (r *RunnerReconciler) completeAssignedWorkflowJob(ctx context.Context, work
 	if !apiEquality.Semantic.DeepEqual(before, &workflowJob.Status) {
 		if err := r.Status().Update(ctx, workflowJob); err != nil {
 			return err
+		}
+		if r.Metrics != nil {
+			r.Metrics.WorkflowJobUpdated(before, workflowJob)
 		}
 		if result == actionsv1alpha1.WorkflowJobResultFailure {
 			recordConditionWarning(r.Recorder, workflowJob, before.Conditions, workflowJob.Status.Conditions, actionsv1alpha1.WorkflowJobConditionSucceeded)
@@ -1288,13 +1299,30 @@ func (r *RunnerReconciler) updateWorkflowJobScheduled(ctx context.Context, workf
 	return r.Status().Patch(ctx, workflowJob, client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{}))
 }
 
-func (r *RunnerReconciler) assignWorkflowJob(ctx context.Context, workflowJob *actionsv1alpha1.WorkflowJob, runnerName string) error {
+func (r *RunnerReconciler) assignWorkflowJob(ctx context.Context, workflowJob *actionsv1alpha1.WorkflowJob, runnerName string, queuedAt time.Time) error {
 	before := workflowJob.DeepCopy()
 	workflowJob.Status.RunnerRef = &corev1.LocalObjectReference{Name: runnerName}
 	if err := setWorkflowJobScheduled(workflowJob); err != nil {
 		return err
 	}
-	return r.Status().Patch(ctx, workflowJob, client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{}))
+	if err := r.Status().Patch(ctx, workflowJob, client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{})); err != nil {
+		return err
+	}
+	if r.Metrics != nil {
+		r.Metrics.WorkflowJobScheduled(workflowJob, queuedAt)
+	}
+	return nil
+}
+
+func workflowJobQueueStartedAt(workflowJob *actionsv1alpha1.WorkflowJob, planned *metav1.Condition) time.Time {
+	if ready := meta.FindStatusCondition(workflowJob.Status.Conditions, actionsv1alpha1.WorkflowJobConditionReady); ready != nil && ready.Status == metav1.ConditionTrue {
+		return ready.LastTransitionTime.Time
+	}
+	queuedAt := workflowJob.CreationTimestamp.Time
+	if planned != nil && planned.LastTransitionTime.After(queuedAt) {
+		queuedAt = planned.LastTransitionTime.Time
+	}
+	return queuedAt
 }
 
 func setWorkflowJobScheduled(workflowJob *actionsv1alpha1.WorkflowJob) error {

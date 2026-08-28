@@ -2284,10 +2284,10 @@ func TestWorkflowJobAssignmentUsesOptimisticLock(t *testing.T) {
 	if err := clusterClient.Get(context.Background(), key, second); err != nil {
 		t.Fatal(err)
 	}
-	if err := reconciler.assignWorkflowJob(context.Background(), first, "runner-1"); err != nil {
+	if err := reconciler.assignWorkflowJob(context.Background(), first, "runner-1", first.CreationTimestamp.Time); err != nil {
 		t.Fatal(err)
 	}
-	if err := reconciler.assignWorkflowJob(context.Background(), second, "runner-2"); !apierrors.IsConflict(err) {
+	if err := reconciler.assignWorkflowJob(context.Background(), second, "runner-2", second.CreationTimestamp.Time); !apierrors.IsConflict(err) {
 		t.Fatalf("second assignment error = %v, want conflict", err)
 	}
 }
