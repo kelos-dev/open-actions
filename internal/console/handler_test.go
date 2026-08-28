@@ -94,7 +94,7 @@ func TestConsoleServesWorkflowRunsAndLogsWithoutAuthentication(t *testing.T) {
 
 	logResponse := httptest.NewRecorder()
 	handler.ServeHTTP(logResponse, httptest.NewRequest(http.MethodGet, runURL+"/jobs/build", nil))
-	if logResponse.Code != http.StatusOK || !strings.Contains(logResponse.Body.String(), "Show debug") || !strings.Contains(logResponse.Body.String(), "Show timestamps") {
+	if logResponse.Code != http.StatusOK || strings.Contains(logResponse.Body.String(), "Show debug") || !strings.Contains(logResponse.Body.String(), "Show timestamps") {
 		t.Fatalf("log page = %d, %q", logResponse.Code, logResponse.Body.String())
 	}
 

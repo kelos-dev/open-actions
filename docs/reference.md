@@ -342,7 +342,9 @@ separately from Project value sources.
 `true`, after trimming surrounding whitespace and matched without regard to
 case, enables the runner debug indicator for new jobs. The Secret value takes
 precedence when the name exists in both sources. Other values leave the
-indicator disabled.
+indicator disabled. The runner retains `debug` workflow-command output only
+when this setting is enabled, and the Console displays retained debug output
+with the other step logs.
 
 ### Job token permissions
 

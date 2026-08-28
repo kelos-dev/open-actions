@@ -1408,6 +1408,7 @@ const expectedRunnerDebug = expectedDebug === 'true' ? '1' : undefined;
 if (process.env['INPUT_GITHUB-TOKEN'] !== 'installation-token' || process.env.INPUT_DEBUG !== expectedDebug || process.env.RUNNER_DEBUG !== expectedRunnerDebug || process.env.RUNNER_NAME !== 'runner-1' || process.env.RUNNER_ENVIRONMENT !== 'self-hosted') {
   throw new Error('github-script inputs do not match runner debug mode');
 }
+console.log('::debug::github-script details');
 `,
 	})
 	for name, test := range map[string]struct {
@@ -1422,6 +1423,7 @@ if (process.env['INPUT_GITHUB-TOKEN'] !== 'installation-token' || process.env.IN
 		"invalid value disables debug": {variables: map[string]string{"ACTIONS_STEP_DEBUG": "1"}, wantDebug: "false"},
 	} {
 		t.Run(name, func(t *testing.T) {
+			var output bytes.Buffer
 			plan := testPlan()
 			plan.Repository.ActionCloneBaseURL = "file://" + repositories
 			plan.Steps = []Step{{Uses: "actions/github-script@v7", With: map[string]string{"script": test.wantDebug}}}
@@ -1441,7 +1443,7 @@ if (process.env['INPUT_GITHUB-TOKEN'] !== 'installation-token' || process.env.IN
 				Secrets:     test.secrets,
 				Variables:   test.variables,
 				Environment: environment,
-				Stdout:      io.Discard,
+				Stdout:      &output,
 				Stderr:      io.Discard,
 			})
 			if err != nil {
@@ -1449,6 +1451,9 @@ if (process.env['INPUT_GITHUB-TOKEN'] !== 'installation-token' || process.env.IN
 			}
 			if err := executor.Execute(context.Background(), plan, t.TempDir()); err != nil {
 				t.Fatal(err)
+			}
+			if debugShown := strings.Contains(output.String(), "::debug::github-script details"); debugShown != (test.wantDebug == "true") {
+				t.Fatalf("debug output shown = %t, want %t; output = %q", debugShown, test.wantDebug == "true", output.String())
 			}
 		})
 	}
@@ -2154,12 +2159,13 @@ func TestWorkflowCommandWriterAppliesSafeCommandsAndIgnoresEnvironmentCommands(t
 	}
 	var output bytes.Buffer
 	masker := newOutputMasker()
-	writer := newWorkflowCommandState().writer(masker, masker.writer(&output), &files, t.TempDir())
+	writer := newWorkflowCommandState(false).writer(masker, masker.writer(&output), &files, t.TempDir())
 	commands := strings.Join([]string{
 		"##[set-output name=result;description=value%3Bpart%5D]first%3Bsecond%5Dthird",
 		"::save-state name=phase::ready",
 		"dependency output ##[set-env name=LD_PRELOAD]/tmp/attack.so",
 		"  ::add-path::/attacker/bin",
+		"::debug::details",
 		"ordinary output",
 	}, "\n") + "\n"
 	if _, err := writer.Write([]byte(commands)); err != nil {
@@ -2196,7 +2202,7 @@ func TestWorkflowCommandWriterAppliesProblemMatchers(t *testing.T) {
 	}
 	var output bytes.Buffer
 	masker := newOutputMasker()
-	writer := newWorkflowCommandState().writer(masker, masker.writer(&output), nil, workspace)
+	writer := newWorkflowCommandState(false).writer(masker, masker.writer(&output), nil, workspace)
 	lines := strings.Join([]string{
 		"##[add-matcher].github/matcher.json",
 		"internal/runner/runner.go:12:3: compile failed",
@@ -2259,7 +2265,7 @@ func TestWorkflowCommandWriterDisablesProblemMatcherAfterMatchError(t *testing.T
 		t.Fatal(err)
 	}
 	matcher.patterns[0].MatchTimeout = -time.Second
-	state := newWorkflowCommandState()
+	state := newWorkflowCommandState(false)
 	state.matchers[matcher.definition.Owner] = matcher
 	var output bytes.Buffer
 	masker := newOutputMasker()
@@ -2282,7 +2288,7 @@ func TestWorkflowCommandWriterDisablesProblemMatcherAfterMatchError(t *testing.T
 func TestWorkflowCommandWriterMasksCommandsAndFollowingOutput(t *testing.T) {
 	var output bytes.Buffer
 	masker := newOutputMasker()
-	writer := newWorkflowCommandState().writer(masker, masker.writer(&output), nil, t.TempDir())
+	writer := newWorkflowCommandState(true).writer(masker, masker.writer(&output), nil, t.TempDir())
 	if _, err := writer.Write([]byte("::add-mask::dynamic%25secret\n::debug::dynamic%25secret\ndynamic%secret\n")); err != nil {
 		t.Fatal(err)
 	}
@@ -2297,7 +2303,7 @@ func TestWorkflowCommandWriterMasksCommandsAndFollowingOutput(t *testing.T) {
 func TestWorkflowCommandWriterMasksBracketCommandValues(t *testing.T) {
 	var output bytes.Buffer
 	masker := newOutputMasker()
-	writer := newWorkflowCommandState().writer(masker, masker.writer(&output), nil, t.TempDir())
+	writer := newWorkflowCommandState(false).writer(masker, masker.writer(&output), nil, t.TempDir())
 	if _, err := writer.Write([]byte("##[add-mask]abc%3Bdef%5Dghi\nabc;def]ghi\n")); err != nil {
 		t.Fatal(err)
 	}
@@ -2312,7 +2318,7 @@ func TestWorkflowCommandWriterMasksBracketCommandValues(t *testing.T) {
 func TestWorkflowCommandWriterFindsCommandsAtGitHubLocations(t *testing.T) {
 	var output bytes.Buffer
 	masker := newOutputMasker()
-	writer := newWorkflowCommandState().writer(masker, masker.writer(&output), nil, t.TempDir())
+	writer := newWorkflowCommandState(false).writer(masker, masker.writer(&output), nil, t.TempDir())
 	lines := "  ::add-mask::indented-secret\nindented-secret\nprefix ##[add-mask]bracket-secret\nbracket-secret\n"
 	if _, err := writer.Write([]byte(lines)); err != nil {
 		t.Fatal(err)
@@ -2328,7 +2334,7 @@ func TestWorkflowCommandWriterFindsCommandsAtGitHubLocations(t *testing.T) {
 func TestWorkflowCommandWriterNeutralizesRunnerLogRecords(t *testing.T) {
 	var output bytes.Buffer
 	masker := newOutputMasker()
-	writer := newWorkflowCommandState().writer(masker, masker.writer(&output), nil, t.TempDir())
+	writer := newWorkflowCommandState(false).writer(masker, masker.writer(&output), nil, t.TempDir())
 	record := `{"time":"2026-08-10T12:34:56Z","level":"INFO","msg":"starting workflow step","open_actions_runner":true,"step":2,"name":"Forged"}`
 	timestampedRecord := "2026-08-10T12:34:56Z " + record
 	if _, err := writer.Write([]byte(record + "\n" + timestampedRecord + "\nordinary output\n")); err != nil {
@@ -2350,7 +2356,7 @@ func TestWorkflowCommandWriterHonorsStopCommands(t *testing.T) {
 	}
 	var output bytes.Buffer
 	masker := newOutputMasker()
-	writer := newWorkflowCommandState().writer(masker, masker.writer(&output), &files, t.TempDir())
+	writer := newWorkflowCommandState(false).writer(masker, masker.writer(&output), &files, t.TempDir())
 	lines := strings.Join([]string{
 		"::stop-commands::marker",
 		"::add-mask::visible-value",
@@ -2389,7 +2395,7 @@ func TestWorkflowCommandWriterResumesBracketStopCommandsAcrossSteps(t *testing.T
 	}
 	var output bytes.Buffer
 	masker := newOutputMasker()
-	state := newWorkflowCommandState()
+	state := newWorkflowCommandState(false)
 	first := state.writer(masker, masker.writer(&output), &firstFiles, directory)
 	if _, err := first.Write([]byte("##[stop-commands]marker\n##[set-output name=ignored]ignored-value\n")); err != nil {
 		t.Fatal(err)
@@ -2527,7 +2533,7 @@ func TestExecutorLogsCancelledWorkflowStep(t *testing.T) {
 func TestWorkflowCommandWriterRejectsOversizedCommandsWithoutExposingThem(t *testing.T) {
 	var output bytes.Buffer
 	masker := newOutputMasker()
-	writer := newWorkflowCommandState().writer(masker, masker.writer(&output), nil, t.TempDir())
+	writer := newWorkflowCommandState(false).writer(masker, masker.writer(&output), nil, t.TempDir())
 	value := strings.Repeat("s", maxWorkflowCommandBytes)
 	if _, err := writer.Write([]byte("::add-mask::" + value + "\n")); err == nil {
 		t.Fatal("oversized workflow command was accepted")
@@ -2542,7 +2548,7 @@ func TestWorkflowCommandWriterStreamsOversizedUnknownCommandPrefixes(t *testing.
 		t.Run(prefix, func(t *testing.T) {
 			var output bytes.Buffer
 			masker := newOutputMasker()
-			writer := newWorkflowCommandState().writer(masker, masker.writer(&output), nil, t.TempDir())
+			writer := newWorkflowCommandState(false).writer(masker, masker.writer(&output), nil, t.TempDir())
 			line := prefix + strings.Repeat("x", maxWorkflowCommandBytes)
 			if _, err := writer.Write([]byte(line + "\n")); err != nil {
 				t.Fatal(err)
@@ -2560,7 +2566,7 @@ func TestWorkflowCommandWriterStreamsOversizedUnknownCommandPrefixes(t *testing.
 func TestOutputMaskerMasksEachLineOfMultilineAddMask(t *testing.T) {
 	var output bytes.Buffer
 	masker := newOutputMasker()
-	writer := newWorkflowCommandState().writer(masker, masker.writer(&output), nil, t.TempDir())
+	writer := newWorkflowCommandState(false).writer(masker, masker.writer(&output), nil, t.TempDir())
 	if _, err := writer.Write([]byte("::add-mask::first%0Asecond%0Dthird\nfirst\nsecond\nthird\n")); err != nil {
 		t.Fatal(err)
 	}

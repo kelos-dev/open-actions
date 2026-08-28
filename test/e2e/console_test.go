@@ -141,7 +141,7 @@ var _ = Describe("Console", func() {
 		jobPath := runPath + "/jobs/" + url.PathEscape(workflowJob.Name)
 		jobPage := getConsolePage(webClient, consoleURL+jobPath, http.StatusOK)
 		Expect(jobPage).To(ContainSubstring("<h1>test</h1>"))
-		Expect(jobPage).To(ContainSubstring("Show debug"))
+		Expect(jobPage).NotTo(ContainSubstring("Show debug"))
 		Expect(jobPage).To(ContainSubstring("Show timestamps"))
 		Expect(jobPage).To(ContainSubstring(`data-stream-url="` + jobPath + `/stream"`))
 

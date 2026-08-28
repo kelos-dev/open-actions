@@ -29,6 +29,7 @@ type workflowCommandState struct {
 	mutex          sync.Mutex
 	matchers       map[string]*compiledProblemMatcher
 	stoppedCommand string
+	stepDebug      bool
 }
 
 type workflowCommandWriter struct {
@@ -83,8 +84,8 @@ type problemMatch struct {
 	severity  string
 }
 
-func newWorkflowCommandState() *workflowCommandState {
-	return &workflowCommandState{matchers: map[string]*compiledProblemMatcher{}}
+func newWorkflowCommandState(stepDebug bool) *workflowCommandState {
+	return &workflowCommandState{matchers: map[string]*compiledProblemMatcher{}, stepDebug: stepDebug}
 }
 
 func (s *workflowCommandState) writer(masker *outputMasker, target *maskingWriter, files *commandFiles, workspace string) *workflowCommandWriter {
@@ -177,6 +178,9 @@ func (w *workflowCommandWriter) processLine(line []byte, newline bool) error {
 	commandsStopped := w.state.commandsStopped(text)
 	command, commandFound := workflowcommand.Parse(text)
 	if commandFound && !commandsStopped {
+		if command.Name == "debug" && !w.state.stepDebug {
+			return nil
+		}
 		if renderedWorkflowCommand(command.Name) {
 			return w.writeRenderedCommand(command, newline)
 		}
