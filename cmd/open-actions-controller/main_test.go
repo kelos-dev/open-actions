@@ -13,6 +13,7 @@ import (
 
 	actionsv1alpha1 "github.com/kelos-dev/open-actions/api/v1alpha1"
 	batchv1 "k8s.io/api/batch/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 )
 
@@ -83,6 +84,20 @@ func TestControllerCacheOptions(t *testing.T) {
 	options := controllerCacheOptions()
 	if !options.ReaderFailOnMissingInformer {
 		t.Fatal("cache permits reads to create undeclared informers")
+	}
+	object := &actionsv1alpha1.WorkflowRun{ObjectMeta: metav1.ObjectMeta{
+		ManagedFields: []metav1.ManagedFieldsEntry{{Manager: "test-manager"}},
+	}}
+	transformed, err := options.DefaultTransform(object)
+	if err != nil {
+		t.Fatal(err)
+	}
+	transformedObject, ok := transformed.(metav1.Object)
+	if !ok {
+		t.Fatalf("cache transformed object has type %T, want metav1.Object", transformed)
+	}
+	if transformedObject.GetManagedFields() != nil {
+		t.Fatal("cache retains managed fields")
 	}
 	if len(options.ByObject) != 1 {
 		t.Fatalf("cache has %d object-specific configurations, want 1", len(options.ByObject))
