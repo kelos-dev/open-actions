@@ -272,6 +272,7 @@ func controllerCacheOptions() cache.Options {
 	}
 	return cache.Options{
 		ReaderFailOnMissingInformer: true,
+		DefaultTransform:            cache.TransformStripManagedFields(),
 		ByObject: map[client.Object]cache.ByObject{
 			&batchv1.Job{}: {Label: labels.NewSelector().Add(*managedJob)},
 		},
