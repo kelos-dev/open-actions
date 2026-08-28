@@ -132,7 +132,7 @@ func TestActionLogParserStructuresRunnerMessages(t *testing.T) {
 		t.Fatalf("cancellation entry = %#v, %t", entry, visible)
 	}
 	entry, visible = parser.parse(`{"time":"2026-08-10T12:34:58Z","level":"INFO","msg":"skipping workflow step","open_actions_runner":true,"job":"build","step":3,"name":"Deploy"}`)
-	if !visible || entry.Kind != "runner" || entry.Text != "Skipped 3. Deploy" {
+	if !visible || entry.Kind != "group" || entry.Text != "3. Deploy" || entry.Scope != "workflow" || entry.Conclusion != "skipped" {
 		t.Fatalf("skipped entry = %#v, %t", entry, visible)
 	}
 	entry, visible = parser.parse(`{"time":"2026-08-10T12:35:00Z","level":"INFO","msg":"workflow step input","open_actions_runner":true,"name":"token","value":"sensitive-value"}`)

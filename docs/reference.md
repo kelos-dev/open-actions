@@ -68,9 +68,10 @@ runner output as line-oriented GitHub Actions logs. It
 supports `group` and `endgroup`, debug and annotation commands, command lines,
 escaped command data and properties, and `stop-commands` markers. It also shows
 action input and output names without persisting their values and groups post
-actions separately. Workflow step headings show running, succeeded, failed, and
-cancelled states; succeeded steps collapse automatically, while failed and
-cancelled steps remain expanded. ANSI SGR foreground and background colors,
+actions separately. Workflow step headings show running, succeeded, failed,
+cancelled, and skipped states; succeeded and skipped steps collapse
+automatically, while failed and cancelled steps remain expanded. ANSI SGR
+foreground and background colors,
 including standard, bright, 256-color, and RGB values, are rendered along with
 bold, dim, italic, underline, and strike-through text. Other CSI control
 sequences are discarded. Log lines larger than 256 KiB are truncated so a

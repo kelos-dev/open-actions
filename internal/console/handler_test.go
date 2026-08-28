@@ -228,6 +228,28 @@ func TestConsoleKeepsFourDigitLineNumbersOnOneRow(t *testing.T) {
 	}
 }
 
+func TestConsoleRendersSkippedWorkflowSteps(t *testing.T) {
+	handler := newTestHandler(t, false)
+	request := httptest.NewRequest(http.MethodGet, "/runs/default/ci/jobs/build", nil)
+	request.Header.Set("Authorization", "Bearer "+testConsoleToken)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("log page status = %d, want %d", response.Code, http.StatusOK)
+	}
+	for _, expected := range []string{
+		`.group-status.skipped{color:#8b949e}`,
+		`skipped:'Skipped'`,
+		`details.open=!entry.conclusion`,
+		`if(entry.conclusion){setGroupConclusion(container,entry.conclusion);return}`,
+	} {
+		if !strings.Contains(response.Body.String(), expected) {
+			t.Fatalf("log page does not support skipped workflow steps: missing %q", expected)
+		}
+	}
+}
+
 func TestConsoleResumesReconnectedLogStream(t *testing.T) {
 	handler := newTestHandler(t, false)
 	source := handler.logs.(*testLogSource)
@@ -1265,6 +1287,7 @@ func TestConsoleStructuresGitHubActionsLogs(t *testing.T) {
 		"\x1b[38;5;243mcolored output\x1b[0m",
 		`{"time":"2026-08-10T12:34:57Z","level":"INFO","msg":"workflow step output","open_actions_runner":true,"name":"artifact","value":"sensitive-output-value"}`,
 		`{"time":"2026-08-10T12:34:57Z","level":"INFO","msg":"completed workflow step","open_actions_runner":true,"job":"build","step":1,"name":"Build"}`,
+		`{"time":"2026-08-10T12:34:58Z","level":"INFO","msg":"skipping workflow step","open_actions_runner":true,"job":"build","step":2,"name":"Deploy"}`,
 		`{"time":"2026-08-10T12:34:58Z","level":"INFO","msg":"starting post action","open_actions_runner":true,"action":"actions/example@v1"}`,
 		`{"time":"2026-08-10T12:34:59Z","level":"INFO","msg":"completed post action","open_actions_runner":true,"action":"actions/example@v1"}`,
 	}, "\n") + "\n"
@@ -1285,6 +1308,7 @@ func TestConsoleStructuresGitHubActionsLogs(t *testing.T) {
 		`"kind":"output","text":"colored output","parts":[{"text":"colored output","foreground":"#767676"}]`,
 		`"kind":"step-output","text":"artifact"`,
 		`"scope":"workflow","conclusion":"success"`,
+		`"kind":"group","text":"2. Deploy","time":"2026-08-10T12:34:58Z","scope":"workflow","conclusion":"skipped"`,
 		`"kind":"group","text":"Post actions/example@v1"`,
 	} {
 		if !strings.Contains(body, expected) {
