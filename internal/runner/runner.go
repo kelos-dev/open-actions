@@ -257,7 +257,7 @@ func NewExecutor(config ExecutorConfig) (*Executor, error) {
 		stdout:      config.Stdout,
 		stderr:      config.Stderr,
 		masker:      masker,
-		commands:    newWorkflowCommandState(),
+		commands:    newWorkflowCommandState(stepDebugEnabled(config.Secrets, config.Variables)),
 	}, nil
 }
 
