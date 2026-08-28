@@ -157,7 +157,7 @@ func runnerLogEntry(record runnerLogRecord, timestamp string) (logEntry, bool) {
 		if title == "" {
 			title = "workflow step"
 		}
-		return logEntry{Kind: "runner", Text: "Skipped " + title, Time: timestamp}, true
+		return logEntry{Kind: "group", Text: title, Time: timestamp, Scope: "workflow", Conclusion: "skipped"}, true
 	case "starting composite step":
 		title := record.Name
 		if title == "" {
