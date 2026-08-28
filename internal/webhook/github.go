@@ -13,11 +13,13 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	actionsv1alpha1 "github.com/kelos-dev/open-actions/api/v1alpha1"
 	"github.com/kelos-dev/open-actions/internal/eventsnapshot"
 	githubclient "github.com/kelos-dev/open-actions/internal/github"
+	actionmetrics "github.com/kelos-dev/open-actions/internal/metrics"
 	"github.com/kelos-dev/open-actions/internal/workflow"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -39,6 +41,8 @@ type GitHubHandler struct {
 	Client    client.Client
 	APIReader client.Reader
 	Logger    *slog.Logger
+	Metrics   actionmetrics.DurationRecorder
+	Now       func() time.Time
 }
 
 type payloadRepository struct {
@@ -182,6 +186,14 @@ type normalizedRerun struct {
 }
 
 func (h *GitHubHandler) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
+	startedAt := h.now()
+	metricEvent := "unknown"
+	metricResult := "rejected"
+	defer func() {
+		if h.Metrics != nil {
+			h.Metrics.WebhookRequest(metricEvent, metricResult, h.now().Sub(startedAt))
+		}
+	}()
 	if request.Method != http.MethodPost {
 		writer.Header().Set("Allow", http.MethodPost)
 		http.Error(writer, "method not allowed", http.StatusMethodNotAllowed)
@@ -197,6 +209,7 @@ func (h *GitHubHandler) ServeHTTP(writer http.ResponseWriter, request *http.Requ
 		return
 	}
 	eventName := request.Header.Get("X-GitHub-Event")
+	metricEvent = eventName
 	deliveryID := request.Header.Get("X-GitHub-Delivery")
 	parsed := &payload{}
 	if err := json.Unmarshal(body, parsed); err != nil {
@@ -210,6 +223,7 @@ func (h *GitHubHandler) ServeHTTP(writer http.ResponseWriter, request *http.Requ
 
 	project, webhookSecret, err := h.projectForInstallation(request.Context(), parsed.Installation.ID)
 	if err != nil {
+		metricResult = "error"
 		h.Logger.Error("failed to resolve project for webhook", "installation_id", parsed.Installation.ID, "error", err)
 		http.Error(writer, "project unavailable", http.StatusServiceUnavailable)
 		return
@@ -225,10 +239,12 @@ func (h *GitHubHandler) ServeHTTP(writer http.ResponseWriter, request *http.Requ
 			return
 		}
 		if !supported {
+			metricResult = "ignored"
 			writeJSON(writer, http.StatusAccepted, map[string]any{"accepted": true, "queued": false})
 			return
 		}
 		if err := h.enqueueRerunDelivery(request.Context(), project, parsed, rerun, deliveryID); err != nil {
+			metricResult = "error"
 			h.Logger.Error("failed to enqueue GitHub check rerun", "delivery_id", deliveryID, "check_run_id", rerun.CheckRunID, "error", err)
 			if apierrors.IsConflict(err) {
 				http.Error(writer, "webhook replay conflict", http.StatusConflict)
@@ -238,6 +254,7 @@ func (h *GitHubHandler) ServeHTTP(writer http.ResponseWriter, request *http.Requ
 			return
 		}
 		h.Logger.Info("accepted GitHub check rerun", "delivery_id", deliveryID, "check_run_id", rerun.CheckRunID)
+		metricResult = "accepted"
 		writeJSON(writer, http.StatusAccepted, map[string]any{"accepted": true, "queued": true})
 		return
 	}
@@ -247,10 +264,12 @@ func (h *GitHubHandler) ServeHTTP(writer http.ResponseWriter, request *http.Requ
 		return
 	}
 	if !supported {
+		metricResult = "ignored"
 		writeJSON(writer, http.StatusAccepted, map[string]any{"accepted": true, "queued": false})
 		return
 	}
 	if err := h.enqueueDelivery(request.Context(), project, parsed, normalized, deliveryID, body); err != nil {
+		metricResult = "error"
 		h.Logger.Error("failed to enqueue GitHub webhook", "delivery_id", deliveryID, "event", eventName, "error", err)
 		if apierrors.IsConflict(err) {
 			http.Error(writer, "webhook replay conflict", http.StatusConflict)
@@ -260,7 +279,15 @@ func (h *GitHubHandler) ServeHTTP(writer http.ResponseWriter, request *http.Requ
 		return
 	}
 	h.Logger.Info("accepted GitHub webhook", "delivery_id", deliveryID, "event", eventName)
+	metricResult = "accepted"
 	writeJSON(writer, http.StatusAccepted, map[string]any{"accepted": true, "queued": true})
+}
+
+func (h *GitHubHandler) now() time.Time {
+	if h.Now != nil {
+		return h.Now()
+	}
+	return time.Now()
 }
 
 func normalizeRerun(project *actionsv1alpha1.Project, event *payload) (*normalizedRerun, bool, error) {

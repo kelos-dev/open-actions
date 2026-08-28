@@ -174,6 +174,38 @@ open-actions-console \
   --secure-cookie
 ```
 
+### Metrics
+
+The controller serves Prometheus metrics from `--metrics-bind-address`, which
+defaults to `:8082`. In addition to controller-runtime metrics, it exposes these
+duration histograms:
+
+| Metric | Interval | Labels |
+| --- | --- | --- |
+| `open_actions_workflow_run_duration_seconds` | First child Job start to WorkflowRun completion | `namespace`, `project`, `conclusion` |
+| `open_actions_workflow_job_queue_duration_seconds` | WorkflowJob readiness to Runner assignment | `namespace`, `project` |
+| `open_actions_workflow_job_startup_duration_seconds` | Runner assignment to native Job start | `namespace`, `project` |
+| `open_actions_workflow_job_execution_duration_seconds` | Native Job start to WorkflowJob completion | `namespace`, `project`, `conclusion` |
+| `open_actions_webhook_request_duration_seconds` | GitHub webhook HTTP request handling | `event`, `result` |
+| `open_actions_webhook_delivery_duration_seconds` | Queued delivery creation to asynchronous workflow discovery completion | `namespace`, `project`, `event`, `result` |
+
+Run and job conclusions are `success`, `failure`, `cancelled`, or `timed_out`.
+Webhook request results are `accepted`, `ignored`, `rejected`, or `error`, and
+delivery results are `completed` or `failed`. Unknown or unsupported event names
+use the bounded `unknown` label value.
+
+A WorkflowJob becomes ready after its dependencies, condition, and concurrency
+group permit Runner assignment. Dependency-free jobs without those gates begin
+queuing after both the WorkflowJob exists and its WorkflowRun is planned. Queue
+duration excludes time waiting on the dependency graph, but includes
+`strategy.max-parallel` throttling and time waiting for a matching Runner.
+
+Run, startup, and execution duration observations require their corresponding
+start and completion timestamps. Runs and jobs that finish without starting are
+omitted from those histograms. Webhook delivery duration covers the asynchronous
+work that can create zero or more WorkflowRuns; it does not include the execution
+time of those runs.
+
 ## Kubernetes API
 
 Open Actions exposes the namespaced `Project`, `Runner`, `RunnerSet`,

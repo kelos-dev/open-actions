@@ -20,6 +20,7 @@ import (
 	"github.com/kelos-dev/open-actions/internal/eventsnapshot"
 	githubclient "github.com/kelos-dev/open-actions/internal/github"
 	"github.com/kelos-dev/open-actions/internal/gitrepository"
+	actionmetrics "github.com/kelos-dev/open-actions/internal/metrics"
 	"github.com/kelos-dev/open-actions/internal/workflow"
 	"github.com/kelos-dev/open-actions/internal/workflowrun"
 	corev1 "k8s.io/api/core/v1"
@@ -118,6 +119,7 @@ type DeliveryReconciler struct {
 	Logger                             *slog.Logger
 	WorkflowRunTTLSecondsAfterFinished *int32
 	Now                                func() time.Time
+	Metrics                            actionmetrics.DurationRecorder
 	workflowCacheOnce                  sync.Once
 	workflowCache                      *workflowRevisionCache
 }
@@ -1019,13 +1021,16 @@ func matchingWorkflowRun(existing, desired *actionsv1alpha1.WorkflowRun) error {
 
 func (r *DeliveryReconciler) finish(ctx context.Context, object *corev1.ConfigMap, state string, workflowRuns int, message string) error {
 	before := object.DeepCopy()
+	finishedAt := r.now()
 	if object.Data == nil {
 		object.Data = map[string]string{}
 	}
 	object.Data[deliveryStateKey] = state
 	object.Data[deliveryRunCountKey] = strconv.Itoa(workflowRuns)
 	if object.Data[deliveryFinishedKey] == "" {
-		object.Data[deliveryFinishedKey] = r.now().UTC().Format(time.RFC3339)
+		object.Data[deliveryFinishedKey] = finishedAt.UTC().Format(time.RFC3339)
+	} else if recorded, err := time.Parse(time.RFC3339, object.Data[deliveryFinishedKey]); err == nil {
+		finishedAt = recorded
 	}
 	if message == "" {
 		delete(object.Data, deliveryMessageKey)
@@ -1035,7 +1040,21 @@ func (r *DeliveryReconciler) finish(ctx context.Context, object *corev1.ConfigMa
 	if apiequality.Semantic.DeepEqual(before.Data, object.Data) {
 		return nil
 	}
-	return r.Patch(ctx, object, client.MergeFrom(before))
+	if err := r.Patch(ctx, object, client.MergeFrom(before)); err != nil {
+		return err
+	}
+	if r.Metrics != nil && before.Data[deliveryStateKey] == "" && !object.CreationTimestamp.IsZero() {
+		delivery := queuedDelivery{}
+		_ = json.Unmarshal([]byte(object.Data[deliveryDataKey]), &delivery)
+		event := delivery.Event.Name
+		if delivery.Rerun != nil {
+			event = "check_run"
+		}
+		r.Metrics.WebhookDelivery(
+			object.Namespace, delivery.ProjectName, event, strings.ToLower(state), finishedAt.Sub(object.CreationTimestamp.Time),
+		)
+	}
+	return nil
 }
 
 func (r *DeliveryReconciler) persistResolvedRevision(ctx context.Context, object *corev1.ConfigMap, eventName, revision, mergeBase string) error {

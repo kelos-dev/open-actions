@@ -19,6 +19,7 @@ import (
 	"github.com/kelos-dev/open-actions/internal/endpointurl"
 	githubclient "github.com/kelos-dev/open-actions/internal/github"
 	"github.com/kelos-dev/open-actions/internal/gitrepository"
+	actionmetrics "github.com/kelos-dev/open-actions/internal/metrics"
 	githubwebhook "github.com/kelos-dev/open-actions/internal/webhook"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -31,6 +32,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
+	controllermetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 )
 
@@ -185,6 +187,10 @@ func runManager(arguments []string) error {
 	if err != nil {
 		return fmt.Errorf("create controller manager: %w", err)
 	}
+	durationMetrics, err := actionmetrics.New(controllermetrics.Registry)
+	if err != nil {
+		return fmt.Errorf("register duration metrics: %w", err)
+	}
 	if err := (&controller.ProjectReconciler{
 		Client: controllerManager.GetClient(), APIReader: controllerManager.GetAPIReader(),
 		Recorder: controllerManager.GetEventRecorder("project-controller"),
@@ -208,6 +214,7 @@ func runManager(arguments []string) error {
 		ConsoleURL:         normalizedConsoleURL,
 		MaxJobTimeout:      *maxJobTimeout,
 		Recorder:           controllerManager.GetEventRecorder("workflowrun-controller"),
+		Metrics:            durationMetrics,
 	}).SetupWithManager(controllerManager); err != nil {
 		return fmt.Errorf("configure WorkflowRun controller: %w", err)
 	}
@@ -220,6 +227,7 @@ func runManager(arguments []string) error {
 		ArtifactResultsURL:       normalizedArtifactServiceURL,
 		ArtifactMaxRetentionDays: *artifactMaxRetentionDays,
 		ArtifactTokens:           artifactTokens,
+		Metrics:                  durationMetrics,
 	}).SetupWithManager(controllerManager); err != nil {
 		return fmt.Errorf("configure Runner controller: %w", err)
 	}
@@ -236,6 +244,7 @@ func runManager(arguments []string) error {
 		GitRepository:                      gitRepository,
 		Logger:                             logger,
 		WorkflowRunTTLSecondsAfterFinished: workflowRunTTLSecondsAfterFinished,
+		Metrics:                            durationMetrics,
 	}).SetupWithManager(controllerManager); err != nil {
 		return fmt.Errorf("configure webhook delivery controller: %w", err)
 	}
@@ -243,6 +252,7 @@ func runManager(arguments []string) error {
 		Client:    controllerManager.GetClient(),
 		APIReader: controllerManager.GetAPIReader(),
 		Logger:    logger,
+		Metrics:   durationMetrics,
 	}
 	webhookRunnable := &webhookServer{server: &http.Server{
 		Addr:              *webhookAddress,
