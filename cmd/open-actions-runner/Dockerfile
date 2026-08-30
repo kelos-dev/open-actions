@@ -14,11 +14,38 @@ FROM node:20.20.2-bookworm@sha256:8f693eaa7e0a8e71560c9a82b55fd54c2ae920a2ba5d2c
 
 FROM ubuntu:24.04@sha256:33ceb71981b602c1a7443a53469e4dba065f7503eab3078a2d7a57a2ab987517
 
+ARG GH_VERSION=2.98.0
+ARG KUBECTL_VERSION=1.35.8
+
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl git make passwd \
+    && apt-get install -y --no-install-recommends build-essential ca-certificates curl git jq make netcat-openbsd openssl passwd \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --gid 65532 open-actions \
     && useradd --uid 65532 --gid 65532 --create-home open-actions
+RUN set -eu; \
+    architecture="$(dpkg --print-architecture)"; \
+    case "${architecture}" in \
+        amd64) \
+            gh_sha256="3b8ac6b30336802fc1a858d7c084e11cdf24ac1a761ca90b68022d7d729208de"; \
+            kubectl_sha256="874d5e72dbb819f43cff16bcd1e4f8bac5b7f2361fe1e55049b0a6c676fb0cbf" \
+            ;; \
+        arm64) \
+            gh_sha256="cf689084f3a3618f7eae4a2420d335d74626d65f5e594b9828d125d69f800d86"; \
+            kubectl_sha256="cc749967b62f4422260bc9c0aa7a7c55f45175ae38cb8d95767b5d2b7e04c1fd" \
+            ;; \
+        *) \
+            echo "unsupported architecture: ${architecture}" >&2; \
+            exit 1 \
+            ;; \
+    esac; \
+    curl -fsSLo /tmp/gh.tar.gz "https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_linux_${architecture}.tar.gz"; \
+    echo "${gh_sha256}  /tmp/gh.tar.gz" | sha256sum --check; \
+    tar -xzf /tmp/gh.tar.gz -C /tmp; \
+    install -m 0755 "/tmp/gh_${GH_VERSION}_linux_${architecture}/bin/gh" /usr/local/bin/gh; \
+    curl -fsSLo /tmp/kubectl "https://dl.k8s.io/release/v${KUBECTL_VERSION}/bin/linux/${architecture}/kubectl"; \
+    echo "${kubectl_sha256}  /tmp/kubectl" | sha256sum --check; \
+    install -m 0755 /tmp/kubectl /usr/local/bin/kubectl; \
+    rm -rf /tmp/gh.tar.gz "/tmp/gh_${GH_VERSION}_linux_${architecture}" /tmp/kubectl
 COPY --from=node20 /usr/local/ /usr/local/
 COPY --from=node20 /opt/ /opt/
 COPY --from=build /usr/local/go /usr/local/go

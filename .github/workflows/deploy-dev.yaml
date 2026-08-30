@@ -281,6 +281,7 @@ jobs:
               - self-hosted
               - linux
               - x64
+              - ubuntu-latest
               - docker
           EOF
 

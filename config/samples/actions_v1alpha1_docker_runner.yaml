@@ -29,4 +29,5 @@ spec:
     - self-hosted
     - linux
     - x64
+    - ubuntu-latest
     - docker

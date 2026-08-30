@@ -480,13 +480,62 @@ with output-derived dynamic matrices currently require a full rerun with
 `jobIDs` omitted because their expanded IDs do not exist until dependencies
 finish.
 
+### Runner images
+
 Runner labels are canonical lowercase ASCII in Kubernetes resources. Workflow
 `runs-on` labels use the same representation. Each Runner is one reusable
 execution slot and accepts one queued `WorkflowJob` from its `spec.projectRef`
 whose `runs-on` labels are all present in `spec.labels`.
 
-The standard `ghcr.io/kelos-dev/open-actions-runner` image is based on Ubuntu
-24.04. A custom runner image can add tools by extending the standard image:
+The standard `ghcr.io/kelos-dev/open-actions-runner` image is currently based
+on Ubuntu 24.04. Administrators identify this maintained profile by adding
+`ubuntu-latest` to the Runner or RunnerSet `spec.labels`; workflows select it
+by setting `runs-on` to `ubuntu-latest`. Open Actions publishes one standard
+Ubuntu runner image per release rather than separate images for Ubuntu
+versions. The image provides this supported command and native-build baseline:
+
+| Capability | Commands or files |
+| --- | --- |
+| Shell and source operations | `bash`, `curl`, `git`, and `make` |
+| Go builds | `go` and the compiler and headers required by cgo |
+| Action runtimes | `node`, `node24`, `npm`, and `npx` |
+| Docker client | `docker` |
+| C and C++ builds | `cc`, `gcc`, `g++`, `ld`, and the Ubuntu libc development headers provided by `build-essential` |
+| JSON processing | `jq` |
+| GitHub API and releases | `gh` 2.98.0 |
+| Kubernetes API | `kubectl` 1.35.8 |
+| Cryptography and random data | `openssl` |
+| TCP and UDP probes | `nc` from `netcat-openbsd` |
+
+The native compiler and headers support cgo, including `go test -race` after
+`actions/setup-go`. The image contract guarantees the listed command names and
+capabilities, not exact Ubuntu package patch versions.
+
+The runner image is versioned and published with Open Actions rather than on an
+independent schedule. Patch releases may update tool patch versions and Ubuntu
+packages for fixes, but keep the commands in the table. Removing a command,
+changing the Ubuntu release, or upgrading a tool across a compatibility
+boundary is a user-facing release-note item. Pin the image to the controller's
+Open Actions release tag, or to an OCI digest when the exact filesystem must be
+immutable. `main` and `latest` are moving tags. Workflows that require another
+tool version should install it in user-writable storage or use a custom runner
+image. In particular, select a `kubectl` version compatible with the target
+cluster according to the Kubernetes
+[version-skew policy](https://kubernetes.io/releases/version-skew-policy/).
+
+The image runs as numeric user and group `65532:65532` under the restricted
+workflow Pod security context. It remains intentionally different from a
+GitHub-hosted Ubuntu virtual machine, where GitHub documents
+[passwordless `sudo`](https://docs.github.com/en/actions/reference/runners/github-hosted-runners#administrative-privileges).
+The workflow container has no `sudo` access and cannot install Debian packages
+or modify system paths at runtime. It does not provide the full GitHub-hosted
+software inventory, a system service manager, or VM-level kernel access. The
+Pod does not receive a Kubernetes service-account token, so the included
+`kubectl` requires credentials supplied explicitly to the workflow. Docker
+commands require `spec.execution.docker`; that option adds a privileged sidecar
+as described below but does not grant root privileges to workflow steps.
+
+A custom runner image can add other tools by extending the standard image:
 
 ```dockerfile
 ARG OPEN_ACTIONS_RUNNER_IMAGE=ghcr.io/kelos-dev/open-actions-runner:latest
@@ -494,7 +543,7 @@ FROM ${OPEN_ACTIONS_RUNNER_IMAGE}
 
 USER root
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends jq \
+    && apt-get install -y --no-install-recommends rsync \
     && rm -rf /var/lib/apt/lists/*
 USER 65532:65532
 ```
@@ -515,7 +564,7 @@ Set `spec.execution.image` on a Runner or
 `spec.template.spec.execution.image` on a RunnerSet to the published address.
 Using the same Open Actions release for the controller and base runner keeps
 their job-plan versions compatible. Preserve the inherited entrypoint and
-numeric non-root user. The complete Dockerfile is available at
+numeric non-root user. The complete example Dockerfile is available at
 [`examples/runner/Dockerfile`](../examples/runner/Dockerfile).
 
 A RunnerSet creates and owns homogeneous Runner resources from
@@ -548,14 +597,10 @@ sidecar does not receive the job plan or authentication Secret volume, and the
 Pod does not mount the node's Docker socket or a Kubernetes service-account
 token.
 
-The standard Ubuntu runner image has a focused tool set: Bash, curl, Git, Go,
-Make, Node 20 and 24, their package managers, and the Docker CLI. It does not
-replicate the larger software inventory of a GitHub-hosted runner. Install
-additional compilers and command-line tools in a custom runner image. A custom
-runner image used with `spec.execution.docker` must provide a compatible
-`docker` executable on `PATH`. The runner remains non-root; action options that
-invoke `sudo`, such as `helm/kind-action`'s local-registry and cloud-provider
-setup, are not supported by the standard image.
+A custom runner image used with `spec.execution.docker` must provide a
+compatible `docker` executable on `PATH`. The runner remains non-root; action
+options that invoke `sudo`, such as `helm/kind-action`'s local-registry and
+cloud-provider setup, are not supported by the standard runner image.
 
 Docker execution is disabled when `spec.execution.docker` is omitted. Enabling
 it changes the WorkflowJob Pod's security posture because the daemon sidecar is

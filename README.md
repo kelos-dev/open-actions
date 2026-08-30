@@ -189,11 +189,15 @@ kubectl wait --for=condition=Ready runnerset/linux \
 ```
 
 Each Runner executes one job at a time, and its labels must include every label
-in the job's `runs-on` value. The standard runner image is based on Ubuntu
-24.04. To add tools, build a [custom runner image](examples/runner/Dockerfile)
-from the standard image. Use the [Docker Runner
-sample](config/samples/actions_v1alpha1_docker_runner.yaml) for jobs that need
-Docker.
+in the job's `runs-on` value. Use `ubuntu-latest` to select the single standard
+Ubuntu runner profile, currently based on Ubuntu 24.04. The image includes
+the compiler and libc headers required by cgo plus `jq`, `kubectl`, `gh`,
+`openssl`, and `nc`. It remains non-root and does not support runtime package
+installation through `sudo`. See [Runner images](docs/reference.md#runner-images)
+for the complete tool and versioning contract. To add other tools, build a
+[custom runner image](examples/runner/Dockerfile) from the standard image. Use
+the [Docker Runner sample](config/samples/actions_v1alpha1_docker_runner.yaml)
+for jobs that need Docker.
 
 ### 5. Migrate a workflow
 
