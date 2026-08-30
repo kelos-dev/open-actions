@@ -59,9 +59,17 @@ jobs:
           test "$KIND_ACTION_RUNTIME" = "24"
           test "$KIND_ACTION_DOCKER" = "ready"
           test "$COMPOSITE_VALUE" = "from composite"
+          for tool in bash cc gcc g++ curl docker gh git go jq kubectl ld make nc node node24 npm npx openssl; do
+            command -v "$tool"
+          done
+          gh --version
+          jq --version
+          kubectl version --client
+          openssl version
           git status --short
           printf 'runner workspace git works\n'
-          go test ./...
+          go test -race ./...
+          printf 'runner tool baseline works\n'
           printf 'open actions e2e works\n'
       - name: Verify Docker execution
         run: |

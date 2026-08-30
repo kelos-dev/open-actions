@@ -192,6 +192,7 @@ var _ = Describe("Runner", func() {
 		Expect(output).To(ContainSubstring("external composite run"))
 		Expect(output).To(ContainSubstring("Docker execution works"))
 		Expect(output).To(ContainSubstring("runner workspace git works"))
+		Expect(output).To(ContainSubstring("runner tool baseline works"))
 		Expect(output).To(ContainSubstring("open actions e2e works"))
 		Expect(output).To(ContainSubstring("external marker post ran"))
 		Expect(output).To(ContainSubstring("external kind-action post ran"))
