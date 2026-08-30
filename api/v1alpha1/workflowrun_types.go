@@ -138,6 +138,14 @@ type WorkflowRunRerun struct {
 	// +optional
 	RequestID string `json:"requestID,omitempty"`
 
+	// TriggeringActor is the GitHub login that requested this attempt. It is
+	// omitted when the rerun source cannot identify a GitHub user.
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=100
+	// +kubebuilder:validation:Pattern=`^[A-Za-z0-9][A-Za-z0-9_-]*(\[bot\])?$`
+	// +optional
+	TriggeringActor string `json:"triggeringActor,omitempty"`
+
 	// JobIDs selects expanded WorkflowJob IDs to rerun. Selected jobs reuse the
 	// latest available results and outputs of prerequisite jobs from earlier
 	// attempts. Omit it to execute every job in the workflow.

@@ -8,23 +8,29 @@ import (
 
 	workflowexpression "github.com/kelos-dev/open-actions/internal/expression"
 	"github.com/kelos-dev/open-actions/internal/workflow"
+	"github.com/kelos-dev/open-actions/internal/workflowcontext"
 )
 
 var (
-	runnerJobAvailability          = workflowexpression.NewAvailability("github", "open_actions", "matrix", "needs", "vars", "secrets", "inputs")
-	actionDefaultAvailability      = workflowexpression.NewAvailability("github", "open_actions", "runner")
-	runnerStepAvailability         = workflowexpression.NewAvailability("github", "open_actions", "matrix", "needs", "runner", "env", "vars", "secrets", "inputs", "steps").WithHashFiles()
-	runnerConditionAvailability    = workflowexpression.NewAvailability("github", "open_actions", "matrix", "needs", "runner", "env", "vars", "inputs", "steps").WithStatusFunctions().WithHashFiles()
-	compositeAvailability          = workflowexpression.NewAvailability("github", "open_actions", "runner", "env", "inputs", "steps").WithHashFiles()
-	compositeConditionAvailability = workflowexpression.NewAvailability("github", "open_actions", "runner", "env", "inputs", "steps").WithStatusFunctions().WithHashFiles()
+	runnerJobAvailability          = workflow.ExpressionAvailability(workflow.ExpressionJobEnvironment)
+	runnerJobOutputAvailability    = workflow.ExpressionAvailability(workflow.ExpressionJobOutput)
+	actionDefaultAvailability      = workflow.ExpressionAvailability(workflow.ExpressionActionInputDefault)
+	runnerStepAvailability         = workflow.ExpressionAvailability(workflow.ExpressionStep)
+	runnerConditionAvailability    = workflow.ExpressionAvailability(workflow.ExpressionStepCondition)
+	compositeAvailability          = workflow.ExpressionAvailability(workflow.ExpressionCompositeStep)
+	compositeConditionAvailability = workflow.ExpressionAvailability(workflow.ExpressionCompositeCondition)
+	compositeOutputAvailability    = workflow.ExpressionAvailability(workflow.ExpressionCompositeOutput)
 )
 
 func resolveJobEnvironment(values map[string]string, plan *Plan, environment []string, token string, secrets, variables map[string]string) (map[string]string, error) {
-	return resolveExpressionMap(values, expressionContext(plan, environment, "", nil, runnerJobAvailability, nil, token, secrets, variables))
+	return resolveExpressionMap(values, expressionContext(plan, environment, nil, "", nil, runnerJobAvailability, nil, token, secrets, variables))
 }
 
-func resolveActionDefaultExpression(input string, plan *Plan, environment []string, token string) (string, error) {
-	context := expressionContext(plan, environment, "", nil, actionDefaultAvailability, nil, token, nil, nil)
+func resolveActionDefaultExpression(input string, plan *Plan, environment []string, token, actionPath, actionRepository, actionRef string, status *workflowexpression.Status) (string, error) {
+	context := expressionContext(plan, environment, nil, actionPath, nil, actionDefaultAvailability, status, token, nil, nil)
+	github := context.Values["github"].(map[string]any)
+	github["action_repository"] = actionRepository
+	github["action_ref"] = actionRef
 	return resolveExpressionString(input, context)
 }
 
@@ -37,12 +43,12 @@ func validateActionDefaultExpression(input string) error {
 }
 
 func resolveWorkflowStepEnvironment(step Step, state *executionState) (map[string]string, error) {
-	context := workflowExpressionContext(state, state.environment, runnerStepAvailability, nil)
+	context := workflowExpressionContext(state, state.contextEnvironment, runnerStepAvailability, nil)
 	return resolveExpressionMap(step.Env, context)
 }
 
 func resolveWorkflowStep(step Step, environment map[string]string, state *executionState) (Step, error) {
-	stepEnvironment := appendEnvironment(append([]string(nil), state.environment...), environment)
+	stepEnvironment := mergeEnvironment(state.contextEnvironment, environment)
 	context := workflowExpressionContext(state, stepEnvironment, runnerStepAvailability, nil)
 	resolved := step
 	var err error
@@ -104,8 +110,8 @@ func workflowStepCondition(input string, environment map[string]string, status w
 	if strings.TrimSpace(input) == "" {
 		return status.Success, nil
 	}
-	context := workflowExpressionContext(state, state.environment, runnerConditionAvailability, &status)
-	environmentContext := workflowExpressionContext(state, state.environment, runnerStepAvailability, nil)
+	context := workflowExpressionContext(state, state.contextEnvironment, runnerConditionAvailability, &status)
+	environmentContext := workflowExpressionContext(state, state.contextEnvironment, runnerStepAvailability, nil)
 	baseEnvironment := context.Values["env"].(map[string]any)
 	resolveEnvironment := func(name string) (any, bool, error) {
 		if input, found := stringMapValue(environment, name); found {
@@ -133,66 +139,130 @@ func workflowStepCondition(input string, environment map[string]string, status w
 	return evaluateCondition(input, context, status.Success)
 }
 
-func workflowExpressionContext(state *executionState, environment []string, availability workflowexpression.Availability, status *workflowexpression.Status) workflowexpression.Context {
+func workflowExpressionContext(state *executionState, environment map[string]string, availability workflowexpression.Availability, status *workflowexpression.Status) workflowexpression.Context {
 	values := map[string]any{"steps": state.stepOutputs}
-	return expressionContext(state.plan, environment, "", values, availability, status, state.githubToken, state.secrets, state.variables)
+	if status == nil {
+		status = &state.jobStatus
+	}
+	return expressionContext(state.plan, state.environment, environment, "", values, availability, status, state.githubToken, state.secrets, state.variables)
 }
 
 func compositeExpressionContext(compositeContext *compositeContext, availability workflowexpression.Availability, status *workflowexpression.Status) workflowexpression.Context {
-	environment := appendEnvironment(append([]string(nil), compositeContext.state.environment...), compositeContext.scopedEnvironment)
+	environment := mergeEnvironment(compositeContext.state.contextEnvironment, compositeContext.scopedEnvironment)
 	steps := make(map[string]any, len(compositeContext.stepOutput))
-	for id, outputs := range compositeContext.stepOutput {
-		steps[id] = map[string]any{"outputs": outputs}
+	for id, result := range compositeContext.stepOutput {
+		steps[id] = result
 	}
 	values := map[string]any{
 		"inputs": compositeContext.inputs,
 		"steps":  steps,
 	}
-	return expressionContext(compositeContext.state.plan, environment, compositeContext.actionPath, values, availability, status, compositeContext.state.githubToken, nil, nil)
+	if status == nil {
+		status = &compositeContext.state.jobStatus
+	}
+	context := expressionContext(compositeContext.state.plan, compositeContext.state.environment, environment, compositeContext.actionPath, values, availability, status, compositeContext.state.githubToken, nil, nil)
+	github := context.Values["github"].(map[string]any)
+	github["action_ref"] = compositeContext.actionRef
+	github["action_repository"] = compositeContext.actionRepository
+	github["action_status"] = compositeContext.actionStatus
+	return context
 }
 
-func expressionContext(plan *Plan, environment []string, actionPath string, extra map[string]any, availability workflowexpression.Availability, status *workflowexpression.Status, token string, secrets, variables map[string]string) workflowexpression.Context {
+func compositeOutputExpressionContext(compositeContext *compositeContext) workflowexpression.Context {
+	return compositeExpressionContext(compositeContext, compositeOutputAvailability, nil)
+}
+
+func expressionContext(plan *Plan, environment []string, declaredEnvironment map[string]string, actionPath string, extra map[string]any, availability workflowexpression.Availability, status *workflowexpression.Status, token string, secrets, variables map[string]string) workflowexpression.Context {
 	pullRequestRefs := planPullRequestRefs(plan)
-	github := map[string]any{
-		"actor":       plan.Run.Actor,
-		"workflow":    plan.WorkflowName,
-		"event_name":  plan.Event.Name,
-		"event":       githubExpressionEvent(plan),
-		"repository":  plan.Repository.Owner + "/" + plan.Repository.Name,
-		"sha":         plan.Revision.SHA,
-		"ref":         plan.Revision.Ref,
-		"ref_name":    plan.Revision.RefName,
-		"head_ref":    pullRequestRefs.head,
-		"base_ref":    pullRequestRefs.base,
-		"workspace":   environmentValue(environment, "GITHUB_WORKSPACE"),
-		"server_url":  strings.TrimSuffix(plan.Repository.ServerURL, "/"),
-		"api_url":     strings.TrimSuffix(plan.Repository.APIURL, "/"),
-		"run_id":      strconv.FormatInt(plan.Run.ID, 10),
-		"run_number":  strconv.FormatInt(plan.Run.Number, 10),
-		"run_attempt": strconv.FormatInt(int64(plan.Run.Attempt), 10),
-		"token":       workflowexpression.Secret(token),
-	}
-	if actionPath != "" {
-		github["action_path"] = actionPath
-	}
+	repository := plan.Repository.Owner + "/" + plan.Repository.Name
+	event := githubExpressionEvent(plan)
+	github := workflowcontext.GitHub(workflowcontext.GitHubValues{
+		Action:            environmentValue(environment, "GITHUB_ACTION"),
+		ActionPath:        actionPath,
+		ActionRef:         environmentValue(environment, "GITHUB_ACTION_REF"),
+		ActionRepository:  environmentValue(environment, "GITHUB_ACTION_REPOSITORY"),
+		ActionStatus:      environmentValue(environment, "GITHUB_ACTION_STATUS"),
+		Actor:             plan.Run.Actor,
+		ActorID:           workflowcontext.EventID(event, "sender", "id"),
+		APIURL:            plan.Repository.APIURL,
+		BaseRef:           pullRequestRefs.base,
+		EnvironmentFile:   environmentValue(environment, "GITHUB_ENV"),
+		Event:             event,
+		EventName:         plan.Event.Name,
+		EventPath:         environmentValue(environment, "GITHUB_EVENT_PATH"),
+		HeadRef:           pullRequestRefs.head,
+		JobID:             plan.JobID,
+		PathFile:          environmentValue(environment, "GITHUB_PATH"),
+		Ref:               plan.Revision.Ref,
+		RefName:           plan.Revision.RefName,
+		RepositoryID:      plan.Repository.ID,
+		RepositoryName:    plan.Repository.Name,
+		RepositoryOwner:   plan.Repository.Owner,
+		RepositoryOwnerID: workflowcontext.EventID(event, "repository", "owner", "id"),
+		RepositoryURL:     workflowcontext.EventString(event, "repository", "git_url"),
+		RetentionDays:     environmentValue(environment, "GITHUB_RETENTION_DAYS"),
+		RunAttempt:        plan.Run.Attempt,
+		RunID:             plan.Run.ID,
+		RunNumber:         plan.Run.Number,
+		ServerURL:         plan.Repository.ServerURL,
+		SHA:               plan.Revision.SHA,
+		Token:             workflowexpression.Secret(token),
+		TriggeringActor:   triggeringActor(plan.Run),
+		WorkflowName:      plan.WorkflowName,
+		WorkflowPath:      plan.WorkflowPath,
+		Workspace:         environmentValue(environment, "GITHUB_WORKSPACE"),
+	})
 	values := map[string]any{
 		"github": github,
 		"open_actions": map[string]any{
 			"run_url":       plan.Run.URL,
 			"run_query_url": plan.Run.QueryURL,
 		},
-		"inputs":  plan.Inputs,
-		"matrix":  plan.Matrix,
-		"needs":   plan.Needs.ExpressionValues(),
-		"secrets": secretContext(token, secrets),
-		"vars":    variables,
-		"runner":  runnerExpressionValues(environment),
-		"env":     environmentContext(environment),
+		"inputs":   plan.Inputs,
+		"matrix":   plan.Matrix,
+		"strategy": plan.Strategy,
+		"needs":    plan.Needs.ExpressionValues(),
+		"secrets":  secretContext(token, secrets),
+		"vars":     variables,
+		"runner":   runnerExpressionValues(environment),
+		"env":      expressionEnvironment(declaredEnvironment),
+		"job": workflowcontext.Job(
+			expressionStatus(status),
+			workflowcontext.WorkflowRef(repository, plan.WorkflowPath, plan.Revision.Ref),
+			plan.Revision.SHA,
+			repository,
+			plan.WorkflowPath,
+		),
 	}
 	for name, value := range extra {
 		values[name] = value
 	}
 	return workflowexpression.Context{Availability: availability, Values: values, Status: status}
+}
+
+func triggeringActor(run Run) string {
+	if run.TriggeringActor != "" {
+		return run.TriggeringActor
+	}
+	return run.Actor
+}
+
+func expressionStatus(status *workflowexpression.Status) string {
+	if status == nil || status.Success || !status.Failure && !status.Cancelled {
+		return "success"
+	}
+	if status.Cancelled {
+		return "cancelled"
+	}
+	return "failure"
+}
+
+func expressionEnvironment(environment map[string]string) map[string]any {
+	values := make(map[string]any, len(environment))
+	for name, value := range environment {
+		values[name] = value
+	}
+	return values
 }
 
 func runnerExpressionValues(environment []string) map[string]any {
@@ -258,17 +328,6 @@ func githubExpressionEvent(plan *Plan) map[string]any {
 	}
 	if plan.Event.Name == "release" {
 		result["release"] = map[string]any{"tag_name": plan.Revision.RefName}
-	}
-	return result
-}
-
-func environmentContext(environment []string) map[string]any {
-	result := make(map[string]any, len(environment))
-	for _, entry := range environment {
-		name, value, found := strings.Cut(entry, "=")
-		if found {
-			result[name] = value
-		}
 	}
 	return result
 }

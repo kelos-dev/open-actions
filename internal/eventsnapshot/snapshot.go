@@ -20,6 +20,7 @@ func Decode(data []byte) (map[string]any, error) {
 	}
 	document := map[string]any{}
 	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.UseNumber()
 	if err := decoder.Decode(&document); err != nil {
 		return nil, fmt.Errorf("decode GitHub event snapshot: %w", err)
 	}

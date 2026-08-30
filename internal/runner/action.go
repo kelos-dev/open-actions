@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"github.com/kelos-dev/open-actions/internal/actionref"
+	workflowexpression "github.com/kelos-dev/open-actions/internal/expression"
 	"github.com/kelos-dev/open-actions/internal/gitrepository"
 	"gopkg.in/yaml.v3"
 )
@@ -169,9 +170,6 @@ func (r *actionResolver) resolve(ctx context.Context, uses string) (preparedActi
 			return preparedAction{}, fmt.Errorf("action %s uses an unsupported lifecycle condition", uses)
 		}
 	case "composite":
-		if err := validateComposite(definition); err != nil {
-			return preparedAction{}, fmt.Errorf("action %s: %w", uses, err)
-		}
 	default:
 		return preparedAction{}, fmt.Errorf("action %s uses unsupported runtime %q", uses, definition.Runs.Using)
 	}
@@ -180,7 +178,7 @@ func (r *actionResolver) resolve(ctx context.Context, uses string) (preparedActi
 	return action, nil
 }
 
-func (r *actionResolver) invocation(step Step, plan *Plan, token string) (*actionInvocation, error) {
+func (r *actionResolver) invocation(step Step, plan *Plan, token string, status *workflowexpression.Status) (*actionInvocation, error) {
 	reference, err := actionref.Parse(step.Uses)
 	if err != nil {
 		return nil, err
@@ -189,7 +187,7 @@ func (r *actionResolver) invocation(step Step, plan *Plan, token string) (*actio
 	if !found {
 		return nil, fmt.Errorf("action %s was not prepared", step.Uses)
 	}
-	inputs, err := actionInputs(action.definition.Inputs, step.With, plan, r.environment, token)
+	inputs, err := actionInputsForAction(action.definition.Inputs, step.With, plan, r.environment, token, action, status)
 	if err != nil {
 		return nil, fmt.Errorf("configure action %s: %w", step.Uses, err)
 	}
@@ -297,10 +295,39 @@ func loadActionDefinition(directory string) (actionDefinition, error) {
 			return actionDefinition{}, fmt.Errorf("input %q default: %w", name, err)
 		}
 	}
+	for name, output := range definition.Outputs {
+		if output.Value == nil {
+			continue
+		}
+		value, err := inputString(output.Value)
+		if err != nil {
+			return actionDefinition{}, fmt.Errorf("output %q value: %w", name, err)
+		}
+		if err := validateActionExpression(value, compositeOutputAvailability); err != nil {
+			return actionDefinition{}, fmt.Errorf("output %q value: %w", name, err)
+		}
+	}
+	if definition.Runs.Using == "composite" {
+		if err := validateComposite(definition); err != nil {
+			return actionDefinition{}, err
+		}
+	}
 	return definition, nil
 }
 
 func actionInputs(definitions map[string]actionInput, supplied map[string]string, plan *Plan, environment []string, token string) (map[string]string, error) {
+	return actionInputsWithContext(definitions, supplied, plan, environment, token, "", "", "", nil)
+}
+
+func actionInputsForAction(definitions map[string]actionInput, supplied map[string]string, plan *Plan, environment []string, token string, action preparedAction, status *workflowexpression.Status) (map[string]string, error) {
+	actionPath := ""
+	if action.definition.Runs.Using == "composite" {
+		actionPath = action.directory
+	}
+	return actionInputsWithContext(definitions, supplied, plan, environment, token, actionPath, action.reference.Owner+"/"+action.reference.Repository, action.reference.Ref, status)
+}
+
+func actionInputsWithContext(definitions map[string]actionInput, supplied map[string]string, plan *Plan, environment []string, token, actionPath, actionRepository, actionRef string, status *workflowexpression.Status) (map[string]string, error) {
 	result := make(map[string]string, len(definitions)+len(supplied))
 	definitionNames := make(map[string]string, len(definitions))
 	for name := range definitions {
@@ -329,7 +356,7 @@ func actionInputs(definitions map[string]actionInput, supplied map[string]string
 			if err != nil {
 				return nil, fmt.Errorf("input %q default: %w", name, err)
 			}
-			resolved, err := resolveActionDefault(value, plan, environment, token)
+			resolved, err := resolveActionDefault(value, plan, environment, token, actionPath, actionRepository, actionRef, status)
 			if err != nil {
 				return nil, fmt.Errorf("input %q default: %w", name, err)
 			}
@@ -350,11 +377,11 @@ func inputString(value any) (string, error) {
 	}
 }
 
-func resolveActionDefault(value string, plan *Plan, environment []string, token string) (string, error) {
-	return resolveActionDefaultExpression(value, plan, environment, token)
+func resolveActionDefault(value string, plan *Plan, environment []string, token, actionPath, actionRepository, actionRef string, status *workflowexpression.Status) (string, error) {
+	return resolveActionDefaultExpression(value, plan, environment, token, actionPath, actionRepository, actionRef, status)
 }
 
-func (e *Executor) runJavaScriptHook(ctx context.Context, invocation *actionInvocation, hook, entrypoint, temporaryDirectory, workspace string, environment *[]string) error {
+func (e *Executor) runJavaScriptHook(ctx context.Context, invocation *actionInvocation, hook, entrypoint string, state *executionState) error {
 	if entrypoint == "" {
 		return nil
 	}
@@ -368,11 +395,11 @@ func (e *Executor) runJavaScriptHook(ctx context.Context, invocation *actionInvo
 	if _, err := os.Stat(entrypointPath); err != nil {
 		return fmt.Errorf("find %s entrypoint: %w", hook, err)
 	}
-	files, err := newCommandFiles(filepath.Join(temporaryDirectory, "commands"), fmt.Sprintf("%d-%s", e.commandID.Add(1), hook))
+	files, err := newCommandFiles(filepath.Join(state.temporaryDirectory, "commands"), fmt.Sprintf("%d-%s", e.commandID.Add(1), hook))
 	if err != nil {
 		return err
 	}
-	actionEnvironment := append([]string(nil), (*environment)...)
+	actionEnvironment := append([]string(nil), state.environment...)
 	actionEnvironment = appendEnvironment(actionEnvironment, invocation.step.Env)
 	actionEnvironment = setEnvironment(actionEnvironment, "GITHUB_ACTION_PATH", invocation.directory)
 	actionEnvironment = setEnvironment(actionEnvironment, "GITHUB_ACTION_REPOSITORY", invocation.reference.Owner+"/"+invocation.reference.Repository)
@@ -385,12 +412,13 @@ func (e *Executor) runJavaScriptHook(ctx context.Context, invocation *actionInvo
 			actionEnvironment = setEnvironment(actionEnvironment, "STATE_"+name, value)
 		}
 	}
-	executionError := e.executeCommandWithFiles(ctx, invocation.executable, []string{entrypointPath}, workspace, actionEnvironment, &files, workspace)
+	executionError := e.executeCommandWithFiles(ctx, invocation.executable, []string{entrypointPath}, state.workspace, actionEnvironment, &files, state.workspace)
 	updates, commandError := files.read()
 	if commandError != nil {
 		return errors.Join(executionError, commandError)
 	}
-	applyEnvironmentUpdates(environment, updates)
+	applyEnvironmentUpdates(&state.environment, updates)
+	applyContextEnvironmentUpdates(&state.contextEnvironment, updates)
 	for name, value := range updates.state {
 		invocation.state[name] = value
 	}
@@ -403,7 +431,7 @@ func (e *Executor) runJavaScriptHook(ctx context.Context, invocation *actionInvo
 }
 
 func (e *Executor) executeAction(ctx context.Context, state *executionState, step Step, cancelled bool) (map[string]string, error) {
-	invocation, err := state.resolver.invocation(step, state.plan, e.githubToken)
+	invocation, err := state.resolver.invocation(step, state.plan, e.githubToken, &state.jobStatus)
 	if err != nil {
 		return nil, err
 	}
@@ -423,10 +451,10 @@ func (e *Executor) executeAction(ctx context.Context, state *executionState, ste
 		if invocation.definition.Runs.Post != "" {
 			state.posts = append(state.posts, invocation)
 		}
-		if err := e.runJavaScriptHook(ctx, invocation, "pre", invocation.definition.Runs.Pre, state.temporaryDirectory, state.workspace, &state.environment); err != nil {
+		if err := e.runJavaScriptHook(ctx, invocation, "pre", invocation.definition.Runs.Pre, state); err != nil {
 			return nil, err
 		}
-		if err := e.runJavaScriptHook(ctx, invocation, "main", invocation.definition.Runs.Main, state.temporaryDirectory, state.workspace, &state.environment); err != nil {
+		if err := e.runJavaScriptHook(ctx, invocation, "main", invocation.definition.Runs.Main, state); err != nil {
 			return invocation.outputs, err
 		}
 		if integrate {

@@ -340,16 +340,16 @@ type Repository struct {
 }
 
 var (
-	workflowConcurrencyAvailability = expression.NewAvailability("github", "inputs", "vars")
-	workflowEnvironmentAvailability = expression.NewAvailability("github", "open_actions", "secrets", "inputs", "vars")
-	jobNameAvailability             = expression.NewAvailability("github", "open_actions", "needs", "strategy", "matrix", "vars", "inputs")
-	jobEnvironmentAvailability      = expression.NewAvailability("github", "open_actions", "needs", "strategy", "matrix", "vars", "secrets", "inputs")
-	jobConditionAvailability        = expression.NewAvailability("github", "open_actions", "needs", "vars", "inputs").WithStatusFunctions()
-	jobConcurrencyAvailability      = expression.NewAvailability("github", "open_actions", "needs", "strategy", "matrix", "vars", "inputs")
-	matrixAvailability              = expression.NewAvailability("github", "open_actions", "needs", "vars", "inputs")
-	stepAvailability                = expression.NewAvailability("github", "open_actions", "needs", "strategy", "matrix", "job", "runner", "env", "vars", "secrets", "steps", "inputs").WithHashFiles()
-	stepConditionAvailability       = expression.NewAvailability("github", "open_actions", "needs", "strategy", "matrix", "job", "runner", "env", "vars", "steps", "inputs").WithStatusFunctions().WithHashFiles()
-	jobOutputAvailability           = expression.NewAvailability("github", "open_actions", "needs", "strategy", "matrix", "job", "runner", "env", "vars", "secrets", "steps", "inputs")
+	workflowConcurrencyAvailability = ExpressionAvailability(ExpressionWorkflowConcurrency)
+	workflowEnvironmentAvailability = ExpressionAvailability(ExpressionWorkflowEnvironment)
+	jobNameAvailability             = ExpressionAvailability(ExpressionJobConfiguration)
+	jobEnvironmentAvailability      = ExpressionAvailability(ExpressionJobEnvironment)
+	jobConditionAvailability        = ExpressionAvailability(ExpressionJobCondition)
+	jobConcurrencyAvailability      = ExpressionAvailability(ExpressionJobConfiguration)
+	matrixAvailability              = ExpressionAvailability(ExpressionJobStrategy)
+	stepAvailability                = ExpressionAvailability(ExpressionStep)
+	stepConditionAvailability       = ExpressionAvailability(ExpressionStepCondition)
+	jobOutputAvailability           = ExpressionAvailability(ExpressionJobOutput)
 )
 
 func Parse(data []byte) (*Definition, error) {
@@ -484,8 +484,8 @@ func validateJob(id string, job *Job, workflowEnv map[string]any) error {
 	if err := job.TimeoutMinutes.validate(id); err != nil {
 		return err
 	}
-	if MatrixUsesNeeds(job.Strategy) && len(job.Needs) == 0 {
-		return fmt.Errorf("job %q matrix uses needs but the job declares no dependencies", id)
+	if JobPlanningUsesNeeds(*job) && len(job.Needs) == 0 {
+		return fmt.Errorf("job %q planning expressions use needs but the job declares no dependencies", id)
 	}
 	if job.If != "" {
 		if len(job.If) > MaxConditionBytes {
@@ -823,6 +823,22 @@ func MatrixRequiresEvaluation(strategy Strategy) bool {
 // MatrixUsesNeeds reports whether matrix expansion reads the needs context.
 func MatrixUsesNeeds(strategy Strategy) bool {
 	for _, input := range matrixExpressions(strategy.Matrix) {
+		program, err := expression.Parse(input)
+		if err == nil && program.UsesContext("needs") {
+			return true
+		}
+	}
+	return false
+}
+
+// JobPlanningUsesNeeds reports whether fields resolved before a WorkflowJob is
+// created read the needs context.
+func JobPlanningUsesNeeds(job Job) bool {
+	if MatrixUsesNeeds(job.Strategy) {
+		return true
+	}
+	inputs := append([]string{job.Name, job.TimeoutMinutes.expression}, job.RunsOn...)
+	for _, input := range inputs {
 		program, err := expression.Parse(input)
 		if err == nil && program.UsesContext("needs") {
 			return true
@@ -1355,6 +1371,7 @@ func scalarString(value any) (string, bool) {
 
 // EvaluateJob resolves fields needed before a WorkflowJob can be created.
 func EvaluateJob(id string, job Job, context expression.Context) (Job, error) {
+	context.Availability = jobNameAvailability
 	name, err := expression.Parse(job.Name)
 	if err != nil {
 		return Job{}, fmt.Errorf("job %q name: %w", id, err)
@@ -1462,16 +1479,8 @@ func EvaluateJobConcurrency(id string, concurrency Concurrency, context expressi
 }
 
 func EvaluateConcurrency(definition *Definition, event Event, variables any) (string, bool, error) {
-	if definition.Concurrency.Group == "" {
-		return "", false, nil
-	}
-	program, err := expression.Parse(definition.Concurrency.Group)
-	if err != nil {
-		return "", false, fmt.Errorf("parse concurrency group: %w", err)
-	}
 	eventValues := eventExpressionValue(event)
 	context := expression.Context{
-		Availability: workflowConcurrencyAvailability,
 		Values: map[string]any{
 			"inputs": event.InputValues,
 			"vars":   variables,
@@ -1486,6 +1495,20 @@ func EvaluateConcurrency(definition *Definition, event Event, variables any) (st
 			},
 		},
 	}
+	return EvaluateConcurrencyContext(definition, context)
+}
+
+// EvaluateConcurrencyContext evaluates workflow concurrency with a complete
+// planning context supplied by the caller.
+func EvaluateConcurrencyContext(definition *Definition, context expression.Context) (string, bool, error) {
+	if definition.Concurrency.Group == "" {
+		return "", false, nil
+	}
+	program, err := expression.Parse(definition.Concurrency.Group)
+	if err != nil {
+		return "", false, fmt.Errorf("parse concurrency group: %w", err)
+	}
+	context.Availability = workflowConcurrencyAvailability
 	result, err := program.Evaluate(context)
 	if err != nil {
 		return "", false, fmt.Errorf("evaluate concurrency group: %w", err)

@@ -36,8 +36,11 @@ type compositeStep struct {
 
 type compositeContext struct {
 	inputs            map[string]string
-	stepOutput        map[string]map[string]string
+	stepOutput        map[string]map[string]any
 	actionPath        string
+	actionRef         string
+	actionRepository  string
+	actionStatus      string
 	scopedEnvironment map[string]string
 	state             *executionState
 }
@@ -78,15 +81,62 @@ func validateComposite(definition actionDefinition) error {
 				return fmt.Errorf("composite action step %d configures run-only fields", index+1)
 			}
 		}
+		for field, value := range map[string]string{
+			"name": step.Name, "run": step.Run, "shell": step.Shell, "working-directory": step.WorkingDirectory,
+		} {
+			if err := validateActionExpression(value, compositeAvailability); err != nil {
+				return fmt.Errorf("composite step %d %s: %w", index+1, field, err)
+			}
+		}
+		for field, values := range map[string]map[string]any{"env": step.Env, "with": step.With} {
+			for name, rawValue := range values {
+				value, err := inputString(rawValue)
+				if err != nil {
+					return fmt.Errorf("composite step %d %s value %q: %w", index+1, field, name, err)
+				}
+				if err := validateActionExpression(value, compositeAvailability); err != nil {
+					return fmt.Errorf("composite step %d %s value %q: %w", index+1, field, name, err)
+				}
+			}
+		}
+		if step.ContinueOnError != nil {
+			value, err := inputString(step.ContinueOnError)
+			if err != nil {
+				return fmt.Errorf("composite step %d continue-on-error: %w", index+1, err)
+			}
+			if err := validateActionExpression(value, compositeAvailability); err != nil {
+				return fmt.Errorf("composite step %d continue-on-error: %w", index+1, err)
+			}
+		}
+		if strings.TrimSpace(step.If) != "" {
+			condition, err := workflowexpression.ParseCondition(step.If)
+			if err != nil {
+				return fmt.Errorf("composite step %d if: %w", index+1, err)
+			}
+			if err := condition.Validate(compositeConditionAvailability); err != nil {
+				return fmt.Errorf("composite step %d if: %w", index+1, err)
+			}
+		}
 	}
 	return nil
+}
+
+func validateActionExpression(value string, availability workflowexpression.Availability) error {
+	program, err := workflowexpression.Parse(value)
+	if err != nil {
+		return err
+	}
+	return program.Validate(availability)
 }
 
 func (e *Executor) runComposite(ctx context.Context, state *executionState, invocation *actionInvocation, cancelled bool) (map[string]string, error) {
 	compositeContext := &compositeContext{
 		inputs:            invocation.inputs,
-		stepOutput:        map[string]map[string]string{},
+		stepOutput:        map[string]map[string]any{},
 		actionPath:        invocation.directory,
+		actionRef:         invocation.reference.Ref,
+		actionRepository:  invocation.reference.Owner + "/" + invocation.reference.Repository,
+		actionStatus:      "success",
 		scopedEnvironment: invocation.step.Env,
 		state:             state,
 	}
@@ -99,6 +149,9 @@ func (e *Executor) runComposite(ctx context.Context, state *executionState, invo
 			return nil, fmt.Errorf("composite step %d condition: %w", index+1, err)
 		}
 		if !runStep {
+			if rawStep.ID != "" {
+				recordCompositeStep(compositeContext, rawStep.ID, nil, "skipped", "skipped")
+			}
 			continue
 		}
 		stepEnvironment, err := resolveCompositeMap(rawStep.Env, compositeContext)
@@ -135,19 +188,26 @@ func (e *Executor) runComposite(ctx context.Context, state *executionState, invo
 		} else {
 			outputs, err = e.runCompositeScript(commandContext, state, invocation, step)
 		}
-		if rawStep.ID != "" && outputs != nil {
-			compositeContext.stepOutput[rawStep.ID] = outputs
-		}
 		if err != nil {
 			if continueOnError {
+				recordCompositeStep(compositeContext, rawStep.ID, outputs, "failure", "success")
 				e.logger.Warn("composite step failed with continue-on-error", "action", invocation.step.Uses, "step", index+1, "name", name, "error", e.masker.mask(err.Error()))
 			} else {
 				cancelledDuringCommand := !cancelledBeforeCommand && ctx.Err() != nil
+				outcome := "failure"
+				if cancelledDuringCommand {
+					outcome = "cancelled"
+					compositeContext.actionStatus = "cancelled"
+				}
+				recordCompositeStep(compositeContext, rawStep.ID, outputs, outcome, outcome)
 				if !cancelledDuringCommand {
 					compositeFailed = true
+					compositeContext.actionStatus = "failure"
 				}
 				compositeError = errors.Join(compositeError, fmt.Errorf("composite step %d (%s): %w", index+1, name, err))
 			}
+		} else {
+			recordCompositeStep(compositeContext, rawStep.ID, outputs, "success", "success")
 		}
 		e.logger.Info("completed composite step", "action", invocation.step.Uses, "step", index+1, "name", name)
 	}
@@ -161,13 +221,24 @@ func (e *Executor) runComposite(ctx context.Context, state *executionState, invo
 		if err != nil {
 			return outputs, errors.Join(compositeError, fmt.Errorf("composite output %q: %w", name, err))
 		}
-		value, err = resolveCompositeExpressions(value, compositeContext)
+		value, err = resolveCompositeOutput(value, compositeContext)
 		if err != nil {
 			return outputs, errors.Join(compositeError, fmt.Errorf("composite output %q: %w", name, err))
 		}
 		outputs[name] = value
 	}
 	return outputs, compositeError
+}
+
+func recordCompositeStep(context *compositeContext, id string, outputs map[string]string, outcome, conclusion string) {
+	if id == "" {
+		return
+	}
+	values := make(map[string]any, len(outputs))
+	for name, value := range outputs {
+		values[name] = value
+	}
+	context.stepOutput[id] = map[string]any{"outputs": values, "outcome": outcome, "conclusion": conclusion}
 }
 
 func (e *Executor) runCompositeScript(ctx context.Context, state *executionState, invocation *actionInvocation, step Step) (map[string]string, error) {
@@ -190,6 +261,7 @@ func (e *Executor) runCompositeScript(ctx context.Context, state *executionState
 		return nil, errors.Join(executionError, commandError)
 	}
 	applyEnvironmentUpdates(&state.environment, updates)
+	applyContextEnvironmentUpdates(&state.contextEnvironment, updates)
 	e.logCommandNames("workflow step output", updates.outputs)
 	return updates.outputs, executionError
 }
@@ -318,6 +390,10 @@ func resolveCompositeExpressions(value string, compositeContext *compositeContex
 	return resolveExpressionString(value, context)
 }
 
+func resolveCompositeOutput(value string, compositeContext *compositeContext) (string, error) {
+	return resolveExpressionString(value, compositeOutputExpressionContext(compositeContext))
+}
+
 func applyEnvironmentUpdates(environment *[]string, updates commandUpdates) {
 	for name, value := range updates.environment {
 		if workflowenv.IsRunnerOwned(name) || workflowenv.IsEnvironmentFileBlocked(name) {
@@ -333,6 +409,18 @@ func applyEnvironmentUpdates(environment *[]string, updates commandUpdates) {
 		pathValue = value + string(os.PathListSeparator) + pathValue
 	}
 	*environment = setEnvironment(*environment, "PATH", pathValue)
+}
+
+func applyContextEnvironmentUpdates(environment *map[string]string, updates commandUpdates) {
+	if *environment == nil {
+		*environment = map[string]string{}
+	}
+	for name, value := range updates.environment {
+		if workflowenv.IsRunnerOwned(name) || workflowenv.IsEnvironmentFileBlocked(name) {
+			continue
+		}
+		(*environment)[name] = value
+	}
 }
 
 func mergeEnvironment(base, override map[string]string) map[string]string {

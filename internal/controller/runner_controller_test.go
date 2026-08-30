@@ -2138,6 +2138,7 @@ func runnerControllerPlanData(t *testing.T, permissions map[string]string, steps
 		Event:                  runner.Event{Name: "push", DeliveryID: "delivery"},
 		Revision:               runner.Revision{SHA: strings.Repeat("a", 40), Ref: "refs/heads/main", RefName: "main"},
 		WorkflowName:           "CI",
+		WorkflowPath:           ".github/workflows/ci.yml",
 		JobID:                  "build",
 		GitHubTokenPermissions: permissions,
 		TimeoutSeconds:         int64((6 * time.Hour) / time.Second),

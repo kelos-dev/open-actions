@@ -21,12 +21,13 @@ import (
 	"github.com/kelos-dev/open-actions/internal/eventsnapshot"
 	"github.com/kelos-dev/open-actions/internal/expression"
 	"github.com/kelos-dev/open-actions/internal/workflow"
+	"github.com/kelos-dev/open-actions/internal/workflowcontext"
 	"github.com/kelos-dev/open-actions/internal/workflowenv"
 )
 
 const (
 	minimumPlanVersion       = 1
-	PlanVersion              = 8
+	PlanVersion              = 9
 	ContainerName            = "runner"
 	RunnerNameEnvVar         = "RUNNER_NAME"
 	GitHubTokenEnvVar        = "OPEN_ACTIONS_GITHUB_TOKEN"
@@ -48,8 +49,10 @@ type Plan struct {
 	Revision               Revision          `json:"revision"`
 	Inputs                 map[string]any    `json:"inputs,omitempty"`
 	WorkflowName           string            `json:"workflowName"`
+	WorkflowPath           string            `json:"workflowPath,omitempty"`
 	JobID                  string            `json:"jobID"`
 	Matrix                 map[string]any    `json:"matrix,omitempty"`
+	Strategy               map[string]any    `json:"strategy,omitempty"`
 	Needs                  Needs             `json:"-"`
 	Env                    map[string]string `json:"env,omitempty"`
 	Outputs                map[string]string `json:"outputs,omitempty"`
@@ -62,12 +65,13 @@ type Plan struct {
 }
 
 type Run struct {
-	ID       int64  `json:"id"`
-	Number   int64  `json:"number"`
-	Attempt  int32  `json:"attempt"`
-	Actor    string `json:"actor"`
-	URL      string `json:"url,omitempty"`
-	QueryURL string `json:"queryURL,omitempty"`
+	ID              int64  `json:"id"`
+	Number          int64  `json:"number"`
+	Attempt         int32  `json:"attempt"`
+	Actor           string `json:"actor"`
+	TriggeringActor string `json:"triggeringActor,omitempty"`
+	URL             string `json:"url,omitempty"`
+	QueryURL        string `json:"queryURL,omitempty"`
 }
 
 type Repository struct {
@@ -181,12 +185,14 @@ type executionState struct {
 	workspace          string
 	temporaryDirectory string
 	environment        []string
+	contextEnvironment map[string]string
 	githubToken        string
 	secrets            map[string]string
 	variables          map[string]string
 	resolver           *actionResolver
 	posts              []*actionInvocation
 	stepOutputs        map[string]map[string]any
+	jobStatus          expression.Status
 	resolvedContent    int
 	contexts           *executionContexts
 }
@@ -320,6 +326,9 @@ func DecodePlan(data []byte) (*Plan, error) {
 	if plan.Version >= 8 && !validGitHubTokenPermissions(plan.GitHubTokenPermissions) {
 		return nil, errors.New("job plan GitHub token permissions are incomplete")
 	}
+	if plan.Version >= 9 && (plan.WorkflowPath == "" || (plan.Matrix != nil) != (plan.Strategy != nil)) {
+		return nil, errors.New("job plan expression context is incomplete")
+	}
 	return plan, nil
 }
 
@@ -451,17 +460,24 @@ func (e *Executor) executePlan(ctx context.Context, plan *Plan, workspace string
 		"GITHUB_EVENT_ACTION="+plan.Event.Action,
 		"GITHUB_EVENT_NAME="+plan.Event.Name,
 		"GITHUB_EVENT_PATH="+eventPath,
+		"GITHUB_GRAPHQL_URL="+workflowcontext.GraphQLURL(plan.Repository.APIURL),
 		"GITHUB_HEAD_REF="+planPullRequestRefs(plan).head,
 		"GITHUB_JOB="+plan.JobID,
 		"GITHUB_REF="+plan.Revision.Ref,
 		"GITHUB_REF_NAME="+plan.Revision.RefName,
+		"GITHUB_REF_TYPE="+workflowcontext.RefType(plan.Revision.Ref),
 		"GITHUB_REPOSITORY="+plan.Repository.Owner+"/"+plan.Repository.Name,
+		"GITHUB_REPOSITORY_ID="+strconv.FormatInt(plan.Repository.ID, 10),
+		"GITHUB_REPOSITORY_OWNER="+plan.Repository.Owner,
 		"GITHUB_RUN_ATTEMPT="+strconv.FormatInt(int64(plan.Run.Attempt), 10),
 		"GITHUB_RUN_ID="+strconv.FormatInt(plan.Run.ID, 10),
 		"GITHUB_RUN_NUMBER="+strconv.FormatInt(plan.Run.Number, 10),
 		"GITHUB_SERVER_URL="+strings.TrimSuffix(plan.Repository.ServerURL, "/"),
 		"GITHUB_SHA="+plan.Revision.SHA,
+		"GITHUB_TRIGGERING_ACTOR="+triggeringActor(plan.Run),
 		"GITHUB_WORKFLOW="+plan.WorkflowName,
+		"GITHUB_WORKFLOW_REF="+workflowcontext.WorkflowRef(plan.Repository.Owner+"/"+plan.Repository.Name, plan.WorkflowPath, plan.Revision.Ref),
+		"GITHUB_WORKFLOW_SHA="+plan.Revision.SHA,
 		"GITHUB_WORKSPACE="+workspace,
 		"OPEN_ACTIONS_RUN_QUERY_URL="+plan.Run.QueryURL,
 		"OPEN_ACTIONS_RUN_URL="+plan.Run.URL,
@@ -492,11 +508,13 @@ func (e *Executor) executePlan(ctx context.Context, plan *Plan, workspace string
 		workspace:          workspace,
 		temporaryDirectory: temporaryDirectory,
 		environment:        environment,
+		contextEnvironment: cloneStringMap(jobEnvironment),
 		githubToken:        e.githubToken,
 		secrets:            e.secrets,
 		variables:          e.variables,
 		resolver:           newActionResolver(plan.Repository.ActionCloneBaseURL, filepath.Join(temporaryDirectory, "actions"), environment, actionTokenForClone(plan, e.actionToken), e.executeCommand),
 		stepOutputs:        map[string]map[string]any{},
+		jobStatus:          workflowStepStatus(false, false),
 		resolvedContent:    jobContentBytes,
 		contexts:           contexts,
 	}
@@ -508,6 +526,7 @@ func (e *Executor) executePlan(ctx context.Context, plan *Plan, workspace string
 	var executionErrors error
 	for index, rawStep := range plan.Steps {
 		status := workflowStepStatus(failed, ctx.Err() != nil)
+		state.jobStatus = status
 		runStep, err := workflowStepCondition(rawStep.If, rawStep.Env, status, state)
 		if err != nil {
 			executionErrors = errors.Join(executionErrors, fmt.Errorf("step %d condition: %w", index+1, err))
@@ -594,7 +613,11 @@ func (e *Executor) executePlan(ctx context.Context, plan *Plan, workspace string
 		executionErrors = errors.Join(executionErrors, ctx.Err())
 	}
 	status := workflowStepStatus(failed, ctx.Err() != nil)
+	state.jobStatus = status
 	postError := e.runPostActions(contexts.command(), state, status)
+	if postError != nil {
+		state.jobStatus = workflowStepStatus(true, ctx.Err() != nil)
+	}
 	outputs, outputError := e.resolveJobOutputs(state)
 	executionError := errors.Join(executionErrors, postError, outputError)
 	result, resultError := newResult(outputs, executionConclusion(ctx, executionError), resultVersionForPlan(plan.Version))
@@ -774,7 +797,7 @@ func (e *Executor) runPostActions(ctx context.Context, state *executionState, st
 			continue
 		}
 		e.logger.Info("starting post action", "action", invocation.step.Uses)
-		err := e.runJavaScriptHook(ctx, invocation, "post", invocation.definition.Runs.Post, state.temporaryDirectory, state.workspace, &state.environment)
+		err := e.runJavaScriptHook(ctx, invocation, "post", invocation.definition.Runs.Post, state)
 		e.logger.Info("completed post action", "action", invocation.step.Uses)
 		if err != nil {
 			result = errors.Join(result, fmt.Errorf("post action %s: %w", invocation.step.Uses, err))
@@ -802,6 +825,7 @@ func (e *Executor) runScript(ctx context.Context, state *executionState, step St
 		return nil, errors.Join(executionError, commandError)
 	}
 	applyEnvironmentUpdates(&state.environment, updates)
+	applyContextEnvironmentUpdates(&state.contextEnvironment, updates)
 	e.logCommandNames("workflow step output", updates.outputs)
 	return updates.outputs, executionError
 }
@@ -822,7 +846,7 @@ func (e *Executor) resolveJobOutputs(state *executionState) (map[string]string, 
 	if len(state.plan.Outputs) == 0 {
 		return nil, nil
 	}
-	context := workflowExpressionContext(state, state.environment, runnerStepAvailability, nil)
+	context := workflowExpressionContext(state, state.contextEnvironment, runnerJobOutputAvailability, nil)
 	outputs := make(map[string]string, len(state.plan.Outputs))
 	for name, input := range state.plan.Outputs {
 		program, err := expression.Parse(input)

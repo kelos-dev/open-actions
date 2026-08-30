@@ -470,15 +470,16 @@ attempt lineage, `previousRunRef` names the immediately preceding completed
 attempt, and `attempt` starts at 2. Both references include the WorkflowRun UID
 to reject names that were deleted and recreated. `requestID` is an optional
 idempotency identity and contains the webhook delivery ID for GitHub
-rerequests. `jobIDs` is an optional set of expanded WorkflowJob IDs; the
-selected jobs reuse the latest available results and outputs of prerequisites
-from earlier attempts. Omitting `jobIDs` reruns every job. The rerun fields are
-immutable.
+rerequests. `triggeringActor` is the optional GitHub login that requested this
+attempt; GitHub Check Run rerequests populate it. `jobIDs` is an optional set of
+expanded WorkflowJob IDs; the selected jobs reuse the latest available results
+and outputs of prerequisites from earlier attempts. Omitting `jobIDs` reruns
+every job. The rerun fields are immutable.
 The controller also requires the project, source, workflow path, lineage, and
 attempt number to match the previous run before it executes a rerun. Workflows
-with output-derived dynamic matrices currently require a full rerun with
-`jobIDs` omitted because their expanded IDs do not exist until dependencies
-finish.
+with jobs whose planning depends on `needs` require a full rerun with `jobIDs`
+omitted because their final configuration and expanded IDs do not exist until
+dependencies finish.
 
 Runner labels are canonical lowercase ASCII in Kubernetes resources. Workflow
 `runs-on` labels use the same representation. Each Runner is one reusable
@@ -575,23 +576,24 @@ in declaration order: compatible entries augment base combinations and
 incompatible entries add standalone combinations. Include-only matrices are
 supported.
 
-Matrix expressions may use `github`, `needs`, `vars`, and `inputs`. If an
-expression reads `needs`, expansion waits until every direct dependency is
-terminal and its outputs are persisted. The controller then evaluates the job
-condition before the matrix. A failed, skipped, or cancelled dependency
-therefore skips the dynamic job under the default success condition; an
-explicit status function such as `always()` can permit evaluation. Missing
-outputs, invalid JSON, non-array axes, non-mapping complete matrices,
-non-scalar final values, empty axes, and oversized results finish the logical
-job with `MatrixEvaluationFailed` rather than leaving it pending.
+Matrix expressions may use `github`, `open_actions`, `needs`, `vars`, and
+`inputs`. Job names, runner labels, and timeout expressions may also use
+`needs`. When one of these planning expressions reads `needs`, planning waits
+until every direct dependency is terminal and its outputs are persisted. The
+controller then evaluates the job condition before the deferred fields. A
+failed, skipped, or cancelled dependency therefore skips the job under the
+default success condition; an explicit status function such as `always()` can
+permit evaluation. Missing outputs, invalid JSON, non-array axes, non-mapping
+complete matrices, non-scalar final values, empty axes, and oversized results
+finish the logical job with `JobPlanningFailed` rather than leaving it pending.
 
 The controller creates one `WorkflowJob` per final combination in deterministic
 order. Each child has a unique `spec.jobID`, while
 `spec.matrix.logicalJobID`, `values`, `maxParallel`, and `failFast` preserve its
-logical identity and strategy. Deferred matrix plans are immutable resources
-owned by the WorkflowRun, so the same children are recovered across controller
-restarts. `max-parallel` limits active children in that group independently of
-the number of matching Runners.
+logical identity and strategy. Deferred job plans are immutable resources
+owned by the WorkflowRun, so the same configuration and children are recovered
+across controller restarts. `max-parallel` limits active children in that group
+independently of the number of matching Runners.
 
 `fail-fast` defaults to `true`. After a matrix child fails, queued combinations
 in the same WorkflowRun and logical matrix job finish with `MatrixFailFast`, and
@@ -653,15 +655,15 @@ The resources expose these condition contracts:
 | `WorkflowRun` | `Succeeded` | `False` | `ProjectUnavailable`, `WorkflowFetchFailed`, `WorkflowInvalid`, `TriggerInvalid`, `RerunInvalid`, `ChildCreationFailed`, `JobFailed`, `JobTimedOut`, `JobCancelled`, `RevisionSuperseded`, `ExecutionStateLost` |
 | `WorkflowJob` | `Ready` | `Unknown` | `DependenciesPending`, `WaitingForConcurrency` |
 | `WorkflowJob` | `Ready` | `True` | `ConditionPassed`, `ConcurrencyAcquired` |
-| `WorkflowJob` | `Ready` | `False` | `ConditionFalse`, `ConditionEvaluationFailed`, `MatrixEvaluationFailed`, `ConcurrencyEvaluationFailed`, `ConcurrencySuperseded`, `ConcurrencyCancelled`, `CancellationRequested`, `MatrixFailFast` |
+| `WorkflowJob` | `Ready` | `False` | `ConditionFalse`, `ConditionEvaluationFailed`, `JobPlanningFailed`, `ConcurrencyEvaluationFailed`, `ConcurrencySuperseded`, `ConcurrencyCancelled`, `CancellationRequested`, `MatrixFailFast` |
 | `WorkflowJob` | `ConcurrencyAcquired` | `Unknown` | `WaitingForConcurrency` |
 | `WorkflowJob` | `ConcurrencyAcquired` | `True` | `ConcurrencyAcquired` |
 | `WorkflowJob` | `ConcurrencyAcquired` | `False` | `ConcurrencySuperseded` |
 | `WorkflowJob` | `Scheduled` | `True` | `RunnerAssigned` |
-| `WorkflowJob` | `Scheduled` | `False` | `ConditionFalse`, `ConditionEvaluationFailed`, `MatrixEvaluationFailed`, `ConcurrencyEvaluationFailed`, `ConcurrencySuperseded`, `ConcurrencyCancelled`, `CancellationRequested`, `MatrixFailFast`, `ProjectRecreated` |
+| `WorkflowJob` | `Scheduled` | `False` | `ConditionFalse`, `ConditionEvaluationFailed`, `JobPlanningFailed`, `ConcurrencyEvaluationFailed`, `ConcurrencySuperseded`, `ConcurrencyCancelled`, `CancellationRequested`, `MatrixFailFast`, `ProjectRecreated` |
 | `WorkflowJob` | `Succeeded` | `Unknown` | `JobRunning` |
 | `WorkflowJob` | `Succeeded` | `True` | `JobSucceeded` |
-| `WorkflowJob` | `Succeeded` | `False` | `JobFailed`, `JobTimedOut`, `JobCancelled`, `JobResultInvalid`, `ConditionEvaluationFailed`, `MatrixEvaluationFailed`, `ConcurrencyEvaluationFailed`, `PlanUnavailable`, `JobStartFailed`, `GitHubTokenPermissionsRejected`, `ExecutionStateLost`, `CancellationRequested`, `MatrixFailFast`, `ProjectRecreated` |
+| `WorkflowJob` | `Succeeded` | `False` | `JobFailed`, `JobTimedOut`, `JobCancelled`, `JobResultInvalid`, `ConditionEvaluationFailed`, `JobPlanningFailed`, `ConcurrencyEvaluationFailed`, `PlanUnavailable`, `JobStartFailed`, `GitHubTokenPermissionsRejected`, `ExecutionStateLost`, `CancellationRequested`, `MatrixFailFast`, `ProjectRecreated` |
 | `WorkflowJob` | `CancellationRequested` | `True` | `CancellationRequested`, `ConditionEvaluationFailed`, `ConcurrencyCancelled`, `MatrixFailFast` |
 | `WorkflowJob` | `CancellationRequested` | `False` | `ConditionPassed` |
 
@@ -745,10 +747,14 @@ Open Actions supplies the following runner-owned names:
 
 - Action identity: `GITHUB_ACTION_PATH`, `GITHUB_ACTION_REPOSITORY`.
 - Workflow and repository identity: `GITHUB_ACTIONS`, `GITHUB_API_URL`,
-  `GITHUB_BASE_REF`, `GITHUB_EVENT_ACTION`, `GITHUB_EVENT_NAME`,
-  `GITHUB_EVENT_PATH`, `GITHUB_HEAD_REF`, `GITHUB_JOB`, `GITHUB_REF`,
-  `GITHUB_REF_NAME`, `GITHUB_REPOSITORY`, `GITHUB_SERVER_URL`, `GITHUB_SHA`,
-  `GITHUB_WORKFLOW`, `GITHUB_WORKSPACE`.
+  `GITHUB_ACTOR`, `GITHUB_BASE_REF`, `GITHUB_EVENT_ACTION`,
+  `GITHUB_EVENT_NAME`, `GITHUB_EVENT_PATH`, `GITHUB_GRAPHQL_URL`,
+  `GITHUB_HEAD_REF`, `GITHUB_JOB`, `GITHUB_REF`, `GITHUB_REF_NAME`,
+  `GITHUB_REF_TYPE`, `GITHUB_REPOSITORY`, `GITHUB_REPOSITORY_ID`,
+  `GITHUB_REPOSITORY_OWNER`, `GITHUB_RETENTION_DAYS`, `GITHUB_RUN_ATTEMPT`,
+  `GITHUB_RUN_ID`, `GITHUB_RUN_NUMBER`, `GITHUB_SERVER_URL`, `GITHUB_SHA`,
+  `GITHUB_TRIGGERING_ACTOR`, `GITHUB_WORKFLOW`, `GITHUB_WORKFLOW_REF`,
+  `GITHUB_WORKFLOW_SHA`, `GITHUB_WORKSPACE`.
 - Command files: `GITHUB_ENV`, `GITHUB_OUTPUT`, `GITHUB_PATH`, `GITHUB_STATE`,
   `GITHUB_STEP_SUMMARY`.
 - Runner identity and paths: `RUNNER_ARCH`, `RUNNER_ENVIRONMENT`, `RUNNER_NAME`,
@@ -805,34 +811,89 @@ supported. Directories and symlink targets outside the workspace are not
 hashed. The function returns the SHA-256 digest of the matched file digests in
 path order, or an empty string when no files match.
 
-Contexts are restricted by evaluation phase. An allowed context still fails at
-evaluation when the corresponding execution feature has not supplied it.
+Contexts are restricted by expression site. A context that is not listed below
+is rejected when the workflow or action metadata is loaded.
 
-| Phase | Allowed contexts and functions | Currently supplied |
-| --- | --- | --- |
-| Workflow concurrency | `github`, `inputs`, `vars` | All listed contexts |
-| Job concurrency | `github`, `open_actions`, `needs`, `strategy`, `matrix`, `inputs`, `vars` | All listed contexts after dependencies settle; `strategy` and `matrix` are present for matrix jobs |
-| Workflow environment | `github`, `open_actions`, `secrets`, `inputs`, `vars` | All listed contexts |
-| Matrix expansion | `github`, `open_actions`, `needs`, `vars`, `inputs` | All listed contexts; `needs` contains terminal direct dependencies |
-| Workflow job condition | `github`, `open_actions`, `needs`, `vars`, `inputs`, and status functions | `github`, `open_actions`, direct dependency results and outputs, `vars`, `inputs`, and status functions |
-| Job name, timeout, and runner labels | `github`, `open_actions`, `needs`, `strategy`, `matrix`, `vars`, `inputs` | `github`, `open_actions`, `inputs`, `vars`, and `matrix` for matrix jobs; deferred matrix jobs also receive `needs` |
-| Job environment | `github`, `open_actions`, `needs`, `strategy`, `matrix`, `vars`, `secrets`, `inputs` | `github`, `open_actions`, direct dependency results and outputs, `inputs`, `vars`, `secrets`, and `matrix` for matrix jobs |
-| Workflow step name, run script, working directory, environment, and inputs | `github`, `open_actions`, `needs`, `strategy`, `matrix`, `job`, `runner`, `env`, `vars`, `secrets`, `steps`, `inputs`, and `hashFiles` | `github`, `open_actions`, direct dependency results and outputs, `matrix`, `runner`, `env`, `vars`, `secrets`, `inputs`, `steps`, and `hashFiles` |
-| Workflow step `continue-on-error` | `github`, `open_actions`, `needs`, `strategy`, `matrix`, `job`, `runner`, `env`, `vars`, `secrets`, `steps`, `inputs`, and `hashFiles` | `github`, `open_actions`, direct dependency results and outputs, `matrix`, `runner`, `env`, `vars`, `secrets`, `inputs`, `steps`, and `hashFiles` |
-| Workflow step condition | Step contexts except `secrets`, plus status functions and `hashFiles` | `github`, `open_actions`, direct dependency results and outputs, `matrix`, `runner`, `env`, `vars`, `inputs`, `steps`, status functions, and `hashFiles` |
-| Job outputs | Workflow step contexts without `hashFiles` | `github`, `open_actions`, direct dependency results and outputs, `matrix`, `runner`, `env`, `vars`, `secrets`, `inputs`, `steps` |
-| Composite step fields and outputs | `github`, `open_actions`, `runner`, `env`, `inputs`, `steps`, and `hashFiles` | All listed contexts and functions |
-| Composite step condition | Composite contexts, status functions, and `hashFiles` | All listed contexts and functions |
-| Action input default | `github`, `open_actions`, `runner` | All listed contexts; a default is evaluated only when the workflow does not supply that input |
+| Expression site | Contexts and functions |
+| --- | --- |
+| Workflow concurrency | `github`, `inputs`, `vars` |
+| Workflow environment | `github`, `open_actions`, `secrets`, `inputs`, `vars` |
+| Job condition | `github`, `open_actions`, `needs`, `vars`, `inputs`; status functions |
+| Job matrix | `github`, `open_actions`, `needs`, `vars`, `inputs` |
+| Job name, runner labels, timeout, and concurrency | `github`, `open_actions`, `needs`, `strategy`, `matrix`, `vars`, `inputs` |
+| Job environment | `github`, `open_actions`, `needs`, `strategy`, `matrix`, `vars`, `secrets`, `inputs` |
+| Job outputs | `github`, `open_actions`, `needs`, `strategy`, `matrix`, `job`, `runner`, `env`, `vars`, `secrets`, `steps`, `inputs` |
+| Workflow step name, run script, working directory, environment, inputs, and `continue-on-error` | `github`, `open_actions`, `needs`, `strategy`, `matrix`, `job`, `runner`, `env`, `vars`, `secrets`, `steps`, `inputs`; `hashFiles` |
+| Workflow step condition | Step contexts except `secrets`; status functions and `hashFiles` |
+| Action input default | `github`, `open_actions`, `strategy`, `matrix`, `job`, `runner`; `hashFiles` |
+| Composite step name, run script, working directory, environment, inputs, and `continue-on-error` | `github`, `open_actions`, `inputs`, `strategy`, `matrix`, `steps`, `job`, `runner`, `env`; `hashFiles` |
+| Composite step condition | Composite step contexts; status functions and `hashFiles` |
+| Composite output | Composite step contexts without `hashFiles` |
 
-The runner context supplies `name`, `os`, `arch`, `temp`, `tool_cache`, and
-`environment` during job execution. `runner.name` and `RUNNER_NAME` identify
-the assigned Runner resource. `runner.environment` and `RUNNER_ENVIRONMENT`
-are `self-hosted`, because Open Actions runners execute on user-managed
-infrastructure. When `ACTIONS_STEP_DEBUG` enables the runner debug indicator,
-`runner.debug` and `RUNNER_DEBUG` have the string value `1`; otherwise the
-property and environment variable are absent. Action metadata input defaults
-receive the same runner context, including the expression used by
+`open_actions` is an Open Actions extension. It supplies `run_url` and
+`run_query_url` at every site where the table lists it.
+
+The `github` context supplies the following properties when their source is
+available:
+
+- Repository and revision: `repository`, `repository_id`, `repository_owner`,
+  `repositoryUrl`, `sha`, `ref`, `ref_name`, `ref_type`, `head_ref`, and
+  `base_ref`.
+- Workflow and run: `workflow`, `workflow_ref`, `workflow_sha`, `run_id`,
+  `run_number`, `run_attempt`, `actor`, `triggering_actor`, `job`, and
+  `retention_days`.
+- Event and endpoints: `event`, `event_name`, `event_path`, `server_url`,
+  `api_url`, and `graphql_url`.
+- Execution: `workspace`, `token`, and `secret_source`.
+- Action metadata: `action_path`, `action_ref`, `action_repository`, and
+  `action_status` for composite actions, with repository and ref also available
+  while action input defaults are evaluated.
+
+IDs and run counters in `github` are strings, `ref_protected` is Boolean when
+available, and all other scalar properties are strings. `event` preserves the
+JSON payload's Boolean, number, string, array, object, and null types. Webhook
+payloads also supply `actor_id` and `repository_owner_id` when the corresponding
+numeric ID is present. Synthetic events do not invent those IDs. Open Actions
+does not currently supply `github.action`, `github.env`, `github.path`, or
+`github.ref_protected` to expressions. The `GITHUB_ENV` and `GITHUB_PATH`
+process variables still identify the current command files. Missing and
+inapplicable properties evaluate to an empty string.
+
+The `job` context supplies `status`, `workflow_ref`, `workflow_sha`,
+`workflow_repository`, and `workflow_file_path`. `status` reflects the job's
+current `success`, `failure`, or `cancelled` state. Job containers and services
+are unsupported, so `job.container` and `job.services` are unavailable. Open
+Actions reports one Check Run for the workflow rather than one per job and does
+not supply `job.check_run_id`.
+
+For each expanded matrix job, `strategy` supplies numeric `job-index`,
+`job-total`, and `max-parallel` values and Boolean `fail-fast`; `matrix`
+contains the typed scalar values for that combination. Both contexts are empty
+for a non-matrix job. `runner` supplies `name`, `os`, `arch`, `temp`,
+`tool_cache`, and `environment` during job execution. When
+`ACTIONS_STEP_DEBUG` enables the runner debug indicator, `runner.debug` has the
+string value `1`; otherwise that property is absent.
+
+Each completed or skipped identified step appears in `steps` with an `outputs`
+mapping plus `outcome` and `conclusion`. The latter values are `success`,
+`failure`, `cancelled`, or `skipped`; `continue-on-error` can make a failed
+outcome have a successful conclusion. Composite actions receive the same shape
+for their own identified steps. `needs` contains only direct dependencies and
+supplies their `result` and persisted `outputs` mappings.
+
+`inputs` preserves the declared input types: strings remain strings, Booleans
+remain Boolean, and numeric values remain numbers. `vars`, `secrets`, and `env`
+contain string values. The `env` context includes only values declared at the
+workflow, job, current step, or current composite scope and values written to
+`GITHUB_ENV` by completed commands. It does not expose inherited process
+variables or runner default variables. Context and property lookup is
+case-insensitive; environment variable names remain case-sensitive on Linux.
+
+`runner.name` and `RUNNER_NAME` identify the assigned Runner resource.
+`runner.environment` and `RUNNER_ENVIRONMENT` are `self-hosted`, because Open
+Actions runners execute on user-managed infrastructure. The `RUNNER_DEBUG`
+process variable follows `runner.debug`. Action metadata input defaults receive
+the same runner context, including the expression used by
 `actions/github-script`: `${{ runner.debug == '1' }}`.
 Every action input default is syntax- and context-validated when the action
 metadata loads, including defaults for supplied inputs and skipped steps.
@@ -864,7 +925,9 @@ Webhook runs use the signed payload's `sender.login` as `actor`. Direct
 `workflow_dispatch` and `workflow_call` resources use
 `spec.source.github.actor`; it defaults to `open-actions` when the caller does
 not supply an identity. Scheduled runs use `open-actions`. Reruns preserve the
-first attempt's actor, matching GitHub's `github.actor` behavior.
+first attempt's actor, matching GitHub's `github.actor` behavior. For GitHub
+Check Run rerequests, `github.triggering_actor` identifies the user who
+requested the current attempt; otherwise it matches `github.actor`.
 
 The values are available during planning and runner execution:
 
@@ -874,6 +937,7 @@ The values are available during planning and runner execution:
 | `github.run_number` | `GITHUB_RUN_NUMBER` |
 | `github.run_attempt` | `GITHUB_RUN_ATTEMPT` |
 | `github.actor` | `GITHUB_ACTOR` |
+| `github.triggering_actor` | `GITHUB_TRIGGERING_ACTOR` |
 | `open_actions.run_url` | `OPEN_ACTIONS_RUN_URL` |
 
 `open_actions.run_url` links to the current attempt in the Open Actions Console. It
@@ -1383,20 +1447,20 @@ same immutable snapshot. Synthetic `workflow_dispatch`, `schedule`, and
 `workflow_call` runs use a bounded generated document containing their inputs,
 schedule, repository identity, and supported event metadata.
 
-The controller emits job-plan version 8, and the runner accepts versions 1
-through 8. When a release changes the job-plan version, update every Runner
+The controller emits job-plan version 9, and the runner accepts versions 1
+through 9. When a release changes the job-plan version, update every Runner
 `spec.execution.image` to an image that accepts both the installed and target
 controller versions before upgrading the controller. The received job-plan
 version also determines the runner result version: plan versions 1 through 5
-use result version 1, and plan versions 6 through 8 use result version 2. A
+use result version 1, and plan versions 6 through 9 use result version 2. A
 runner that accepts more than one plan version must emit the result version
 assigned to that plan, not always the latest result version supported by the
 runner binary. Integration
 commit construction is part of this versioned contract; changing its merge
 behavior or commit metadata requires a job-plan version transition.
 
-Docker and local actions, matrix `include` and `exclude`, service containers,
-and caches are not supported. Expressions outside the documented
+Docker actions, local actions, service containers, and caches are not
+supported. Expressions outside the documented
 fields and runtime contexts are rejected during planning or execution and are
 never interpreted as literal values.
 `WorkflowJob` resources are not retried or reassigned when a Runner is removed.

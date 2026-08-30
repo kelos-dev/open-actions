@@ -63,6 +63,7 @@ func (r *countingReader) Get(ctx context.Context, key client.ObjectKey, object c
 func TestJobPlanCoversSupportedSteps(t *testing.T) {
 	reconciler := &WorkflowRunReconciler{GitHubServerURL: "https://github.com", GitHubAPIBase: "https://api.github.com", ActionCloneBaseURL: "https://github.com/git"}
 	run := &actionsv1alpha1.WorkflowRun{Spec: actionsv1alpha1.WorkflowRunSpec{
+		WorkflowPath: ".github/workflows/ci.yml",
 		Source: actionsv1alpha1.WorkflowRunSource{
 			Type: actionsv1alpha1.SourceTypeGitHub,
 			GitHub: &actionsv1alpha1.GitHubWorkflowRunSource{
@@ -89,6 +90,9 @@ func TestJobPlanCoversSupportedSteps(t *testing.T) {
 	}
 	if plan.Version != runner.PlanVersion || plan.Repository.ID != 1 || plan.Event.DeliveryID != "delivery" || plan.Revision.BaseRef != "target" {
 		t.Errorf("plan identity = %#v", plan)
+	}
+	if plan.WorkflowPath != ".github/workflows/ci.yml" {
+		t.Errorf("workflow path = %q", plan.WorkflowPath)
 	}
 	if plan.TimeoutSeconds != 90*60 || plan.CleanupTimeoutSeconds != int64(runner.CleanupTimeout/time.Second) {
 		t.Errorf("plan timeouts = execution %d, cleanup %d", plan.TimeoutSeconds, plan.CleanupTimeoutSeconds)
@@ -420,7 +424,7 @@ func TestPlanWorkflowJobsAppliesPermissionPrecedence(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	run := &actionsv1alpha1.WorkflowRun{Spec: actionsv1alpha1.WorkflowRunSpec{Source: actionsv1alpha1.WorkflowRunSource{
+	run := &actionsv1alpha1.WorkflowRun{Spec: actionsv1alpha1.WorkflowRunSpec{WorkflowPath: ".github/workflows/ci.yml", Source: actionsv1alpha1.WorkflowRunSource{
 		Type: actionsv1alpha1.SourceTypeGitHub,
 		GitHub: &actionsv1alpha1.GitHubWorkflowRunSource{
 			Actor:      "octocat",
@@ -1308,11 +1312,12 @@ func TestJobExpressionsIncludeRunIdentity(t *testing.T) {
 	}
 	run := &actionsv1alpha1.WorkflowRun{
 		ObjectMeta: metav1.ObjectMeta{Name: "ci", Namespace: "default"},
-		Spec: actionsv1alpha1.WorkflowRunSpec{Source: actionsv1alpha1.WorkflowRunSource{
+		Spec: actionsv1alpha1.WorkflowRunSpec{WorkflowPath: ".github/workflows/ci.yml", Rerun: &actionsv1alpha1.WorkflowRunRerun{TriggeringActor: "hubot"}, Source: actionsv1alpha1.WorkflowRunSource{
 			Type: actionsv1alpha1.SourceTypeGitHub,
 			GitHub: &actionsv1alpha1.GitHubWorkflowRunSource{
 				Actor: "octocat", Event: actionsv1alpha1.GitHubEvent{Name: "push", DeliveryID: "delivery"},
-				Revision: actionsv1alpha1.GitRevision{SHA: strings.Repeat("a", 40), Ref: "refs/heads/main"},
+				Repository: actionsv1alpha1.GitHubRepository{ID: 1, Owner: "acme", Name: "example"},
+				Revision:   actionsv1alpha1.GitRevision{SHA: strings.Repeat("a", 40), Ref: "refs/heads/main"},
 			},
 		}},
 		Status: actionsv1alpha1.WorkflowRunStatus{Identity: &actionsv1alpha1.WorkflowRunIdentityStatus{
@@ -1320,13 +1325,13 @@ func TestJobExpressionsIncludeRunIdentity(t *testing.T) {
 		}},
 	}
 	job, err := workflow.EvaluateJob("test", workflow.Job{
-		Name:   "${{ github.run_id }}-${{ github.run_number }}-${{ github.run_attempt }}-${{ github.actor }}-${{ open_actions.run_url }}-${{ open_actions.run_query_url }}",
+		Name:   "${{ github.run_id }}-${{ github.run_number }}-${{ github.run_attempt }}-${{ github.actor }}-${{ github.triggering_actor }}-${{ github.repository_owner }}-${{ github.ref_type }}-${{ github.workflow_ref }}-${{ open_actions.run_url }}-${{ open_actions.run_query_url }}",
 		RunsOn: workflow.StringList{"ubuntu-latest"},
 	}, reconciler.jobExpressionContext(run, "CI", nil, nil, nil))
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := "101-7-2-octocat-https://actions.example/runs/default/ci-https://actions.example/api/v1/runs/default/ci/newer"
+	want := "101-7-2-octocat-hubot-acme-branch-acme/example/.github/workflows/ci.yml@refs/heads/main-https://actions.example/runs/default/ci-https://actions.example/api/v1/runs/default/ci/newer"
 	if job.Name != want {
 		t.Fatalf("job name = %q, want %q", job.Name, want)
 	}
@@ -1371,7 +1376,10 @@ func TestPlanWorkflowJobsExpandsArchitectureMatrix(t *testing.T) {
 		if err := json.Unmarshal([]byte(job.plan), plan); err != nil {
 			t.Fatal(err)
 		}
-		if plan.JobID != "build-images" || plan.Matrix["arch"] != arch || plan.Outputs["image"] != "${{ matrix.arch }}-${{ steps.build.outputs.image }}" {
+		if plan.JobID != "build-images" || plan.Matrix["arch"] != arch ||
+			plan.Strategy["job-index"] != float64(index) || plan.Strategy["job-total"] != float64(2) ||
+			plan.Strategy["max-parallel"] != float64(1) || plan.Strategy["fail-fast"] != true ||
+			plan.Outputs["image"] != "${{ matrix.arch }}-${{ steps.build.outputs.image }}" {
 			t.Errorf("plan for %s = %#v", arch, plan)
 		}
 	}
@@ -1403,25 +1411,30 @@ func TestPlanWorkflowJobsEnforcesExpandedWorkflowLimit(t *testing.T) {
 	}
 }
 
-func TestStaticMatrixJobCannotUseUnavailableNeedsContext(t *testing.T) {
-	definition, err := workflow.Parse([]byte("name: CI\non: push\njobs:\n  prepare:\n    runs-on: ubuntu-latest\n    steps:\n      - run: prepare\n  build:\n    needs: prepare\n    strategy:\n      matrix:\n        arch: [amd64]\n    name: Build ${{ needs.prepare.result }}\n    runs-on: ubuntu-latest\n    steps:\n      - run: build\n"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	run := &actionsv1alpha1.WorkflowRun{Spec: actionsv1alpha1.WorkflowRunSpec{Source: actionsv1alpha1.WorkflowRunSource{GitHub: &actionsv1alpha1.GitHubWorkflowRunSource{}}}}
-	setTestWorkflowRunIdentity(run)
-	_, _, err = (&WorkflowRunReconciler{}).planWorkflowJobs(run, definition, nil, nil, nil)
-	if err == nil || !strings.Contains(err.Error(), `context "needs" is unavailable`) {
-		t.Fatalf("planning error = %v, want unavailable needs context", err)
+func TestJobPlanningDefersNeedsContext(t *testing.T) {
+	for _, strategy := range []string{"", "    strategy:\n      matrix:\n        arch: [amd64]\n"} {
+		definition, err := workflow.Parse([]byte("name: CI\non: push\njobs:\n  prepare:\n    runs-on: ubuntu-latest\n    steps:\n      - run: prepare\n  build:\n    needs: prepare\n" + strategy + "    name: Build ${{ needs.prepare.result }}\n    runs-on: ubuntu-latest\n    steps:\n      - run: build\n"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		run := &actionsv1alpha1.WorkflowRun{Spec: actionsv1alpha1.WorkflowRunSpec{Source: actionsv1alpha1.WorkflowRunSource{GitHub: &actionsv1alpha1.GitHubWorkflowRunSource{}}}}
+		setTestWorkflowRunIdentity(run)
+		planned, deferred, err := (&WorkflowRunReconciler{}).planWorkflowJobs(run, definition, nil, nil, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(planned) != 1 || planned[0].id != "prepare" || len(deferred) != 1 || deferred[0].JobID != "build" {
+			t.Fatalf("planned = %#v, deferred = %#v", planned, deferred)
+		}
 	}
 }
 
-func TestProjectedWorkflowJobCountIncludesExistingAndPendingMatrices(t *testing.T) {
-	matrixIDs := []string{"a", "m", "z"}
+func TestProjectedWorkflowJobCountIncludesExistingAndPendingJobs(t *testing.T) {
+	deferredJobIDs := []string{"a", "m", "z"}
 	jobsByLogicalID := map[string][]*actionsv1alpha1.WorkflowJob{
 		"z": make([]*actionsv1alpha1.WorkflowJob, 50),
 	}
-	if got := projectedWorkflowJobCount(950, jobsByLogicalID, matrixIDs, "a", 50); got != 1001 {
+	if got := projectedWorkflowJobCount(950, jobsByLogicalID, deferredJobIDs, "a", 50); got != 1001 {
 		t.Fatalf("projected jobs = %d, want 1001", got)
 	}
 
@@ -1452,6 +1465,175 @@ func TestPlanWorkflowJobsPreservesDisabledMatrixFailFast(t *testing.T) {
 	}
 	if len(planned) != 1 || planned[0].matrix == nil || planned[0].matrix.FailFast == nil || *planned[0].matrix.FailFast {
 		t.Fatalf("planned matrix strategy = %#v", planned)
+	}
+}
+
+func TestReconcileDeferredJobConfigurationFromDependencyResult(t *testing.T) {
+	scheme := runnerTestScheme(t)
+	run := &actionsv1alpha1.WorkflowRun{
+		ObjectMeta: metav1.ObjectMeta{Name: "deferred", Namespace: "default", UID: types.UID("run-uid")},
+		Spec: actionsv1alpha1.WorkflowRunSpec{
+			ProjectRef:   corev1.LocalObjectReference{Name: "default"},
+			WorkflowPath: ".github/workflows/ci.yml",
+			Source: actionsv1alpha1.WorkflowRunSource{Type: actionsv1alpha1.SourceTypeGitHub, GitHub: &actionsv1alpha1.GitHubWorkflowRunSource{
+				Repository: actionsv1alpha1.GitHubRepository{ID: 1, Owner: "acme", Name: "example"},
+				Event:      actionsv1alpha1.GitHubEvent{Name: actionsv1alpha1.GitHubEventNamePush, DeliveryID: "delivery"},
+				Revision:   actionsv1alpha1.GitRevision{SHA: strings.Repeat("a", 40), Ref: "refs/heads/main"},
+			}},
+		},
+	}
+	setTestWorkflowRunIdentity(run)
+	project := &actionsv1alpha1.Project{ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: "default", UID: types.UID("project-uid")}}
+	definition, err := workflow.Parse([]byte("name: Deferred\non: push\njobs:\n  prepare:\n    runs-on: ubuntu-latest\n    steps:\n      - run: prepare\n  build:\n    needs: prepare\n    name: Build ${{ needs.prepare.result }}\n    runs-on: ubuntu-latest\n    steps:\n      - run: build\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	clusterClient := fake.NewClientBuilder().WithScheme(scheme).
+		WithStatusSubresource(&actionsv1alpha1.WorkflowRun{}, &actionsv1alpha1.WorkflowJob{}).
+		WithObjects(run).
+		Build()
+	reconciler := &WorkflowRunReconciler{Client: clusterClient, APIReader: clusterClient}
+	planned, deferred, err := reconciler.planWorkflowJobs(run, definition, nil, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := reconciler.ensureWorkflowPlan(context.Background(), run, project, planned, deferred); err != nil {
+		t.Fatal(err)
+	}
+	if err := reconciler.ensureWorkflowJobs(context.Background(), run, project, planned); err != nil {
+		t.Fatal(err)
+	}
+
+	jobs := &actionsv1alpha1.WorkflowJobList{}
+	if err := clusterClient.List(context.Background(), jobs, client.InNamespace(run.Namespace), client.MatchingLabels{actionsv1alpha1.LabelWorkflowRunUID: string(run.UID)}); err != nil {
+		t.Fatal(err)
+	}
+	for index := range jobs.Items {
+		if jobs.Items[index].Spec.JobID == "prepare" {
+			jobs.Items[index].Status.Result = actionsv1alpha1.WorkflowJobResultSuccess
+			if err := clusterClient.Status().Update(context.Background(), &jobs.Items[index]); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	jobs = &actionsv1alpha1.WorkflowJobList{}
+	if err := clusterClient.List(context.Background(), jobs, client.InNamespace(run.Namespace), client.MatchingLabels{actionsv1alpha1.LabelWorkflowRunUID: string(run.UID)}); err != nil {
+		t.Fatal(err)
+	}
+	state, err := reconciler.reconcileDeferredJobs(context.Background(), run, jobs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !state.changed {
+		t.Fatal("deferred job creation did not report a change")
+	}
+
+	build := &actionsv1alpha1.WorkflowJob{}
+	if err := clusterClient.Get(context.Background(), client.ObjectKey{Namespace: run.Namespace, Name: workflowJobName(run.Name, "build")}, build); err != nil {
+		t.Fatal(err)
+	}
+	if build.Spec.DisplayName != "Build success" || build.Spec.Matrix != nil {
+		t.Fatalf("deferred WorkflowJob = %#v", build.Spec)
+	}
+}
+
+func TestReconcileDeferredJobsCompletesExistingResultPlaceholder(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		strategy string
+		runsOn   string
+	}{
+		{name: "job", runsOn: deferredJobResultRunsOn},
+		{name: "matrix", strategy: "    strategy:\n      matrix:\n        arch: [amd64]\n", runsOn: deferredJobResultRunsOn},
+		{name: "persisted matrix placeholder", strategy: "    strategy:\n      matrix:\n        arch: [amd64]\n", runsOn: matrixEvaluationResultRunsOn},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			scheme := runnerTestScheme(t)
+			run := &actionsv1alpha1.WorkflowRun{
+				ObjectMeta: metav1.ObjectMeta{Name: "deferred", Namespace: "default", UID: types.UID("run-uid")},
+				Spec: actionsv1alpha1.WorkflowRunSpec{
+					ProjectRef: corev1.LocalObjectReference{Name: "default"},
+					Source: actionsv1alpha1.WorkflowRunSource{Type: actionsv1alpha1.SourceTypeGitHub, GitHub: &actionsv1alpha1.GitHubWorkflowRunSource{
+						Repository: actionsv1alpha1.GitHubRepository{ID: 1, Owner: "acme", Name: "example"},
+						Event:      actionsv1alpha1.GitHubEvent{Name: actionsv1alpha1.GitHubEventNamePush, DeliveryID: "delivery"},
+						Revision:   actionsv1alpha1.GitRevision{SHA: strings.Repeat("a", 40), Ref: "refs/heads/main"},
+					}},
+				},
+			}
+			setTestWorkflowRunIdentity(run)
+			project := &actionsv1alpha1.Project{ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: "default", UID: types.UID("project-uid")}}
+			definition, err := workflow.Parse([]byte("name: Deferred\non: push\njobs:\n  prepare:\n    runs-on: ubuntu-latest\n    steps:\n      - run: prepare\n  build:\n    needs: prepare\n    if: ${{ needs.prepare.result == 'failure' }}\n    name: Build ${{ needs.prepare.result }}\n" + test.strategy + "    runs-on: ubuntu-latest\n    steps:\n      - run: build\n"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			clusterClient := fake.NewClientBuilder().WithScheme(scheme).
+				WithStatusSubresource(&actionsv1alpha1.WorkflowRun{}, &actionsv1alpha1.WorkflowJob{}).
+				WithObjects(run).
+				Build()
+			reconciler := &WorkflowRunReconciler{Client: clusterClient, APIReader: clusterClient}
+			planned, deferred, err := reconciler.planWorkflowJobs(run, definition, nil, nil, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(planned) != 1 || len(deferred) != 1 {
+				t.Fatalf("planned = %#v, deferred = %#v", planned, deferred)
+			}
+			ctx := context.Background()
+			if err := reconciler.ensureWorkflowPlan(ctx, run, project, planned, deferred); err != nil {
+				t.Fatal(err)
+			}
+			if err := reconciler.ensureWorkflowJobs(ctx, run, project, planned); err != nil {
+				t.Fatal(err)
+			}
+
+			jobs := &actionsv1alpha1.WorkflowJobList{}
+			if err := clusterClient.List(ctx, jobs, client.InNamespace(run.Namespace), client.MatchingLabels{actionsv1alpha1.LabelWorkflowRunUID: string(run.UID)}); err != nil {
+				t.Fatal(err)
+			}
+			prepare := &jobs.Items[0]
+			prepare.Status.Result = actionsv1alpha1.WorkflowJobResultSuccess
+			if err := clusterClient.Status().Update(ctx, prepare); err != nil {
+				t.Fatal(err)
+			}
+			planConfigMap := &corev1.ConfigMap{}
+			if err := clusterClient.Get(ctx, client.ObjectKey{Namespace: run.Namespace, Name: deferredJobPlanConfigMapName(run.Name, "build")}, planConfigMap); err != nil {
+				t.Fatal(err)
+			}
+			placeholder, err := reconciler.deferredJobResultPlaceholder(run, planConfigMap, deferred[0])
+			if err != nil {
+				t.Fatal(err)
+			}
+			placeholder.Spec.RunsOn = []string{test.runsOn}
+			if err := clusterClient.Create(ctx, placeholder); err != nil {
+				t.Fatal(err)
+			}
+
+			jobs = &actionsv1alpha1.WorkflowJobList{}
+			if err := clusterClient.List(ctx, jobs, client.InNamespace(run.Namespace), client.MatchingLabels{actionsv1alpha1.LabelWorkflowRunUID: string(run.UID)}); err != nil {
+				t.Fatal(err)
+			}
+			state, err := reconciler.reconcileDeferredJobs(ctx, run, jobs)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !state.changed {
+				t.Fatal("placeholder completion did not report a change")
+			}
+			stored := &actionsv1alpha1.WorkflowJob{}
+			if err := clusterClient.Get(ctx, client.ObjectKeyFromObject(placeholder), stored); err != nil {
+				t.Fatal(err)
+			}
+			if stored.Status.Result != actionsv1alpha1.WorkflowJobResultSkipped || stored.Status.CompletionTime == nil {
+				t.Fatalf("placeholder status = %#v", stored.Status)
+			}
+			jobs = &actionsv1alpha1.WorkflowJobList{}
+			if err := clusterClient.List(ctx, jobs, client.InNamespace(run.Namespace), client.MatchingLabels{actionsv1alpha1.LabelWorkflowRunUID: string(run.UID)}); err != nil {
+				t.Fatal(err)
+			}
+			if len(jobs.Items) != 2 {
+				t.Fatalf("WorkflowJobs = %d, want dependency and result placeholder", len(jobs.Items))
+			}
+		})
 	}
 }
 
@@ -1502,7 +1684,7 @@ func TestReconcileDynamicMatrixFromDependencyOutput(t *testing.T) {
 	if err := clusterClient.List(context.Background(), jobs, client.InNamespace(run.Namespace), client.MatchingLabels{actionsv1alpha1.LabelWorkflowRunUID: string(run.UID)}); err != nil {
 		t.Fatal(err)
 	}
-	state, err := reconciler.reconcileDynamicMatrices(context.Background(), run, jobs)
+	state, err := reconciler.reconcileDeferredJobs(context.Background(), run, jobs)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1520,7 +1702,7 @@ func TestReconcileDynamicMatrixFromDependencyOutput(t *testing.T) {
 	if err := clusterClient.List(context.Background(), jobs, client.InNamespace(run.Namespace), client.MatchingLabels{actionsv1alpha1.LabelWorkflowRunUID: string(run.UID)}); err != nil {
 		t.Fatal(err)
 	}
-	state, err = reconciler.reconcileDynamicMatrices(context.Background(), run, jobs)
+	state, err = reconciler.reconcileDeferredJobs(context.Background(), run, jobs)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1571,7 +1753,7 @@ func TestReconcileDynamicMatrixFromDependencyOutput(t *testing.T) {
 	}
 
 	restarted := &WorkflowRunReconciler{Client: clusterClient, APIReader: clusterClient, GitHubAPIBase: "https://api.github.example", GitHubServerURL: "https://github.example"}
-	state, err = restarted.reconcileDynamicMatrices(context.Background(), run, jobs)
+	state, err = restarted.reconcileDeferredJobs(context.Background(), run, jobs)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1580,7 +1762,7 @@ func TestReconcileDynamicMatrixFromDependencyOutput(t *testing.T) {
 	}
 
 	run.Spec.CancelRequested = true
-	state, err = restarted.reconcileDynamicMatrices(context.Background(), run, jobs)
+	state, err = restarted.reconcileDeferredJobs(context.Background(), run, jobs)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1605,7 +1787,7 @@ func TestReconcileDynamicMatrixFromDependencyOutput(t *testing.T) {
 	}
 }
 
-func TestReconcileDynamicMatricesTreatsMissingPlanAsTerminal(t *testing.T) {
+func TestReconcileDeferredJobsTreatsMissingPlanAsTerminal(t *testing.T) {
 	scheme := runnerTestScheme(t)
 	run := &actionsv1alpha1.WorkflowRun{
 		ObjectMeta: metav1.ObjectMeta{
@@ -1616,8 +1798,8 @@ func TestReconcileDynamicMatricesTreatsMissingPlanAsTerminal(t *testing.T) {
 		},
 	}
 	data, err := json.Marshal(workflowPlanManifest{
-		SourceIDs: []string{"build"},
-		Matrices:  map[string]string{"build": "missing-plan-build-matrix-plan"},
+		SourceIDs:    []string{"build"},
+		DeferredJobs: map[string]string{"build": "missing-plan-build-matrix-plan"},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -1633,14 +1815,14 @@ func TestReconcileDynamicMatricesTreatsMissingPlanAsTerminal(t *testing.T) {
 	}
 	clusterClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(run, workflowPlan).Build()
 	reconciler := &WorkflowRunReconciler{Client: clusterClient, APIReader: clusterClient}
-	_, err = reconciler.reconcileDynamicMatrices(context.Background(), run, &actionsv1alpha1.WorkflowJobList{})
+	_, err = reconciler.reconcileDeferredJobs(context.Background(), run, &actionsv1alpha1.WorkflowJobList{})
 	terminal := &terminalPlanningError{}
 	if !errors.As(err, &terminal) || !strings.Contains(err.Error(), "missing-plan-build-matrix-plan") || !strings.Contains(err.Error(), run.Name) {
 		t.Fatalf("reconciliation error = %v, want terminal missing-plan error naming the ConfigMap and WorkflowRun", err)
 	}
 }
 
-func TestReconcileDynamicMatricesRefreshesJobsBetweenExpansions(t *testing.T) {
+func TestReconcileDeferredJobsRefreshesJobsBetweenExpansions(t *testing.T) {
 	scheme := runnerTestScheme(t)
 	run := &actionsv1alpha1.WorkflowRun{
 		ObjectMeta: metav1.ObjectMeta{Name: "dynamic", Namespace: "default", UID: types.UID("run-uid")},
@@ -1684,7 +1866,7 @@ func TestReconcileDynamicMatricesRefreshesJobsBetweenExpansions(t *testing.T) {
 		if err := clusterClient.List(context.Background(), jobs, client.InNamespace(run.Namespace), client.MatchingLabels{actionsv1alpha1.LabelWorkflowRunUID: string(run.UID)}); err != nil {
 			t.Fatal(err)
 		}
-		state, err := reconciler.reconcileDynamicMatrices(context.Background(), run, jobs)
+		state, err := reconciler.reconcileDeferredJobs(context.Background(), run, jobs)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1734,7 +1916,7 @@ func TestReconcileDynamicMatrixFailsInvalidOutput(t *testing.T) {
 	if err := clusterClient.List(context.Background(), jobs, client.InNamespace(run.Namespace), client.MatchingLabels{actionsv1alpha1.LabelWorkflowRunUID: string(run.UID)}); err != nil {
 		t.Fatal(err)
 	}
-	state, err := reconciler.reconcileDynamicMatrices(context.Background(), run, jobs)
+	state, err := reconciler.reconcileDeferredJobs(context.Background(), run, jobs)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1749,7 +1931,7 @@ func TestReconcileDynamicMatrixFailsInvalidOutput(t *testing.T) {
 		t.Fatalf("result = %q, want failure", failed.Status.Result)
 	}
 	condition := meta.FindStatusCondition(failed.Status.Conditions, actionsv1alpha1.WorkflowJobConditionSucceeded)
-	if condition == nil || condition.Reason != "MatrixEvaluationFailed" || !strings.Contains(condition.Message, "parse JSON") {
+	if condition == nil || condition.Reason != "JobPlanningFailed" || !strings.Contains(condition.Message, "parse JSON") {
 		t.Fatalf("Succeeded condition = %#v", condition)
 	}
 }
