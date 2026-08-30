@@ -291,7 +291,7 @@ func TestConcurrentRerunRequestsDoNotShareAnAttempt(t *testing.T) {
 	clusterClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(snapshot).Build()
 	reconciler := &DeliveryReconciler{Client: clusterClient, APIReader: clusterClient}
 
-	if err := reconciler.createRerunWorkflowRun(context.Background(), root, root, 2, "delivery-a", []string{"unit"}); err != nil {
+	if err := reconciler.createRerunWorkflowRun(context.Background(), root, root, 2, "delivery-a", "octocat", []string{"unit"}); err != nil {
 		t.Fatal(err)
 	}
 	retry := &actionsv1alpha1.WorkflowRun{}
@@ -300,6 +300,9 @@ func TestConcurrentRerunRequestsDoNotShareAnAttempt(t *testing.T) {
 	}
 	if retry.Spec.CancelRequested {
 		t.Fatal("rerun retained the previous cancellation request")
+	}
+	if retry.Spec.Rerun.TriggeringActor != "octocat" {
+		t.Fatalf("rerun triggering actor = %q", retry.Spec.Rerun.TriggeringActor)
 	}
 	if retry.Annotations[eventsnapshot.Annotation] != snapshot.Name {
 		t.Fatalf("rerun event snapshot = %q", retry.Annotations[eventsnapshot.Annotation])
@@ -314,7 +317,7 @@ func TestConcurrentRerunRequestsDoNotShareAnAttempt(t *testing.T) {
 	if !foundOwner {
 		t.Fatalf("snapshot owners = %#v", snapshot.OwnerReferences)
 	}
-	if err := reconciler.createRerunWorkflowRun(context.Background(), root, root, 2, "delivery-b", []string{"unit"}); !errors.Is(err, errRerunAttemptClaimed) {
+	if err := reconciler.createRerunWorkflowRun(context.Background(), root, root, 2, "delivery-b", "hubot", []string{"unit"}); !errors.Is(err, errRerunAttemptClaimed) {
 		t.Fatalf("second rerun error = %v", err)
 	}
 }

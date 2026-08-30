@@ -1,6 +1,7 @@
 package expression
 
 import (
+	"encoding/json"
 	"fmt"
 	"math"
 	"reflect"
@@ -105,6 +106,12 @@ func normalize(input any, sensitive bool) value {
 		return value{kind: boolKind, boolean: typed, sensitive: sensitive}
 	case string:
 		return value{kind: stringKind, text: typed, sensitive: sensitive}
+	case json.Number:
+		number, err := typed.Float64()
+		if err != nil {
+			return value{kind: stringKind, text: typed.String(), sensitive: sensitive}
+		}
+		return value{kind: numberKind, number: number, sensitive: sensitive}
 	case float64:
 		return value{kind: numberKind, number: typed, sensitive: sensitive}
 	case float32:

@@ -685,7 +685,7 @@ func (r *DeliveryReconciler) reconcileRerun(ctx context.Context, object *corev1.
 	if latest.Spec.Rerun != nil {
 		attempt = latest.Spec.Rerun.Attempt + 1
 	}
-	if err := r.createRerunWorkflowRun(ctx, root, latest, attempt, delivery.DeliveryID, jobIDs); err != nil {
+	if err := r.createRerunWorkflowRun(ctx, root, latest, attempt, delivery.DeliveryID, delivery.Rerun.TriggeringActor, jobIDs); err != nil {
 		if errors.Is(err, errRerunAttemptClaimed) {
 			return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
 		}
@@ -764,12 +764,13 @@ func (r *DeliveryReconciler) rerunWorkflowJobIDs(ctx context.Context, run *actio
 	return workflowrun.FailedJobIDs(run, jobs.Items)
 }
 
-func (r *DeliveryReconciler) createRerunWorkflowRun(ctx context.Context, root, previous *actionsv1alpha1.WorkflowRun, attempt int32, requestID string, jobIDs []string) error {
+func (r *DeliveryReconciler) createRerunWorkflowRun(ctx context.Context, root, previous *actionsv1alpha1.WorkflowRun, attempt int32, requestID, triggeringActor string, jobIDs []string) error {
 	snapshotName, err := r.rerunEventSnapshot(ctx, root)
 	if err != nil {
 		return err
 	}
 	desired := workflowrun.NewRerun(root, previous, attempt, requestID, jobIDs)
+	desired.Spec.Rerun.TriggeringActor = triggeringActor
 	if snapshotName != "" {
 		desired.Annotations = map[string]string{eventsnapshot.Annotation: snapshotName}
 	}
@@ -825,6 +826,7 @@ func matchingRerunRequest(existing, desired *actionsv1alpha1.WorkflowRun) bool {
 	existingCopy := existing.DeepCopy()
 	desiredCopy := desired.DeepCopy()
 	existingCopy.Spec.Rerun.RequestID = desiredCopy.Spec.Rerun.RequestID
+	existingCopy.Spec.Rerun.TriggeringActor = desiredCopy.Spec.Rerun.TriggeringActor
 	return matchingWorkflowRun(existingCopy, desiredCopy) == nil
 }
 

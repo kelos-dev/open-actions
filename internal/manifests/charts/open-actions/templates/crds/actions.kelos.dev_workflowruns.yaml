@@ -194,6 +194,14 @@ spec:
                     minLength: 1
                     pattern: ^[A-Za-z0-9-]+$
                     type: string
+                  triggeringActor:
+                    description: |-
+                      TriggeringActor is the GitHub login that requested this attempt. It is
+                      omitted when the rerun source cannot identify a GitHub user.
+                    maxLength: 100
+                    minLength: 1
+                    pattern: ^[A-Za-z0-9][A-Za-z0-9_-]*(\[bot\])?$
+                    type: string
                 required:
                 - attempt
                 - originalRunRef

@@ -314,9 +314,10 @@ func TestNormalizeRerunAcceptsOnlyProjectCheckRuns(t *testing.T) {
 	event.CheckRun.App.ID = 17
 	event.CheckRun.ExternalID = "workflow-run-uid"
 	event.CheckRun.HeadSHA = strings.Repeat("a", 40)
+	event.Sender.Login = "octocat"
 
 	rerun, supported, err := normalizeRerun(project, event)
-	if err != nil || !supported || rerun.CheckRunID != 42 || rerun.RootRunUID != "workflow-run-uid" || rerun.HeadSHA != event.CheckRun.HeadSHA {
+	if err != nil || !supported || rerun.CheckRunID != 42 || rerun.RootRunUID != "workflow-run-uid" || rerun.HeadSHA != event.CheckRun.HeadSHA || rerun.TriggeringActor != "octocat" {
 		t.Fatalf("normalized rerun = %#v, supported = %v, error = %v", rerun, supported, err)
 	}
 	event.Action = "completed"

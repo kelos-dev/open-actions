@@ -2,6 +2,7 @@ package expression
 
 import (
 	"crypto/sha256"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -9,6 +10,17 @@ import (
 	"strings"
 	"testing"
 )
+
+func TestEvaluationPreservesDecodedJSONNumberType(t *testing.T) {
+	context := Context{
+		Availability: NewAvailability("matrix"),
+		Values:       map[string]any{"matrix": map[string]any{"count": json.Number("2")}},
+	}
+	result := evaluateForTest(t, "${{ matrix.count }}", context)
+	if result.Value != float64(2) {
+		t.Fatalf("value = %#v (%T), want numeric 2", result.Value, result.Value)
+	}
+}
 
 func TestTemplateEvaluationPreservesTypesAndLiteralText(t *testing.T) {
 	context := Context{

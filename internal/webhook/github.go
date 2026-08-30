@@ -180,9 +180,10 @@ type normalizedEvent struct {
 }
 
 type normalizedRerun struct {
-	CheckRunID int64  `json:"checkRunID"`
-	RootRunUID string `json:"rootRunUID"`
-	HeadSHA    string `json:"headSHA"`
+	CheckRunID      int64  `json:"checkRunID"`
+	RootRunUID      string `json:"rootRunUID"`
+	HeadSHA         string `json:"headSHA"`
+	TriggeringActor string `json:"triggeringActor,omitempty"`
 }
 
 func (h *GitHubHandler) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
@@ -301,7 +302,7 @@ func normalizeRerun(project *actionsv1alpha1.Project, event *payload) (*normaliz
 	if event.CheckRun.ID < 1 || event.CheckRun.ExternalID == "" || len(validation.IsValidLabelValue(event.CheckRun.ExternalID)) > 0 || !validGitSHA(event.CheckRun.HeadSHA) {
 		return nil, false, errors.New("GitHub check run event is incomplete")
 	}
-	return &normalizedRerun{CheckRunID: event.CheckRun.ID, RootRunUID: event.CheckRun.ExternalID, HeadSHA: event.CheckRun.HeadSHA}, true, nil
+	return &normalizedRerun{CheckRunID: event.CheckRun.ID, RootRunUID: event.CheckRun.ExternalID, HeadSHA: event.CheckRun.HeadSHA, TriggeringActor: event.Sender.Login}, true, nil
 }
 
 func (h *GitHubHandler) projectForInstallation(ctx context.Context, installationID int64) (*actionsv1alpha1.Project, []byte, error) {

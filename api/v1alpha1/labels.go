@@ -16,5 +16,7 @@ const (
 	AnnotationProjectName            = "actions.kelos.dev/project-name"
 	AnnotationWorkflowFile           = "actions.kelos.dev/workflow-file"
 	AnnotationWorkflowPlan           = "actions.kelos.dev/workflow-plan"
-	AnnotationMatrixPlan             = "actions.kelos.dev/matrix-plan"
+	// AnnotationDeferredJobPlan is persisted on planning ConfigMaps and must
+	// remain stable for stored WorkflowRuns.
+	AnnotationDeferredJobPlan = "actions.kelos.dev/matrix-plan"
 )

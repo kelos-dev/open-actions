@@ -385,12 +385,17 @@ func TestExecuteResolvesProblemMatchersFromWorkspace(t *testing.T) {
 func TestExecuteEvaluatesWorkflowExpressions(t *testing.T) {
 	workspace := t.TempDir()
 	plan := testPlan()
+	plan.Run.TriggeringActor = "hubot"
 	plan.Matrix = map[string]any{"arch": "arm64"}
+	plan.Strategy = map[string]any{"job-index": int32(1), "job-total": int32(2), "max-parallel": int32(1), "fail-fast": true}
 	plan.Env = map[string]string{
 		"ARCH": "${{ matrix.arch }}", "BRANCH": "${{ github.ref_name }}", "JOB_TOKEN": "${{ github.token }}",
+		"REPOSITORY_OWNER": "${{ github.repository_owner }}", "REF_TYPE": "${{ github.ref_type }}",
+		"WORKFLOW_REF":   "${{ github.workflow_ref }}",
 		"RUN_ID_CONTEXT": "${{ github.run_id }}", "RUN_NUMBER_CONTEXT": "${{ github.run_number }}",
 		"RUN_ATTEMPT_CONTEXT": "${{ github.run_attempt }}", "ACTOR_CONTEXT": "${{ github.actor }}",
-		"RUN_URL_CONTEXT": "${{ open_actions.run_url }}", "RUN_QUERY_URL_CONTEXT": "${{ open_actions.run_query_url }}",
+		"TRIGGERING_ACTOR_CONTEXT": "${{ github.triggering_actor }}",
+		"RUN_URL_CONTEXT":          "${{ open_actions.run_url }}", "RUN_QUERY_URL_CONTEXT": "${{ open_actions.run_query_url }}",
 	}
 	plan.Outputs = map[string]string{"image": "${{ matrix.arch }}-${{ steps.build.outputs.image }}"}
 	plan.Steps = []Step{
@@ -408,8 +413,10 @@ func TestExecuteEvaluatesWorkflowExpressions(t *testing.T) {
 				"REPOSITORY": "${{ github.repository }}",
 				"STEP_TOKEN": "${{ github.token }}",
 				"TARGET":     "main",
+				"JOB_STATUS": "${{ job.status }}",
+				"JOB_INDEX":  "${{ strategy.job-index }}",
 			},
-			Run: "test \"$JOB_TOKEN\" = installation-token && test \"$STEP_TOKEN\" = installation-token && test \"$RUN_ID_CONTEXT\" = \"$GITHUB_RUN_ID\" && test \"$RUN_NUMBER_CONTEXT\" = \"$GITHUB_RUN_NUMBER\" && test \"$RUN_ATTEMPT_CONTEXT\" = \"$GITHUB_RUN_ATTEMPT\" && test \"$ACTOR_CONTEXT\" = \"$GITHUB_ACTOR\" && test \"$RUN_URL_CONTEXT\" = \"$OPEN_ACTIONS_RUN_URL\" && test \"$RUN_QUERY_URL_CONTEXT\" = \"$OPEN_ACTIONS_RUN_QUERY_URL\" && printf '%s/%s/${{ github.sha }}/${{ env.TARGET }}/${{ matrix.arch }}' \"$BRANCH\" \"$REPOSITORY\" > result && echo 'image=ready' >> \"$GITHUB_OUTPUT\"",
+			Run: "test \"$JOB_TOKEN\" = installation-token && test \"$STEP_TOKEN\" = installation-token && test \"$RUN_ID_CONTEXT\" = \"$GITHUB_RUN_ID\" && test \"$RUN_NUMBER_CONTEXT\" = \"$GITHUB_RUN_NUMBER\" && test \"$RUN_ATTEMPT_CONTEXT\" = \"$GITHUB_RUN_ATTEMPT\" && test \"$ACTOR_CONTEXT\" = \"$GITHUB_ACTOR\" && test \"$TRIGGERING_ACTOR_CONTEXT\" = \"$GITHUB_TRIGGERING_ACTOR\" && test \"$TRIGGERING_ACTOR_CONTEXT\" = hubot && test \"$RUN_URL_CONTEXT\" = \"$OPEN_ACTIONS_RUN_URL\" && test \"$RUN_QUERY_URL_CONTEXT\" = \"$OPEN_ACTIONS_RUN_QUERY_URL\" && test \"$REPOSITORY_OWNER\" = acme && test \"$REF_TYPE\" = branch && test \"$WORKFLOW_REF\" = 'acme/example/.github/workflows/ci.yml@refs/heads/main' && test \"$JOB_STATUS\" = success && test \"$JOB_INDEX\" = 1 && printf '%s/%s/${{ github.sha }}/${{ env.TARGET }}/${{ matrix.arch }}' \"$BRANCH\" \"$REPOSITORY\" > result && echo 'image=ready' >> \"$GITHUB_OUTPUT\"",
 		},
 	}
 	executor := testExecutor(t, io.Discard, io.Discard)
@@ -429,6 +436,52 @@ func TestExecuteEvaluatesWorkflowExpressions(t *testing.T) {
 	}
 	if string(result) != "main/acme/example/"+strings.Repeat("a", 40)+"/main/arm64" {
 		t.Fatalf("result = %q", result)
+	}
+}
+
+func TestEnvContextContainsOnlyWorkflowDeclaredValues(t *testing.T) {
+	plan := testPlan()
+	plan.Env = map[string]string{"DECLARED": "workflow"}
+	plan.Steps = []Step{
+		{
+			Env: map[string]string{
+				"DECLARED_CONTEXT":  "${{ env.DECLARED }}",
+				"INHERITED_CONTEXT": "${{ env.POD_SENTINEL }}",
+				"DEFAULT_CONTEXT":   "${{ env.GITHUB_SHA }}",
+			},
+			Run: "test \"$DECLARED_CONTEXT\" = workflow && test -z \"$INHERITED_CONTEXT\" && test -z \"$DEFAULT_CONTEXT\" && test \"$POD_SENTINEL\" = inherited && echo 'EXPORTED=command' >> \"$GITHUB_ENV\"",
+		},
+		{
+			Env: map[string]string{"EXPORTED_CONTEXT": "${{ env.EXPORTED }}"},
+			Run: "test \"$EXPORTED_CONTEXT\" = command",
+		},
+	}
+	environment := setEnvironment(os.Environ(), "POD_SENTINEL", "inherited")
+	if err := testExecutorWithEnvironment(t, environment, io.Discard, io.Discard).Execute(context.Background(), plan, t.TempDir()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestJobContextTracksCurrentStatus(t *testing.T) {
+	workspace := t.TempDir()
+	plan := testPlan()
+	plan.Steps = []Step{
+		{Run: "exit 1"},
+		{
+			If:  "failure()",
+			Env: map[string]string{"STATUS": "${{ job.status }}"},
+			Run: "printf '%s' \"$STATUS\" > status",
+		},
+	}
+	if err := testExecutor(t, io.Discard, io.Discard).Execute(context.Background(), plan, workspace); err == nil {
+		t.Fatal("Execute() succeeded after a failed step")
+	}
+	data, err := os.ReadFile(filepath.Join(workspace, "status"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "failure" {
+		t.Fatalf("job.status = %q", data)
 	}
 }
 
@@ -891,7 +944,11 @@ func TestLoadPlanSupportsCompatibleVersions(t *testing.T) {
 			if version >= 8 {
 				permissions = `,"githubTokenPermissions":{"contents":"read"}`
 			}
-			data := fmt.Sprintf(`{"version":%d%s,"repository":{"id":1,"owner":"acme","name":"example","serverURL":"https://github.com","apiURL":"https://api.github.com","actionCloneBaseURL":"https://github.com"},"event":{"name":"push","deliveryID":"delivery"},"revision":{"sha":"abc","ref":"refs/heads/main","refName":"main"},"workflowName":"CI","jobID":"build"%s%s,"steps":[{"run":"true"}]}`, version, run, timeouts, permissions)
+			expressionContext := ""
+			if version >= 9 {
+				expressionContext = `,"workflowPath":".github/workflows/ci.yml"`
+			}
+			data := fmt.Sprintf(`{"version":%d%s,"repository":{"id":1,"owner":"acme","name":"example","serverURL":"https://github.com","apiURL":"https://api.github.com","actionCloneBaseURL":"https://github.com"},"event":{"name":"push","deliveryID":"delivery"},"revision":{"sha":"abc","ref":"refs/heads/main","refName":"main"},"workflowName":"CI"%s,"jobID":"build"%s%s,"steps":[{"run":"true"}]}`, version, run, expressionContext, timeouts, permissions)
 			if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
 				t.Fatal(err)
 			}
@@ -984,7 +1041,7 @@ func TestExpressionContextsPreserveTriggerInputTypes(t *testing.T) {
 	plan := testPlan()
 	plan.Inputs = map[string]any{"enabled": false, "retries": float64(2)}
 	plan.Event.Schedule = "0 6 * * *"
-	context := expressionContext(plan, nil, "", nil, runnerConditionAvailability, nil, "token", nil, nil)
+	context := expressionContext(plan, nil, nil, "", nil, runnerConditionAvailability, nil, "token", nil, nil)
 	enabled, err := evaluateCondition("${{ inputs.enabled }}", context, true)
 	if err != nil {
 		t.Fatal(err)
@@ -1048,7 +1105,7 @@ func TestLoadEventSnapshotUsesProviderPayload(t *testing.T) {
 	pullRequest := event["pull_request"].(map[string]any)
 	head := pullRequest["head"].(map[string]any)
 	base := pullRequest["base"].(map[string]any)
-	if pullRequest["number"] != float64(42) || pullRequest["html_url"] != "https://github.com/acme/example/pull/42" ||
+	if pullRequest["number"] != json.Number("42") || pullRequest["html_url"] != "https://github.com/acme/example/pull/42" ||
 		head["sha"] != strings.Repeat("2", 40) || base["sha"] != strings.Repeat("1", 40) ||
 		head["repo"].(map[string]any)["full_name"] != "acme/example" {
 		t.Fatalf("github.event.pull_request = %#v", pullRequest)
@@ -1057,7 +1114,7 @@ func TestLoadEventSnapshotUsesProviderPayload(t *testing.T) {
 		t.Fatalf("loaded event snapshot = path %q, event %#v", plan.eventPath, event)
 	}
 	plan.Env = map[string]string{"EXPECTED_EVENT_PATH": absolutePath}
-	plan.Steps = []Step{{Run: `cmp "$GITHUB_EVENT_PATH" "$EXPECTED_EVENT_PATH" && test "${{ github.event.sender.login }}" = octocat`}}
+	plan.Steps = []Step{{Run: `cmp "$GITHUB_EVENT_PATH" "$EXPECTED_EVENT_PATH" && test "${{ github.event.sender.login }}" = octocat && test "${{ github.event.pull_request.number == 42 }}" = true`}}
 	if err := testExecutor(t, io.Discard, io.Discard).Execute(context.Background(), plan, t.TempDir()); err != nil {
 		t.Fatal(err)
 	}
@@ -1728,6 +1785,8 @@ func TestExecuteNestedCompositeAction(t *testing.T) {
 inputs:
   message:
     required: true
+  metadata:
+    default: ${{ github.action_repository }}@${{ github.action_ref }}
 runs:
   using: node20
   main: index.js
@@ -1737,6 +1796,7 @@ runs:
 if (process.env.STATE_nested === 'true') {
   console.log('nested post ran');
 } else {
+  if (process.env.INPUT_METADATA !== 'actions/nested@v1') throw new Error('unexpected action metadata: ' + process.env.INPUT_METADATA);
   fs.appendFileSync(process.env.GITHUB_OUTPUT, 'value=' + process.env['INPUT_MESSAGE'] + '\n');
   fs.appendFileSync(process.env.GITHUB_STATE, 'nested=true\n');
 }
@@ -1747,6 +1807,8 @@ if (process.env.STATE_nested === 'true') {
 inputs:
   message:
     required: true
+  action-path:
+    default: ${{ github.action_path }}
 outputs:
   result:
     value: ${{ steps.nested.outputs.value }}
@@ -1755,10 +1817,10 @@ runs:
   steps:
     - name: Skip unavailable fields
       if: false
-      run: echo "${{ secrets.TOKEN }}"
+      run: echo "${{ github.repository }}"
       shell: bash
       env:
-        TOKEN: ${{ secrets.TOKEN }}
+        REPOSITORY: ${{ github.repository }}
     - id: ignored-failure
       run: exit 1
       shell: bash
@@ -1777,6 +1839,14 @@ runs:
         test "$STEP_SCOPE" = "workflow action step env"
         test "$EXPECTED_STEP_SCOPE" = "workflow action step env"
         test "$GITHUB_TOKEN" = "installation-token"
+        test "$ACTION_PATH_DEFAULT" = "${{ github.action_path }}"
+        test "${{ github.action_ref }}" = v1
+        test "${{ github.action_repository }}" = actions/composite
+        test "${{ github.action_status }}" = success
+        test "${{ steps.ignored-failure.outcome }}" = failure
+        test "${{ steps.ignored-failure.conclusion }}" = success
+        test "${{ job.status }}" = success
+        test "${{ strategy.job-index }}" = 0
         test "$GITHUB_WORKSPACE" != "untrusted"
         test "$github_workspace" = "composite-lower"
         test "${{ env.LOCAL }}" = "composite-local"
@@ -1784,6 +1854,7 @@ runs:
       shell: bash
       env:
         EXPECTED: ${{ inputs.message }}
+        ACTION_PATH_DEFAULT: ${{ inputs['action-path'] }}
         EXPECTED_OUTER: ${{ env.OUTER }}
         EXPECTED_STEP_SCOPE: ${{ env.STEP_SCOPE }}
         LOCAL: composite-local
@@ -1811,6 +1882,8 @@ runs:
 	})
 	plan := testPlan()
 	plan.Repository.ActionCloneBaseURL = "file://" + repositories
+	plan.Matrix = map[string]any{"arch": "amd64"}
+	plan.Strategy = map[string]any{"job-index": int32(0), "job-total": int32(1), "max-parallel": int32(1), "fail-fast": true}
 	plan.Env = map[string]string{"OUTER": "workflow action env"}
 	plan.Steps = []Step{
 		{Uses: "actions/parent@v1", With: map[string]string{"message": "composite value"}, Env: map[string]string{"STEP_SCOPE": "workflow action step env"}},
@@ -1823,6 +1896,47 @@ runs:
 	}
 	if !strings.Contains(output.String(), "nested post ran") {
 		t.Errorf("nested post output was not recorded: %s", output.String())
+	}
+}
+
+func TestCompositeActionUsesCurrentJobStatusAfterFailure(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git is not installed")
+	}
+	repositories := t.TempDir()
+	createActionRepository(t, repositories, "actions", "job-status", "v1", map[string]string{
+		"action.yml": `name: Job status fixture
+inputs:
+  invocation-status:
+    default: ${{ job.status }}
+outputs:
+  observed:
+    value: ${{ steps.capture.outputs.status }}-${{ job.status }}
+runs:
+  using: composite
+  steps:
+    - id: capture
+      run: |
+        test "${{ inputs.invocation-status }}" = failure
+        test "${{ job.status }}" = failure
+        printf 'status=%s\n' "${{ job.status }}" >> "$GITHUB_OUTPUT"
+      shell: bash
+`,
+	})
+	plan := testPlan()
+	plan.Repository.ActionCloneBaseURL = "file://" + repositories
+	plan.Steps = []Step{
+		{Run: "exit 1"},
+		{ID: "cleanup", Uses: "actions/job-status@v1", If: "always()"},
+		{If: "always()", Run: `test "${{ steps.cleanup.outputs.observed }}" = failure-failure && touch "$GITHUB_WORKSPACE/job-status-observed"`},
+	}
+	workspace := t.TempDir()
+	err := testExecutor(t, io.Discard, io.Discard).Execute(context.Background(), plan, workspace)
+	if err == nil {
+		t.Fatal("failed workflow completed successfully")
+	}
+	if _, statErr := os.Stat(filepath.Join(workspace, "job-status-observed")); statErr != nil {
+		t.Fatalf("cleanup action did not observe the failed job status: %v", statErr)
 	}
 }
 
@@ -1886,7 +2000,7 @@ func TestResolveCompositeStepKeepsUsesLiteral(t *testing.T) {
 	state := &executionState{plan: testPlan(), environment: os.Environ()}
 	context := &compositeContext{
 		inputs:     map[string]string{"name": "resolved name", "version": "v2"},
-		stepOutput: map[string]map[string]string{},
+		stepOutput: map[string]map[string]any{},
 		state:      state,
 	}
 	step, _, err := resolveCompositeStep(compositeStep{
@@ -1946,6 +2060,24 @@ runs:
 	}
 }
 
+func TestLoadActionDefinitionRejectsUnavailableCompositeContext(t *testing.T) {
+	directory := t.TempDir()
+	metadata := `name: Invalid composite fixture
+runs:
+  using: composite
+  steps:
+    - run: echo "${{ secrets.TOKEN }}"
+      shell: bash
+`
+	if err := os.WriteFile(filepath.Join(directory, "action.yml"), []byte(metadata), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err := loadActionDefinition(directory)
+	if err == nil || !strings.Contains(err.Error(), `context "secrets" is unavailable`) {
+		t.Fatalf("loadActionDefinition() error = %v", err)
+	}
+}
+
 func TestActionInputsResolveGitHubDefaults(t *testing.T) {
 	plan := testPlan()
 	environment := []string{"GITHUB_WORKSPACE=/workspace"}
@@ -1987,6 +2119,47 @@ func TestActionInputsResolveRunnerDefaults(t *testing.T) {
 				t.Fatalf("runner inputs = %#v", inputs)
 			}
 		})
+	}
+}
+
+func TestActionInputsResolveMatrixAndJobDefaults(t *testing.T) {
+	plan := testPlan()
+	plan.Matrix = map[string]any{"arch": "arm64"}
+	plan.Strategy = map[string]any{"job-index": int32(1), "job-total": int32(2), "max-parallel": int32(1), "fail-fast": true}
+	inputs, err := actionInputs(map[string]actionInput{
+		"arch":   {Default: "${{ matrix.arch }}"},
+		"index":  {Default: "${{ strategy.job-index }}"},
+		"status": {Default: "${{ job.status }}"},
+	}, nil, plan, []string{"GITHUB_WORKSPACE=/workspace"}, "installation-token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if inputs["arch"] != "arm64" || inputs["index"] != "1" || inputs["status"] != "success" {
+		t.Fatalf("inputs = %#v", inputs)
+	}
+}
+
+func TestActionInputsResolveActionMetadataDefaults(t *testing.T) {
+	inputs, err := actionInputsWithContext(
+		map[string]actionInput{
+			"path":       {Default: "${{ github.action_path }}"},
+			"repository": {Default: "${{ github.action_repository }}"},
+			"ref":        {Default: "${{ github.action_ref }}"},
+		},
+		nil,
+		testPlan(),
+		[]string{"GITHUB_WORKSPACE=/workspace"},
+		"installation-token",
+		"/actions/example",
+		"actions/example",
+		"v1",
+		nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if inputs["path"] != "/actions/example" || inputs["repository"] != "actions/example" || inputs["ref"] != "v1" {
+		t.Fatalf("inputs = %#v", inputs)
 	}
 }
 
@@ -2779,6 +2952,7 @@ func testPlan() *Plan {
 		Event:                  Event{Name: "push", DeliveryID: "delivery"},
 		Revision:               Revision{SHA: strings.Repeat("a", 40), Ref: "refs/heads/main", RefName: "main"},
 		WorkflowName:           "CI",
+		WorkflowPath:           ".github/workflows/ci.yml",
 		JobID:                  "test",
 		GitHubTokenPermissions: map[string]string{"contents": "read"},
 		TimeoutSeconds:         int64((6 * time.Hour) / time.Second),
