@@ -124,6 +124,7 @@ jobs:
             image:
               tag: ${OPEN_ACTIONS_IMAGE_TAG}
               pullPolicy: Always
+            workflowRunTTLSecondsAfterFinished: 172800
           artifacts:
             image:
               tag: ${OPEN_ACTIONS_IMAGE_TAG}
