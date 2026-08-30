@@ -53,6 +53,17 @@ type RunnerExecutionSpec struct {
 	// +required
 	Image string `json:"image"`
 
+	// Env defines environment variables for the runner container. Kubernetes
+	// resolves value sources before the runner starts. These variables are
+	// available to every WorkflowJob assigned to the Runner, including jobs for
+	// fork pull requests. Controller-defined variables take precedence when a
+	// name conflicts.
+	// +listType=map
+	// +listMapKey=name
+	// +kubebuilder:validation:MaxItems=100
+	// +optional
+	Env []corev1.EnvVar `json:"env,omitempty"`
+
 	// ImagePullSecrets identifies Secrets in the Runner's namespace that
 	// Kubernetes uses to pull images for the workflow Pod.
 	// +listType=map

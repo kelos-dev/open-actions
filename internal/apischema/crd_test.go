@@ -738,6 +738,38 @@ func TestRunnerImagePullPolicyContract(t *testing.T) {
 	}
 }
 
+func TestRunnerEnvironmentContract(t *testing.T) {
+	crd, _ := loadCRD(t, "actions.kelos.dev_runners.yaml")
+	object := loadSample(t, "actions_v1alpha1_runner.yaml")
+	execution := object["spec"].(map[string]any)["execution"].(map[string]any)
+	execution["env"] = []any{
+		map[string]any{"name": "CACHE_URL", "value": "https://cache.example"},
+		map[string]any{"name": "CACHE_TOKEN", "valueFrom": map[string]any{
+			"secretKeyRef": map[string]any{"name": "runner-environment", "key": "cache-token"},
+		}},
+	}
+	if errs := validateObject(t, crd, object, nil); len(errs) > 0 {
+		t.Fatalf("valid runner environment was rejected: %v", errs.ToAggregate())
+	}
+
+	environment := make([]any, 101)
+	for index := range environment {
+		environment[index] = map[string]any{"name": fmt.Sprintf("VARIABLE_%d", index), "value": "value"}
+	}
+	execution["env"] = environment
+	if errs := validateObject(t, crd, object, nil); len(errs) == 0 {
+		t.Fatal("more than 100 runner environment variables passed validation")
+	}
+
+	execution["env"] = []any{
+		map[string]any{"name": "CACHE_URL", "value": "one"},
+		map[string]any{"name": "CACHE_URL", "value": "two"},
+	}
+	if errs := validateObject(t, crd, object, nil); len(errs) == 0 {
+		t.Fatal("duplicate runner environment variables passed validation")
+	}
+}
+
 func TestRunnerImagePullSecretsContract(t *testing.T) {
 	crd, _ := loadCRD(t, "actions.kelos.dev_runners.yaml")
 	object := loadSample(t, "actions_v1alpha1_runner.yaml")
@@ -880,6 +912,10 @@ func TestCRDConventions(t *testing.T) {
 				}
 				if slices.Contains(execution.Required, "docker") {
 					t.Error("spec.execution.docker is required")
+				}
+				environment := execution.Properties["env"]
+				if environment.MaxItems == nil || *environment.MaxItems != 100 || environment.XListType == nil || *environment.XListType != "map" || !slices.Contains(environment.XListMapKeys, "name") {
+					t.Errorf("spec.execution.env schema = %#v", environment)
 				}
 				resources := execution.Properties["resources"]
 				for _, fieldName := range []string{"limits", "requests"} {

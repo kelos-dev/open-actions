@@ -9,6 +9,9 @@ spec:
   execution:
     image: ghcr.io/kelos-dev/open-actions-runner:latest
     imagePullPolicy: IfNotPresent
+    env:
+      - name: CACHE_URL
+        value: https://cache.example
     resources:
       requests:
         cpu: "1"

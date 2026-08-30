@@ -234,7 +234,14 @@ immutable `spec.source.github.actor` records the source actor. Set
 allowing cancellation-aware reporting and cleanup jobs to finish. Deleting a
 WorkflowRun force-cancels and removes its child resources. A Runner's
 `spec.projectRef` is immutable, and changes to `spec.execution` apply only to
-Kubernetes Jobs created afterward. `spec.execution.imagePullPolicy` controls
+Kubernetes Jobs created afterward. `spec.execution.env` accepts up to 100
+Kubernetes container environment variables with literal values or Kubernetes
+`valueFrom` sources. The variables are inherited by every workflow process on
+that Runner, but are not added to the workflow `env` expression context.
+Secret-backed values are exposed to every assigned workflow, including fork
+pull requests regardless of `spec.source.github.forkPullRequests.sendSecrets`.
+Controller-defined variables take precedence over configured entries with the
+same name. `spec.execution.imagePullPolicy` controls
 when Kubernetes pulls the runner image and accepts `Always`, `IfNotPresent`, or
 `Never`; omitting it uses Kubernetes defaulting. `spec.execution.imagePullSecrets`
 accepts up to 32 unique Secret references in the Runner's namespace that
