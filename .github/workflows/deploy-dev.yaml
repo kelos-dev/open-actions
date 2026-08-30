@@ -235,6 +235,9 @@ jobs:
               name: default
             execution:
               image: ghcr.io/kelos-dev/open-actions-runner:${OPEN_ACTIONS_IMAGE_TAG}
+              env:
+                - name: GOMAXPROCS
+                  value: "2"
               resources:
                 requests:
                   cpu: 100m
@@ -261,6 +264,9 @@ jobs:
               name: default
             execution:
               image: ghcr.io/kelos-dev/open-actions-runner:${OPEN_ACTIONS_IMAGE_TAG}
+              env:
+                - name: GOMAXPROCS
+                  value: "2"
               resources:
                 requests:
                   cpu: 100m

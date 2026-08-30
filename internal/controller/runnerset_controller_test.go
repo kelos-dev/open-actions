@@ -49,7 +49,7 @@ func TestRunnerSetCreatesDesiredRunners(t *testing.T) {
 		if runner.Labels[actionsv1alpha1.LabelRunnerSetUID] != string(runnerSet.UID) {
 			t.Errorf("Runner %q RunnerSet UID label = %q", runner.Name, runner.Labels[actionsv1alpha1.LabelRunnerSetUID])
 		}
-		if runner.Spec.Execution.Image != "runner:test" || len(runner.Spec.Labels) != 2 {
+		if runner.Spec.Execution.Image != "runner:test" || len(runner.Spec.Execution.Env) != 1 || runner.Spec.Execution.Env[0].Name != "CACHE_URL" || runner.Spec.Execution.Env[0].Value != "https://cache.example" || len(runner.Spec.Labels) != 2 {
 			t.Errorf("Runner %q spec = %#v", runner.Name, runner.Spec)
 		}
 	}
@@ -351,7 +351,10 @@ func runnerSetTestRunner(t *testing.T, scheme *runtime.Scheme, runnerSet *action
 func runnerSetTestRunnerSpec() actionsv1alpha1.RunnerSpec {
 	return actionsv1alpha1.RunnerSpec{
 		ProjectRef: corev1.LocalObjectReference{Name: "default"},
-		Execution:  actionsv1alpha1.RunnerExecutionSpec{Image: "runner:test"},
-		Labels:     []string{"self-hosted", "linux"},
+		Execution: actionsv1alpha1.RunnerExecutionSpec{
+			Image: "runner:test",
+			Env:   []corev1.EnvVar{{Name: "CACHE_URL", Value: "https://cache.example"}},
+		},
+		Labels: []string{"self-hosted", "linux"},
 	}
 }

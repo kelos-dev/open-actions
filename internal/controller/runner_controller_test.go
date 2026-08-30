@@ -46,7 +46,15 @@ func TestRunnerBuildsOwnedJob(t *testing.T) {
 	runnerObject := &actionsv1alpha1.Runner{
 		ObjectMeta: metav1.ObjectMeta{Name: "runner-1", Namespace: "default", UID: types.UID("runner-uid")},
 		Spec: actionsv1alpha1.RunnerSpec{Execution: actionsv1alpha1.RunnerExecutionSpec{
-			Image:            "runner:test",
+			Image: "runner:test",
+			Env: []corev1.EnvVar{
+				{Name: "CACHE_URL", Value: "https://cache.example"},
+				{Name: "CACHE_TOKEN", ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: "runner-environment"},
+					Key:                  "cache-token",
+				}}},
+				{Name: runner.RunnerNameEnvVar, Value: "untrusted"},
+			},
 			ImagePullSecrets: []actionsv1alpha1.RunnerImagePullSecretReference{{Name: "registry-credentials"}},
 			ImagePullPolicy:  corev1.PullAlways,
 			Resources: &actionsv1alpha1.RunnerResources{Requests: actionsv1alpha1.RunnerResourceList{
@@ -87,9 +95,11 @@ func TestRunnerBuildsOwnedJob(t *testing.T) {
 	if container.TerminationMessagePath != jobResultPath || container.TerminationMessagePolicy != corev1.TerminationMessageReadFile {
 		t.Errorf("termination message = %q, policy = %q", container.TerminationMessagePath, container.TerminationMessagePolicy)
 	}
-	if len(container.Env) != 3 || container.Env[0].Name != runner.RunnerNameEnvVar || container.Env[0].Value != runnerObject.Name ||
-		container.Env[1].Name != runner.GitHubTokenEnvVar || container.Env[1].ValueFrom.SecretKeyRef.Key != jobTokenSecretKey ||
-		container.Env[2].Name != runner.ActionTokenEnvVar || container.Env[2].ValueFrom.SecretKeyRef.Key != actionTokenSecretKey {
+	if len(container.Env) != 5 || container.Env[0].Name != "CACHE_URL" || container.Env[0].Value != "https://cache.example" ||
+		container.Env[1].Name != "CACHE_TOKEN" || container.Env[1].ValueFrom.SecretKeyRef.Name != "runner-environment" || container.Env[1].ValueFrom.SecretKeyRef.Key != "cache-token" ||
+		container.Env[2].Name != runner.RunnerNameEnvVar || container.Env[2].Value != runnerObject.Name ||
+		container.Env[3].Name != runner.GitHubTokenEnvVar || container.Env[3].ValueFrom.SecretKeyRef.Key != jobTokenSecretKey ||
+		container.Env[4].Name != runner.ActionTokenEnvVar || container.Env[4].ValueFrom.SecretKeyRef.Key != actionTokenSecretKey {
 		t.Fatalf("runner environment = %#v", container.Env)
 	}
 	workspaceMount := ""

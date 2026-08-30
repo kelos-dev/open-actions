@@ -919,6 +919,23 @@ func (r *RunnerReconciler) buildJob(workflowJob *actionsv1alpha1.WorkflowJob, ru
 	for index, secret := range runnerObject.Spec.Execution.ImagePullSecrets {
 		imagePullSecrets[index].Name = secret.Name
 	}
+	runnerEnvironment := setEnvironmentVariables(runnerObject.Spec.Execution.Env,
+		corev1.EnvVar{Name: runner.RunnerNameEnvVar, Value: runnerObject.Name},
+		corev1.EnvVar{
+			Name: runner.GitHubTokenEnvVar,
+			ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
+				LocalObjectReference: corev1.LocalObjectReference{Name: childName(workflowJob.Name, "auth")},
+				Key:                  jobTokenSecretKey,
+			}},
+		},
+		corev1.EnvVar{
+			Name: runner.ActionTokenEnvVar,
+			ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
+				LocalObjectReference: corev1.LocalObjectReference{Name: childName(workflowJob.Name, "auth")},
+				Key:                  actionTokenSecretKey,
+			}},
+		},
+	)
 	podTemplate := corev1.PodTemplateSpec{
 		ObjectMeta: metav1.ObjectMeta{Labels: labels, Annotations: annotations},
 		Spec: corev1.PodSpec{
@@ -947,23 +964,7 @@ func (r *RunnerReconciler) buildJob(workflowJob *actionsv1alpha1.WorkflowJob, ru
 				Args:                     []string{"--job-file=" + jobPlanMountPath + "/" + jobPlanKey, "--result-file=" + jobResultPath, "--workspace=" + workspacePath},
 				TerminationMessagePath:   jobResultPath,
 				TerminationMessagePolicy: corev1.TerminationMessageReadFile,
-				Env: []corev1.EnvVar{
-					{Name: runner.RunnerNameEnvVar, Value: runnerObject.Name},
-					{
-						Name: runner.GitHubTokenEnvVar,
-						ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
-							LocalObjectReference: corev1.LocalObjectReference{Name: childName(workflowJob.Name, "auth")},
-							Key:                  jobTokenSecretKey,
-						}},
-					},
-					{
-						Name: runner.ActionTokenEnvVar,
-						ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
-							LocalObjectReference: corev1.LocalObjectReference{Name: childName(workflowJob.Name, "auth")},
-							Key:                  actionTokenSecretKey,
-						}},
-					},
-				},
+				Env:                      runnerEnvironment,
 				VolumeMounts: []corev1.VolumeMount{
 					{Name: jobPlanVolume, MountPath: jobPlanMountPath, ReadOnly: true},
 					{Name: workspaceVolume, MountPath: workspaceVolumeMountPath},
@@ -1004,7 +1005,7 @@ func (r *RunnerReconciler) buildJob(workflowJob *actionsv1alpha1.WorkflowJob, ru
 	configureProjectValues(&podTemplate.Spec, &podTemplate.Spec.Containers[0], run, project)
 	if r.ArtifactResultsURL != "" {
 		container := &podTemplate.Spec.Containers[0]
-		container.Env = append(container.Env,
+		container.Env = setEnvironmentVariables(container.Env,
 			corev1.EnvVar{Name: runner.ArtifactTokenEnvVar, ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
 				LocalObjectReference: corev1.LocalObjectReference{Name: childName(workflowJob.Name, "auth")}, Key: artifact.TokenSecretKey,
 			}}},
@@ -1089,7 +1090,7 @@ func workflowRunUsesProjectSecrets(run *actionsv1alpha1.WorkflowRun) bool {
 }
 
 func configureDockerExecution(pod *corev1.PodSpec, runnerContainer *corev1.Container, dockerSpec *actionsv1alpha1.RunnerDockerSpec) {
-	runnerContainer.Env = append(runnerContainer.Env, corev1.EnvVar{Name: "DOCKER_HOST", Value: dockerHost})
+	runnerContainer.Env = setEnvironmentVariables(runnerContainer.Env, corev1.EnvVar{Name: "DOCKER_HOST", Value: dockerHost})
 	runnerContainer.VolumeMounts = append(runnerContainer.VolumeMounts, corev1.VolumeMount{Name: dockerSocketVolume, MountPath: dockerSocketDirectory})
 
 	dockerStorage := &corev1.EmptyDirVolumeSource{}
@@ -1123,6 +1124,20 @@ func configureDockerExecution(pod *corev1.PodSpec, runnerContainer *corev1.Conta
 			{Name: workspaceVolume, MountPath: workspaceVolumeMountPath},
 		},
 	})
+}
+
+func setEnvironmentVariables(environment []corev1.EnvVar, variables ...corev1.EnvVar) []corev1.EnvVar {
+	names := make(map[string]struct{}, len(variables))
+	for _, variable := range variables {
+		names[variable.Name] = struct{}{}
+	}
+	result := make([]corev1.EnvVar, 0, len(environment)+len(variables))
+	for _, variable := range environment {
+		if _, replaced := names[variable.Name]; !replaced {
+			result = append(result, variable)
+		}
+	}
+	return append(result, variables...)
 }
 
 func runnerResources(resources *actionsv1alpha1.RunnerResources) corev1.ResourceRequirements {
