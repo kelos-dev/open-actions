@@ -442,6 +442,46 @@ Because this token belongs to the Project's GitHub App, GitHub treats events it
 creates as ordinary App events. It does not receive the special recursive-run
 suppression that GitHub applies to its native Actions `GITHUB_TOKEN`.
 
+### GitHub Packages registry authentication
+
+The Open Actions job token is a custom GitHub App installation token. GitHub's
+[package registry authentication documentation](https://docs.github.com/en/packages/learn-github-packages/about-permissions-for-github-packages#about-scopes-and-permissions-for-package-registries)
+supports a classic personal access token and the `GITHUB_TOKEN` issued inside
+GitHub Actions, but not custom GitHub App installation tokens. Consequently,
+requesting `packages: read` or `packages: write` narrows the App token for
+GitHub API requests but does not allow `github.token` or
+`secrets.GITHUB_TOKEN` to authenticate to a GitHub Packages registry such as
+`ghcr.io`. This compatibility limitation is tracked in
+[#147](https://github.com/kelos-dev/open-actions/issues/147).
+
+To pull a private package, store a classic personal access token with
+`read:packages` in a Project Secret. To publish a package, use
+`write:packages`. The account that owns the token must have access to the
+package, and the token must be authorized for SSO when the organization
+requires it. Store the account name as a Project variable and pass the
+credential explicitly to the registry action:
+
+```yaml
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ vars.GHCR_USERNAME }}
+          password: ${{ secrets.GHCR_TOKEN }}
+```
+
+Use a non-reserved Project Secret name such as `GHCR_TOKEN`; Project Secret
+names cannot use the `GITHUB_` prefix. The workflow `permissions` map does not
+restrict a personal access token, and Open Actions cannot revoke it when the
+job finishes, so grant only the necessary scopes and do not expose it to
+untrusted workflows or fork pull requests.
+
 ### External actions
 
 External action repositories on the configured GitHub server are downloaded
