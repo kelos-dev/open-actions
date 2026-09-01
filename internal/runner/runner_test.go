@@ -1613,7 +1613,8 @@ console.log('external post ran');
 				`"msg":"workflow step input","open_actions_runner":true,"name":"message"`,
 				`"msg":"workflow step output","open_actions_runner":true,"name":"command"`,
 				`"msg":"workflow step output","open_actions_runner":true,"name":"modern"`,
-				`"msg":"completed post action","open_actions_runner":true,"action":"actions/example@v1"`,
+				`"msg":"starting post action","open_actions_runner":true,"job":"test","step":4,"action":"actions/example@v1"`,
+				`"msg":"completed post action","open_actions_runner":true,"job":"test","step":4,"action":"actions/example@v1"`,
 			} {
 				if !strings.Contains(output.String(), expected) {
 					t.Errorf("runner output does not contain %q: %s", expected, output.String())
@@ -2700,6 +2701,77 @@ func TestExecutorLogsCancelledWorkflowStep(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(workspace, "cancellation-recorded")); err != nil {
 		t.Fatalf("cancelled outcome was not exposed to a cleanup step: %v", err)
+	}
+}
+
+func TestExecutorLogsPostActionConclusions(t *testing.T) {
+	tests := []struct {
+		name        string
+		postIf      string
+		script      string
+		cancel      bool
+		wantEvent   string
+		wantError   bool
+		wantStarted bool
+	}{
+		{name: "failed", postIf: "always()", script: "exit 1\n", wantEvent: "failed post action", wantError: true, wantStarted: true},
+		{name: "cancelled", postIf: "always()", script: "sleep 30\n", cancel: true, wantEvent: "cancelled post action", wantError: true, wantStarted: true},
+		{name: "skipped", postIf: "failure()", script: "exit 99\n", wantEvent: "skipping post action"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			directory := t.TempDir()
+			if err := os.WriteFile(filepath.Join(directory, "post.sh"), []byte(test.script), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			var output bytes.Buffer
+			executor, err := NewExecutor(ExecutorConfig{
+				Logger:      slog.New(slog.NewJSONHandler(&output, nil)),
+				RunnerName:  "runner-1",
+				GitHubToken: "installation-token",
+				ActionToken: "action-installation-token",
+				Environment: os.Environ(),
+				Stdout:      &output,
+				Stderr:      &output,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			plan := testPlan()
+			plan.Steps = []Step{{Run: "true"}, {Run: "true"}}
+			state := &executionState{
+				plan:               plan,
+				workspace:          t.TempDir(),
+				temporaryDirectory: t.TempDir(),
+				environment:        os.Environ(),
+				posts: []*actionInvocation{{
+					step:       Step{Uses: "actions/example@v1"},
+					directory:  directory,
+					definition: actionDefinition{Runs: actionRuns{Post: "post.sh", PostIf: test.postIf}},
+					executable: "/bin/sh",
+					inputs:     map[string]string{},
+					state:      map[string]string{},
+				}},
+			}
+			ctx := context.Background()
+			if test.cancel {
+				cancelled, cancel := context.WithCancel(ctx)
+				cancel()
+				ctx = cancelled
+			}
+			err = executor.runPostActions(ctx, state, workflowexpression.Status{Success: true})
+			if (err != nil) != test.wantError {
+				t.Fatalf("runPostActions() error = %v, want error %t", err, test.wantError)
+			}
+			want := `"msg":"` + test.wantEvent + `","open_actions_runner":true,"job":"test","step":3,"action":"actions/example@v1"`
+			if !strings.Contains(output.String(), want) {
+				t.Fatalf("runner output has no %s event: %s", test.name, output.String())
+			}
+			started := strings.Contains(output.String(), `"msg":"starting post action","open_actions_runner":true,"job":"test","step":3,"action":"actions/example@v1"`)
+			if started != test.wantStarted {
+				t.Fatalf("starting post action event present = %t, want %t: %s", started, test.wantStarted, output.String())
+			}
+		})
 	}
 }
 

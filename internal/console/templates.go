@@ -306,7 +306,7 @@ const logPageTemplate = `<!doctype html>
     }
     function addEntry(entry,appender,renderNewClusters,groupsToCollapse){
       if(entry.kind==='group'){
-        if(entry.scope==='workflow'||entry.scope==='post')while(containers.length>1)containers.pop();const parent=containers[containers.length-1];parent.cluster=null;
+        if(entry.scope==='workflow')while(containers.length>1)containers.pop();const parent=containers[containers.length-1];parent.cluster=null;
         const details=document.createElement('details');details.className='log-group';details.open=!entry.conclusion;
         const summary=document.createElement('summary');const label=document.createElement('span');if(entry.text)appendLogText(label,entry);else label.textContent='Log group';
         let status;if(entry.scope==='workflow'){status=document.createElement('span');status.className='group-status running';status.setAttribute('aria-label','Running');status.title='Running';summary.append(status)}summary.append(label);

@@ -170,9 +170,15 @@ func runnerLogEntry(record runnerLogRecord, timestamp string) (logEntry, bool) {
 	case "completed composite step":
 		return logEntry{Kind: "endgroup", Time: timestamp, Scope: "composite"}, true
 	case "starting post action":
-		return logEntry{Kind: "group", Text: "Post " + record.Action, Time: timestamp, Scope: "post"}, true
+		return logEntry{Kind: "group", Text: postActionTitle(record), Time: timestamp, Scope: "workflow"}, true
 	case "completed post action":
-		return logEntry{Kind: "endgroup", Time: timestamp, Scope: "post"}, true
+		return logEntry{Kind: "endgroup", Time: timestamp, Scope: "workflow", Conclusion: "success"}, true
+	case "failed post action":
+		return logEntry{Kind: "endgroup", Time: timestamp, Scope: "workflow", Conclusion: "failure"}, true
+	case "cancelled post action":
+		return logEntry{Kind: "endgroup", Time: timestamp, Scope: "workflow", Conclusion: "cancelled"}, true
+	case "skipping post action":
+		return logEntry{Kind: "group", Text: postActionTitle(record), Time: timestamp, Scope: "workflow", Conclusion: "skipped"}, true
 	case "prepared external action":
 		return logEntry{Kind: "debug", Text: "Prepared " + record.Action, Time: timestamp}, true
 	case "workflow step input":
@@ -195,6 +201,14 @@ func runnerLogEntry(record runnerLogRecord, timestamp string) (logEntry, bool) {
 	default:
 		return logEntry{Kind: "runner", Text: text, Time: timestamp}, true
 	}
+}
+
+func postActionTitle(record runnerLogRecord) string {
+	title := "Post " + record.Action
+	if record.Step > 0 {
+		title = strconv.Itoa(record.Step) + ". " + title
+	}
+	return title
 }
 
 func internalCommandEntry(action, name, timestamp string) logEntry {
