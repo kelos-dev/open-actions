@@ -80,6 +80,7 @@ func (e *secretCountLimitError) Error() string {
 // Config contains required Console dependencies.
 type Config struct {
 	Client                             client.Client
+	WorkflowRuns                       RecentWorkflowRuns
 	Logs                               LogSource
 	Repositories                       RepositoryResolver
 	Token                              string
@@ -92,6 +93,7 @@ type Config struct {
 // Handler serves workflow information and authenticated Console administration.
 type Handler struct {
 	client                             client.Client
+	workflowRuns                       RecentWorkflowRuns
 	logs                               LogSource
 	repositories                       RepositoryResolver
 	tokenDigest                        [sha256.Size]byte
@@ -115,25 +117,9 @@ type loginRequest struct {
 }
 
 type mainPageData struct {
-	Runs      []mainRunPageData
+	Runs      []WorkflowRunSummary
 	Limit     int
 	Truncated bool
-}
-
-type mainRunPageData struct {
-	URL           string
-	Repository    string
-	WorkflowName  string
-	Namespace     string
-	Project       string
-	Event         string
-	RefName       string
-	Revision      string
-	ShortRevision string
-	Status        string
-	StatusClass   string
-	Created       string
-	Duration      string
 }
 
 type projectsPageData struct {
@@ -275,7 +261,7 @@ type logRead struct {
 
 // New creates a Console handler.
 func New(config Config) (*Handler, error) {
-	if config.Client == nil || config.Logs == nil || config.Repositories == nil {
+	if config.Client == nil || config.WorkflowRuns == nil || config.Logs == nil || config.Repositories == nil {
 		return nil, errors.New("Console clients are required")
 	}
 	if strings.TrimSpace(config.Token) == "" {
@@ -322,7 +308,7 @@ func New(config Config) (*Handler, error) {
 		workflowRunTTLSecondsAfterFinished = &value
 	}
 	return &Handler{
-		client: config.Client, logs: config.Logs, repositories: config.Repositories, tokenDigest: tokenDigest,
+		client: config.Client, workflowRuns: config.WorkflowRuns, logs: config.Logs, repositories: config.Repositories, tokenDigest: tokenDigest,
 		sessionValue: sessionValue(config.Token), csrfToken: csrfValue(config.Token), secretManagementNamespace: config.SecretManagementNamespace,
 		workflowRunTTLSecondsAfterFinished: workflowRunTTLSecondsAfterFinished,
 		secureCookie:                       config.SecureCookie, logger: config.Logger,
@@ -575,62 +561,16 @@ func (h *Handler) validCSRF(token string) bool {
 }
 
 func (h *Handler) main(writer http.ResponseWriter, request *http.Request) {
-	data, err := h.loadMainPageData(request.Context())
-	if err != nil {
-		h.writeResolutionError(writer, request, err)
+	if !h.workflowRuns.Synced() {
+		http.Error(writer, "Console run index is not ready", http.StatusServiceUnavailable)
 		return
 	}
-	h.writeHTML(writer, h.mainPage, data)
+	h.writeHTML(writer, h.mainPage, h.loadMainPageData())
 }
 
-func (h *Handler) loadMainPageData(ctx context.Context) (mainPageData, error) {
-	runs := &actionsv1alpha1.WorkflowRunList{}
-	if err := h.client.List(ctx, runs); err != nil {
-		return mainPageData{}, fmt.Errorf("load workflow runs: %w", err)
-	}
-	sort.SliceStable(runs.Items, func(left, right int) bool {
-		leftRun := &runs.Items[left]
-		rightRun := &runs.Items[right]
-		if leftRun.CreationTimestamp.Equal(&rightRun.CreationTimestamp) {
-			if leftRun.Namespace == rightRun.Namespace {
-				return leftRun.Name < rightRun.Name
-			}
-			return leftRun.Namespace < rightRun.Namespace
-		}
-		return leftRun.CreationTimestamp.After(rightRun.CreationTimestamp.Time)
-	})
-	data := mainPageData{Limit: mainPageRunLimit}
-	for index := range runs.Items {
-		run := &runs.Items[index]
-		if run.Spec.Source.Type != actionsv1alpha1.SourceTypeGitHub || run.Spec.Source.GitHub == nil {
-			continue
-		}
-		if len(data.Runs) == mainPageRunLimit {
-			data.Truncated = true
-			break
-		}
-		workflowName := run.Status.WorkflowName
-		if workflowName == "" {
-			workflowName = run.Spec.WorkflowPath
-		}
-		status := workflowstatus.Run(run)
-		refName := run.Spec.Source.GitHub.Revision.HeadRef
-		if refName == "" {
-			refName = shortRef(run.Spec.Source.GitHub.Revision.Ref)
-		}
-		item := mainRunPageData{
-			URL: runPath(run), Repository: run.Spec.Source.GitHub.Repository.Owner + "/" + run.Spec.Source.GitHub.Repository.Name,
-			WorkflowName: workflowName, Namespace: run.Namespace, Project: run.Spec.ProjectRef.Name,
-			Event: strings.ReplaceAll(string(run.Spec.Source.GitHub.Event.Name), "_", " "), RefName: refName,
-			Revision: run.Spec.Source.GitHub.Revision.SHA, ShortRevision: shortRevision(run.Spec.Source.GitHub.Revision.SHA),
-			Status: status, StatusClass: statusClass(status), Duration: elapsedTime(run.Status.StartTime, run.Status.CompletionTime),
-		}
-		if !run.CreationTimestamp.IsZero() {
-			item.Created = run.CreationTimestamp.UTC().Format(time.RFC3339)
-		}
-		data.Runs = append(data.Runs, item)
-	}
-	return data, nil
+func (h *Handler) loadMainPageData() mainPageData {
+	runs, truncated := h.workflowRuns.Recent(mainPageRunLimit)
+	return mainPageData{Runs: runs, Limit: mainPageRunLimit, Truncated: truncated}
 }
 
 func (h *Handler) projects(writer http.ResponseWriter, request *http.Request) {

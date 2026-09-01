@@ -373,6 +373,17 @@ func TestConsoleMainPageListsWorkflowRunsNewestFirst(t *testing.T) {
 	}
 }
 
+func TestConsoleMainPageWaitsForWorkflowRunStore(t *testing.T) {
+	handler := newTestHandler(t, false)
+	handler.workflowRuns.(*WorkflowRunStore).synced = func() bool { return false }
+
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/", nil))
+	if response.Code != http.StatusServiceUnavailable || !strings.Contains(response.Body.String(), "run index is not ready") {
+		t.Fatalf("main page = %d, %q", response.Code, response.Body.String())
+	}
+}
+
 func TestNewerRunQueryDetectsConcurrencyReplacementAndRerun(t *testing.T) {
 	handler := newTestHandler(t, false)
 	clusterClient := handler.client.(client.Client)
@@ -455,6 +466,7 @@ func TestConsoleMainPageLimitsWorkflowRuns(t *testing.T) {
 		if err := clusterClient.Create(context.Background(), run); err != nil {
 			t.Fatal(err)
 		}
+		handler.workflowRuns.(*WorkflowRunStore).upsert(run)
 		oldestName = run.Name
 	}
 
@@ -1345,10 +1357,11 @@ func TestConsoleRequiresAuthenticationForProjectSecretUpdates(t *testing.T) {
 
 func TestNewRequiresToken(t *testing.T) {
 	scheme := runtime.NewScheme()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	handler, err := New(Config{
-		Client: fake.NewClientBuilder().WithScheme(scheme).Build(),
-		Logs:   &testLogSource{pod: &corev1.Pod{}}, Repositories: &testRepositoryResolver{},
-		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Client: fake.NewClientBuilder().WithScheme(scheme).Build(), WorkflowRuns: readyWorkflowRunStore(logger),
+		Logs: &testLogSource{pod: &corev1.Pod{}}, Repositories: &testRepositoryResolver{},
+		Logger: logger,
 	})
 	if err == nil || handler != nil || !strings.Contains(err.Error(), "token is required") {
 		t.Fatalf("New() = %#v, %v", handler, err)
@@ -1358,11 +1371,12 @@ func TestNewRequiresToken(t *testing.T) {
 func TestNewRejectsNegativeWorkflowRunTTL(t *testing.T) {
 	scheme := runtime.NewScheme()
 	negative := int32(-1)
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	handler, err := New(Config{
-		Client: fake.NewClientBuilder().WithScheme(scheme).Build(),
-		Logs:   &testLogSource{pod: &corev1.Pod{}}, Repositories: &testRepositoryResolver{}, Token: testConsoleToken,
+		Client: fake.NewClientBuilder().WithScheme(scheme).Build(), WorkflowRuns: readyWorkflowRunStore(logger),
+		Logs: &testLogSource{pod: &corev1.Pod{}}, Repositories: &testRepositoryResolver{}, Token: testConsoleToken,
 		WorkflowRunTTLSecondsAfterFinished: &negative,
-		Logger:                             slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Logger:                             logger,
 	})
 	if err == nil || handler != nil || !strings.Contains(err.Error(), "TTL must not be negative") {
 		t.Fatalf("New() = %#v, %v", handler, err)
@@ -1474,15 +1488,25 @@ jobs:
 	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "build", Namespace: "default", Labels: map[string]string{actionsv1alpha1.LabelWorkflowJobUID: string(job.UID)}}}
 	clusterClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(run, newerRun, job, workflowFile, project, secret).Build()
 	workflowRunTTLSecondsAfterFinished := int32(604800)
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	handler, err := New(Config{
-		Client: clusterClient, Logs: &testLogSource{pod: pod, logs: "build output\n"}, Repositories: &testRepositoryResolver{}, Token: testConsoleToken,
+		Client: clusterClient, WorkflowRuns: readyWorkflowRunStore(logger, run, newerRun), Logs: &testLogSource{pod: pod, logs: "build output\n"}, Repositories: &testRepositoryResolver{}, Token: testConsoleToken,
 		SecretManagementNamespace: "default", WorkflowRunTTLSecondsAfterFinished: &workflowRunTTLSecondsAfterFinished,
-		SecureCookie: secureCookie, Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		SecureCookie: secureCookie, Logger: logger,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	return handler
+}
+
+func readyWorkflowRunStore(logger *slog.Logger, runs ...*actionsv1alpha1.WorkflowRun) *WorkflowRunStore {
+	store := newWorkflowRunStore(logger)
+	store.synced = func() bool { return true }
+	for _, run := range runs {
+		store.upsert(run)
+	}
+	return store
 }
 
 func responseCookie(t *testing.T, response *http.Response, name string) *http.Cookie {
