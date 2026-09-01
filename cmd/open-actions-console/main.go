@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -19,6 +20,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
+	ctrlcache "sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
@@ -78,6 +80,25 @@ func runConsole(ctx context.Context, arguments []string) error {
 	if err != nil {
 		return fmt.Errorf("create Kubernetes clientset: %w", err)
 	}
+	noResync := time.Duration(0)
+	workflowRunCache, err := ctrlcache.New(configuration, ctrlcache.Options{
+		Scheme:                      scheme,
+		ReaderFailOnMissingInformer: true,
+		ByObject: map[client.Object]ctrlcache.ByObject{
+			&actionsv1alpha1.WorkflowRun{}: {Transform: console.WorkflowRunCacheTransform, SyncPeriod: &noResync},
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("create Console WorkflowRun cache: %w", err)
+	}
+	workflowRunInformer, err := workflowRunCache.GetInformer(ctx, &actionsv1alpha1.WorkflowRun{}, ctrlcache.BlockUntilSynced(false))
+	if err != nil {
+		return fmt.Errorf("create Console WorkflowRun informer: %w", err)
+	}
+	workflowRuns, err := console.NewWorkflowRunStore(workflowRunInformer, logger)
+	if err != nil {
+		return fmt.Errorf("configure Console WorkflowRun store: %w", err)
+	}
 	github, err := githubclient.NewClient(normalizedGitHubAPIURL, nil)
 	if err != nil {
 		return err
@@ -87,7 +108,7 @@ func runConsole(ctx context.Context, arguments []string) error {
 		return fmt.Errorf("configure GitHub repository resolver: %w", err)
 	}
 	handler, err := console.New(console.Config{
-		Client: kubernetesClient, Logs: console.NewKubernetesLogSource(clientset), Repositories: repositories,
+		Client: kubernetesClient, WorkflowRuns: workflowRuns, Logs: console.NewKubernetesLogSource(clientset), Repositories: repositories,
 		Token: token, SecretManagementNamespace: *secretManagementNamespace, WorkflowRunTTLSecondsAfterFinished: workflowRunTTLSecondsAfterFinished,
 		SecureCookie: *secureCookie, Logger: logger,
 	})
@@ -100,7 +121,7 @@ func runConsole(ctx context.Context, arguments []string) error {
 	mux.Handle("/login", handler)
 	mux.Handle("/api/login", handler)
 	mux.HandleFunc("/healthz", healthy)
-	mux.HandleFunc("/readyz", healthy)
+	mux.HandleFunc("/readyz", readiness(workflowRuns.Synced))
 	mux.Handle("/", handler)
 	server := &http.Server{
 		Addr:              *bindAddress,
@@ -113,6 +134,13 @@ func runConsole(ctx context.Context, arguments []string) error {
 	if err != nil {
 		return err
 	}
+	cacheErrors := make(chan error, 1)
+	go func() {
+		cacheErrors <- workflowRunCache.Start(ctx)
+		if ctx.Err() == nil {
+			_ = server.Close()
+		}
+	}()
 	go func() {
 		<-ctx.Done()
 		shutdownContext, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -120,10 +148,22 @@ func runConsole(ctx context.Context, arguments []string) error {
 		_ = server.Shutdown(shutdownContext)
 	}()
 	logger.Info("starting Open Actions Console", "address", listener.Addr().String())
-	if err := server.Serve(listener); err != nil && err != http.ErrServerClosed {
-		return err
+	serverError := server.Serve(listener)
+	if ctx.Err() != nil {
+		return nil
 	}
-	return nil
+	if serverError != nil && serverError != http.ErrServerClosed {
+		return serverError
+	}
+	select {
+	case cacheError := <-cacheErrors:
+		if cacheError != nil {
+			return fmt.Errorf("run Console WorkflowRun cache: %w", cacheError)
+		}
+		return errors.New("Console WorkflowRun cache stopped")
+	default:
+		return serverError
+	}
 }
 
 func readToken(path string) (string, error) {
@@ -144,4 +184,14 @@ func readToken(path string) (string, error) {
 func healthy(writer http.ResponseWriter, _ *http.Request) {
 	writer.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	_, _ = writer.Write([]byte("ok\n"))
+}
+
+func readiness(synced func() bool) http.HandlerFunc {
+	return func(writer http.ResponseWriter, _ *http.Request) {
+		if !synced() {
+			http.Error(writer, "WorkflowRun cache is not ready", http.StatusServiceUnavailable)
+			return
+		}
+		healthy(writer, nil)
+	}
 }

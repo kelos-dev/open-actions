@@ -106,6 +106,39 @@ func TestConsoleCanReadProjectPrivateKeys(t *testing.T) {
 	t.Fatalf("Console ClusterRole does not grant get access to Secrets: %#v", clusterRole.Rules)
 }
 
+func TestConsoleCanWatchWorkflowRuns(t *testing.T) {
+	chart := Chart()
+	data, err := fs.ReadFile(chart, "templates/console-rbac.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmpl, err := template.New("rbac").Option("missingkey=error").Parse(string(data))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var output bytes.Buffer
+	if err := tmpl.Execute(&output, map[string]any{
+		"Release": map[string]any{"Namespace": "open-actions-system"},
+		"Values":  map[string]any{"console": map[string]any{"enabled": true}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	clusterRole := rbacv1.ClusterRole{}
+	if err := yaml.Unmarshal(bytes.Split(output.Bytes(), []byte("---"))[0], &clusterRole); err != nil {
+		t.Fatal(err)
+	}
+	for _, rule := range clusterRole.Rules {
+		if len(rule.APIGroups) == 1 && rule.APIGroups[0] == "actions.kelos.dev" && len(rule.Resources) == 1 && rule.Resources[0] == "workflowruns" {
+			for _, verb := range rule.Verbs {
+				if verb == "watch" {
+					return
+				}
+			}
+		}
+	}
+	t.Fatalf("Console ClusterRole does not grant watch access to WorkflowRuns: %#v", clusterRole.Rules)
+}
+
 func TestServiceTemplate(t *testing.T) {
 	chart := Chart()
 	valuesData, err := fs.ReadFile(chart, "values.yaml")

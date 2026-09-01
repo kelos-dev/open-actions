@@ -67,3 +67,22 @@ func TestHealthy(t *testing.T) {
 		t.Fatalf("health response = %d, %q", response.Code, response.Body.String())
 	}
 }
+
+func TestReadinessWaitsForWorkflowRunCache(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		synced bool
+		status int
+	}{
+		{name: "waiting", status: http.StatusServiceUnavailable},
+		{name: "synced", synced: true, status: http.StatusOK},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			response := httptest.NewRecorder()
+			readiness(func() bool { return test.synced })(response, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+			if response.Code != test.status {
+				t.Fatalf("readiness status = %d, want %d", response.Code, test.status)
+			}
+		})
+	}
+}
