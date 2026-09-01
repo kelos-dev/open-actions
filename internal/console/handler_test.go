@@ -1288,8 +1288,8 @@ func TestConsoleStructuresGitHubActionsLogs(t *testing.T) {
 		`{"time":"2026-08-10T12:34:57Z","level":"INFO","msg":"workflow step output","open_actions_runner":true,"name":"artifact","value":"sensitive-output-value"}`,
 		`{"time":"2026-08-10T12:34:57Z","level":"INFO","msg":"completed workflow step","open_actions_runner":true,"job":"build","step":1,"name":"Build"}`,
 		`{"time":"2026-08-10T12:34:58Z","level":"INFO","msg":"skipping workflow step","open_actions_runner":true,"job":"build","step":2,"name":"Deploy"}`,
-		`{"time":"2026-08-10T12:34:58Z","level":"INFO","msg":"starting post action","open_actions_runner":true,"action":"actions/example@v1"}`,
-		`{"time":"2026-08-10T12:34:59Z","level":"INFO","msg":"completed post action","open_actions_runner":true,"action":"actions/example@v1"}`,
+		`{"time":"2026-08-10T12:34:58Z","level":"INFO","msg":"starting post action","open_actions_runner":true,"job":"build","step":3,"action":"actions/example@v1"}`,
+		`{"time":"2026-08-10T12:34:59Z","level":"INFO","msg":"completed post action","open_actions_runner":true,"job":"build","step":3,"action":"actions/example@v1"}`,
 	}, "\n") + "\n"
 
 	request := httptest.NewRequest(http.MethodGet, "/runs/default/ci/jobs/build/stream", nil)
@@ -1309,7 +1309,8 @@ func TestConsoleStructuresGitHubActionsLogs(t *testing.T) {
 		`"kind":"step-output","text":"artifact"`,
 		`"scope":"workflow","conclusion":"success"`,
 		`"kind":"group","text":"2. Deploy","time":"2026-08-10T12:34:58Z","scope":"workflow","conclusion":"skipped"`,
-		`"kind":"group","text":"Post actions/example@v1"`,
+		`"kind":"group","text":"3. Post actions/example@v1"`,
+		`"kind":"endgroup","time":"2026-08-10T12:34:59Z","scope":"workflow","conclusion":"success"`,
 	} {
 		if !strings.Contains(body, expected) {
 			t.Fatalf("stream does not contain %q: %s", expected, body)

@@ -791,19 +791,29 @@ func planPullRequestRefs(plan *Plan) pullRequestRefs {
 
 func (e *Executor) runPostActions(ctx context.Context, state *executionState, status expression.Status) error {
 	var result error
+	step := len(state.plan.Steps) + 1
 	for index := len(state.posts) - 1; index >= 0; index-- {
 		invocation := state.posts[index]
 		if !matchesPostCondition(invocation.definition.Runs.PostIf, status) {
+			e.logger.Info("skipping post action", "job", state.plan.JobID, "step", step, "action", invocation.step.Uses)
+			step++
 			continue
 		}
-		e.logger.Info("starting post action", "action", invocation.step.Uses)
+		e.logger.Info("starting post action", "job", state.plan.JobID, "step", step, "action", invocation.step.Uses)
 		err := e.runJavaScriptHook(ctx, invocation, "post", invocation.definition.Runs.Post, state)
-		e.logger.Info("completed post action", "action", invocation.step.Uses)
 		if err != nil {
 			result = errors.Join(result, fmt.Errorf("post action %s: %w", invocation.step.Uses, err))
 			status.Success = false
 			status.Failure = true
+			message := "failed post action"
+			if ctx.Err() != nil {
+				message = "cancelled post action"
+			}
+			e.logger.Info(message, "job", state.plan.JobID, "step", step, "action", invocation.step.Uses)
+		} else {
+			e.logger.Info("completed post action", "job", state.plan.JobID, "step", step, "action", invocation.step.Uses)
 		}
+		step++
 	}
 	return result
 }

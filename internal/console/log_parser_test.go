@@ -143,13 +143,26 @@ func TestActionLogParserStructuresRunnerMessages(t *testing.T) {
 	if !visible || entry.Kind != "step-output" || entry.Text != "artifact" {
 		t.Fatalf("output entry = %#v, %t", entry, visible)
 	}
-	entry, visible = parser.parse(`{"time":"2026-08-10T12:35:02Z","level":"INFO","msg":"starting post action","open_actions_runner":true,"action":"actions/checkout@v4"}`)
-	if !visible || entry.Kind != "group" || entry.Scope != "post" || entry.Text != "Post actions/checkout@v4" {
+	entry, visible = parser.parse(`{"time":"2026-08-10T12:35:02Z","level":"INFO","msg":"starting post action","open_actions_runner":true,"job":"build","step":4,"action":"actions/checkout@v4"}`)
+	if !visible || entry.Kind != "group" || entry.Scope != "workflow" || entry.Text != "4. Post actions/checkout@v4" {
 		t.Fatalf("post entry = %#v, %t", entry, visible)
 	}
-	entry, visible = parser.parse(`{"time":"2026-08-10T12:35:03Z","level":"INFO","msg":"completed post action","open_actions_runner":true,"action":"actions/checkout@v4"}`)
-	if !visible || entry.Kind != "endgroup" || entry.Scope != "post" {
+	entry, visible = parser.parse(`{"time":"2026-08-10T12:35:03Z","level":"INFO","msg":"completed post action","open_actions_runner":true,"job":"build","step":4,"action":"actions/checkout@v4"}`)
+	if !visible || entry.Kind != "endgroup" || entry.Scope != "workflow" || entry.Conclusion != "success" {
 		t.Fatalf("post completion entry = %#v, %t", entry, visible)
+	}
+	for message, conclusion := range map[string]string{
+		"failed post action":    "failure",
+		"cancelled post action": "cancelled",
+	} {
+		entry, visible = parser.parse(`{"time":"2026-08-10T12:35:03Z","level":"INFO","msg":"` + message + `","open_actions_runner":true,"job":"build","step":4,"action":"actions/checkout@v4"}`)
+		if !visible || entry.Kind != "endgroup" || entry.Scope != "workflow" || entry.Conclusion != conclusion {
+			t.Fatalf("%s entry = %#v, %t", message, entry, visible)
+		}
+	}
+	entry, visible = parser.parse(`{"time":"2026-08-10T12:35:03Z","level":"INFO","msg":"skipping post action","open_actions_runner":true,"job":"build","step":5,"action":"actions/cache@v4"}`)
+	if !visible || entry.Kind != "group" || entry.Scope != "workflow" || entry.Text != "5. Post actions/cache@v4" || entry.Conclusion != "skipped" {
+		t.Fatalf("skipped post entry = %#v, %t", entry, visible)
 	}
 }
 
