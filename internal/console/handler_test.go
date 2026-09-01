@@ -228,6 +228,27 @@ func TestConsoleKeepsFourDigitLineNumbersOnOneRow(t *testing.T) {
 	}
 }
 
+func TestConsolePreviewsOversizedLogLines(t *testing.T) {
+	handler := newTestHandler(t, false)
+	request := httptest.NewRequest(http.MethodGet, "/runs/default/ci/jobs/build", nil)
+	request.Header.Set("Authorization", "Bearer "+testConsoleToken)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("log page status = %d, want %d", response.Code, http.StatusOK)
+	}
+	for _, expected := range []string{
+		"const maxRenderedLineCharacters=4096",
+		"'Show full line ('+(value.length-logPreview(value).length).toLocaleString()+' more characters)'",
+		"let text=record.expanded?entry.text||'':logPreview(entry.text)",
+	} {
+		if !strings.Contains(response.Body.String(), expected) {
+			t.Fatalf("log page does not defer oversized line rendering: missing %q", expected)
+		}
+	}
+}
+
 func TestConsoleRendersSkippedWorkflowSteps(t *testing.T) {
 	handler := newTestHandler(t, false)
 	request := httptest.NewRequest(http.MethodGet, "/runs/default/ci/jobs/build", nil)
