@@ -75,7 +75,9 @@ foreground and background colors,
 including standard, bright, 256-color, and RGB values, are rendered along with
 bold, dim, italic, underline, and strike-through text. Other CSI control
 sequences are discarded. Log lines larger than 256 KiB are truncated so a
-workflow cannot retain unbounded Console memory.
+workflow cannot retain unbounded Console memory. Lines longer than 4,096
+characters initially render as previews; users can expand and collapse the
+complete retained line in place.
 
 After signing in with the Console administrator token, an administrator can
 gracefully cancel an active workflow attempt. The Console sets that
