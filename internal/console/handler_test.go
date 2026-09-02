@@ -820,6 +820,77 @@ func TestConsoleRerunsFailedWorkflowJobs(t *testing.T) {
 	}
 }
 
+func TestConsoleSelectiveRerunShowsEffectiveJobs(t *testing.T) {
+	handler := newTestHandler(t, false)
+	clusterClient, ok := handler.client.(client.Client)
+	if !ok {
+		t.Fatal("test Console reader is not a client")
+	}
+	root := &actionsv1alpha1.WorkflowRun{}
+	if err := clusterClient.Get(context.Background(), client.ObjectKey{Namespace: "default", Name: "ci"}, root); err != nil {
+		t.Fatal(err)
+	}
+	scheme := runtime.NewScheme()
+	if err := actionsv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+
+	retained := &actionsv1alpha1.WorkflowJob{
+		ObjectMeta: metav1.ObjectMeta{Name: "lint", Namespace: root.Namespace, UID: "lint-job-uid", Labels: map[string]string{actionsv1alpha1.LabelWorkflowRunUID: string(root.UID)}},
+		Spec:       actionsv1alpha1.WorkflowJobSpec{WorkflowRunRef: corev1.LocalObjectReference{Name: root.Name}, JobID: "lint"},
+		Status:     actionsv1alpha1.WorkflowJobStatus{Result: actionsv1alpha1.WorkflowJobResultSuccess},
+	}
+	if err := controllerutil.SetControllerReference(root, retained, scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := clusterClient.Create(context.Background(), retained); err != nil {
+		t.Fatal(err)
+	}
+
+	rerun := workflowrun.NewRerun(root, root, 2, "", []string{"build"})
+	rerun.UID = "rerun-uid"
+	rerun.Status.WorkflowName = "CI"
+	if err := clusterClient.Create(context.Background(), rerun); err != nil {
+		t.Fatal(err)
+	}
+	runURL := runPath(rerun)
+
+	queuedPage := httptest.NewRecorder()
+	handler.ServeHTTP(queuedPage, httptest.NewRequest(http.MethodGet, runURL, nil))
+	if queuedPage.Code != http.StatusOK || !strings.Contains(queuedPage.Body.String(), `Jobs <span class="count">1</span>`) || !strings.Contains(queuedPage.Body.String(), runURL+`/jobs/lint`) || strings.Contains(queuedPage.Body.String(), runURL+`/jobs/build"`) {
+		t.Fatalf("queued selective rerun page = %d, %q", queuedPage.Code, queuedPage.Body.String())
+	}
+
+	retried := &actionsv1alpha1.WorkflowJob{
+		ObjectMeta: metav1.ObjectMeta{Name: "build-attempt-2", Namespace: rerun.Namespace, UID: "retried-job-uid", Labels: map[string]string{actionsv1alpha1.LabelWorkflowRunUID: string(rerun.UID)}},
+		Spec:       actionsv1alpha1.WorkflowJobSpec{WorkflowRunRef: corev1.LocalObjectReference{Name: rerun.Name}, JobID: "build"},
+	}
+	if err := controllerutil.SetControllerReference(rerun, retried, scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := clusterClient.Create(context.Background(), retried); err != nil {
+		t.Fatal(err)
+	}
+
+	page := httptest.NewRecorder()
+	handler.ServeHTTP(page, httptest.NewRequest(http.MethodGet, runURL, nil))
+	if page.Code != http.StatusOK || !strings.Contains(page.Body.String(), `Jobs <span class="count">2</span>`) || !strings.Contains(page.Body.String(), runURL+`/jobs/build-attempt-2`) || !strings.Contains(page.Body.String(), runURL+`/jobs/lint`) || strings.Contains(page.Body.String(), runURL+`/jobs/build"`) {
+		t.Fatalf("selective rerun page = %d, %q", page.Code, page.Body.String())
+	}
+
+	retainedLogs := httptest.NewRecorder()
+	handler.ServeHTTP(retainedLogs, httptest.NewRequest(http.MethodGet, runURL+"/jobs/lint", nil))
+	if retainedLogs.Code != http.StatusOK || !strings.Contains(retainedLogs.Body.String(), `body data-stream-url="`+runURL+`/jobs/lint/stream"`) {
+		t.Fatalf("retained job log page = %d, %q", retainedLogs.Code, retainedLogs.Body.String())
+	}
+
+	replacedLogs := httptest.NewRecorder()
+	handler.ServeHTTP(replacedLogs, httptest.NewRequest(http.MethodGet, runURL+"/jobs/build", nil))
+	if replacedLogs.Code == http.StatusOK {
+		t.Fatalf("replaced job log page = %d, want non-success", replacedLogs.Code)
+	}
+}
+
 func TestConsoleRejectsRerunBeforeWorkflowCompletes(t *testing.T) {
 	handler := newTestHandler(t, false)
 	form := url.Values{"csrf": {handler.csrfToken}, "jobs": {"all"}}

@@ -99,7 +99,9 @@ instead rerun the failed expanded job IDs, matrix combinations cancelled by
 fail-fast, and their transitive dependents.
 Jobs in the new attempt reuse the latest results and outputs of prerequisites
 that completed in earlier attempts instead of executing those prerequisites
-again.
+again. A selective rerun's Console page shows those retained jobs alongside the
+jobs executed by the current attempt, and their log links remain available as
+long as the earlier WorkflowJobs and runner logs are retained.
 The Console creates a new immutable WorkflowRun attempt with the same project,
 source, workflow path, and retention setting, clears any prior cancellation
 request, and redirects to the new run. Rerun actions are unavailable while the

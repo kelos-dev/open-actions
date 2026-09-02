@@ -241,6 +241,11 @@ type jobPageData struct {
 	Selected    bool
 }
 
+type effectiveWorkflowJob struct {
+	run *actionsv1alpha1.WorkflowRun
+	job actionsv1alpha1.WorkflowJob
+}
+
 type logPageData struct {
 	Repository    string
 	WorkflowName  string
@@ -1362,11 +1367,10 @@ func (h *Handler) workflowRunLineage(ctx context.Context, run *actionsv1alpha1.W
 }
 
 func (h *Handler) loadRunPageData(ctx context.Context, run *actionsv1alpha1.WorkflowRun) (runPageData, error) {
-	jobs := &actionsv1alpha1.WorkflowJobList{}
-	if err := h.client.List(ctx, jobs, client.InNamespace(run.Namespace), client.MatchingLabels{actionsv1alpha1.LabelWorkflowRunUID: string(run.UID)}); err != nil {
-		return runPageData{}, fmt.Errorf("load workflow jobs: %w", err)
+	jobs, err := h.effectiveWorkflowJobs(ctx, run)
+	if err != nil {
+		return runPageData{}, err
 	}
-	sort.Slice(jobs.Items, func(left, right int) bool { return jobs.Items[left].Spec.JobID < jobs.Items[right].Spec.JobID })
 	data := runPageData{
 		RunURL:        runPath(run),
 		Repository:    run.Spec.Source.GitHub.Repository.Owner + "/" + run.Spec.Source.GitHub.Repository.Name,
@@ -1388,8 +1392,8 @@ func (h *Handler) loadRunPageData(ctx context.Context, run *actionsv1alpha1.Work
 		data.Started = run.Status.StartTime.UTC().Format(time.RFC3339)
 	}
 	data.Duration = elapsedTime(run.Status.StartTime, run.Status.CompletionTime)
-	for index := range jobs.Items {
-		job := &jobs.Items[index]
+	for index := range jobs {
+		job := &jobs[index].job
 		item := jobPageData{ID: job.Spec.JobID, DisplayName: job.Spec.DisplayName, Status: workflowstatus.Job(job), URL: runPath(run) + "/jobs/" + url.PathEscape(job.Name)}
 		if item.DisplayName == "" {
 			item.DisplayName = item.ID
@@ -1405,6 +1409,75 @@ func (h *Handler) loadRunPageData(ctx context.Context, run *actionsv1alpha1.Work
 		data.Jobs = append(data.Jobs, item)
 	}
 	return data, nil
+}
+
+func (h *Handler) effectiveWorkflowJobs(ctx context.Context, run *actionsv1alpha1.WorkflowRun) ([]effectiveWorkflowJob, error) {
+	effectiveByID := make(map[string]effectiveWorkflowJob)
+	replacedIDs := make(map[string]struct{})
+	visited := map[types.UID]struct{}{run.UID: {}}
+	current := run
+	var rootRef actionsv1alpha1.WorkflowRunReference
+	if run.Spec.Rerun != nil {
+		rootRef = run.Spec.Rerun.OriginalRunRef
+	}
+
+	for {
+		jobs := &actionsv1alpha1.WorkflowJobList{}
+		if err := h.client.List(ctx, jobs, client.InNamespace(current.Namespace), client.MatchingLabels{actionsv1alpha1.LabelWorkflowRunUID: string(current.UID)}); err != nil {
+			return nil, fmt.Errorf("load WorkflowJobs for WorkflowRun %q: %w", current.Name, err)
+		}
+		for index := range jobs.Items {
+			job := jobs.Items[index]
+			if _, replaced := replacedIDs[job.Spec.JobID]; replaced {
+				continue
+			}
+			if _, found := effectiveByID[job.Spec.JobID]; !found {
+				effectiveByID[job.Spec.JobID] = effectiveWorkflowJob{run: current, job: job}
+			}
+		}
+
+		if current.Spec.Rerun == nil || len(current.Spec.Rerun.JobIDs) == 0 {
+			break
+		}
+		// Selected IDs must not fall back to an older execution while their current WorkflowJobs are being created.
+		for _, id := range current.Spec.Rerun.JobIDs {
+			replacedIDs[id] = struct{}{}
+		}
+
+		ref := current.Spec.Rerun.PreviousRunRef
+		previous := &actionsv1alpha1.WorkflowRun{}
+		if err := h.client.Get(ctx, client.ObjectKey{Namespace: run.Namespace, Name: ref.Name}, previous); err != nil {
+			if apierrors.IsNotFound(err) {
+				break
+			}
+			return nil, fmt.Errorf("load previous WorkflowRun %q for WorkflowRun %q: %w", ref.Name, run.Name, err)
+		}
+		if previous.UID != ref.UID {
+			break
+		}
+		if _, found := visited[previous.UID]; found {
+			break
+		}
+		visited[previous.UID] = struct{}{}
+		if previous.Spec.ProjectRef != run.Spec.ProjectRef || previous.Spec.WorkflowPath != run.Spec.WorkflowPath || !apiequality.Semantic.DeepEqual(previous.Spec.Source, run.Spec.Source) {
+			break
+		}
+		if previous.Spec.Rerun == nil {
+			if previous.Name != rootRef.Name || previous.UID != rootRef.UID {
+				break
+			}
+		} else if previous.Spec.Rerun.OriginalRunRef != rootRef {
+			break
+		}
+		current = previous
+	}
+
+	jobs := make([]effectiveWorkflowJob, 0, len(effectiveByID))
+	for _, job := range effectiveByID {
+		jobs = append(jobs, job)
+	}
+	sort.Slice(jobs, func(left, right int) bool { return jobs[left].job.Spec.JobID < jobs[right].job.Spec.JobID })
+	return jobs, nil
 }
 
 func (h *Handler) loadWorkflowFile(ctx context.Context, run *actionsv1alpha1.WorkflowRun) (string, bool, error) {
@@ -1630,10 +1703,22 @@ func (h *Handler) workflowJob(ctx context.Context, run *actionsv1alpha1.Workflow
 	if err := h.client.Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: name}, job); err != nil {
 		return nil, err
 	}
-	if job.Labels[actionsv1alpha1.LabelWorkflowRunUID] != string(run.UID) || !metav1.IsControlledBy(job, run) {
-		return nil, errors.New("workflow job does not belong to this run")
+	if job.Labels[actionsv1alpha1.LabelWorkflowRunUID] == string(run.UID) && metav1.IsControlledBy(job, run) {
+		return job, nil
 	}
-	return job, nil
+	if run.Spec.Rerun != nil && len(run.Spec.Rerun.JobIDs) > 0 {
+		jobs, err := h.effectiveWorkflowJobs(ctx, run)
+		if err != nil {
+			return nil, err
+		}
+		for index := range jobs {
+			candidate := &jobs[index]
+			if candidate.job.Name == job.Name && candidate.job.UID == job.UID && metav1.IsControlledBy(&candidate.job, candidate.run) {
+				return job, nil
+			}
+		}
+	}
+	return nil, fmt.Errorf("WorkflowJob %q does not belong to WorkflowRun %q", job.Name, run.Name)
 }
 
 func (h *Handler) waitForPod(ctx context.Context, job *actionsv1alpha1.WorkflowJob, heartbeat func()) (*corev1.Pod, error) {
