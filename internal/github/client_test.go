@@ -171,6 +171,7 @@ func TestRevokeInstallationToken(t *testing.T) {
 }
 
 func TestInstallationForAllRepositoriesOmitsRepositorySelection(t *testing.T) {
+	expiresAt := time.Date(2026, time.September, 3, 1, 0, 0, 0, time.UTC)
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		body := map[string]any{}
 		if err := json.NewDecoder(request.Body).Decode(&body); err != nil {
@@ -186,7 +187,7 @@ func TestInstallationForAllRepositoriesOmitsRepositorySelection(t *testing.T) {
 			http.Error(writer, "unexpected permissions", http.StatusBadRequest)
 			return
 		}
-		fmt.Fprint(writer, `{"token":"action-installation-token"}`)
+		_ = json.NewEncoder(writer).Encode(map[string]any{"token": "action-installation-token", "expires_at": expiresAt})
 	}))
 	defer server.Close()
 	client, err := NewClient(server.URL, server.Client())
@@ -199,6 +200,9 @@ func TestInstallationForAllRepositoriesOmitsRepositorySelection(t *testing.T) {
 	}
 	if installation.Token() != "action-installation-token" {
 		t.Fatalf("token = %q", installation.Token())
+	}
+	if !installation.ExpiresAt().Equal(expiresAt) {
+		t.Fatalf("expiry = %s, want %s", installation.ExpiresAt(), expiresAt)
 	}
 }
 

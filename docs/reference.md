@@ -184,10 +184,10 @@ duration histograms:
 
 | Metric | Interval | Labels |
 | --- | --- | --- |
-| `open_actions_workflow_run_duration_seconds` | First child Job start to WorkflowRun completion | `namespace`, `project`, `conclusion` |
+| `open_actions_workflow_run_duration_seconds` | First runner container start to WorkflowRun completion | `namespace`, `project`, `conclusion` |
 | `open_actions_workflow_job_queue_duration_seconds` | WorkflowJob readiness to Runner assignment | `namespace`, `project` |
-| `open_actions_workflow_job_startup_duration_seconds` | Runner assignment to native Job start | `namespace`, `project` |
-| `open_actions_workflow_job_execution_duration_seconds` | Native Job start to WorkflowJob completion | `namespace`, `project`, `conclusion` |
+| `open_actions_workflow_job_startup_duration_seconds` | Runner assignment to runner container start | `namespace`, `project` |
+| `open_actions_workflow_job_execution_duration_seconds` | Runner container start to WorkflowJob completion | `namespace`, `project`, `conclusion` |
 | `open_actions_webhook_request_duration_seconds` | GitHub webhook HTTP request handling | `event`, `result` |
 | `open_actions_webhook_delivery_duration_seconds` | Queued delivery creation to asynchronous workflow discovery completion | `namespace`, `project`, `event`, `result` |
 
@@ -436,9 +436,13 @@ The controller stores the job token in an owned Kubernetes Secret. Jobs that
 reference external actions on the configured GitHub server also receive a
 separate action-download token; script-only jobs do not request one. The
 controller revokes the tokens after the job finishes and then deletes the
-Secret. GitHub App installation tokens also expire one hour after creation, so
-a token used by a job running longer than one hour can expire before the job
-completes.
+Secret. [GitHub App installation tokens](https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/authenticating-as-a-github-app-installation)
+expire one hour after creation. Scheduling time and execution time both consume
+that fixed lifetime. The controller calculates the native Job startup deadline
+from the earliest installation-token expiry with a five-minute reserve, so a
+late-scheduled Pod fails instead of waiting for that credential to expire. The
+tokens are not refreshed during execution, so scheduling plus execution can
+still outlive them.
 
 Because this token belongs to the Project's GitHub App, GitHub treats events it
 creates as ordinary App events. It does not receive the special recursive-run
@@ -705,17 +709,35 @@ resolves to a positive whole number. It defaults to 360 minutes. The controller
 caps both explicit and default values at `--max-job-timeout` and persists the
 effective value in `WorkflowJob.spec.timeoutSeconds`.
 
-The effective timeout is applied to both the runner execution context and the
-native Kubernetes Job's `activeDeadlineSeconds`. When it expires, the active
-command is cancelled and eligible `cancelled()` and `always()` workflow and
-composite steps run before action post hooks. All timeout and cancellation
-cleanup has an internal five-minute deadline. The Runner's
-`spec.execution.terminationGracePeriodSeconds` controls the workflow Pod's
-termination grace period when set; omitting it uses Kubernetes' 30-second
-default. If the native Job deadline expires or a cancellation deletes the Job,
-the time available for cleanup is bounded by both the Pod's termination grace
-period and the runner's five-minute cleanup deadline. A longer Pod grace period
-does not extend the runner's cleanup deadline.
+The effective timeout starts when the runner container begins job execution;
+time spent waiting for Kubernetes to schedule and start the Pod does not consume
+it. The runner enforces the timeout and, when it expires, cancels the active
+command before running eligible `cancelled()` and `always()` workflow and
+composite steps and action post hooks. All timeout and cancellation cleanup has
+an internal five-minute deadline.
+
+The native Kubernetes Job has a separate startup deadline while it waits for
+the runner container to start. The deadline is at most 24 hours and is also
+capped using the earliest GitHub installation-token expiry with a five-minute
+reserve. If the deadline expires, the WorkflowJob fails with reason
+`JobStartFailed`.
+After the runner starts, the controller replaces the startup deadline with an
+execution deadline measured from the runner's start time. The native deadline
+includes the five-minute cleanup allowance, so it remains a cluster-enforced
+fallback for a runner that hangs during execution or cleanup.
+
+A valid runner `success`, `failure`, or `timed_out` result is authoritative if
+Kubernetes records a late `DeadlineExceeded` condition after the runner has
+already finished. A native `DeadlineExceeded` condition takes precedence over
+a `cancelled` runner result because Kubernetes stopped the Job at its hard
+deadline.
+
+The Runner's `spec.execution.terminationGracePeriodSeconds` controls the
+workflow Pod's termination grace period when set; omitting it uses Kubernetes'
+30-second default. If the native Job deadline expires or a cancellation deletes
+the Job, the time available for cleanup is bounded by both the Pod's termination
+grace period and the runner's five-minute cleanup deadline. A longer Pod grace
+period does not extend the runner's cleanup deadline.
 
 A timed-out WorkflowJob has `status.result: failure` and a false `Succeeded`
 condition with reason `JobTimedOut`, while user cancellation has
@@ -791,7 +813,9 @@ configured. Queued jobs record their project name in the
 distinguished from the original object. Workflow jobs, their native Jobs, and
 their Pods carry the
 `actions.kelos.dev/runner-result-version` annotation. Its value identifies the
-runner result format required to complete that job.
+runner result format required to complete that job. Native Jobs also carry
+`actions.kelos.dev/job-deadline`: `startup` means deadline expiry is reported
+as `JobStartFailed`, while `execution` means it is reported as `JobTimedOut`.
 
 Webhook-created WorkflowRuns use the workflow filename followed by a stable
 20-character digest of the project, delivery replay, and workflow path.
@@ -1438,11 +1462,11 @@ and cross-run downloads through GitHub's artifact REST API are not supported.
 
 Each job receives `ACTIONS_RESULTS_URL` and an `ACTIONS_RUNTIME_TOKEN`. The
 controller mints the token immediately before creating the native Job and sets
-its lifetime to the job's effective, capped execution timeout plus five-minute
-startup and cleanup allowances. The token is held in the job's owned
-authentication Secret and is removed after the job finishes. The signed token
-remains valid until its expiry, including if the authentication Secret is
-deleted.
+its lifetime to the enforced runner-start deadline, the job's effective capped
+execution timeout, and the five-minute cleanup allowance. The token is held in
+the job's owned authentication Secret and is removed after the job finishes.
+The signed token remains valid until its expiry, including if the
+authentication Secret is deleted.
 Its scope includes the Project UID, GitHub repository ID, WorkflowRun lineage
 and attempt, WorkflowRun UID, and WorkflowJob UID.
 Jobs in one attempt may list and download artifacts finalized by other jobs in

@@ -383,7 +383,7 @@ spec:
                 type: object
                 x-kubernetes-map-type: atomic
               startTime:
-                description: StartTime is when the native Job started.
+                description: StartTime is when the runner container started.
                 format: date-time
                 type: string
             type: object

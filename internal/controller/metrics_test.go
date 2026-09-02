@@ -88,14 +88,14 @@ func TestWorkflowJobStatusRecordsMetricsOnce(t *testing.T) {
 	clusterClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&actionsv1alpha1.WorkflowJob{}).WithObjects(workflowJob).Build()
 	metrics := &recordingDurationMetrics{}
 	reconciler := &RunnerReconciler{Client: clusterClient, Metrics: metrics}
-	if err := reconciler.updateWorkflowJobStatus(context.Background(), workflowJob, nativeJob, nil, false); err != nil {
+	if err := reconciler.updateWorkflowJobStatus(context.Background(), workflowJob, nativeJob, &start, nil, false); err != nil {
 		t.Fatal(err)
 	}
 	stored := &actionsv1alpha1.WorkflowJob{}
 	if err := clusterClient.Get(context.Background(), client.ObjectKeyFromObject(workflowJob), stored); err != nil {
 		t.Fatal(err)
 	}
-	if err := reconciler.updateWorkflowJobStatus(context.Background(), stored, nativeJob, nil, false); err != nil {
+	if err := reconciler.updateWorkflowJobStatus(context.Background(), stored, nativeJob, &start, nil, false); err != nil {
 		t.Fatal(err)
 	}
 	if metrics.jobUpdates != 1 {

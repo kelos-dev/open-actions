@@ -1061,7 +1061,8 @@ spec:
                     type: object
                 type: object
               startTime:
-                description: StartTime is when the first child Job started.
+                description: StartTime is when the first child WorkflowJob's runner
+                  container started.
                 format: date-time
                 type: string
               workflowName:

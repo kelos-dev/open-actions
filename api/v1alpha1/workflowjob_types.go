@@ -192,7 +192,7 @@ type WorkflowJobStatus struct {
 	// +optional
 	RunnerRef *corev1.LocalObjectReference `json:"runnerRef,omitempty"`
 
-	// StartTime is when the native Job started.
+	// StartTime is when the runner container started.
 	// +optional
 	StartTime *metav1.Time `json:"startTime,omitempty"`
 
