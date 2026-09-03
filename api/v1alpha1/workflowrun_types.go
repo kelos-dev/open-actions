@@ -656,7 +656,7 @@ type WorkflowRunStatus struct {
 	// +optional
 	Jobs *WorkflowRunJobStatus `json:"jobs,omitempty"`
 
-	// StartTime is when the first child Job started.
+	// StartTime is when the first child WorkflowJob's runner container started.
 	// +optional
 	StartTime *metav1.Time `json:"startTime,omitempty"`
 

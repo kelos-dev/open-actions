@@ -48,6 +48,7 @@ type Client struct {
 type InstallationClient struct {
 	client         *Client
 	token          string
+	expiresAt      time.Time
 	installationID int64
 	cacheKey       *installationCacheKey
 }
@@ -408,11 +409,16 @@ func (c *Client) createInstallation(ctx context.Context, appID, installationID i
 	if response.Token == "" {
 		return nil, time.Time{}, errors.New("GitHub returned an empty installation access token")
 	}
-	return &InstallationClient{client: c, token: response.Token, installationID: installationID}, response.ExpiresAt, nil
+	return &InstallationClient{client: c, token: response.Token, expiresAt: response.ExpiresAt, installationID: installationID}, response.ExpiresAt, nil
 }
 
 func (c *InstallationClient) Token() string {
 	return c.token
+}
+
+// ExpiresAt returns when GitHub expires the installation token.
+func (c *InstallationClient) ExpiresAt() time.Time {
+	return c.expiresAt
 }
 
 // Revoke invalidates this installation access token.

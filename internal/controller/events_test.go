@@ -116,11 +116,11 @@ func TestWorkflowJobFailureEmitsWarningEventOnce(t *testing.T) {
 	clusterClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&actionsv1alpha1.WorkflowJob{}).WithObjects(workflowJob).Build()
 	recorder := events.NewFakeRecorder(2)
 	reconciler := &RunnerReconciler{Client: clusterClient, Recorder: recorder}
-	if err := reconciler.updateWorkflowJobStatus(context.Background(), workflowJob, nativeJob, nil, false); err != nil {
+	if err := reconciler.updateWorkflowJobStatus(context.Background(), workflowJob, nativeJob, nil, nil, false); err != nil {
 		t.Fatal(err)
 	}
 	requireEvent(t, recorder, "Warning JobFailed The workflow job failed")
-	if err := reconciler.updateWorkflowJobStatus(context.Background(), workflowJob, nativeJob, nil, false); err != nil {
+	if err := reconciler.updateWorkflowJobStatus(context.Background(), workflowJob, nativeJob, nil, nil, false); err != nil {
 		t.Fatal(err)
 	}
 	requireNoEvent(t, recorder)

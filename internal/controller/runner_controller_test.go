@@ -72,7 +72,7 @@ func TestRunnerBuildsOwnedJob(t *testing.T) {
 		},
 		Spec: actionsv1alpha1.WorkflowJobSpec{JobID: "build", DisplayName: "Build and test", TimeoutSeconds: 90 * 60},
 	}
-	job, err := reconciler.buildJob(workflowJob, run, project, runnerObject)
+	job, err := reconciler.buildJob(workflowJob, run, project, runnerObject, nativeJobStartDeadline)
 	if err != nil {
 		t.Fatalf("build job: %v", err)
 	}
@@ -127,8 +127,15 @@ func TestRunnerBuildsOwnedJob(t *testing.T) {
 	if job.Spec.TTLSecondsAfterFinished != nil {
 		t.Errorf("native Job TTL = %v, want nil", job.Spec.TTLSecondsAfterFinished)
 	}
-	if job.Spec.ActiveDeadlineSeconds == nil || *job.Spec.ActiveDeadlineSeconds != 90*60 {
-		t.Errorf("active deadline = %v", job.Spec.ActiveDeadlineSeconds)
+	wantStartDeadlineSeconds := int64(nativeJobStartDeadline / time.Second)
+	if job.Spec.ActiveDeadlineSeconds == nil || *job.Spec.ActiveDeadlineSeconds != wantStartDeadlineSeconds {
+		t.Errorf("startup deadline = %v, want %d", job.Spec.ActiveDeadlineSeconds, wantStartDeadlineSeconds)
+	}
+	if job.Annotations[nativeJobDeadlineAnnotation] != nativeJobDeadlineStartup {
+		t.Errorf("native Job deadline phase = %q, want %q", job.Annotations[nativeJobDeadlineAnnotation], nativeJobDeadlineStartup)
+	}
+	if phase := job.Spec.Template.Annotations[nativeJobDeadlineAnnotation]; phase != "" {
+		t.Errorf("Pod template deadline phase = %q, want empty", phase)
 	}
 	if job.Spec.Template.Spec.TerminationGracePeriodSeconds != nil {
 		t.Errorf("termination grace period = %v, want nil", job.Spec.Template.Spec.TerminationGracePeriodSeconds)
@@ -171,6 +178,7 @@ func TestRunnerUsesConfiguredTerminationGracePeriod(t *testing.T) {
 		&actionsv1alpha1.WorkflowRun{},
 		&actionsv1alpha1.Project{},
 		runnerObject,
+		nativeJobStartDeadline,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -189,7 +197,7 @@ func TestRunnerMountsGitHubEventSnapshot(t *testing.T) {
 	}}
 	workflowJob := &actionsv1alpha1.WorkflowJob{ObjectMeta: metav1.ObjectMeta{Name: "build", Namespace: "default", UID: types.UID("job-uid")}}
 	runnerObject := &actionsv1alpha1.Runner{Spec: actionsv1alpha1.RunnerSpec{Execution: actionsv1alpha1.RunnerExecutionSpec{Image: "runner:test"}}}
-	job, err := reconciler.buildJob(workflowJob, run, &actionsv1alpha1.Project{}, runnerObject)
+	job, err := reconciler.buildJob(workflowJob, run, &actionsv1alpha1.Project{}, runnerObject, nativeJobStartDeadline)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -206,28 +214,18 @@ func TestRunnerMountsGitHubEventSnapshot(t *testing.T) {
 	t.Fatalf("runner volumes = %#v", job.Spec.Template.Spec.Volumes)
 }
 
-func TestRunnerCapsNativeJobDeadline(t *testing.T) {
-	scheme := runnerTestScheme(t)
-	reconciler := &RunnerReconciler{Client: fake.NewClientBuilder().WithScheme(scheme).Build(), MaxJobTimeout: 45 * time.Minute}
+func TestRunnerCapsEffectiveJobTimeout(t *testing.T) {
+	reconciler := &RunnerReconciler{MaxJobTimeout: 45 * time.Minute}
 	workflowJob := &actionsv1alpha1.WorkflowJob{
 		ObjectMeta: metav1.ObjectMeta{Name: "ci-build", Namespace: "default", UID: types.UID("workflow-job-uid")},
 		Spec:       actionsv1alpha1.WorkflowJobSpec{TimeoutSeconds: 90 * 60},
 	}
-	nativeJob, err := reconciler.buildJob(
-		workflowJob,
-		&actionsv1alpha1.WorkflowRun{},
-		&actionsv1alpha1.Project{},
-		&actionsv1alpha1.Runner{Spec: actionsv1alpha1.RunnerSpec{Execution: actionsv1alpha1.RunnerExecutionSpec{Image: "runner:test"}}},
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if nativeJob.Spec.ActiveDeadlineSeconds == nil || *nativeJob.Spec.ActiveDeadlineSeconds != 45*60 {
-		t.Fatalf("active deadline = %v, want %d", nativeJob.Spec.ActiveDeadlineSeconds, 45*60)
+	if got := reconciler.effectiveJobTimeout(workflowJob); got != 45*time.Minute {
+		t.Fatalf("effective timeout = %s, want %s", got, 45*time.Minute)
 	}
 }
 
-func TestRunnerUsesDefaultDeadlineWhenWorkflowJobOmitsTimeout(t *testing.T) {
+func TestRunnerUsesDefaultTimeoutWhenWorkflowJobOmitsTimeout(t *testing.T) {
 	for _, test := range []struct {
 		name    string
 		maximum time.Duration
@@ -237,31 +235,161 @@ func TestRunnerUsesDefaultDeadlineWhenWorkflowJobOmitsTimeout(t *testing.T) {
 		{name: "maximum below default", maximum: 90 * time.Minute, want: 90 * time.Minute},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			scheme := runnerTestScheme(t)
-			reconciler := &RunnerReconciler{Client: fake.NewClientBuilder().WithScheme(scheme).Build(), MaxJobTimeout: test.maximum}
-			nativeJob, err := reconciler.buildJob(
-				&actionsv1alpha1.WorkflowJob{ObjectMeta: metav1.ObjectMeta{Name: "ci-build", Namespace: "default", UID: types.UID("workflow-job-uid")}},
-				&actionsv1alpha1.WorkflowRun{},
-				&actionsv1alpha1.Project{},
-				&actionsv1alpha1.Runner{Spec: actionsv1alpha1.RunnerSpec{Execution: actionsv1alpha1.RunnerExecutionSpec{Image: "runner:test"}}},
-			)
-			if err != nil {
-				t.Fatal(err)
-			}
-			wantSeconds := int64(test.want / time.Second)
-			if nativeJob.Spec.ActiveDeadlineSeconds == nil || *nativeJob.Spec.ActiveDeadlineSeconds != wantSeconds {
-				t.Fatalf("active deadline = %v, want %d", nativeJob.Spec.ActiveDeadlineSeconds, wantSeconds)
+			reconciler := &RunnerReconciler{MaxJobTimeout: test.maximum}
+			workflowJob := &actionsv1alpha1.WorkflowJob{ObjectMeta: metav1.ObjectMeta{Name: "ci-build", Namespace: "default", UID: types.UID("workflow-job-uid")}}
+			if got := reconciler.effectiveJobTimeout(workflowJob); got != test.want {
+				t.Fatalf("effective timeout = %s, want %s", got, test.want)
 			}
 		})
+	}
+}
+
+func TestRunnerReplacesStartupDeadlineAfterScheduling(t *testing.T) {
+	scheme := runnerTestScheme(t)
+	jobStart := metav1.NewTime(time.Date(2026, time.September, 2, 10, 0, 0, 0, time.UTC))
+	runnerStart := metav1.NewTime(jobStart.Add(7 * time.Minute))
+	startDeadlineSeconds := int64((time.Hour - installationTokenStartMargin) / time.Second)
+	workflowJob := &actionsv1alpha1.WorkflowJob{
+		TypeMeta: metav1.TypeMeta{APIVersion: actionsv1alpha1.GroupVersion.String(), Kind: "WorkflowJob"},
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "build", Namespace: "default", UID: types.UID("workflow-job-uid"),
+		},
+		Spec: actionsv1alpha1.WorkflowJobSpec{TimeoutSeconds: 5 * 60},
+		Status: actionsv1alpha1.WorkflowJobStatus{
+			RunnerRef: &corev1.LocalObjectReference{Name: "runner"},
+		},
+	}
+	nativeJob := &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: workflowJob.Name, Namespace: workflowJob.Namespace, UID: types.UID("native-job-uid"),
+			Annotations: map[string]string{nativeJobDeadlineAnnotation: nativeJobDeadlineStartup},
+		},
+		Spec:   batchv1.JobSpec{ActiveDeadlineSeconds: pointerTo(startDeadlineSeconds)},
+		Status: batchv1.JobStatus{Active: 1, StartTime: &jobStart},
+	}
+	if err := controllerutil.SetControllerReference(workflowJob, nativeJob, scheme); err != nil {
+		t.Fatal(err)
+	}
+	clusterClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&actionsv1alpha1.WorkflowJob{}, &batchv1.Job{}).
+		WithObjects(workflowJob, nativeJob).
+		Build()
+	reconciler := &RunnerReconciler{
+		Client:    &podListErrorClient{Client: clusterClient, err: errors.New("cached Pod list is unavailable")},
+		APIReader: &podListErrorReader{Reader: clusterClient, err: errors.New("unexpected Pod list before native Job is ready")},
+	}
+
+	found, terminal, err := reconciler.observeNativeJob(context.Background(), workflowJob)
+	if err != nil || !found || terminal {
+		t.Fatalf("observe pending native Job = found %t, terminal %t, error %v", found, terminal, err)
+	}
+	storedNativeJob := &batchv1.Job{}
+	if err := clusterClient.Get(context.Background(), client.ObjectKeyFromObject(nativeJob), storedNativeJob); err != nil {
+		t.Fatal(err)
+	}
+	if storedNativeJob.Spec.ActiveDeadlineSeconds == nil || *storedNativeJob.Spec.ActiveDeadlineSeconds != startDeadlineSeconds {
+		t.Fatalf("pending native Job deadline = %v, want %d", storedNativeJob.Spec.ActiveDeadlineSeconds, startDeadlineSeconds)
+	}
+	if phase := storedNativeJob.Annotations[nativeJobDeadlineAnnotation]; phase != nativeJobDeadlineStartup {
+		t.Fatalf("pending native Job deadline phase = %q, want %q", phase, nativeJobDeadlineStartup)
+	}
+	storedWorkflowJob := &actionsv1alpha1.WorkflowJob{}
+	if err := clusterClient.Get(context.Background(), client.ObjectKeyFromObject(workflowJob), storedWorkflowJob); err != nil {
+		t.Fatal(err)
+	}
+	if storedWorkflowJob.Status.StartTime != nil {
+		t.Fatalf("pending WorkflowJob start time = %s, want nil", storedWorkflowJob.Status.StartTime)
+	}
+
+	reconciler.APIReader = clusterClient
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "build-pod", Namespace: workflowJob.Namespace,
+			Labels: map[string]string{actionsv1alpha1.LabelWorkflowJobUID: string(workflowJob.UID)},
+		},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning, ContainerStatuses: []corev1.ContainerStatus{{
+			Name: runner.ContainerName,
+			State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{
+				StartedAt: runnerStart,
+			}},
+		}}},
+	}
+	if err := controllerutil.SetControllerReference(nativeJob, pod, scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := clusterClient.Create(context.Background(), pod); err != nil {
+		t.Fatal(err)
+	}
+	storedNativeJob.Status.Ready = pointerTo(int32(1))
+	if err := clusterClient.Status().Update(context.Background(), storedNativeJob); err != nil {
+		t.Fatal(err)
+	}
+	found, terminal, err = reconciler.observeNativeJob(context.Background(), storedWorkflowJob)
+	if err != nil || !found || terminal {
+		t.Fatalf("observe running native Job = found %t, terminal %t, error %v", found, terminal, err)
+	}
+	if err := clusterClient.Get(context.Background(), client.ObjectKeyFromObject(nativeJob), storedNativeJob); err != nil {
+		t.Fatal(err)
+	}
+	const wantDeadlineSeconds = int64(17 * 60)
+	if storedNativeJob.Spec.ActiveDeadlineSeconds == nil {
+		t.Fatal("running native Job deadline = nil")
+	}
+	if *storedNativeJob.Spec.ActiveDeadlineSeconds != wantDeadlineSeconds {
+		t.Fatalf("running native Job deadline = %d, want %d", *storedNativeJob.Spec.ActiveDeadlineSeconds, wantDeadlineSeconds)
+	}
+	if phase := storedNativeJob.Annotations[nativeJobDeadlineAnnotation]; phase != nativeJobDeadlineExecution {
+		t.Fatalf("running native Job deadline phase = %q, want %q", phase, nativeJobDeadlineExecution)
+	}
+	if err := clusterClient.Get(context.Background(), client.ObjectKeyFromObject(workflowJob), storedWorkflowJob); err != nil {
+		t.Fatal(err)
+	}
+	if storedWorkflowJob.Status.StartTime == nil || !storedWorkflowJob.Status.StartTime.Equal(&runnerStart) {
+		t.Fatalf("WorkflowJob start time = %v, want %s", storedWorkflowJob.Status.StartTime, runnerStart.String())
+	}
+	reconciler.APIReader = &podListErrorReader{Reader: clusterClient, err: errors.New("unexpected uncached Pod list")}
+	found, terminal, err = reconciler.observeNativeJob(context.Background(), storedWorkflowJob)
+	if err != nil || !found || terminal {
+		t.Fatalf("observe armed native Job = found %t, terminal %t, error %v", found, terminal, err)
 	}
 }
 
 func TestArtifactTokenLifetimeCoversEffectiveJobLifetime(t *testing.T) {
 	reconciler := &RunnerReconciler{MaxJobTimeout: 2 * time.Hour}
 	workflowJob := &actionsv1alpha1.WorkflowJob{Spec: actionsv1alpha1.WorkflowJobSpec{TimeoutSeconds: 3 * 60 * 60}}
-	want := 2*time.Hour + jobStartTimeout + runner.CleanupTimeout
-	if got := reconciler.artifactTokenLifetime(workflowJob); got != want {
+	startupDeadline := time.Hour - installationTokenStartMargin
+	want := 2*time.Hour + startupDeadline + runner.CleanupTimeout
+	if got := reconciler.artifactTokenLifetime(workflowJob, startupDeadline); got != want {
 		t.Fatalf("artifact token lifetime = %s, want %s", got, want)
+	}
+}
+
+func TestArtifactTokenLifetimeSaturatesForMaximumConfiguration(t *testing.T) {
+	const maximumDuration = time.Duration(1<<63 - 1)
+	reconciler := &RunnerReconciler{MaxJobTimeout: maximumDuration / time.Minute * time.Minute}
+	workflowJob := &actionsv1alpha1.WorkflowJob{Spec: actionsv1alpha1.WorkflowJobSpec{TimeoutSeconds: 9223372036}}
+	if got := reconciler.artifactTokenLifetime(workflowJob, time.Hour); got != maximumDuration {
+		t.Fatalf("artifact token lifetime = %s, want %s", got, maximumDuration)
+	}
+}
+
+func TestJobStartDeadlineIsBoundedByInstallationTokenExpiry(t *testing.T) {
+	now := time.Date(2026, time.September, 3, 0, 0, 0, 0, time.UTC)
+	for _, test := range []struct {
+		name        string
+		expirations []time.Time
+		want        time.Duration
+	}{
+		{name: "maximum without token expiry", want: nativeJobStartDeadline},
+		{name: "job token", expirations: []time.Time{now.Add(time.Hour)}, want: time.Hour - installationTokenStartMargin},
+		{name: "earliest token", expirations: []time.Time{now.Add(time.Hour), now.Add(30 * time.Minute)}, want: 30*time.Minute - installationTokenStartMargin},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := credentialBoundedJobStartDeadline(now, test.expirations...); got != test.want {
+				t.Fatalf("startup deadline = %s, want %s", got, test.want)
+			}
+		})
 	}
 }
 
@@ -273,7 +401,7 @@ func TestRunnerMountsNeedsContextForDependentJob(t *testing.T) {
 		Spec:       actionsv1alpha1.WorkflowJobSpec{Needs: []string{"build"}},
 	}
 	runnerObject := &actionsv1alpha1.Runner{Spec: actionsv1alpha1.RunnerSpec{Execution: actionsv1alpha1.RunnerExecutionSpec{Image: "runner:test"}}}
-	job, err := reconciler.buildJob(workflowJob, &actionsv1alpha1.WorkflowRun{}, &actionsv1alpha1.Project{}, runnerObject)
+	job, err := reconciler.buildJob(workflowJob, &actionsv1alpha1.WorkflowRun{}, &actionsv1alpha1.Project{}, runnerObject, nativeJobStartDeadline)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -301,7 +429,7 @@ func TestRunnerBuildsJobWithProjectValues(t *testing.T) {
 	}
 	runnerObject := &actionsv1alpha1.Runner{Spec: actionsv1alpha1.RunnerSpec{Execution: actionsv1alpha1.RunnerExecutionSpec{Image: "runner:test"}}}
 	workflowJob := &actionsv1alpha1.WorkflowJob{ObjectMeta: metav1.ObjectMeta{Name: "ci-build", Namespace: "default", UID: types.UID("workflow-job-uid")}}
-	job, err := reconciler.buildJob(workflowJob, &actionsv1alpha1.WorkflowRun{}, project, runnerObject)
+	job, err := reconciler.buildJob(workflowJob, &actionsv1alpha1.WorkflowRun{}, project, runnerObject, nativeJobStartDeadline)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -342,7 +470,7 @@ func TestRunnerWithholdsProjectSecretsFromForkPullRequests(t *testing.T) {
 	run := &actionsv1alpha1.WorkflowRun{Spec: actionsv1alpha1.WorkflowRunSpec{ForkPullRequest: &actionsv1alpha1.WorkflowRunForkPullRequest{}}}
 	runnerObject := &actionsv1alpha1.Runner{Spec: actionsv1alpha1.RunnerSpec{Execution: actionsv1alpha1.RunnerExecutionSpec{Image: "runner:test"}}}
 	workflowJob := &actionsv1alpha1.WorkflowJob{ObjectMeta: metav1.ObjectMeta{Name: "ci-build", Namespace: "default", UID: types.UID("workflow-job-uid")}}
-	job, err := reconciler.buildJob(workflowJob, run, project, runnerObject)
+	job, err := reconciler.buildJob(workflowJob, run, project, runnerObject, nativeJobStartDeadline)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -363,7 +491,7 @@ func TestRunnerWithholdsProjectSecretsFromForkPullRequests(t *testing.T) {
 
 	trustedRun := run.DeepCopy()
 	trustedRun.Spec.ForkPullRequest.SendSecrets = true
-	trustedJob, err := reconciler.buildJob(workflowJob, trustedRun, project, runnerObject)
+	trustedJob, err := reconciler.buildJob(workflowJob, trustedRun, project, runnerObject, nativeJobStartDeadline)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -384,7 +512,7 @@ func TestRunnerBuildsJobWithArtifactCredential(t *testing.T) {
 	run := &actionsv1alpha1.WorkflowRun{}
 	workflowJob := &actionsv1alpha1.WorkflowJob{ObjectMeta: metav1.ObjectMeta{Name: "build", Namespace: "default", UID: types.UID("job-uid")}}
 	runnerObject := &actionsv1alpha1.Runner{Spec: actionsv1alpha1.RunnerSpec{Execution: actionsv1alpha1.RunnerExecutionSpec{Image: "runner:test"}}}
-	job, err := reconciler.buildJob(workflowJob, run, &actionsv1alpha1.Project{}, runnerObject)
+	job, err := reconciler.buildJob(workflowJob, run, &actionsv1alpha1.Project{}, runnerObject, nativeJobStartDeadline)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -423,7 +551,7 @@ func TestRunnerBuildsDockerEnabledJob(t *testing.T) {
 		}},
 	}
 	workflowJob := &actionsv1alpha1.WorkflowJob{ObjectMeta: metav1.ObjectMeta{Name: "ci-kind", Namespace: "default", UID: types.UID("workflow-job-uid")}}
-	job, err := reconciler.buildJob(workflowJob, &actionsv1alpha1.WorkflowRun{}, &actionsv1alpha1.Project{}, runnerObject)
+	job, err := reconciler.buildJob(workflowJob, &actionsv1alpha1.WorkflowRun{}, &actionsv1alpha1.Project{}, runnerObject, nativeJobStartDeadline)
 	if err != nil {
 		t.Fatalf("build job: %v", err)
 	}
@@ -1117,10 +1245,9 @@ func TestWorkflowJobResultRequiresAssignedVersion(t *testing.T) {
 	if err := controllerutil.SetControllerReference(nativeJob, pod, scheme); err != nil {
 		t.Fatal(err)
 	}
-	clusterClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pod).Build()
-	result, invalid, err := (&RunnerReconciler{APIReader: clusterClient}).workflowJobResult(context.Background(), workflowJob, nativeJob)
-	if err != nil || result != nil || !invalid {
-		t.Fatalf("workflowJobResult() = result %#v, invalid %t, error %v", result, invalid, err)
+	result, invalid := decodeRunnerResult(nativeJob, &pod.Status.ContainerStatuses[0])
+	if result != nil || !invalid {
+		t.Fatalf("workflowJobResult() = result %#v, invalid %t", result, invalid)
 	}
 }
 
@@ -1215,26 +1342,116 @@ func TestFailedNativeJobPersistsRunnerOutputs(t *testing.T) {
 	}
 }
 
-func TestExpiredNativeJobIsReportedAsTimedOut(t *testing.T) {
+func TestExpiredNativeJobDeadlineIsReportedByPhase(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		phase      string
+		started    bool
+		wantReason string
+	}{
+		{name: "runner startup", phase: nativeJobDeadlineStartup, wantReason: "JobStartFailed"},
+		{name: "runner execution without result", phase: nativeJobDeadlineExecution, started: true, wantReason: "JobTimedOut"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			scheme := runnerTestScheme(t)
+			workflowJob := &actionsv1alpha1.WorkflowJob{
+				TypeMeta:   metav1.TypeMeta{APIVersion: actionsv1alpha1.GroupVersion.String(), Kind: "WorkflowJob"},
+				ObjectMeta: metav1.ObjectMeta{Name: "build", Namespace: "default", UID: types.UID("workflow-job-uid")},
+				Status:     actionsv1alpha1.WorkflowJobStatus{RunnerRef: &corev1.LocalObjectReference{Name: "runner"}},
+			}
+			if test.started {
+				workflowJob.Status.StartTime = pointerTo(metav1.Now())
+			}
+			nativeJob := &batchv1.Job{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: workflowJob.Name, Namespace: workflowJob.Namespace, UID: types.UID("native-job-uid"),
+					Annotations: map[string]string{
+						nativeJobDeadlineAnnotation:                   test.phase,
+						actionsv1alpha1.AnnotationRunnerResultVersion: jobResultVersion,
+					},
+				},
+				Status: batchv1.JobStatus{Conditions: []batchv1.JobCondition{{
+					Type: batchv1.JobFailed, Status: corev1.ConditionTrue, Reason: batchv1.JobReasonDeadlineExceeded,
+				}}},
+			}
+			if err := controllerutil.SetControllerReference(workflowJob, nativeJob, scheme); err != nil {
+				t.Fatal(err)
+			}
+			clusterClient := fake.NewClientBuilder().
+				WithScheme(scheme).
+				WithStatusSubresource(&actionsv1alpha1.WorkflowJob{}, &batchv1.Job{}).
+				WithObjects(workflowJob, nativeJob).
+				Build()
+			reconciler := &RunnerReconciler{Client: clusterClient, APIReader: clusterClient}
+			found, terminal, err := reconciler.observeNativeJob(context.Background(), workflowJob)
+			if err != nil || !found || !terminal {
+				t.Fatalf("observeNativeJob() = found %t, terminal %t, error %v", found, terminal, err)
+			}
+			stored := &actionsv1alpha1.WorkflowJob{}
+			if err := clusterClient.Get(context.Background(), client.ObjectKeyFromObject(workflowJob), stored); err != nil {
+				t.Fatal(err)
+			}
+			condition := meta.FindStatusCondition(stored.Status.Conditions, actionsv1alpha1.WorkflowJobConditionSucceeded)
+			if stored.Status.Result != actionsv1alpha1.WorkflowJobResultFailure || condition == nil || condition.Status != metav1.ConditionFalse || condition.Reason != test.wantReason {
+				t.Fatalf("WorkflowJob status = %#v", stored.Status)
+			}
+		})
+	}
+}
+
+func TestSchedulingDelayDoesNotCountTowardJobTimeout(t *testing.T) {
 	scheme := runnerTestScheme(t)
+	jobStart := metav1.NewTime(time.Date(2026, time.September, 2, 10, 0, 0, 0, time.UTC))
+	runnerStart := metav1.NewTime(jobStart.Add(7 * time.Minute))
+	completion := metav1.NewTime(runnerStart.Add(2 * time.Minute))
 	workflowJob := &actionsv1alpha1.WorkflowJob{
 		TypeMeta:   metav1.TypeMeta{APIVersion: actionsv1alpha1.GroupVersion.String(), Kind: "WorkflowJob"},
 		ObjectMeta: metav1.ObjectMeta{Name: "build", Namespace: "default", UID: types.UID("workflow-job-uid")},
+		Spec:       actionsv1alpha1.WorkflowJobSpec{TimeoutSeconds: 5 * 60},
 		Status:     actionsv1alpha1.WorkflowJobStatus{RunnerRef: &corev1.LocalObjectReference{Name: "runner"}},
 	}
 	nativeJob := &batchv1.Job{
-		ObjectMeta: metav1.ObjectMeta{Name: workflowJob.Name, Namespace: workflowJob.Namespace, UID: types.UID("native-job-uid")},
-		Status: batchv1.JobStatus{Conditions: []batchv1.JobCondition{{
-			Type: batchv1.JobFailed, Status: corev1.ConditionTrue, Reason: batchv1.JobReasonDeadlineExceeded,
-		}}},
+		ObjectMeta: metav1.ObjectMeta{
+			Name: workflowJob.Name, Namespace: workflowJob.Namespace, UID: types.UID("native-job-uid"),
+			Annotations: map[string]string{actionsv1alpha1.AnnotationRunnerResultVersion: jobResultVersion},
+		},
+		Status: batchv1.JobStatus{
+			StartTime: &jobStart, CompletionTime: &completion, Succeeded: 1,
+			Conditions: []batchv1.JobCondition{
+				{Type: batchv1.JobFailed, Status: corev1.ConditionTrue, Reason: batchv1.JobReasonDeadlineExceeded},
+				{Type: batchv1.JobComplete, Status: corev1.ConditionTrue},
+			},
+		},
 	}
 	if err := controllerutil.SetControllerReference(workflowJob, nativeJob, scheme); err != nil {
+		t.Fatal(err)
+	}
+	resultData, err := runner.EncodeResult(runner.Result{
+		Version: runner.ResultVersion, Conclusion: runner.ResultConclusionSuccess,
+		Outputs: map[string]string{"artifact": "available"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "build-pod", Namespace: workflowJob.Namespace,
+			Labels: map[string]string{actionsv1alpha1.LabelWorkflowJobUID: string(workflowJob.UID)},
+		},
+		Status: corev1.PodStatus{Phase: corev1.PodSucceeded, ContainerStatuses: []corev1.ContainerStatus{{
+			Name: runner.ContainerName,
+			State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
+				ExitCode: 0, Reason: "Completed", StartedAt: runnerStart, FinishedAt: completion, Message: string(resultData),
+			}},
+		}}},
+	}
+	if err := controllerutil.SetControllerReference(nativeJob, pod, scheme); err != nil {
 		t.Fatal(err)
 	}
 	clusterClient := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithStatusSubresource(&actionsv1alpha1.WorkflowJob{}, &batchv1.Job{}).
-		WithObjects(workflowJob, nativeJob).
+		WithObjects(workflowJob, nativeJob, pod).
 		Build()
 	reconciler := &RunnerReconciler{Client: clusterClient, APIReader: clusterClient}
 	found, terminal, err := reconciler.observeNativeJob(context.Background(), workflowJob)
@@ -1246,20 +1463,34 @@ func TestExpiredNativeJobIsReportedAsTimedOut(t *testing.T) {
 		t.Fatal(err)
 	}
 	condition := meta.FindStatusCondition(stored.Status.Conditions, actionsv1alpha1.WorkflowJobConditionSucceeded)
-	if stored.Status.Result != actionsv1alpha1.WorkflowJobResultFailure || condition == nil || condition.Status != metav1.ConditionFalse || condition.Reason != "JobTimedOut" {
-		t.Fatalf("timed-out WorkflowJob status = %#v", stored.Status)
+	if stored.Status.Result != actionsv1alpha1.WorkflowJobResultSuccess || condition == nil || condition.Status != metav1.ConditionTrue || condition.Reason != "JobSucceeded" {
+		t.Fatalf("WorkflowJob status = %#v", stored.Status)
+	}
+	if stored.Status.StartTime == nil || !stored.Status.StartTime.Equal(&runnerStart) {
+		t.Fatalf("WorkflowJob start time = %v, want %s", stored.Status.StartTime, runnerStart.String())
+	}
+	if stored.Status.Outputs["artifact"] != "available" {
+		t.Fatalf("WorkflowJob outputs = %#v", stored.Status.Outputs)
 	}
 }
 
 func TestRunnerResultConclusionDeterminesWorkflowJobStatus(t *testing.T) {
 	for _, test := range []struct {
-		name       string
-		conclusion runner.ResultConclusion
-		wantResult actionsv1alpha1.WorkflowJobResult
-		wantReason string
+		name            string
+		conclusion      runner.ResultConclusion
+		nativeCondition batchv1.JobConditionType
+		nativeReason    string
+		deadlinePhase   string
+		wantResult      actionsv1alpha1.WorkflowJobResult
+		wantStatus      metav1.ConditionStatus
+		wantReason      string
 	}{
-		{name: "timed out", conclusion: runner.ResultConclusionTimedOut, wantResult: actionsv1alpha1.WorkflowJobResultFailure, wantReason: "JobTimedOut"},
-		{name: "cancelled", conclusion: runner.ResultConclusionCancelled, wantResult: actionsv1alpha1.WorkflowJobResultCancelled, wantReason: "JobCancelled"},
+		{name: "timed out", conclusion: runner.ResultConclusionTimedOut, nativeCondition: batchv1.JobFailed, wantResult: actionsv1alpha1.WorkflowJobResultFailure, wantStatus: metav1.ConditionFalse, wantReason: "JobTimedOut"},
+		{name: "cancelled", conclusion: runner.ResultConclusionCancelled, nativeCondition: batchv1.JobFailed, wantResult: actionsv1alpha1.WorkflowJobResultCancelled, wantStatus: metav1.ConditionFalse, wantReason: "JobCancelled"},
+		{name: "native deadline overrides cancellation", conclusion: runner.ResultConclusionCancelled, nativeCondition: batchv1.JobFailed, nativeReason: batchv1.JobReasonDeadlineExceeded, deadlinePhase: nativeJobDeadlineExecution, wantResult: actionsv1alpha1.WorkflowJobResultFailure, wantStatus: metav1.ConditionFalse, wantReason: "JobTimedOut"},
+		{name: "native startup deadline after runner starts", conclusion: runner.ResultConclusionCancelled, nativeCondition: batchv1.JobFailed, nativeReason: batchv1.JobReasonDeadlineExceeded, deadlinePhase: nativeJobDeadlineStartup, wantResult: actionsv1alpha1.WorkflowJobResultFailure, wantStatus: metav1.ConditionFalse, wantReason: "JobTimedOut"},
+		{name: "runner success overrides native failure", conclusion: runner.ResultConclusionSuccess, nativeCondition: batchv1.JobFailed, wantResult: actionsv1alpha1.WorkflowJobResultSuccess, wantStatus: metav1.ConditionTrue, wantReason: "JobSucceeded"},
+		{name: "runner failure overrides native completion", conclusion: runner.ResultConclusionFailure, nativeCondition: batchv1.JobComplete, wantResult: actionsv1alpha1.WorkflowJobResultFailure, wantStatus: metav1.ConditionFalse, wantReason: "JobFailed"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			scheme := runnerTestScheme(t)
@@ -1270,9 +1501,15 @@ func TestRunnerResultConclusionDeterminesWorkflowJobStatus(t *testing.T) {
 			}
 			clusterClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&actionsv1alpha1.WorkflowJob{}).WithObjects(workflowJob).Build()
 			reconciler := &RunnerReconciler{Client: clusterClient}
-			nativeJob := &batchv1.Job{Status: batchv1.JobStatus{Conditions: []batchv1.JobCondition{{Type: batchv1.JobFailed, Status: corev1.ConditionTrue}}}}
+			nativeJob := &batchv1.Job{
+				Status: batchv1.JobStatus{Conditions: []batchv1.JobCondition{{Type: test.nativeCondition, Status: corev1.ConditionTrue, Reason: test.nativeReason}}},
+			}
+			if test.deadlinePhase != "" {
+				nativeJob.Annotations = map[string]string{nativeJobDeadlineAnnotation: test.deadlinePhase}
+			}
 			executionResult := &runner.Result{Version: runner.ResultVersion, Conclusion: test.conclusion, Outputs: map[string]string{"artifact": "available"}}
-			if err := reconciler.updateWorkflowJobStatus(context.Background(), workflowJob, nativeJob, executionResult, false); err != nil {
+			runnerStart := metav1.Now()
+			if err := reconciler.updateWorkflowJobStatus(context.Background(), workflowJob, nativeJob, &runnerStart, executionResult, false); err != nil {
 				t.Fatal(err)
 			}
 			stored := &actionsv1alpha1.WorkflowJob{}
@@ -1280,7 +1517,7 @@ func TestRunnerResultConclusionDeterminesWorkflowJobStatus(t *testing.T) {
 				t.Fatal(err)
 			}
 			condition := meta.FindStatusCondition(stored.Status.Conditions, actionsv1alpha1.WorkflowJobConditionSucceeded)
-			if stored.Status.Result != test.wantResult || condition == nil || condition.Status != metav1.ConditionFalse || condition.Reason != test.wantReason {
+			if stored.Status.Result != test.wantResult || condition == nil || condition.Status != test.wantStatus || condition.Reason != test.wantReason {
 				t.Fatalf("WorkflowJob status = %#v", stored.Status)
 			}
 			if stored.Status.Outputs["artifact"] != "available" {
@@ -1475,14 +1712,17 @@ func TestMissingPlanFailsAssignedWorkflowJob(t *testing.T) {
 
 func TestExecuteWorkflowJobMintsPlannedTokenPermissions(t *testing.T) {
 	t.Run("external action", func(t *testing.T) {
-		testExecuteWorkflowJobMintsPlannedTokenPermissions(t, []runner.Step{{Uses: "actions/checkout@v4"}}, true)
+		testExecuteWorkflowJobMintsPlannedTokenPermissions(t, []runner.Step{{Uses: "actions/checkout@v4"}}, true, time.Hour)
 	})
 	t.Run("script only", func(t *testing.T) {
-		testExecuteWorkflowJobMintsPlannedTokenPermissions(t, []runner.Step{{Run: "true"}}, false)
+		testExecuteWorkflowJobMintsPlannedTokenPermissions(t, []runner.Step{{Run: "true"}}, false, time.Hour)
+	})
+	t.Run("expiring credentials", func(t *testing.T) {
+		testExecuteWorkflowJobMintsPlannedTokenPermissions(t, []runner.Step{{Uses: "actions/checkout@v4"}}, true, installationTokenStartMargin)
 	})
 }
 
-func testExecuteWorkflowJobMintsPlannedTokenPermissions(t *testing.T, steps []runner.Step, wantActionToken bool) {
+func testExecuteWorkflowJobMintsPlannedTokenPermissions(t *testing.T, steps []runner.Step, wantActionToken bool, tokenLifetime time.Duration) {
 	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
 		t.Fatal(err)
@@ -1492,7 +1732,14 @@ func testExecuteWorkflowJobMintsPlannedTokenPermissions(t *testing.T, steps []ru
 		Repositories []string
 		Permissions  map[string]string
 	}{}
+	revoked := []string{}
+	tokenExpiresAt := time.Now().Add(tokenLifetime)
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.Method == http.MethodDelete && request.URL.Path == "/installation/token" {
+			revoked = append(revoked, strings.TrimPrefix(request.Header.Get("Authorization"), "Bearer "))
+			writer.WriteHeader(http.StatusNoContent)
+			return
+		}
 		if request.Method != http.MethodPost || request.URL.Path != "/app/installations/2/access_tokens" {
 			http.NotFound(writer, request)
 			return
@@ -1510,10 +1757,10 @@ func testExecuteWorkflowJobMintsPlannedTokenPermissions(t *testing.T, steps []ru
 			Permissions  map[string]string
 		}{Repositories: body.Repositories, Permissions: body.Permissions})
 		if len(body.Repositories) == 0 {
-			fmt.Fprint(writer, `{"token":"action-token"}`)
+			_ = json.NewEncoder(writer).Encode(map[string]any{"token": "action-token", "expires_at": tokenExpiresAt})
 			return
 		}
-		fmt.Fprint(writer, `{"token":"job-token"}`)
+		_ = json.NewEncoder(writer).Encode(map[string]any{"token": "job-token", "expires_at": tokenExpiresAt})
 	}))
 	defer server.Close()
 	github, err := githubclient.NewClient(server.URL, server.Client())
@@ -1577,12 +1824,38 @@ func testExecuteWorkflowJobMintsPlannedTokenPermissions(t *testing.T, steps []ru
 		WithObjects(project, run, workflowJob, plan, credentials, runnerObject).Build()
 	reconciler := &RunnerReconciler{Client: clusterClient, APIReader: clusterClient, GitHub: github}
 	terminal, err := reconciler.executeWorkflowJob(context.Background(), runnerObject, workflowJob, project)
-	if err != nil || terminal {
-		t.Fatalf("executeWorkflowJob() = terminal %v, error %v", terminal, err)
-	}
 	wantRequests := 1
 	if wantActionToken {
 		wantRequests = 2
+	}
+	if tokenLifetime <= installationTokenStartMargin {
+		if err != nil || !terminal {
+			t.Fatalf("executeWorkflowJob() = terminal %v, error %v", terminal, err)
+		}
+		if len(requests) != wantRequests {
+			t.Fatalf("installation token requests = %#v", requests)
+		}
+		stored := &actionsv1alpha1.WorkflowJob{}
+		if err := clusterClient.Get(context.Background(), client.ObjectKeyFromObject(workflowJob), stored); err != nil {
+			t.Fatal(err)
+		}
+		condition := meta.FindStatusCondition(stored.Status.Conditions, actionsv1alpha1.WorkflowJobConditionSucceeded)
+		if condition == nil || condition.Status != metav1.ConditionFalse || condition.Reason != "JobStartFailed" {
+			t.Fatalf("succeeded condition = %#v", condition)
+		}
+		if err := clusterClient.Get(context.Background(), client.ObjectKey{Namespace: workflowJob.Namespace, Name: workflowJob.Name}, &batchv1.Job{}); !apierrors.IsNotFound(err) {
+			t.Fatalf("native Job exists after start failure: %v", err)
+		}
+		if err := clusterClient.Get(context.Background(), client.ObjectKey{Namespace: workflowJob.Namespace, Name: childName(workflowJob.Name, "auth")}, &corev1.Secret{}); !apierrors.IsNotFound(err) {
+			t.Fatalf("authentication Secret exists after start failure: %v", err)
+		}
+		if !slices.Equal(revoked, []string{"job-token", "action-token"}) {
+			t.Fatalf("revoked tokens = %#v", revoked)
+		}
+		return
+	}
+	if err != nil || terminal {
+		t.Fatalf("executeWorkflowJob() = terminal %v, error %v", terminal, err)
 	}
 	if len(requests) != wantRequests || !slices.Equal(requests[0].Repositories, []string{"example"}) ||
 		!maps.Equal(requests[0].Permissions, map[string]string{"issues": "write", "statuses": "read"}) {
@@ -1601,6 +1874,14 @@ func testExecuteWorkflowJobMintsPlannedTokenPermissions(t *testing.T, steps []ru
 	}
 	if string(auth.Data[jobTokenSecretKey]) != "job-token" || string(auth.Data[actionTokenSecretKey]) != wantActionTokenValue {
 		t.Fatalf("authentication Secret data = %#v", auth.Data)
+	}
+	nativeJob := &batchv1.Job{}
+	if err := clusterClient.Get(context.Background(), client.ObjectKey{Namespace: "default", Name: workflowJob.Name}, nativeJob); err != nil {
+		t.Fatal(err)
+	}
+	maximumStartSeconds := int64((time.Hour - installationTokenStartMargin) / time.Second)
+	if nativeJob.Spec.ActiveDeadlineSeconds == nil || *nativeJob.Spec.ActiveDeadlineSeconds > maximumStartSeconds || *nativeJob.Spec.ActiveDeadlineSeconds < maximumStartSeconds-60 {
+		t.Fatalf("native Job startup deadline = %v, want no more than %d seconds", nativeJob.Spec.ActiveDeadlineSeconds, maximumStartSeconds)
 	}
 
 	forkRun := run.DeepCopy()
@@ -2340,4 +2621,16 @@ func (r *podListErrorReader) List(ctx context.Context, list client.ObjectList, o
 		return r.err
 	}
 	return r.Reader.List(ctx, list, options...)
+}
+
+type podListErrorClient struct {
+	client.Client
+	err error
+}
+
+func (c *podListErrorClient) List(ctx context.Context, list client.ObjectList, options ...client.ListOption) error {
+	if _, ok := list.(*corev1.PodList); ok {
+		return c.err
+	}
+	return c.Client.List(ctx, list, options...)
 }
