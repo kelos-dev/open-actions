@@ -234,17 +234,18 @@ jobs:
             projectRef:
               name: default
             execution:
-              image: ghcr.io/kelos-dev/open-actions-runner:${OPEN_ACTIONS_IMAGE_TAG}
-              env:
-                - name: GOMAXPROCS
-                  value: "2"
-              resources:
-                requests:
-                  cpu: 100m
-                  memory: 256Mi
-                limits:
-                  cpu: "2"
-                  memory: 4Gi
+              runner:
+                image: ghcr.io/kelos-dev/open-actions-runner:${OPEN_ACTIONS_IMAGE_TAG}
+                env:
+                  - name: GOMAXPROCS
+                    value: "2"
+                resources:
+                  requests:
+                    cpu: 100m
+                    memory: 256Mi
+                  limits:
+                    cpu: "2"
+                    memory: 4Gi
             labels:
               - self-hosted
               - linux
@@ -263,26 +264,25 @@ jobs:
             projectRef:
               name: default
             execution:
-              image: ghcr.io/kelos-dev/open-actions-runner:${OPEN_ACTIONS_IMAGE_TAG}
-              env:
-                - name: GOMAXPROCS
-                  value: "2"
               resources:
                 requests:
-                  cpu: 100m
-                  memory: 256Mi
+                  cpu: 500m
+                  memory: 1Gi
                 limits:
-                  cpu: "2"
-                  memory: 4Gi
+                  cpu: "4"
+                  memory: 8Gi
+              runner:
+                image: ghcr.io/kelos-dev/open-actions-runner:${OPEN_ACTIONS_IMAGE_TAG}
+                env:
+                  - name: GOMAXPROCS
+                    value: "4"
               docker:
                 image: docker:29.7.2-dind@sha256:12e683a161823b2a839aeea999b9d960e6e1f9a97b1679ad6b441982e2d9cf07
+                env:
+                  - name: GOMAXPROCS
+                    value: "4"
                 resources:
-                  requests:
-                    cpu: 500m
-                    memory: 1Gi
                   limits:
-                    cpu: "4"
-                    memory: 8Gi
                     ephemeral-storage: 20Gi
             labels:
               - self-hosted

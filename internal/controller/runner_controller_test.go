@@ -46,20 +46,22 @@ func TestRunnerBuildsOwnedJob(t *testing.T) {
 	runnerObject := &actionsv1alpha1.Runner{
 		ObjectMeta: metav1.ObjectMeta{Name: "runner-1", Namespace: "default", UID: types.UID("runner-uid")},
 		Spec: actionsv1alpha1.RunnerSpec{Execution: actionsv1alpha1.RunnerExecutionSpec{
-			Image: "runner:test",
-			Env: []corev1.EnvVar{
-				{Name: "CACHE_URL", Value: "https://cache.example"},
-				{Name: "CACHE_TOKEN", ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
-					LocalObjectReference: corev1.LocalObjectReference{Name: "runner-environment"},
-					Key:                  "cache-token",
-				}}},
-				{Name: runner.RunnerNameEnvVar, Value: "untrusted"},
-			},
 			ImagePullSecrets: []actionsv1alpha1.RunnerImagePullSecretReference{{Name: "registry-credentials"}},
-			ImagePullPolicy:  corev1.PullAlways,
-			Resources: &actionsv1alpha1.RunnerResources{Requests: actionsv1alpha1.RunnerResourceList{
-				corev1.ResourceCPU: resource.MustParse("1"),
-			}},
+			Runner: actionsv1alpha1.RunnerContainerSpec{
+				Image: "runner:test",
+				Env: []corev1.EnvVar{
+					{Name: "CACHE_URL", Value: "https://cache.example"},
+					{Name: "CACHE_TOKEN", ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
+						LocalObjectReference: corev1.LocalObjectReference{Name: "runner-environment"},
+						Key:                  "cache-token",
+					}}},
+					{Name: runner.RunnerNameEnvVar, Value: "untrusted"},
+				},
+				ImagePullPolicy: corev1.PullAlways,
+				Resources: &actionsv1alpha1.RunnerResources{Requests: actionsv1alpha1.RunnerResourceList{
+					corev1.ResourceCPU: resource.MustParse("1"),
+				}},
+			},
 		}},
 	}
 	workflowJob := &actionsv1alpha1.WorkflowJob{
@@ -169,8 +171,8 @@ func TestRunnerUsesConfiguredTerminationGracePeriod(t *testing.T) {
 	reconciler := &RunnerReconciler{Client: fake.NewClientBuilder().WithScheme(scheme).Build()}
 	terminationGracePeriodSeconds := int64(0)
 	runnerObject := &actionsv1alpha1.Runner{Spec: actionsv1alpha1.RunnerSpec{Execution: actionsv1alpha1.RunnerExecutionSpec{
-		Image:                         "runner:test",
 		TerminationGracePeriodSeconds: &terminationGracePeriodSeconds,
+		Runner:                        actionsv1alpha1.RunnerContainerSpec{Image: "runner:test"},
 	}}}
 
 	job, err := reconciler.buildJob(
@@ -196,7 +198,7 @@ func TestRunnerMountsGitHubEventSnapshot(t *testing.T) {
 		Annotations: map[string]string{eventsnapshot.Annotation: "event-snapshot"},
 	}}
 	workflowJob := &actionsv1alpha1.WorkflowJob{ObjectMeta: metav1.ObjectMeta{Name: "build", Namespace: "default", UID: types.UID("job-uid")}}
-	runnerObject := &actionsv1alpha1.Runner{Spec: actionsv1alpha1.RunnerSpec{Execution: actionsv1alpha1.RunnerExecutionSpec{Image: "runner:test"}}}
+	runnerObject := &actionsv1alpha1.Runner{Spec: actionsv1alpha1.RunnerSpec{Execution: runnerExecution("runner:test")}}
 	job, err := reconciler.buildJob(workflowJob, run, &actionsv1alpha1.Project{}, runnerObject, nativeJobStartDeadline)
 	if err != nil {
 		t.Fatal(err)
@@ -400,7 +402,7 @@ func TestRunnerMountsNeedsContextForDependentJob(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "report", Namespace: "default", UID: types.UID("job-uid")},
 		Spec:       actionsv1alpha1.WorkflowJobSpec{Needs: []string{"build"}},
 	}
-	runnerObject := &actionsv1alpha1.Runner{Spec: actionsv1alpha1.RunnerSpec{Execution: actionsv1alpha1.RunnerExecutionSpec{Image: "runner:test"}}}
+	runnerObject := &actionsv1alpha1.Runner{Spec: actionsv1alpha1.RunnerSpec{Execution: runnerExecution("runner:test")}}
 	job, err := reconciler.buildJob(workflowJob, &actionsv1alpha1.WorkflowRun{}, &actionsv1alpha1.Project{}, runnerObject, nativeJobStartDeadline)
 	if err != nil {
 		t.Fatal(err)
@@ -427,7 +429,7 @@ func TestRunnerBuildsJobWithProjectValues(t *testing.T) {
 			Variables: &actionsv1alpha1.ProjectVariableSource{ConfigMapRef: corev1.LocalObjectReference{Name: "project-variables"}},
 		},
 	}
-	runnerObject := &actionsv1alpha1.Runner{Spec: actionsv1alpha1.RunnerSpec{Execution: actionsv1alpha1.RunnerExecutionSpec{Image: "runner:test"}}}
+	runnerObject := &actionsv1alpha1.Runner{Spec: actionsv1alpha1.RunnerSpec{Execution: runnerExecution("runner:test")}}
 	workflowJob := &actionsv1alpha1.WorkflowJob{ObjectMeta: metav1.ObjectMeta{Name: "ci-build", Namespace: "default", UID: types.UID("workflow-job-uid")}}
 	job, err := reconciler.buildJob(workflowJob, &actionsv1alpha1.WorkflowRun{}, project, runnerObject, nativeJobStartDeadline)
 	if err != nil {
@@ -468,7 +470,7 @@ func TestRunnerWithholdsProjectSecretsFromForkPullRequests(t *testing.T) {
 		Variables: &actionsv1alpha1.ProjectVariableSource{ConfigMapRef: corev1.LocalObjectReference{Name: "project-variables"}},
 	}}
 	run := &actionsv1alpha1.WorkflowRun{Spec: actionsv1alpha1.WorkflowRunSpec{ForkPullRequest: &actionsv1alpha1.WorkflowRunForkPullRequest{}}}
-	runnerObject := &actionsv1alpha1.Runner{Spec: actionsv1alpha1.RunnerSpec{Execution: actionsv1alpha1.RunnerExecutionSpec{Image: "runner:test"}}}
+	runnerObject := &actionsv1alpha1.Runner{Spec: actionsv1alpha1.RunnerSpec{Execution: runnerExecution("runner:test")}}
 	workflowJob := &actionsv1alpha1.WorkflowJob{ObjectMeta: metav1.ObjectMeta{Name: "ci-build", Namespace: "default", UID: types.UID("workflow-job-uid")}}
 	job, err := reconciler.buildJob(workflowJob, run, project, runnerObject, nativeJobStartDeadline)
 	if err != nil {
@@ -511,7 +513,7 @@ func TestRunnerBuildsJobWithArtifactCredential(t *testing.T) {
 	}
 	run := &actionsv1alpha1.WorkflowRun{}
 	workflowJob := &actionsv1alpha1.WorkflowJob{ObjectMeta: metav1.ObjectMeta{Name: "build", Namespace: "default", UID: types.UID("job-uid")}}
-	runnerObject := &actionsv1alpha1.Runner{Spec: actionsv1alpha1.RunnerSpec{Execution: actionsv1alpha1.RunnerExecutionSpec{Image: "runner:test"}}}
+	runnerObject := &actionsv1alpha1.Runner{Spec: actionsv1alpha1.RunnerSpec{Execution: runnerExecution("runner:test")}}
 	job, err := reconciler.buildJob(workflowJob, run, &actionsv1alpha1.Project{}, runnerObject, nativeJobStartDeadline)
 	if err != nil {
 		t.Fatal(err)
@@ -539,16 +541,32 @@ func TestRunnerBuildsDockerEnabledJob(t *testing.T) {
 	reconciler := &RunnerReconciler{Client: fake.NewClientBuilder().WithScheme(scheme).Build()}
 	runnerObject := &actionsv1alpha1.Runner{
 		ObjectMeta: metav1.ObjectMeta{Name: "runner-1", Namespace: "default", UID: types.UID("runner-uid")},
-		Spec: actionsv1alpha1.RunnerSpec{Execution: actionsv1alpha1.RunnerExecutionSpec{
-			Image: "runner:test",
-			Docker: &actionsv1alpha1.RunnerDockerSpec{
-				Image: "docker:dind",
-				Resources: &actionsv1alpha1.RunnerResources{
-					Requests: actionsv1alpha1.RunnerResourceList{corev1.ResourceCPU: resource.MustParse("500m")},
-					Limits:   actionsv1alpha1.RunnerResourceList{corev1.ResourceEphemeralStorage: resource.MustParse("6Gi")},
+		Spec: actionsv1alpha1.RunnerSpec{
+			Execution: actionsv1alpha1.RunnerExecutionSpec{
+				Resources: &actionsv1alpha1.RunnerPodResources{
+					Requests: actionsv1alpha1.RunnerPodResourceList{
+						corev1.ResourceCPU:    resource.MustParse("2"),
+						corev1.ResourceMemory: resource.MustParse("4Gi"),
+					},
+					Limits: actionsv1alpha1.RunnerPodResourceList{
+						corev1.ResourceCPU:    resource.MustParse("4"),
+						corev1.ResourceMemory: resource.MustParse("8Gi"),
+					},
+				},
+				Runner: actionsv1alpha1.RunnerContainerSpec{
+					Image: "runner:test",
+					Env:   []corev1.EnvVar{{Name: "GOMAXPROCS", Value: "4"}},
+				},
+				Docker: &actionsv1alpha1.RunnerDockerSpec{
+					Image: "docker:dind",
+					Env:   []corev1.EnvVar{{Name: "GOMAXPROCS", Value: "4"}},
+					Resources: &actionsv1alpha1.RunnerResources{
+						Requests: actionsv1alpha1.RunnerResourceList{corev1.ResourceCPU: resource.MustParse("500m")},
+						Limits:   actionsv1alpha1.RunnerResourceList{corev1.ResourceEphemeralStorage: resource.MustParse("6Gi")},
+					},
 				},
 			},
-		}},
+		},
 	}
 	workflowJob := &actionsv1alpha1.WorkflowJob{ObjectMeta: metav1.ObjectMeta{Name: "ci-kind", Namespace: "default", UID: types.UID("workflow-job-uid")}}
 	job, err := reconciler.buildJob(workflowJob, &actionsv1alpha1.WorkflowRun{}, &actionsv1alpha1.Project{}, runnerObject, nativeJobStartDeadline)
@@ -557,6 +575,9 @@ func TestRunnerBuildsDockerEnabledJob(t *testing.T) {
 	}
 
 	pod := job.Spec.Template.Spec
+	if pod.Resources == nil || pod.Resources.Requests.Cpu().Cmp(resource.MustParse("2")) != 0 || pod.Resources.Limits.Memory().Cmp(resource.MustParse("8Gi")) != 0 {
+		t.Fatalf("Pod resources = %#v", pod.Resources)
+	}
 	if len(pod.InitContainers) != 1 {
 		t.Fatalf("init containers = %#v", pod.InitContainers)
 	}
@@ -581,6 +602,13 @@ func TestRunnerBuildsDockerEnabledJob(t *testing.T) {
 	if docker.Resources.Requests.Cpu().String() != "500m" {
 		t.Errorf("Docker CPU request = %s", docker.Resources.Requests.Cpu().String())
 	}
+	dockerEnvironment := map[string]string{}
+	for _, variable := range docker.Env {
+		dockerEnvironment[variable.Name] = variable.Value
+	}
+	if dockerEnvironment["GOMAXPROCS"] != "4" || dockerEnvironment["DOCKER_HOST"] != dockerHost || dockerEnvironment["DOCKER_TLS_CERTDIR"] != "" {
+		t.Errorf("Docker environment = %#v", dockerEnvironment)
+	}
 
 	runnerContainer := pod.Containers[0]
 	environment := map[string]string{}
@@ -589,6 +617,12 @@ func TestRunnerBuildsDockerEnabledJob(t *testing.T) {
 	}
 	if environment["DOCKER_HOST"] != dockerHost {
 		t.Errorf("runner DOCKER_HOST = %q", environment["DOCKER_HOST"])
+	}
+	if environment["GOMAXPROCS"] != "4" {
+		t.Errorf("runner GOMAXPROCS = %q", environment["GOMAXPROCS"])
+	}
+	if len(runnerContainer.Resources.Requests) != 0 || len(runnerContainer.Resources.Limits) != 0 {
+		t.Errorf("runner container inherited Pod resources = %#v", runnerContainer.Resources)
 	}
 	expectedRunnerMounts := []corev1.VolumeMount{
 		{Name: jobPlanVolume, MountPath: jobPlanMountPath, ReadOnly: true},
@@ -619,13 +653,273 @@ func TestRunnerBuildsDockerEnabledJob(t *testing.T) {
 	}
 }
 
+func TestRunnerNativeJobCreationRequiresSupportedPodResources(t *testing.T) {
+	scheme := runnerTestScheme(t)
+	clusterClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+	createClient := &recordingCreateClient{
+		Client: clusterClient,
+		err:    apierrors.NewBadRequest("strict decoding error: unknown field spec.template.spec.resources"),
+	}
+	reconciler := &RunnerReconciler{Client: createClient}
+	nativeJob := nativeJobWithPodResources()
+	workflowJob := &actionsv1alpha1.WorkflowJob{ObjectMeta: metav1.ObjectMeta{Name: "build", Namespace: "default"}}
+
+	err := reconciler.createNativeJob(context.Background(), nativeJob, workflowJob)
+	if err == nil || !strings.Contains(err.Error(), `native Job "build"`) || !strings.Contains(err.Error(), `WorkflowJob "build"`) ||
+		!strings.Contains(err.Error(), "Kubernetes 1.34") || !strings.Contains(err.Error(), "PodLevelResources") {
+		t.Fatalf("error = %v", err)
+	}
+	configurationError := &runnerExecutionConfigurationError{}
+	if !errors.As(err, &configurationError) || configurationError.reason != podLevelResourcesUnsupportedReason {
+		t.Fatalf("configuration error = %#v", configurationError)
+	}
+	if len(createClient.calls) != 1 || createClient.calls[0].FieldValidation != metav1.FieldValidationStrict ||
+		!slices.Contains(createClient.calls[0].DryRun, metav1.DryRunAll) {
+		t.Fatalf("create calls = %#v", createClient.calls)
+	}
+}
+
+func TestRunnerNativeJobCreationDetectsDroppedPodResources(t *testing.T) {
+	scheme := runnerTestScheme(t)
+	createClient := &recordingCreateClient{
+		Client:           fake.NewClientBuilder().WithScheme(scheme).Build(),
+		dropPodResources: true,
+	}
+	reconciler := &RunnerReconciler{Client: createClient}
+	nativeJob := nativeJobWithPodResources()
+	workflowJob := &actionsv1alpha1.WorkflowJob{ObjectMeta: metav1.ObjectMeta{Name: "build", Namespace: "default"}}
+
+	err := reconciler.createNativeJob(context.Background(), nativeJob, workflowJob)
+	if err == nil || !strings.Contains(err.Error(), "API server dropped spec.template.spec.resources") ||
+		!strings.Contains(err.Error(), "PodLevelResources") {
+		t.Fatalf("error = %v", err)
+	}
+	configurationError := &runnerExecutionConfigurationError{}
+	if !errors.As(err, &configurationError) || configurationError.reason != podLevelResourcesUnsupportedReason {
+		t.Fatalf("configuration error = %#v", configurationError)
+	}
+	if len(createClient.calls) != 1 || !slices.Contains(createClient.calls[0].DryRun, metav1.DryRunAll) {
+		t.Fatalf("create calls = %#v", createClient.calls)
+	}
+}
+
+func TestRunnerNativeJobCreationReportsInvalidPodResources(t *testing.T) {
+	scheme := runnerTestScheme(t)
+	createClient := &recordingCreateClient{
+		Client: fake.NewClientBuilder().WithScheme(scheme).Build(),
+		err: &apierrors.StatusError{ErrStatus: metav1.Status{
+			Status: metav1.StatusFailure, Reason: metav1.StatusReasonInvalid, Code: http.StatusUnprocessableEntity,
+			Message: "Pod resource requests exceed limits",
+			Details: &metav1.StatusDetails{Causes: []metav1.StatusCause{{
+				Type: metav1.CauseTypeFieldValueInvalid, Field: "spec.template.spec.resources.requests[cpu]",
+			}}},
+		}},
+	}
+	reconciler := &RunnerReconciler{Client: createClient}
+
+	err := reconciler.createNativeJob(context.Background(), nativeJobWithPodResources(), &actionsv1alpha1.WorkflowJob{ObjectMeta: metav1.ObjectMeta{Name: "build"}})
+	configurationError := &runnerExecutionConfigurationError{}
+	if !errors.As(err, &configurationError) || configurationError.reason != podLevelResourcesInvalidReason {
+		t.Fatalf("configuration error = %#v", configurationError)
+	}
+}
+
+func TestRunnerNativeJobCreationDoesNotMisclassifyOtherValidationErrors(t *testing.T) {
+	scheme := runnerTestScheme(t)
+	createClient := &recordingCreateClient{
+		Client: fake.NewClientBuilder().WithScheme(scheme).Build(),
+		err: &apierrors.StatusError{ErrStatus: metav1.Status{
+			Status: metav1.StatusFailure, Reason: metav1.StatusReasonInvalid, Code: http.StatusUnprocessableEntity,
+			Message: "Runner environment variable name is invalid",
+			Details: &metav1.StatusDetails{Causes: []metav1.StatusCause{{
+				Type: metav1.CauseTypeFieldValueInvalid, Field: "spec.template.spec.containers[0].env[0].name",
+			}}},
+		}},
+	}
+	reconciler := &RunnerReconciler{Client: createClient}
+
+	err := reconciler.createNativeJob(context.Background(), nativeJobWithPodResources(), &actionsv1alpha1.WorkflowJob{ObjectMeta: metav1.ObjectMeta{Name: "build"}})
+	if err == nil {
+		t.Fatal("validation error was not returned")
+	}
+	configurationError := &runnerExecutionConfigurationError{}
+	if errors.As(err, &configurationError) {
+		t.Fatalf("unrelated validation error was classified as %q", configurationError.reason)
+	}
+}
+
+func TestRunnerBlocksAfterUnsupportedPodLevelResources(t *testing.T) {
+	scheme := runnerTestScheme(t)
+	runnerObject := &actionsv1alpha1.Runner{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "runner", Namespace: "default", UID: types.UID("runner-uid"), Generation: 2,
+			Finalizers: []string{runnerFinalizer},
+		},
+		Spec: actionsv1alpha1.RunnerSpec{
+			Execution: actionsv1alpha1.RunnerExecutionSpec{
+				Runner: actionsv1alpha1.RunnerContainerSpec{Image: "runner:test"},
+				Resources: &actionsv1alpha1.RunnerPodResources{
+					Requests: actionsv1alpha1.RunnerPodResourceList{corev1.ResourceCPU: resource.MustParse("1")},
+				},
+			},
+		},
+		Status: actionsv1alpha1.RunnerStatus{WorkflowJobRef: &corev1.LocalObjectReference{Name: "build"}},
+	}
+	workflowJob := &actionsv1alpha1.WorkflowJob{
+		ObjectMeta: metav1.ObjectMeta{Name: "build", Namespace: "default", UID: types.UID("job-uid")},
+		Status: actionsv1alpha1.WorkflowJobStatus{
+			RunnerRef: &corev1.LocalObjectReference{Name: runnerObject.Name},
+			Conditions: []metav1.Condition{{
+				Type: actionsv1alpha1.WorkflowJobConditionScheduled, Status: metav1.ConditionTrue, Reason: "RunnerAssigned",
+			}},
+		},
+	}
+	queuedJob := &actionsv1alpha1.WorkflowJob{ObjectMeta: metav1.ObjectMeta{Name: "queued", Namespace: "default"}}
+	clusterClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithIndex(&actionsv1alpha1.WorkflowJob{}, workflowJobRunnerNameIndex, indexWorkflowJobRunnerName).
+		WithStatusSubresource(&actionsv1alpha1.Runner{}, &actionsv1alpha1.WorkflowJob{}).
+		WithObjects(runnerObject, workflowJob, queuedJob).
+		Build()
+	reconciler := &RunnerReconciler{Client: clusterClient, APIReader: clusterClient}
+	message := "The API server does not support Pod-level resources"
+	if err := reconciler.blockRunnerForExecutionConfiguration(context.Background(), runnerObject, workflowJob, podLevelResourcesUnsupportedReason, message); err != nil {
+		t.Fatal(err)
+	}
+
+	storedJob := &actionsv1alpha1.WorkflowJob{}
+	if err := clusterClient.Get(context.Background(), client.ObjectKeyFromObject(workflowJob), storedJob); err != nil {
+		t.Fatal(err)
+	}
+	succeeded := meta.FindStatusCondition(storedJob.Status.Conditions, actionsv1alpha1.WorkflowJobConditionSucceeded)
+	if succeeded == nil || succeeded.Status != metav1.ConditionFalse || succeeded.Reason != podLevelResourcesUnsupportedReason {
+		t.Fatalf("WorkflowJob succeeded condition = %#v", succeeded)
+	}
+
+	storedRunner := &actionsv1alpha1.Runner{}
+	if err := clusterClient.Get(context.Background(), client.ObjectKeyFromObject(runnerObject), storedRunner); err != nil {
+		t.Fatal(err)
+	}
+	ready := meta.FindStatusCondition(storedRunner.Status.Conditions, actionsv1alpha1.RunnerConditionReady)
+	if ready == nil || ready.Status != metav1.ConditionFalse || ready.Reason != podLevelResourcesUnsupportedReason || ready.Message != message {
+		t.Fatalf("Runner ready condition = %#v", ready)
+	}
+	if storedRunner.Status.WorkflowJobRef != nil {
+		t.Fatalf("Runner assignment = %#v", storedRunner.Status.WorkflowJobRef)
+	}
+
+	result, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(runnerObject)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.RequeueAfter != 30*time.Second {
+		t.Fatalf("requeue after = %s", result.RequeueAfter)
+	}
+	if err := clusterClient.Get(context.Background(), client.ObjectKeyFromObject(queuedJob), queuedJob); err != nil {
+		t.Fatal(err)
+	}
+	if queuedJob.Status.RunnerRef != nil {
+		t.Fatalf("queued WorkflowJob was claimed: %#v", queuedJob.Status.RunnerRef)
+	}
+
+	storedRunner.Generation++
+	storedRunner.Spec.Execution.Runner.Image = "runner:updated"
+	if err := clusterClient.Update(context.Background(), storedRunner); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(runnerObject)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := clusterClient.Get(context.Background(), client.ObjectKeyFromObject(runnerObject), storedRunner); err != nil {
+		t.Fatal(err)
+	}
+	ready = meta.FindStatusCondition(storedRunner.Status.Conditions, actionsv1alpha1.RunnerConditionReady)
+	if ready == nil || ready.Reason != "ProjectUnavailable" {
+		t.Fatalf("Runner did not retry after its execution spec changed: %#v", ready)
+	}
+}
+
+func TestRunnerWithoutImageDoesNotClaimWorkflowJobs(t *testing.T) {
+	scheme := runnerTestScheme(t)
+	runnerObject := &actionsv1alpha1.Runner{
+		ObjectMeta: metav1.ObjectMeta{Name: "runner", Namespace: "default", UID: types.UID("runner-uid"), Finalizers: []string{runnerFinalizer}},
+	}
+	workflowJob := &actionsv1alpha1.WorkflowJob{ObjectMeta: metav1.ObjectMeta{Name: "queued", Namespace: "default"}}
+	clusterClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithIndex(&actionsv1alpha1.WorkflowJob{}, workflowJobRunnerNameIndex, indexWorkflowJobRunnerName).
+		WithStatusSubresource(&actionsv1alpha1.Runner{}, &actionsv1alpha1.WorkflowJob{}).
+		WithObjects(runnerObject, workflowJob).
+		Build()
+	reconciler := &RunnerReconciler{Client: clusterClient, APIReader: clusterClient}
+
+	result, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(runnerObject)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.RequeueAfter != 30*time.Second {
+		t.Fatalf("requeue after = %s", result.RequeueAfter)
+	}
+	storedRunner := &actionsv1alpha1.Runner{}
+	if err := clusterClient.Get(context.Background(), client.ObjectKeyFromObject(runnerObject), storedRunner); err != nil {
+		t.Fatal(err)
+	}
+	ready := meta.FindStatusCondition(storedRunner.Status.Conditions, actionsv1alpha1.RunnerConditionReady)
+	if ready == nil || ready.Status != metav1.ConditionFalse || ready.Reason != runnerConfigurationInvalidReason {
+		t.Fatalf("Runner ready condition = %#v", ready)
+	}
+	if err := clusterClient.Get(context.Background(), client.ObjectKeyFromObject(workflowJob), workflowJob); err != nil {
+		t.Fatal(err)
+	}
+	if workflowJob.Status.RunnerRef != nil {
+		t.Fatalf("WorkflowJob was claimed: %#v", workflowJob.Status.RunnerRef)
+	}
+}
+
+func TestRunnerNativeJobCreationPreservesPodResources(t *testing.T) {
+	scheme := runnerTestScheme(t)
+	clusterClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+	createClient := &recordingCreateClient{Client: clusterClient}
+	reconciler := &RunnerReconciler{Client: createClient}
+	nativeJob := nativeJobWithPodResources()
+	workflowJob := &actionsv1alpha1.WorkflowJob{ObjectMeta: metav1.ObjectMeta{Name: "build", Namespace: "default"}}
+
+	if err := reconciler.createNativeJob(context.Background(), nativeJob, workflowJob); err != nil {
+		t.Fatal(err)
+	}
+	if len(createClient.calls) != 2 || !slices.Contains(createClient.calls[0].DryRun, metav1.DryRunAll) ||
+		len(createClient.calls[1].DryRun) != 0 || createClient.calls[1].FieldValidation != metav1.FieldValidationStrict {
+		t.Fatalf("create calls = %#v", createClient.calls)
+	}
+	created := &batchv1.Job{}
+	if err := clusterClient.Get(context.Background(), client.ObjectKeyFromObject(nativeJob), created); err != nil {
+		t.Fatal(err)
+	}
+	if !podResourceRequirementsPreserved(nativeJob.Spec.Template.Spec.Resources, created.Spec.Template.Spec.Resources) {
+		t.Fatalf("created Pod resources = %#v", created.Spec.Template.Spec.Resources)
+	}
+}
+
+func TestPodResourceRequirementsPreservedAllowsServerDefaults(t *testing.T) {
+	expected := &corev1.ResourceRequirements{
+		Limits: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1")},
+	}
+	actual := &corev1.ResourceRequirements{
+		Limits:   corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1000m")},
+		Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1")},
+	}
+	if !podResourceRequirementsPreserved(expected, actual) {
+		t.Fatalf("server-defaulted Pod resources were not preserved: %#v", actual)
+	}
+}
+
 func TestRunnerClaimsOldestMatchingWorkflowJobInProject(t *testing.T) {
 	scheme := runnerTestScheme(t)
 	created := metav1.NewTime(time.Unix(100, 0))
 	runnerObject := &actionsv1alpha1.Runner{
 		ObjectMeta: metav1.ObjectMeta{Name: "runner-1", Namespace: "default", UID: types.UID("runner-uid")},
 		Spec: actionsv1alpha1.RunnerSpec{
-			Execution: actionsv1alpha1.RunnerExecutionSpec{Image: "runner:test"},
+			Execution: runnerExecution("runner:test"),
 			Labels:    []string{"self-hosted", "linux", "arm64"},
 		},
 	}
@@ -909,7 +1203,7 @@ func TestRunnerDoesNotClaimWorkflowJobBeforePlanningCompletes(t *testing.T) {
 	runnerObject := &actionsv1alpha1.Runner{
 		ObjectMeta: metav1.ObjectMeta{Name: "runner-1", Namespace: "default", UID: types.UID("runner-uid")},
 		Spec: actionsv1alpha1.RunnerSpec{
-			Execution: actionsv1alpha1.RunnerExecutionSpec{Image: "runner:test"},
+			Execution: runnerExecution("runner:test"),
 			Labels:    []string{"linux"},
 		},
 	}
@@ -1817,7 +2111,7 @@ func testExecuteWorkflowJobMintsPlannedTokenPermissions(t *testing.T, steps []ru
 	credentials := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "github", Namespace: "default"}, Data: map[string][]byte{"private-key": privateKeyData}}
 	runnerObject := &actionsv1alpha1.Runner{
 		ObjectMeta: metav1.ObjectMeta{Name: "runner", Namespace: "default", UID: types.UID("runner-uid")},
-		Spec:       actionsv1alpha1.RunnerSpec{Execution: actionsv1alpha1.RunnerExecutionSpec{Image: "runner:test"}},
+		Spec:       actionsv1alpha1.RunnerSpec{Execution: runnerExecution("runner:test")},
 	}
 	clusterClient := fake.NewClientBuilder().WithScheme(scheme).
 		WithStatusSubresource(&actionsv1alpha1.WorkflowJob{}, &batchv1.Job{}).
@@ -2611,9 +2905,48 @@ func runnerTestScheme(t *testing.T) *runtime.Scheme {
 	return scheme
 }
 
+func runnerExecution(image string) actionsv1alpha1.RunnerExecutionSpec {
+	return actionsv1alpha1.RunnerExecutionSpec{
+		Runner: actionsv1alpha1.RunnerContainerSpec{Image: image},
+	}
+}
+
+func nativeJobWithPodResources() *batchv1.Job {
+	return &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{Name: "build", Namespace: "default"},
+		Spec: batchv1.JobSpec{Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{
+			Resources: &corev1.ResourceRequirements{
+				Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1")},
+			},
+		}}},
+	}
+}
+
 type podListErrorReader struct {
 	client.Reader
 	err error
+}
+
+type recordingCreateClient struct {
+	client.Client
+	calls            []*client.CreateOptions
+	dropPodResources bool
+	err              error
+}
+
+func (c *recordingCreateClient) Create(ctx context.Context, object client.Object, options ...client.CreateOption) error {
+	createOptions := (&client.CreateOptions{}).ApplyOptions(options)
+	c.calls = append(c.calls, createOptions)
+	if c.err != nil {
+		return c.err
+	}
+	if slices.Contains(createOptions.DryRun, metav1.DryRunAll) {
+		if c.dropPodResources {
+			object.(*batchv1.Job).Spec.Template.Spec.Resources = nil
+		}
+		return nil
+	}
+	return c.Client.Create(ctx, object, options...)
 }
 
 func (r *podListErrorReader) List(ctx context.Context, list client.ObjectList, options ...client.ListOption) error {

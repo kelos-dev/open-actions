@@ -217,6 +217,22 @@ Open Actions exposes the namespaced `Project`, `Runner`, `RunnerSet`,
 schemas define their fields and validation. Example manifests are available
 under [`config/samples`](../config/samples).
 
+### Runner execution API upgrade
+
+This release makes a breaking change to the alpha Runner execution API. Update
+Runner and RunnerSet manifests before upgrading, then reapply them immediately
+after the upgrade. Existing resources are not converted automatically. Move
+`spec.execution.image`, `spec.execution.env`, and
+`spec.execution.imagePullPolicy` under `spec.execution.runner`. Move the former
+runner-container `spec.execution.resources` to
+`spec.execution.runner.resources`.
+`spec.execution.resources` now means the resource budget for the whole workflow
+Pod. Suspend incoming workflows during the migration so stale Runners do not
+receive assignments. On Kubernetes 1.29, validation of the new required fields
+can prevent stale Runners from recording `Ready=False`; the controller still
+refuses to claim jobs, so reapply the resources instead of waiting for the
+condition.
+
 All references resolve within the resource's namespace. A `Project` selects its
 integration through the discriminated `spec.source` union. The supported
 variant is `type: GitHub`, with GitHub App configuration under `source.github`.
@@ -238,14 +254,35 @@ immutable `spec.source.github.actor` records the source actor. Set
 allowing cancellation-aware reporting and cleanup jobs to finish. Deleting a
 WorkflowRun force-cancels and removes its child resources. A Runner's
 `spec.projectRef` is immutable, and changes to `spec.execution` apply only to
-Kubernetes Jobs created afterward. `spec.execution.env` accepts up to 100
+Kubernetes Jobs created afterward. `spec.execution.resources` sets CPU, memory,
+and huge page requests and limits for the workflow Pod as a whole. Requests
+cannot exceed their corresponding limits. During native Job validation,
+Kubernetes also requires huge page requests to equal their limits and be
+accompanied by a CPU or memory request or limit. Kubernetes applies this shared
+budget ahead of container-level CPU and memory values while still allowing
+container-level resources for allocation within the Pod. A Pod-level request
+must be at least the aggregate request of the Pod's containers, and each
+container limit must not exceed the corresponding Pod limit. Pod-level resources
+require Kubernetes 1.34 or newer and the `PodLevelResources` feature gate enabled
+on the control plane and every node. The field is optional, so clusters at the
+general 1.29 minimum remain supported when it is omitted. When it is configured,
+the controller uses a strict dry-run to verify that the API server accepts and
+preserves the field before creating the native Job. Unsupported fields set the
+Runner `Ready=False` with reason `PodLevelResourcesUnsupported`; resource values
+rejected by Kubernetes use `PodLevelResourcesInvalid`. The assigned WorkflowJob
+fails immediately with the same reason, and the Runner does not accept another
+job until its spec changes. After upgrading the cluster or enabling the feature
+gate, change the Runner spec, such as `spec.execution`, or the RunnerSet template
+to trigger validation again. A node with the feature gate disabled rejects the
+workflow Pod.
+`spec.execution.runner.env` accepts up to 100
 Kubernetes container environment variables with literal values or Kubernetes
 `valueFrom` sources. The variables are inherited by every workflow process on
 that Runner, but are not added to the workflow `env` expression context.
 Secret-backed values are exposed to every assigned workflow, including fork
 pull requests regardless of `spec.source.github.forkPullRequests.sendSecrets`.
 Controller-defined variables take precedence over configured entries with the
-same name. `spec.execution.imagePullPolicy` controls
+same name. `spec.execution.runner.imagePullPolicy` controls
 when Kubernetes pulls the runner image and accepts `Always`, `IfNotPresent`, or
 `Never`; omitting it uses Kubernetes defaulting. `spec.execution.imagePullSecrets`
 accepts up to 32 unique Secret references in the Runner's namespace that
@@ -616,8 +653,8 @@ docker build \
 docker push registry.example/custom-runner:latest
 ```
 
-Set `spec.execution.image` on a Runner or
-`spec.template.spec.execution.image` on a RunnerSet to the published address.
+Set `spec.execution.runner.image` on a Runner or
+`spec.template.spec.execution.runner.image` on a RunnerSet to the published address.
 Using the same Open Actions release for the controller and base runner keeps
 their job-plan versions compatible. Preserve the inherited entrypoint and
 numeric non-root user. The complete example Dockerfile is available at
@@ -640,9 +677,36 @@ for a complete manifest.
 `spec.execution.docker` enables a job-scoped Docker daemon. Its required
 `image` field identifies a Docker-in-Docker image whose entrypoint accepts
 `dockerd` as its first argument and that provides the `docker` CLI used by the
-startup probe. `resources` uses the same requests and limits schema as the
-runner container. When an `ephemeral-storage` limit is present, the controller
-also applies it as the Docker data volume's size limit.
+startup probe. `env` configures environment variables on the Docker daemon
+container; the controller's `DOCKER_HOST` and `DOCKER_TLS_CERTDIR` values take
+precedence. `resources` uses the same requests and limits schema as the runner
+container. When an `ephemeral-storage` limit is present, the controller also
+applies it as the Docker data volume's size limit.
+
+Use `spec.execution.resources` for a CPU and memory budget shared by the runner,
+Docker daemon, and workflow containers. Keep `spec.execution.runner.resources` and
+`spec.execution.docker.resources` when individual container allocation is also
+needed. Docker `ephemeral-storage` remains container-level because Kubernetes
+does not support it in a Pod-level resource budget.
+
+The shared budget is optional and requires Kubernetes 1.34 or newer with
+`PodLevelResources` enabled:
+
+```yaml
+spec:
+  execution:
+    resources:
+      requests:
+        cpu: "2"
+        memory: 4Gi
+      limits:
+        cpu: "4"
+        memory: 8Gi
+    runner:
+      image: ghcr.io/kelos-dev/open-actions-runner:latest
+    docker:
+      image: docker:29.7.2-dind
+```
 
 The controller runs the daemon as a privileged Kubernetes native sidecar and
 connects the runner through a private Unix socket exposed as `DOCKER_HOST`.
@@ -758,7 +822,7 @@ The resources expose these condition contracts:
 | `Project` | `Configured` | `True` | `ConfigurationValid` |
 | `Project` | `Configured` | `False` | `DuplicateInstallation`, `CredentialsUnavailable`, `InvalidCredentials`, `ProjectValuesUnavailable` |
 | `Runner` | `Ready` | `True` | `Ready` |
-| `Runner` | `Ready` | `False` | `ProjectUnavailable`, `ProjectNotConfigured` |
+| `Runner` | `Ready` | `False` | `ConfigurationInvalid`, `PodLevelResourcesInvalid`, `PodLevelResourcesUnsupported`, `ProjectUnavailable`, `ProjectNotConfigured` |
 | `Runner` | `Busy` | `False` | `Idle` |
 | `Runner` | `Busy` | `True` | `JobAssigned` |
 | `RunnerSet` | `Ready` | `True` | `RunnersReady` |
@@ -781,7 +845,7 @@ The resources expose these condition contracts:
 | `WorkflowJob` | `Scheduled` | `False` | `ConditionFalse`, `ConditionEvaluationFailed`, `JobPlanningFailed`, `ConcurrencyEvaluationFailed`, `ConcurrencySuperseded`, `ConcurrencyCancelled`, `CancellationRequested`, `MatrixFailFast`, `ProjectRecreated` |
 | `WorkflowJob` | `Succeeded` | `Unknown` | `JobRunning` |
 | `WorkflowJob` | `Succeeded` | `True` | `JobSucceeded` |
-| `WorkflowJob` | `Succeeded` | `False` | `JobFailed`, `JobTimedOut`, `JobCancelled`, `JobResultInvalid`, `ConditionEvaluationFailed`, `JobPlanningFailed`, `ConcurrencyEvaluationFailed`, `PlanUnavailable`, `JobStartFailed`, `GitHubTokenPermissionsRejected`, `ExecutionStateLost`, `CancellationRequested`, `MatrixFailFast`, `ProjectRecreated` |
+| `WorkflowJob` | `Succeeded` | `False` | `JobFailed`, `JobTimedOut`, `JobCancelled`, `JobResultInvalid`, `ConditionEvaluationFailed`, `JobPlanningFailed`, `ConcurrencyEvaluationFailed`, `PlanUnavailable`, `JobStartFailed`, `GitHubTokenPermissionsRejected`, `ExecutionStateLost`, `CancellationRequested`, `MatrixFailFast`, `ProjectRecreated`, `PodLevelResourcesInvalid`, `PodLevelResourcesUnsupported` |
 | `WorkflowJob` | `CancellationRequested` | `True` | `CancellationRequested`, `ConditionEvaluationFailed`, `ConcurrencyCancelled`, `MatrixFailFast` |
 | `WorkflowJob` | `CancellationRequested` | `False` | `ConditionPassed` |
 
@@ -1569,8 +1633,8 @@ schedule, repository identity, and supported event metadata.
 
 The controller emits job-plan version 9, and the runner accepts versions 1
 through 9. When a release changes the job-plan version, update every Runner
-`spec.execution.image` to an image that accepts both the installed and target
-controller versions before upgrading the controller. The received job-plan
+`spec.execution.runner.image` to an image that accepts both the installed and
+target controller versions before upgrading the controller. The received job-plan
 version also determines the runner result version: plan versions 1 through 5
 use result version 1, and plan versions 6 through 9 use result version 2. A
 runner that accepts more than one plan version must emit the result version

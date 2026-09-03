@@ -678,7 +678,7 @@ func TestWorkflowRunAcceptsGitHubCheckRunStatusContract(t *testing.T) {
 func TestRunnerAcceptsQualifiedResourceNames(t *testing.T) {
 	crd, _ := loadCRD(t, "actions.kelos.dev_runners.yaml")
 	object := loadSample(t, "actions_v1alpha1_runner.yaml")
-	resources := object["spec"].(map[string]any)["execution"].(map[string]any)["resources"].(map[string]any)
+	resources := object["spec"].(map[string]any)["execution"].(map[string]any)["runner"].(map[string]any)["resources"].(map[string]any)
 	resources["requests"].(map[string]any)["example.com/accelerator"] = "1"
 	resources["limits"].(map[string]any)["example.com/accelerator"] = "1"
 	if errs := validateObject(t, crd, object, nil); len(errs) > 0 {
@@ -689,6 +689,73 @@ func TestRunnerAcceptsQualifiedResourceNames(t *testing.T) {
 func TestRunnerAcceptsDockerExecution(t *testing.T) {
 	crd, _ := loadCRD(t, "actions.kelos.dev_runners.yaml")
 	validateSample(t, crd, "actions_v1alpha1_docker_runner.yaml")
+}
+
+func TestRunnerPodResourcesAcceptOnlySupportedResources(t *testing.T) {
+	tests := []struct {
+		name       string
+		requests   map[string]any
+		limits     map[string]any
+		wantErrors bool
+	}{
+		{name: "CPU", requests: map[string]any{"cpu": "1"}, limits: map[string]any{"cpu": "2"}},
+		{name: "integer CPU", requests: map[string]any{"cpu": int64(1)}, limits: map[string]any{"cpu": int64(2)}},
+		{name: "memory", requests: map[string]any{"memory": "1Gi"}, limits: map[string]any{"memory": "2Gi"}},
+		{
+			name:     "huge pages",
+			requests: map[string]any{"cpu": "1", "hugepages-2Mi": "1Gi"},
+			limits:   map[string]any{"cpu": "2", "hugepages-2Mi": "1Gi"},
+		},
+		{name: "ephemeral storage", requests: map[string]any{"ephemeral-storage": "1Gi"}, limits: map[string]any{"ephemeral-storage": "2Gi"}, wantErrors: true},
+		{name: "extended resource", requests: map[string]any{"example.com/accelerator": "1"}, limits: map[string]any{"example.com/accelerator": "1"}, wantErrors: true},
+		{name: "request above limit", requests: map[string]any{"cpu": "3"}, limits: map[string]any{"cpu": "2"}, wantErrors: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			crd, _ := loadCRD(t, "actions.kelos.dev_runners.yaml")
+			object := loadSample(t, "actions_v1alpha1_runner.yaml")
+			execution := object["spec"].(map[string]any)["execution"].(map[string]any)
+			execution["resources"] = map[string]any{
+				"requests": test.requests,
+				"limits":   test.limits,
+			}
+			errs := validateObject(t, crd, object, nil)
+			if test.wantErrors && len(errs) == 0 {
+				t.Fatal("invalid Pod-level resources passed validation")
+			}
+			if !test.wantErrors && len(errs) > 0 {
+				t.Fatalf("valid Pod-level resources were rejected: %v", errs.ToAggregate())
+			}
+		})
+	}
+}
+
+func TestRunnerPodResourcesMustNotBeEmpty(t *testing.T) {
+	tests := []struct {
+		name      string
+		resources map[string]any
+		wantError bool
+	}{
+		{name: "empty resources", resources: map[string]any{}, wantError: true},
+		{name: "empty requests", resources: map[string]any{"requests": map[string]any{}}, wantError: true},
+		{name: "empty limits", resources: map[string]any{"limits": map[string]any{}}, wantError: true},
+		{name: "empty requests with a limit", resources: map[string]any{"requests": map[string]any{}, "limits": map[string]any{"cpu": "1"}}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			crd, _ := loadCRD(t, "actions.kelos.dev_runners.yaml")
+			object := loadSample(t, "actions_v1alpha1_runner.yaml")
+			execution := object["spec"].(map[string]any)["execution"].(map[string]any)
+			execution["resources"] = test.resources
+			errs := validateObject(t, crd, object, nil)
+			if test.wantError && len(errs) == 0 {
+				t.Fatal("empty Pod-level resources passed validation")
+			}
+			if !test.wantError && len(errs) > 0 {
+				t.Fatalf("non-empty Pod-level resources were rejected: %v", errs.ToAggregate())
+			}
+		})
+	}
 }
 
 func TestRunnerSetTemplateProjectRefIsImmutable(t *testing.T) {
@@ -722,8 +789,8 @@ func TestRunnerImagePullPolicyContract(t *testing.T) {
 	for _, policy := range []string{"Always", "Never", "IfNotPresent"} {
 		t.Run(policy, func(t *testing.T) {
 			object := loadSample(t, "actions_v1alpha1_runner.yaml")
-			execution := object["spec"].(map[string]any)["execution"].(map[string]any)
-			execution["imagePullPolicy"] = policy
+			runner := object["spec"].(map[string]any)["execution"].(map[string]any)["runner"].(map[string]any)
+			runner["imagePullPolicy"] = policy
 			if errs := validateObject(t, crd, object, nil); len(errs) > 0 {
 				t.Fatalf("image pull policy %q was rejected: %v", policy, errs.ToAggregate())
 			}
@@ -731,8 +798,8 @@ func TestRunnerImagePullPolicyContract(t *testing.T) {
 	}
 
 	object := loadSample(t, "actions_v1alpha1_runner.yaml")
-	execution := object["spec"].(map[string]any)["execution"].(map[string]any)
-	execution["imagePullPolicy"] = "Sometimes"
+	runner := object["spec"].(map[string]any)["execution"].(map[string]any)["runner"].(map[string]any)
+	runner["imagePullPolicy"] = "Sometimes"
 	if errs := validateObject(t, crd, object, nil); len(errs) == 0 {
 		t.Fatal("invalid image pull policy passed validation")
 	}
@@ -741,8 +808,8 @@ func TestRunnerImagePullPolicyContract(t *testing.T) {
 func TestRunnerEnvironmentContract(t *testing.T) {
 	crd, _ := loadCRD(t, "actions.kelos.dev_runners.yaml")
 	object := loadSample(t, "actions_v1alpha1_runner.yaml")
-	execution := object["spec"].(map[string]any)["execution"].(map[string]any)
-	execution["env"] = []any{
+	runner := object["spec"].(map[string]any)["execution"].(map[string]any)["runner"].(map[string]any)
+	runner["env"] = []any{
 		map[string]any{"name": "CACHE_URL", "value": "https://cache.example"},
 		map[string]any{"name": "CACHE_TOKEN", "valueFrom": map[string]any{
 			"secretKeyRef": map[string]any{"name": "runner-environment", "key": "cache-token"},
@@ -756,12 +823,12 @@ func TestRunnerEnvironmentContract(t *testing.T) {
 	for index := range environment {
 		environment[index] = map[string]any{"name": fmt.Sprintf("VARIABLE_%d", index), "value": "value"}
 	}
-	execution["env"] = environment
+	runner["env"] = environment
 	if errs := validateObject(t, crd, object, nil); len(errs) == 0 {
 		t.Fatal("more than 100 runner environment variables passed validation")
 	}
 
-	execution["env"] = []any{
+	runner["env"] = []any{
 		map[string]any{"name": "CACHE_URL", "value": "one"},
 		map[string]any{"name": "CACHE_URL", "value": "two"},
 	}
@@ -900,8 +967,8 @@ func TestCRDConventions(t *testing.T) {
 			}
 			if tt.kind == "Runner" {
 				execution := spec.Properties["execution"]
-				if !slices.Contains(execution.Required, "image") {
-					t.Error("spec.execution.image is not required")
+				if !slices.Contains(execution.Required, "runner") {
+					t.Error("spec.execution.runner is not required")
 				}
 				terminationGracePeriod := execution.Properties["terminationGracePeriodSeconds"]
 				if slices.Contains(execution.Required, "terminationGracePeriodSeconds") {
@@ -913,20 +980,32 @@ func TestCRDConventions(t *testing.T) {
 				if slices.Contains(execution.Required, "docker") {
 					t.Error("spec.execution.docker is required")
 				}
-				environment := execution.Properties["env"]
-				if environment.MaxItems == nil || *environment.MaxItems != 100 || environment.XListType == nil || *environment.XListType != "map" || !slices.Contains(environment.XListMapKeys, "name") {
-					t.Errorf("spec.execution.env schema = %#v", environment)
+				runner := execution.Properties["runner"]
+				if !slices.Contains(runner.Required, "image") {
+					t.Error("spec.execution.runner.image is not required")
 				}
-				resources := execution.Properties["resources"]
+				environment := runner.Properties["env"]
+				if environment.MaxItems == nil || *environment.MaxItems != 100 || environment.XListType == nil || *environment.XListType != "map" || !slices.Contains(environment.XListMapKeys, "name") {
+					t.Errorf("spec.execution.runner.env schema = %#v", environment)
+				}
+				resources := runner.Properties["resources"]
 				for _, fieldName := range []string{"limits", "requests"} {
 					resourceList := resources.Properties[fieldName]
 					if resourceList.MaxProperties == nil || *resourceList.MaxProperties != 7 {
-						t.Errorf("spec.execution.resources.%s is not bounded to 7 entries", fieldName)
+						t.Errorf("spec.execution.runner.resources.%s is not bounded to 7 entries", fieldName)
+					}
+					podResourceList := execution.Properties["resources"].Properties[fieldName]
+					if podResourceList.MaxProperties == nil || *podResourceList.MaxProperties != 6 {
+						t.Errorf("spec.execution.resources.%s is not bounded to 6 entries", fieldName)
 					}
 				}
 				docker := execution.Properties["docker"]
 				if !slices.Contains(docker.Required, "image") {
 					t.Error("spec.execution.docker.image is not required")
+				}
+				dockerEnvironment := docker.Properties["env"]
+				if dockerEnvironment.MaxItems == nil || *dockerEnvironment.MaxItems != 100 || dockerEnvironment.XListType == nil || *dockerEnvironment.XListType != "map" || !slices.Contains(dockerEnvironment.XListMapKeys, "name") {
+					t.Errorf("spec.execution.docker.env schema = %#v", dockerEnvironment)
 				}
 			}
 			if tt.kind == "RunnerSet" {
@@ -1039,14 +1118,14 @@ func TestCRDRejectsInvalidCELValues(t *testing.T) {
 			name: "Runner execution with empty image",
 			crd:  "actions.kelos.dev_runners.yaml", sample: "actions_v1alpha1_runner.yaml",
 			mutate: func(object map[string]any) {
-				object["spec"].(map[string]any)["execution"].(map[string]any)["image"] = ""
+				object["spec"].(map[string]any)["execution"].(map[string]any)["runner"].(map[string]any)["image"] = ""
 			},
 		},
 		{
 			name: "Runner execution image containing whitespace",
 			crd:  "actions.kelos.dev_runners.yaml", sample: "actions_v1alpha1_runner.yaml",
 			mutate: func(object map[string]any) {
-				object["spec"].(map[string]any)["execution"].(map[string]any)["image"] = "runner image"
+				object["spec"].(map[string]any)["execution"].(map[string]any)["runner"].(map[string]any)["image"] = "runner image"
 			},
 		},
 		{
@@ -1060,7 +1139,7 @@ func TestCRDRejectsInvalidCELValues(t *testing.T) {
 			name: "Runner resource with invalid name",
 			crd:  "actions.kelos.dev_runners.yaml", sample: "actions_v1alpha1_runner.yaml",
 			mutate: func(object map[string]any) {
-				resources := object["spec"].(map[string]any)["execution"].(map[string]any)["resources"].(map[string]any)
+				resources := object["spec"].(map[string]any)["execution"].(map[string]any)["runner"].(map[string]any)["resources"].(map[string]any)
 				resources["requests"].(map[string]any)["invalid/name/again"] = "1"
 			},
 		},
@@ -1068,7 +1147,7 @@ func TestCRDRejectsInvalidCELValues(t *testing.T) {
 			name: "Runner resource with negative quantity",
 			crd:  "actions.kelos.dev_runners.yaml", sample: "actions_v1alpha1_runner.yaml",
 			mutate: func(object map[string]any) {
-				resources := object["spec"].(map[string]any)["execution"].(map[string]any)["resources"].(map[string]any)
+				resources := object["spec"].(map[string]any)["execution"].(map[string]any)["runner"].(map[string]any)["resources"].(map[string]any)
 				resources["limits"].(map[string]any)["cpu"] = "-1"
 			},
 		},
@@ -1076,7 +1155,7 @@ func TestCRDRejectsInvalidCELValues(t *testing.T) {
 			name: "Runner resource with non-standard unprefixed name",
 			crd:  "actions.kelos.dev_runners.yaml", sample: "actions_v1alpha1_runner.yaml",
 			mutate: func(object map[string]any) {
-				resources := object["spec"].(map[string]any)["execution"].(map[string]any)["resources"].(map[string]any)
+				resources := object["spec"].(map[string]any)["execution"].(map[string]any)["runner"].(map[string]any)["resources"].(map[string]any)
 				resources["limits"].(map[string]any)["gpu"] = "1"
 			},
 		},
@@ -1084,7 +1163,7 @@ func TestCRDRejectsInvalidCELValues(t *testing.T) {
 			name: "Runner resource with fractional extended quantity",
 			crd:  "actions.kelos.dev_runners.yaml", sample: "actions_v1alpha1_runner.yaml",
 			mutate: func(object map[string]any) {
-				resources := object["spec"].(map[string]any)["execution"].(map[string]any)["resources"].(map[string]any)
+				resources := object["spec"].(map[string]any)["execution"].(map[string]any)["runner"].(map[string]any)["resources"].(map[string]any)
 				resources["limits"].(map[string]any)["example.com/gpu"] = "500m"
 			},
 		},
@@ -1092,7 +1171,7 @@ func TestCRDRejectsInvalidCELValues(t *testing.T) {
 			name: "Runner extended resource request without equal limit",
 			crd:  "actions.kelos.dev_runners.yaml", sample: "actions_v1alpha1_runner.yaml",
 			mutate: func(object map[string]any) {
-				resources := object["spec"].(map[string]any)["execution"].(map[string]any)["resources"].(map[string]any)
+				resources := object["spec"].(map[string]any)["execution"].(map[string]any)["runner"].(map[string]any)["resources"].(map[string]any)
 				resources["requests"].(map[string]any)["example.com/gpu"] = "1"
 				resources["limits"].(map[string]any)["example.com/gpu"] = "2"
 			},
@@ -1101,7 +1180,7 @@ func TestCRDRejectsInvalidCELValues(t *testing.T) {
 			name: "Runner resource request greater than limit",
 			crd:  "actions.kelos.dev_runners.yaml", sample: "actions_v1alpha1_runner.yaml",
 			mutate: func(object map[string]any) {
-				resources := object["spec"].(map[string]any)["execution"].(map[string]any)["resources"].(map[string]any)
+				resources := object["spec"].(map[string]any)["execution"].(map[string]any)["runner"].(map[string]any)["resources"].(map[string]any)
 				resources["requests"].(map[string]any)["cpu"] = "3"
 			},
 		},

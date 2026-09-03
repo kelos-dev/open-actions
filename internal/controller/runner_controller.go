@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	actionsv1alpha1 "github.com/kelos-dev/open-actions/api/v1alpha1"
@@ -56,26 +57,42 @@ const (
 	dockerHost               = "unix://" + dockerSocketPath
 	dockerStoragePath        = "/var/lib/docker"
 	// The repository lives below the volume root so the runner owns its Git worktree.
-	workspacePath                = workspaceVolumeMountPath + "/repository"
-	jobStartTimeout              = 5 * time.Minute
-	nativeJobStartDeadline       = 24 * time.Hour
-	installationTokenStartMargin = 5 * time.Minute
-	nativeJobDeadlineAnnotation  = "actions.kelos.dev/job-deadline"
-	nativeJobDeadlineStartup     = "startup"
-	nativeJobDeadlineExecution   = "execution"
-	runnerFinalizer              = "actions.kelos.dev/runner-finalizer"
-	workflowJobQueuedIndex       = "actions.kelos.dev/workflow-job-queued"
-	workflowJobRunnerNameIndex   = "actions.kelos.dev/workflow-job-runner-name"
-	workflowJobProjectNameIndex  = "actions.kelos.dev/workflow-job-project-name"
-	matrixFailFastReason         = "MatrixFailFast"
-	matrixFailFastMessage        = "Another matrix combination failed"
-	jobTokenSecretKey            = "job-token"
-	actionTokenSecretKey         = "action-token"
+	workspacePath                      = workspaceVolumeMountPath + "/repository"
+	jobStartTimeout                    = 5 * time.Minute
+	nativeJobStartDeadline             = 24 * time.Hour
+	installationTokenStartMargin       = 5 * time.Minute
+	nativeJobDeadlineAnnotation        = "actions.kelos.dev/job-deadline"
+	nativeJobDeadlineStartup           = "startup"
+	nativeJobDeadlineExecution         = "execution"
+	runnerFinalizer                    = "actions.kelos.dev/runner-finalizer"
+	workflowJobQueuedIndex             = "actions.kelos.dev/workflow-job-queued"
+	workflowJobRunnerNameIndex         = "actions.kelos.dev/workflow-job-runner-name"
+	workflowJobProjectNameIndex        = "actions.kelos.dev/workflow-job-project-name"
+	matrixFailFastReason               = "MatrixFailFast"
+	matrixFailFastMessage              = "Another matrix combination failed"
+	runnerConfigurationInvalidReason   = "ConfigurationInvalid"
+	podLevelResourcesInvalidReason     = "PodLevelResourcesInvalid"
+	podLevelResourcesUnsupportedReason = "PodLevelResourcesUnsupported"
+	jobTokenSecretKey                  = "job-token"
+	actionTokenSecretKey               = "action-token"
 )
 
 type workflowJobCancellation struct {
 	reason  string
 	message string
+}
+
+type runnerExecutionConfigurationError struct {
+	reason string
+	err    error
+}
+
+func (e *runnerExecutionConfigurationError) Error() string {
+	return e.err.Error()
+}
+
+func (e *runnerExecutionConfigurationError) Unwrap() error {
+	return e.err
 }
 
 type RunnerReconciler struct {
@@ -167,6 +184,13 @@ func (r *RunnerReconciler) Reconcile(ctx context.Context, request ctrl.Request) 
 		}
 	}
 
+	if reason, message, blocked := runnerExecutionConfigurationIssue(runnerObject); blocked {
+		if err := r.blockRunnerForExecutionConfiguration(ctx, runnerObject, workflowJob, reason, message); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+	}
+
 	project := &actionsv1alpha1.Project{}
 	projectKey := client.ObjectKey{Namespace: runnerObject.Namespace, Name: runnerObject.Spec.ProjectRef.Name}
 	if err := r.APIReader.Get(ctx, projectKey, project); err != nil {
@@ -231,6 +255,13 @@ func (r *RunnerReconciler) Reconcile(ctx context.Context, request ctrl.Request) 
 
 	terminal, err := r.executeWorkflowJob(ctx, runnerObject, workflowJob, project)
 	if err != nil {
+		configurationError := &runnerExecutionConfigurationError{}
+		if errors.As(err, &configurationError) {
+			if blockErr := r.blockRunnerForExecutionConfiguration(ctx, runnerObject, workflowJob, configurationError.reason, configurationError.Error()); blockErr != nil {
+				return ctrl.Result{}, blockErr
+			}
+			return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+		}
 		expired, failureErr := r.failExpiredPreStart(ctx, workflowJob, err.Error())
 		if failureErr != nil {
 			return ctrl.Result{}, failureErr
@@ -250,6 +281,29 @@ func (r *RunnerReconciler) Reconcile(ctx context.Context, request ctrl.Request) 
 		return ctrl.Result{Requeue: true}, nil
 	}
 	return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+}
+
+func runnerExecutionConfigurationIssue(runnerObject *actionsv1alpha1.Runner) (string, string, bool) {
+	if runnerObject.Spec.Execution.Runner.Image == "" {
+		return runnerConfigurationInvalidReason, fmt.Sprintf("Runner %q requires spec.execution.runner.image", runnerObject.Name), true
+	}
+	ready := meta.FindStatusCondition(runnerObject.Status.Conditions, actionsv1alpha1.RunnerConditionReady)
+	if ready == nil || ready.Status != metav1.ConditionFalse || ready.ObservedGeneration != runnerObject.Generation {
+		return "", "", false
+	}
+	if ready.Reason != podLevelResourcesInvalidReason && ready.Reason != podLevelResourcesUnsupportedReason {
+		return "", "", false
+	}
+	return ready.Reason, ready.Message, true
+}
+
+func (r *RunnerReconciler) blockRunnerForExecutionConfiguration(ctx context.Context, runnerObject *actionsv1alpha1.Runner, workflowJob *actionsv1alpha1.WorkflowJob, reason, message string) error {
+	if workflowJob != nil {
+		if err := r.failAssignedWorkflowJob(ctx, workflowJob, reason, message); err != nil {
+			return err
+		}
+	}
+	return r.updateRunnerStatus(ctx, runnerObject, metav1.ConditionFalse, reason, message, nil)
 }
 
 func (r *RunnerReconciler) assignedWorkflowJob(ctx context.Context, runnerObject *actionsv1alpha1.Runner) (*actionsv1alpha1.WorkflowJob, error) {
@@ -617,7 +671,7 @@ func (r *RunnerReconciler) executeWorkflowJob(ctx context.Context, runnerObject 
 	} else if cancellation != nil {
 		return true, r.cancelWorkflowJob(ctx, workflowJob, cancellation)
 	}
-	if err := r.Create(ctx, nativeJob); err != nil {
+	if err := r.createNativeJob(ctx, nativeJob, workflowJob); err != nil {
 		if apierrors.IsAlreadyExists(err) {
 			_, terminal, observeErr := r.observeNativeJob(ctx, workflowJob)
 			return terminal, observeErr
@@ -625,6 +679,61 @@ func (r *RunnerReconciler) executeWorkflowJob(ctx context.Context, runnerObject 
 		return false, errors.Join(err, r.cleanupAuthSecret(ctx, workflowJob))
 	}
 	return false, r.updateWorkflowJobStatus(ctx, workflowJob, nativeJob, nil, nil, false)
+}
+
+func (r *RunnerReconciler) createNativeJob(ctx context.Context, nativeJob *batchv1.Job, workflowJob *actionsv1alpha1.WorkflowJob) error {
+	if nativeJob.Spec.Template.Spec.Resources == nil {
+		if err := r.Create(ctx, nativeJob); err != nil {
+			return fmt.Errorf("create native Job %q for WorkflowJob %q: %w", nativeJob.Name, workflowJob.Name, err)
+		}
+		return nil
+	}
+
+	options := []client.CreateOption{client.FieldValidation(metav1.FieldValidationStrict)}
+	dryRunJob := nativeJob.DeepCopy()
+	if err := r.Create(ctx, dryRunJob, append(options, client.DryRunAll)...); err != nil {
+		validationError := fmt.Errorf("validate native Job %q for WorkflowJob %q with Pod-level resources (requires Kubernetes 1.34 or newer with the PodLevelResources feature gate enabled): %w", nativeJob.Name, workflowJob.Name, err)
+		if reason := podLevelResourcesValidationReason(err); reason != "" {
+			return &runnerExecutionConfigurationError{reason: reason, err: validationError}
+		}
+		return validationError
+	}
+	if !podResourceRequirementsPreserved(nativeJob.Spec.Template.Spec.Resources, dryRunJob.Spec.Template.Spec.Resources) {
+		return &runnerExecutionConfigurationError{
+			reason: podLevelResourcesUnsupportedReason,
+			err:    fmt.Errorf("validate native Job %q for WorkflowJob %q with Pod-level resources: API server dropped spec.template.spec.resources; Kubernetes 1.34 or newer with the PodLevelResources feature gate enabled is required", nativeJob.Name, workflowJob.Name),
+		}
+	}
+	if err := r.Create(ctx, nativeJob, options...); err != nil {
+		return fmt.Errorf("create native Job %q for WorkflowJob %q with Pod-level resources: %w", nativeJob.Name, workflowJob.Name, err)
+	}
+	return nil
+}
+
+func podLevelResourcesValidationReason(err error) string {
+	if !apierrors.IsBadRequest(err) && !apierrors.IsInvalid(err) {
+		return ""
+	}
+	statusError := &apierrors.StatusError{}
+	if !errors.As(err, &statusError) {
+		return ""
+	}
+	mentionsPodResources := apierrors.IsBadRequest(err) && strings.Contains(statusError.ErrStatus.Message, "spec.template.spec.resources")
+	if details := statusError.ErrStatus.Details; details != nil {
+		for _, cause := range details.Causes {
+			if strings.HasPrefix(cause.Field, "spec.template.spec.resources") {
+				mentionsPodResources = true
+				break
+			}
+		}
+	}
+	if !mentionsPodResources {
+		return ""
+	}
+	if apierrors.IsBadRequest(err) {
+		return podLevelResourcesUnsupportedReason
+	}
+	return podLevelResourcesInvalidReason
 }
 
 func (r *RunnerReconciler) handleJobTokenCreationError(ctx context.Context, workflowJob *actionsv1alpha1.WorkflowJob, permissions githubclient.InstallationPermissions, tokenError error) (bool, error) {
@@ -1025,7 +1134,7 @@ func (r *RunnerReconciler) buildJob(workflowJob *actionsv1alpha1.WorkflowJob, ru
 	for index, secret := range runnerObject.Spec.Execution.ImagePullSecrets {
 		imagePullSecrets[index].Name = secret.Name
 	}
-	runnerEnvironment := setEnvironmentVariables(runnerObject.Spec.Execution.Env,
+	runnerEnvironment := setEnvironmentVariables(runnerObject.Spec.Execution.Runner.Env,
 		corev1.EnvVar{Name: runner.RunnerNameEnvVar, Value: runnerObject.Name},
 		corev1.EnvVar{
 			Name: runner.GitHubTokenEnvVar,
@@ -1045,6 +1154,7 @@ func (r *RunnerReconciler) buildJob(workflowJob *actionsv1alpha1.WorkflowJob, ru
 	podTemplate := corev1.PodTemplateSpec{
 		ObjectMeta: metav1.ObjectMeta{Labels: labels, Annotations: annotations},
 		Spec: corev1.PodSpec{
+			Resources:                     runnerPodResources(runnerObject.Spec.Execution.Resources),
 			TerminationGracePeriodSeconds: terminationGracePeriodSeconds,
 			AutomountServiceAccountToken:  pointerTo(false),
 			ImagePullSecrets:              imagePullSecrets,
@@ -1058,9 +1168,9 @@ func (r *RunnerReconciler) buildJob(workflowJob *actionsv1alpha1.WorkflowJob, ru
 			},
 			Containers: []corev1.Container{{
 				Name:            runner.ContainerName,
-				Image:           runnerObject.Spec.Execution.Image,
-				ImagePullPolicy: runnerObject.Spec.Execution.ImagePullPolicy,
-				Resources:       runnerResources(runnerObject.Spec.Execution.Resources),
+				Image:           runnerObject.Spec.Execution.Runner.Image,
+				ImagePullPolicy: runnerObject.Spec.Execution.Runner.ImagePullPolicy,
+				Resources:       runnerResources(runnerObject.Spec.Execution.Runner.Resources),
 				SecurityContext: &corev1.SecurityContext{
 					AllowPrivilegeEscalation: pointerTo(false),
 					Capabilities: &corev1.Capabilities{
@@ -1217,11 +1327,14 @@ func configureDockerExecution(pod *corev1.PodSpec, runnerContainer *corev1.Conta
 		corev1.Volume{Name: dockerStorageVolume, VolumeSource: corev1.VolumeSource{EmptyDir: dockerStorage}},
 	)
 	pod.InitContainers = append(pod.InitContainers, corev1.Container{
-		Name:            "docker",
-		Image:           dockerSpec.Image,
-		RestartPolicy:   pointerTo(corev1.ContainerRestartPolicyAlways),
-		Args:            []string{"dockerd", "--host=" + dockerHost, "--group=65532"},
-		Env:             []corev1.EnvVar{{Name: "DOCKER_HOST", Value: dockerHost}, {Name: "DOCKER_TLS_CERTDIR", Value: ""}},
+		Name:          "docker",
+		Image:         dockerSpec.Image,
+		RestartPolicy: pointerTo(corev1.ContainerRestartPolicyAlways),
+		Args:          []string{"dockerd", "--host=" + dockerHost, "--group=65532"},
+		Env: setEnvironmentVariables(dockerSpec.Env,
+			corev1.EnvVar{Name: "DOCKER_HOST", Value: dockerHost},
+			corev1.EnvVar{Name: "DOCKER_TLS_CERTDIR", Value: ""},
+		),
 		Resources:       runnerResources(dockerSpec.Resources),
 		SecurityContext: &corev1.SecurityContext{Privileged: pointerTo(true), RunAsNonRoot: pointerTo(false), RunAsUser: pointerTo(int64(0))},
 		StartupProbe: &corev1.Probe{
@@ -1260,6 +1373,36 @@ func runnerResources(resources *actionsv1alpha1.RunnerResources) corev1.Resource
 		Limits:   corev1.ResourceList(resources.Limits).DeepCopy(),
 		Requests: corev1.ResourceList(resources.Requests).DeepCopy(),
 	}
+}
+
+func runnerPodResources(resources *actionsv1alpha1.RunnerPodResources) *corev1.ResourceRequirements {
+	if resources == nil {
+		return nil
+	}
+	return &corev1.ResourceRequirements{
+		Limits:   corev1.ResourceList(resources.Limits).DeepCopy(),
+		Requests: corev1.ResourceList(resources.Requests).DeepCopy(),
+	}
+}
+
+func podResourceRequirementsPreserved(expected, actual *corev1.ResourceRequirements) bool {
+	if expected == nil {
+		return true
+	}
+	if actual == nil {
+		return false
+	}
+	return resourceListPreserved(expected.Limits, actual.Limits) && resourceListPreserved(expected.Requests, actual.Requests)
+}
+
+func resourceListPreserved(expected, actual corev1.ResourceList) bool {
+	for name, expectedQuantity := range expected {
+		actualQuantity, found := actual[name]
+		if !found || !expectedQuantity.Equal(actualQuantity) {
+			return false
+		}
+	}
+	return true
 }
 
 func (r *RunnerReconciler) updateWorkflowJobStatus(ctx context.Context, workflowJob *actionsv1alpha1.WorkflowJob, nativeJob *batchv1.Job, runnerStartTime *metav1.Time, executionResult *runner.Result, resultInvalid bool) error {
