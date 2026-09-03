@@ -91,6 +91,11 @@ func TestConsoleServesWorkflowRunsAndLogsWithoutAuthentication(t *testing.T) {
 	if runResponse.Code != http.StatusOK || !strings.Contains(runBody, "CI") || !strings.Contains(runBody, "build") || !strings.Contains(runBody, "Workflow run Queued") || !strings.Contains(runBody, "name: CI\non:\n  push:") || !strings.Contains(runBody, "&lt;script&gt;alert(&#39;unsafe&#39;)&lt;/script&gt;") || strings.Contains(runBody, "<script>alert('unsafe')</script>") {
 		t.Fatalf("run page = %d, %q", runResponse.Code, runResponse.Body.String())
 	}
+	jobsPosition := strings.Index(runBody, `<section class="jobs" aria-label="Jobs">`)
+	workflowFilePosition := strings.Index(runBody, `<section class="workflow-file" aria-label="Workflow file">`)
+	if jobsPosition == -1 || workflowFilePosition == -1 || workflowFilePosition < jobsPosition {
+		t.Fatalf("run page jobs position = %d, workflow file position = %d", jobsPosition, workflowFilePosition)
+	}
 
 	logResponse := httptest.NewRecorder()
 	handler.ServeHTTP(logResponse, httptest.NewRequest(http.MethodGet, runURL+"/jobs/build", nil))

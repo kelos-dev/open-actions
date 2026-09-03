@@ -197,16 +197,16 @@ const runPageTemplate = `<!doctype html>
         <div class="summary-meta"><span>{{.RefName}}</span><code title="{{.Revision}}">{{.ShortRevision}}</code>{{if .Started}}<time data-time="{{.Started}}">{{.Started}}</time>{{end}}{{if .Duration}}<span>{{.Duration}}</span>{{end}}</div>
       </div>
     </section>
-    <h2 class="section-title">Workflow file</h2>
-    <section class="workflow-file" aria-label="Workflow file">
-      {{if .HasWorkflowFile}}<div class="workflow-file-header"><code>{{.WorkflowPath}}</code></div><pre class="workflow-source"><code>{{.WorkflowFile}}</code></pre>{{else}}<div class="empty">The workflow file is not available for this run.</div>{{end}}
-    </section>
     <h2 class="section-title">Jobs <span class="count">{{len .Jobs}}</span></h2>
     <section class="jobs" aria-label="Jobs">
       {{range .Jobs}}<div class="job">
         <a class="job-link" href="{{.URL}}"><span class="status-mark job-status {{.StatusClass}}" aria-hidden="true"></span><span class="job-name"><span>{{.DisplayName}}</span>{{if ne .DisplayName .ID}}<small>{{.ID}}</small>{{end}}</span></a>
         <span class="cell status-text">{{.Status}}</span><span class="cell runner">{{if .Runner}}{{.Runner}}{{else}}—{{end}}</span><span class="cell started">{{if .Duration}}{{.Duration}}{{else if .Started}}In progress{{else}}Not started{{end}}</span>
       </div>{{else}}<div class="empty">No jobs have been created.</div>{{end}}
+    </section>
+    <h2 class="section-title">Workflow file</h2>
+    <section class="workflow-file" aria-label="Workflow file">
+      {{if .HasWorkflowFile}}<div class="workflow-file-header"><code>{{.WorkflowPath}}</code></div><pre class="workflow-source"><code>{{.WorkflowFile}}</code></pre>{{else}}<div class="empty">The workflow file is not available for this run.</div>{{end}}
     </section>
   </main>
   <script>for(const element of document.querySelectorAll('[data-time]')){const date=new Date(element.dataset.time);if(!Number.isNaN(date.valueOf()))element.textContent=new Intl.DateTimeFormat(undefined,{dateStyle:'medium',timeStyle:'short'}).format(date)}</script>
