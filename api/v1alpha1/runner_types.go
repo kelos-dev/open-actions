@@ -42,9 +42,43 @@ type RunnerSpec struct {
 	Labels []string `json:"labels"`
 }
 
-// RunnerExecutionSpec describes the user-configurable execution environment
-// for a Runner.
+// RunnerExecutionSpec describes the workflow Pod and its execution containers.
 type RunnerExecutionSpec struct {
+	// Resources describes the total compute resource budget shared by all
+	// containers in the workflow Pod. It requires Kubernetes 1.34 or newer
+	// with the PodLevelResources feature gate enabled. Changes apply only to Jobs
+	// created afterward.
+	// +optional
+	Resources *RunnerPodResources `json:"resources,omitempty"`
+
+	// ImagePullSecrets identifies Secrets in the Runner's namespace that
+	// Kubernetes uses to pull images for the workflow Pod.
+	// +listType=map
+	// +listMapKey=name
+	// +kubebuilder:validation:MaxItems=32
+	// +optional
+	ImagePullSecrets []RunnerImagePullSecretReference `json:"imagePullSecrets,omitempty"`
+
+	// TerminationGracePeriodSeconds is how long Kubernetes waits for a workflow
+	// Pod's containers to stop after termination is requested. Omit it to use
+	// Kubernetes termination grace period defaulting. Set it to zero to stop
+	// containers immediately.
+	// +kubebuilder:validation:Minimum=0
+	// +optional
+	TerminationGracePeriodSeconds *int64 `json:"terminationGracePeriodSeconds,omitempty"`
+
+	// Runner configures the container that executes workflow steps.
+	// +required
+	Runner RunnerContainerSpec `json:"runner"`
+
+	// Docker configures a job-scoped Docker daemon. The daemon runs in a
+	// privileged sidecar and is available to workflow steps through DOCKER_HOST.
+	// +optional
+	Docker *RunnerDockerSpec `json:"docker,omitempty"`
+}
+
+// RunnerContainerSpec describes the container that executes workflow steps.
+type RunnerContainerSpec struct {
 	// Image is a container image whose entrypoint launches the Open Actions
 	// runner.
 	// +kubebuilder:validation:MinLength=1
@@ -64,36 +98,15 @@ type RunnerExecutionSpec struct {
 	// +optional
 	Env []corev1.EnvVar `json:"env,omitempty"`
 
-	// ImagePullSecrets identifies Secrets in the Runner's namespace that
-	// Kubernetes uses to pull images for the workflow Pod.
-	// +listType=map
-	// +listMapKey=name
-	// +kubebuilder:validation:MaxItems=32
-	// +optional
-	ImagePullSecrets []RunnerImagePullSecretReference `json:"imagePullSecrets,omitempty"`
-
 	// ImagePullPolicy controls when Kubernetes pulls the runner image. Omit it
 	// to use Kubernetes image pull policy defaulting.
 	// +kubebuilder:validation:Enum=Always;Never;IfNotPresent
 	// +optional
 	ImagePullPolicy corev1.PullPolicy `json:"imagePullPolicy,omitempty"`
 
-	// TerminationGracePeriodSeconds is how long Kubernetes waits for a workflow
-	// Pod's containers to stop after termination is requested. Omit it to use
-	// Kubernetes termination grace period defaulting. Set it to zero to stop
-	// containers immediately.
-	// +kubebuilder:validation:Minimum=0
-	// +optional
-	TerminationGracePeriodSeconds *int64 `json:"terminationGracePeriodSeconds,omitempty"`
-
-	// Resources describes the compute resources available to the runner.
+	// Resources describes the compute resources available to the runner container.
 	// +optional
 	Resources *RunnerResources `json:"resources,omitempty"`
-
-	// Docker configures a job-scoped Docker daemon. The daemon runs in a
-	// privileged sidecar and is available to workflow steps through DOCKER_HOST.
-	// +optional
-	Docker *RunnerDockerSpec `json:"docker,omitempty"`
 }
 
 // RunnerImagePullSecretReference identifies an image pull Secret in the
@@ -116,6 +129,15 @@ type RunnerDockerSpec struct {
 	// +kubebuilder:validation:Pattern=`^[^[:space:]]+$`
 	// +required
 	Image string `json:"image"`
+
+	// Env defines environment variables for the Docker daemon container.
+	// Kubernetes resolves value sources before the daemon starts. Controller-defined
+	// variables take precedence when a name conflicts.
+	// +listType=map
+	// +listMapKey=name
+	// +kubebuilder:validation:MaxItems=100
+	// +optional
+	Env []corev1.EnvVar `json:"env,omitempty"`
 
 	// Resources describes the compute resources available to the Docker daemon
 	// and the containers it starts. An ephemeral-storage limit also sets the
@@ -146,6 +168,28 @@ type RunnerResources struct {
 // +kubebuilder:validation:XValidation:rule="self.all(k, sign(quantity(string(self[k]))) >= 0)",message="resource quantities must not be negative"
 // +kubebuilder:validation:XValidation:rule="self.all(k, !k.contains('/') || quantity(string(self[k])).isInteger())",message="extended resource quantities must be whole numbers"
 type RunnerResourceList map[corev1.ResourceName]resource.Quantity
+
+// RunnerPodResources describes compute resource requests and limits shared by
+// all containers in a workflow Pod.
+// +kubebuilder:validation:XValidation:rule="(has(self.requests) && size(self.requests) > 0) || (has(self.limits) && size(self.limits) > 0)",message="at least one resource request or limit must be specified"
+// +kubebuilder:validation:XValidation:rule="!has(self.requests) || !has(self.limits) || self.requests.all(k, !(k in self.limits) || !quantity(string(self.requests[k])).isGreaterThan(quantity(string(self.limits[k]))))",message="resource requests must not exceed limits"
+type RunnerPodResources struct {
+	// Limits describes the maximum compute resources available to the Pod.
+	// +optional
+	Limits RunnerPodResourceList `json:"limits,omitempty"`
+
+	// Requests describes the minimum compute resources reserved for the Pod.
+	// +optional
+	Requests RunnerPodResourceList `json:"requests,omitempty"`
+}
+
+// RunnerPodResourceList maps up to six Pod-level resource names to
+// quantities. The bound keeps cross-map quantity validation within the
+// Kubernetes CEL cost budget.
+// +kubebuilder:validation:MaxProperties=6
+// +kubebuilder:validation:XValidation:rule="self.all(k, k == 'cpu' || k == 'memory' || k.startsWith('hugepages-'))",message="Pod-level resources support only CPU, memory, and huge pages"
+// +kubebuilder:validation:XValidation:rule="self.all(k, sign(quantity(string(self[k]))) >= 0)",message="resource quantities must not be negative"
+type RunnerPodResourceList map[corev1.ResourceName]resource.Quantity
 
 // RunnerStatus contains observations about one execution agent.
 // +kubebuilder:validation:XValidation:rule="!has(self.workflowJobRef) || (size(self.workflowJobRef.name) > 0 && size(self.workflowJobRef.name) <= 253 && self.workflowJobRef.name.matches('^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?([.][a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?)*$'))",message="`workflowJobRef.name` must be a DNS subdomain"

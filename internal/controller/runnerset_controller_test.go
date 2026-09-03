@@ -49,7 +49,7 @@ func TestRunnerSetCreatesDesiredRunners(t *testing.T) {
 		if runner.Labels[actionsv1alpha1.LabelRunnerSetUID] != string(runnerSet.UID) {
 			t.Errorf("Runner %q RunnerSet UID label = %q", runner.Name, runner.Labels[actionsv1alpha1.LabelRunnerSetUID])
 		}
-		if runner.Spec.Execution.Image != "runner:test" || len(runner.Spec.Execution.Env) != 1 || runner.Spec.Execution.Env[0].Name != "CACHE_URL" || runner.Spec.Execution.Env[0].Value != "https://cache.example" || len(runner.Spec.Labels) != 2 {
+		if runner.Spec.Execution.Runner.Image != "runner:test" || len(runner.Spec.Execution.Runner.Env) != 1 || runner.Spec.Execution.Runner.Env[0].Name != "CACHE_URL" || runner.Spec.Execution.Runner.Env[0].Value != "https://cache.example" || len(runner.Spec.Labels) != 2 {
 			t.Errorf("Runner %q spec = %#v", runner.Name, runner.Spec)
 		}
 	}
@@ -151,7 +151,7 @@ func TestRunnerSetReconcilesTemplate(t *testing.T) {
 		},
 	}
 	runner := runnerSetTestRunner(t, scheme, runnerSet, "runner")
-	runner.Spec.Execution.Image = "stale:test"
+	runner.Spec.Execution.Runner.Image = "stale:test"
 	clusterClient := runnerSetTestClient(scheme, runnerSet, runner)
 	if _, err := runnerSetTestReconciler(clusterClient).Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(runnerSet)}); err != nil {
 		t.Fatal(err)
@@ -160,8 +160,8 @@ func TestRunnerSetReconcilesTemplate(t *testing.T) {
 	if err := clusterClient.Get(context.Background(), client.ObjectKeyFromObject(runner), updated); err != nil {
 		t.Fatal(err)
 	}
-	if updated.Spec.Execution.Image != "runner:test" {
-		t.Fatalf("Runner image = %q", updated.Spec.Execution.Image)
+	if updated.Spec.Execution.Runner.Image != "runner:test" {
+		t.Fatalf("Runner image = %q", updated.Spec.Execution.Runner.Image)
 	}
 }
 
@@ -352,8 +352,10 @@ func runnerSetTestRunnerSpec() actionsv1alpha1.RunnerSpec {
 	return actionsv1alpha1.RunnerSpec{
 		ProjectRef: corev1.LocalObjectReference{Name: "default"},
 		Execution: actionsv1alpha1.RunnerExecutionSpec{
-			Image: "runner:test",
-			Env:   []corev1.EnvVar{{Name: "CACHE_URL", Value: "https://cache.example"}},
+			Runner: actionsv1alpha1.RunnerContainerSpec{
+				Image: "runner:test",
+				Env:   []corev1.EnvVar{{Name: "CACHE_URL", Value: "https://cache.example"}},
+			},
 		},
 		Labels: []string{"self-hosted", "linux"},
 	}

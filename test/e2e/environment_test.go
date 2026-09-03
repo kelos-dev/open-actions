@@ -227,19 +227,21 @@ func setupTestProject(createRunner bool) {
 			Spec: actionsv1alpha1.RunnerSpec{
 				ProjectRef: corev1.LocalObjectReference{Name: "default"},
 				Execution: actionsv1alpha1.RunnerExecutionSpec{
-					Image: runnerImage,
+					Runner: actionsv1alpha1.RunnerContainerSpec{
+						Image: runnerImage,
+						Resources: &actionsv1alpha1.RunnerResources{
+							Requests: actionsv1alpha1.RunnerResourceList{
+								corev1.ResourceCPU:    resource.MustParse("50m"),
+								corev1.ResourceMemory: resource.MustParse("64Mi"),
+							},
+							Limits: actionsv1alpha1.RunnerResourceList{
+								corev1.ResourceCPU:    resource.MustParse("1"),
+								corev1.ResourceMemory: resource.MustParse("512Mi"),
+							},
+						},
+					},
 					Docker: &actionsv1alpha1.RunnerDockerSpec{
 						Image: dockerImage,
-					},
-					Resources: &actionsv1alpha1.RunnerResources{
-						Requests: actionsv1alpha1.RunnerResourceList{
-							corev1.ResourceCPU:    resource.MustParse("50m"),
-							corev1.ResourceMemory: resource.MustParse("64Mi"),
-						},
-						Limits: actionsv1alpha1.RunnerResourceList{
-							corev1.ResourceCPU:    resource.MustParse("1"),
-							corev1.ResourceMemory: resource.MustParse("512Mi"),
-						},
 					},
 				},
 				Labels: []string{"self-hosted", "linux", "x64", "ubuntu-latest", "docker"},

@@ -167,14 +167,15 @@ spec:
       projectRef:
         name: default
       execution:
-        image: ghcr.io/kelos-dev/open-actions-runner:latest
-        resources:
-          requests:
-            cpu: "1"
-            memory: 1Gi
-          limits:
-            cpu: "2"
-            memory: 2Gi
+        runner:
+          image: ghcr.io/kelos-dev/open-actions-runner:latest
+          resources:
+            requests:
+              cpu: "1"
+              memory: 1Gi
+            limits:
+              cpu: "2"
+              memory: 2Gi
       labels:
         - self-hosted
         - linux
