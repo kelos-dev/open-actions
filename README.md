@@ -19,10 +19,14 @@ constraints. Unsupported workflows fail explicitly.
 
 The controller receives GitHub webhooks, creates `WorkflowRun` and `WorkflowJob`
 resources, schedules jobs on matching `Runner` resources, and reports status
-through GitHub Check Runs. Runners execute steps in Kubernetes Jobs and use the
-standalone artifact service for workflow artifact uploads and downloads. The
-Console shows runs, jobs, and live logs. Each `Project` defines an execution
-domain and its GitHub App integration.
+through GitHub commit statuses for push, pull request, and merge-group runs.
+These workflow-level statuses do not populate a pull request's Checks tab or
+publish per-job checks. This GitHub Actions compatibility gap is tracked in
+[issue #162](https://github.com/kelos-dev/open-actions/issues/162).
+Runners execute steps in Kubernetes Jobs and use the standalone artifact service
+for workflow artifact uploads and downloads. The Console shows runs, jobs, and
+live logs. Each `Project` defines an execution domain and its GitHub App
+integration.
 
 ## Quickstart
 
@@ -85,12 +89,11 @@ curl -i https://open-actions.example.com/
 with the HTTPS URL from the previous step as its webhook URL. Enable the
 webhook, set a strong webhook secret, and grant:
 
-- read and write access to Actions, Checks, Contents, Issues, Packages, Pull
-  requests, and Commit statuses
+- read and write access to Actions, Checks, Commit statuses, Contents, Issues,
+  Packages, and Pull requests
 - read access to Merge queues
 - subscriptions to Push, Pull request, Merge group, Workflow run, Issues,
-  Issue comment, Pull request review comment, Pull request review, Release, and
-  Check run events
+  Issue comment, Pull request review comment, Pull request review, and Release
 
 Generate a private key, then [install the
 App](https://docs.github.com/en/apps/using-github-apps/installing-your-own-github-app)

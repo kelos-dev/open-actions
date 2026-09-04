@@ -6,6 +6,7 @@ const (
 	LabelRunnerSetUID       = "actions.kelos.dev/runner-set-uid"
 	LabelWorkflowRunUID     = "actions.kelos.dev/workflow-run-uid"
 	LabelWorkflowRunRootUID = "actions.kelos.dev/workflow-run-root-uid"
+	LabelGitHubStatusKey    = "actions.kelos.dev/github-status-key"
 	LabelWorkflowJobUID     = "actions.kelos.dev/workflow-job-uid"
 	LabelWorkflowJob        = "actions.kelos.dev/workflow-job"
 

@@ -130,22 +130,6 @@ type WorkflowRunRerun struct {
 	// +required
 	Attempt int32 `json:"attempt"`
 
-	// RequestID is an optional idempotency identity for the request that created
-	// this attempt. GitHub rerequests use the webhook delivery ID.
-	// +kubebuilder:validation:MinLength=1
-	// +kubebuilder:validation:MaxLength=128
-	// +kubebuilder:validation:Pattern=`^[A-Za-z0-9-]+$`
-	// +optional
-	RequestID string `json:"requestID,omitempty"`
-
-	// TriggeringActor is the GitHub login that requested this attempt. It is
-	// omitted when the rerun source cannot identify a GitHub user.
-	// +kubebuilder:validation:MinLength=1
-	// +kubebuilder:validation:MaxLength=100
-	// +kubebuilder:validation:Pattern=`^[A-Za-z0-9][A-Za-z0-9_-]*(\[bot\])?$`
-	// +optional
-	TriggeringActor string `json:"triggeringActor,omitempty"`
-
 	// JobIDs selects expanded WorkflowJob IDs to rerun. Selected jobs reuse the
 	// latest available results and outputs of prerequisite jobs from earlier
 	// attempts. Omit it to execute every job in the workflow.
@@ -440,9 +424,9 @@ type GitRevision struct {
 	// +required
 	SHA string `json:"sha"`
 
-	// HeadSHA is the pull request head commit used for GitHub check reporting.
+	// HeadSHA is the pull request head commit used for GitHub status reporting.
 	// It may differ from SHA when the workflow executes an integration commit.
-	// When absent, GitHub checks are reported on SHA.
+	// When absent, GitHub statuses are reported on SHA.
 	// +kubebuilder:validation:Pattern=`^[0-9a-f]{40}$`
 	// +optional
 	HeadSHA string `json:"headSHA,omitempty"`
@@ -551,28 +535,26 @@ type WorkflowRunJobStatus struct {
 	Cancelled int32 `json:"cancelled,omitempty"`
 }
 
-// GitHubCheckRunStatus records the GitHub Check Run that reports this
+// GitHubCommitStatusState is a state accepted by GitHub's commit-status API.
+type GitHubCommitStatusState string
+
+const (
+	GitHubCommitStatusStateError   GitHubCommitStatusState = "error"
+	GitHubCommitStatusStateFailure GitHubCommitStatusState = "failure"
+	GitHubCommitStatusStatePending GitHubCommitStatusState = "pending"
+	GitHubCommitStatusStateSuccess GitHubCommitStatusState = "success"
+)
+
+// GitHubCommitStatus records the GitHub commit status that reports this
 // WorkflowRun.
-// +kubebuilder:validation:XValidation:rule="self.status == 'completed' ? has(self.conclusion) : !has(self.conclusion)",message="conclusion must be specified exactly when status is completed"
-type GitHubCheckRunStatus struct {
-	// ID is GitHub's check-run identifier.
-	// +kubebuilder:validation:Minimum=1
-	// +kubebuilder:validation:Maximum=9007199254740991
+type GitHubCommitStatus struct {
+	// State is the last commit-status state accepted by GitHub.
+	// +kubebuilder:validation:Enum=error;failure;pending;success
 	// +required
-	ID int64 `json:"id"`
+	State GitHubCommitStatusState `json:"state"`
 
-	// Status is the last check-run status accepted by GitHub.
-	// +kubebuilder:validation:Enum=queued;in_progress;completed
-	// +required
-	Status string `json:"status"`
-
-	// Conclusion is the terminal result accepted by GitHub.
-	// +kubebuilder:validation:Enum=success;failure;cancelled;timed_out
-	// +optional
-	Conclusion string `json:"conclusion,omitempty"`
-
-	// ReportDigest is the SHA-256 digest of the check-run fields last accepted
-	// by GitHub.
+	// ReportDigest is the SHA-256 digest of the commit-status fields last
+	// accepted by GitHub.
 	// +kubebuilder:validation:Pattern=`^[0-9a-f]{64}$`
 	// +optional
 	ReportDigest string `json:"reportDigest,omitempty"`
@@ -580,9 +562,9 @@ type GitHubCheckRunStatus struct {
 
 // GitHubWorkflowRunStatus contains GitHub observations for a WorkflowRun.
 type GitHubWorkflowRunStatus struct {
-	// CheckRun is the GitHub check that reports this WorkflowRun.
+	// CommitStatus is the GitHub commit status that reports this WorkflowRun.
 	// +optional
-	CheckRun *GitHubCheckRunStatus `json:"checkRun,omitempty"`
+	CommitStatus *GitHubCommitStatus `json:"commitStatus,omitempty"`
 }
 
 // WorkflowRunSourceStatus contains provider-specific observations.

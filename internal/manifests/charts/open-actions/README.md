@@ -115,7 +115,7 @@ controller:
 | `artifacts.persistence.size` | `20Gi` | Requested capacity for the StatefulSet-managed claim |
 | `console.enabled` | `true` | Deploy the Open Actions Console |
 | `console.replicas` | `1` | Console replica count |
-| `console.publicURL` | `http://localhost:8080` | Public Console URL used by GitHub Check Run links |
+| `console.publicURL` | `http://localhost:8080` | Public Console URL used by GitHub commit-status links |
 | `console.secretName` | `""` | Existing Console administrator Secret; the chart creates `open-actions-console-auth` when empty |
 | `console.tokenKey` | `token` | Secret key containing the Console administrator token |
 | `console.image.repository` | `ghcr.io/kelos-dev/open-actions-console` | Console image repository |

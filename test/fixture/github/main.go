@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -740,6 +741,13 @@ func main() {
 	preparationActionsBlocked := false
 	installationTokenRequestsMutex := sync.RWMutex{}
 	installationTokenRequests := map[string][]installationTokenRequest{}
+	mux.HandleFunc("/app", func(writer http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodGet {
+			http.Error(writer, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		writeJSON(writer, map[string]any{"id": 12345, "slug": "open-actions"})
+	})
 	mux.Handle("/preparation-actions/", http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		preparationActionsMutex.RLock()
 		blocked := preparationActionsBlocked
@@ -845,48 +853,55 @@ func main() {
 	mux.HandleFunc("/repos/acme/example/contents/"+selectiveRerunWorkflowPath, func(writer http.ResponseWriter, _ *http.Request) {
 		writeJSON(writer, map[string]string{"encoding": "base64", "content": base64.StdEncoding.EncodeToString([]byte(selectiveRerunWorkflowData))})
 	})
-	checkRunMutex := sync.RWMutex{}
-	checkRuns := map[string]map[string]any{}
-	recordCheckRun := func(writer http.ResponseWriter, request *http.Request) {
-		body := struct {
-			DetailsURL string `json:"details_url"`
-			ExternalID string `json:"external_id"`
-			Status     string `json:"status"`
-			Conclusion string `json:"conclusion"`
-		}{}
-		if err := json.NewDecoder(request.Body).Decode(&body); err != nil || body.ExternalID == "" {
-			http.Error(writer, "invalid check run", http.StatusBadRequest)
+	commitStatusMutex := sync.RWMutex{}
+	commitStatuses := map[string]map[string]any{}
+	commitStatusHistory := []map[string]any{}
+	mux.HandleFunc("/repos/acme/example/commits/", func(writer http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodGet || !strings.HasSuffix(request.URL.Path, "/statuses") {
+			http.NotFound(writer, request)
 			return
 		}
-		result := map[string]any{
-			"id": 1, "details_url": body.DetailsURL, "external_id": body.ExternalID,
-			"status": body.Status, "conclusion": body.Conclusion,
+		page, err := strconv.Atoi(request.URL.Query().Get("page"))
+		if err != nil || page < 1 || request.URL.Query().Get("per_page") != "100" {
+			http.Error(writer, "invalid commit status page", http.StatusBadRequest)
+			return
 		}
-		checkRunMutex.Lock()
-		checkRuns[body.ExternalID] = result
-		checkRunMutex.Unlock()
-		writeJSON(writer, result)
-	}
-	mux.HandleFunc("/repos/acme/example/check-runs", func(writer http.ResponseWriter, request *http.Request) {
+		commitStatusMutex.RLock()
+		start := (page - 1) * 100
+		end := min(start+100, len(commitStatusHistory))
+		statuses := []map[string]any{}
+		if start < len(commitStatusHistory) {
+			for index := len(commitStatusHistory) - 1 - start; index >= len(commitStatusHistory)-end; index-- {
+				statuses = append(statuses, commitStatusHistory[index])
+			}
+		}
+		commitStatusMutex.RUnlock()
+		writeJSON(writer, statuses)
+	})
+	mux.HandleFunc("/repos/acme/example/statuses/", func(writer http.ResponseWriter, request *http.Request) {
 		if request.Method != http.MethodPost {
 			http.Error(writer, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
-		recordCheckRun(writer, request)
-	})
-	mux.HandleFunc("/repos/acme/example/check-runs/1", func(writer http.ResponseWriter, request *http.Request) {
-		if request.Method != http.MethodPatch {
-			http.Error(writer, "method not allowed", http.StatusMethodNotAllowed)
+		body := struct {
+			State       string `json:"state"`
+			TargetURL   string `json:"target_url"`
+			Description string `json:"description"`
+			Context     string `json:"context"`
+		}{}
+		if err := json.NewDecoder(request.Body).Decode(&body); err != nil || body.TargetURL == "" || body.Context == "" {
+			http.Error(writer, "invalid commit status", http.StatusBadRequest)
 			return
 		}
-		recordCheckRun(writer, request)
-	})
-	mux.HandleFunc("/repos/acme/example/commits/", func(writer http.ResponseWriter, request *http.Request) {
-		if request.Method != http.MethodGet || !strings.HasSuffix(request.URL.Path, "/check-runs") {
-			http.NotFound(writer, request)
-			return
+		commitStatusMutex.Lock()
+		result := map[string]any{
+			"id": len(commitStatusHistory) + 1, "state": body.State, "target_url": body.TargetURL,
+			"description": body.Description, "context": body.Context, "creator": map[string]string{"login": "open-actions[bot]"},
 		}
-		writeJSON(writer, map[string]any{"total_count": 0, "check_runs": []any{}})
+		commitStatuses[body.TargetURL] = result
+		commitStatusHistory = append(commitStatusHistory, result)
+		commitStatusMutex.Unlock()
+		writeJSON(writer, result)
 	})
 	for repository, data := range map[string]string{
 		"invalid-trigger": unsupportedTriggerWorkflowData,
@@ -925,15 +940,15 @@ func main() {
 			http.Error(writer, "method not allowed", http.StatusMethodNotAllowed)
 		}
 	})
-	mux.HandleFunc("/fixture/check-runs/", func(writer http.ResponseWriter, request *http.Request) {
+	mux.HandleFunc("/fixture/commit-status", func(writer http.ResponseWriter, request *http.Request) {
 		if request.Method != http.MethodGet {
 			http.Error(writer, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
-		externalID := strings.TrimPrefix(request.URL.Path, "/fixture/check-runs/")
-		checkRunMutex.RLock()
-		result, found := checkRuns[externalID]
-		checkRunMutex.RUnlock()
+		targetURL := request.URL.Query().Get("target_url")
+		commitStatusMutex.RLock()
+		result, found := commitStatuses[targetURL]
+		commitStatusMutex.RUnlock()
 		if !found {
 			http.NotFound(writer, request)
 			return

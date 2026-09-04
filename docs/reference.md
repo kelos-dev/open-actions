@@ -36,8 +36,13 @@ GitHub Enterprise API path such as `/api/v3`. `--github-server-url` defaults to
 `https://github.com` and supplies `github.server_url`. `--action-clone-base-url`
 defaults to the GitHub server URL and is used only to fetch external action
 repositories. Set it explicitly when actions are hosted on another server. The
-controller's optional `--console-url` adds Console links to GitHub Check Runs
-and supplies workflow run and stale-query URLs to job contexts.
+controller's optional `--console-url` sets the direct target link on GitHub
+commit statuses for push, pull request, and merge-group runs and supplies
+workflow run and stale-query URLs to job contexts.
+Open Actions publishes one workflow-level commit status per workflow path, not
+per-job checks. Unlike GitHub Actions checks, these statuses do not populate a
+pull request's Checks tab. This unsupported compatibility gap is tracked in
+[issue #162](https://github.com/kelos-dev/open-actions/issues/162).
 `--max-job-timeout` is the cluster-wide upper bound for workflow job execution
 and defaults to `6h`. It must be a positive whole number of minutes. The Helm
 chart configures it through `controller.maxJobTimeout`.
@@ -93,10 +98,9 @@ pull request head before creating jobs. Approval is unavailable after
 cancellation or completion.
 
 An administrator can also rerun all jobs from the latest completed attempt in
-a workflow lineage. When
-the attempt failed because one or more jobs failed, the administrator can
-instead rerun the failed expanded job IDs, matrix combinations cancelled by
-fail-fast, and their transitive dependents.
+a workflow lineage. When the attempt failed because one or more jobs failed,
+the administrator can instead rerun the failed expanded job IDs, matrix
+combinations cancelled by fail-fast, and their transitive dependents.
 Jobs in the new attempt reuse the latest results and outputs of prerequisites
 that completed in earlier attempts instead of executing those prerequisites
 again. A selective rerun's Console page shows those retained jobs alongside the
@@ -104,9 +108,13 @@ jobs executed by the current attempt, and their log links remain available as
 long as the earlier WorkflowJobs and runner logs are retained.
 The Console creates a new immutable WorkflowRun attempt with the same project,
 source, workflow path, and retention setting, clears any prior cancellation
-request, and redirects to the new run. Rerun actions are unavailable while the
-latest attempt is still active. The Helm chart grants the Console `create` and
-`update` access to WorkflowRuns across the namespaces it displays.
+request, preserves the original signed GitHub event snapshot, and redirects to
+the new run. Rerun actions are unavailable while the latest attempt is still
+active. The Helm chart grants the Console `create` and `update` access to
+WorkflowRuns across the namespaces it displays.
+GitHub commit statuses do not provide a rerun action; request reruns from the
+Console. GitHub UI and CLI reruns for Open Actions reports are unsupported and
+tracked in [issue #160](https://github.com/kelos-dev/open-actions/issues/160).
 
 An administrator can use **Run workflow** to create a `workflow_dispatch`
 WorkflowRun in any configured Project namespace. The form accepts a repository,
@@ -150,7 +158,7 @@ The controller image must provide Git with support for
 revisions.
 
 The controller reuses installation tokens for workflow discovery, planning,
-and GitHub Check reporting until five minutes before their GitHub expiration.
+and GitHub status reporting until five minutes before their GitHub expiration.
 Job tokens remain unique to each job. When GitHub returns a rate-limit response,
 the controller pauses requests for the affected installation until
 `X-RateLimit-Reset` permits another attempt. A secondary limit with
@@ -233,6 +241,17 @@ can prevent stale Runners from recording `Ready=False`; the controller still
 refuses to claim jobs, so reapply the resources instead of waiting for the
 condition.
 
+### Commit status reporting upgrade
+
+This alpha release does not migrate WorkflowRuns created with the
+`actions.kelos.dev/github-check` finalizer. Before upgrading, delete retained
+WorkflowRuns and wait for their deletion to complete under the existing
+controller. If a WorkflowRun is already stuck in `Terminating` after the
+upgrade, confirm that its execution workloads have finished, then use
+`kubectl edit workflowrun` to remove only the
+`actions.kelos.dev/github-check` entry from `metadata.finalizers`. Preserve any
+other finalizers on the object.
+
 All references resolve within the resource's namespace. A `Project` selects its
 integration through the discriminated `spec.source` union. The supported
 variant is `type: GitHub`, with GitHub App configuration under `source.github`.
@@ -241,11 +260,36 @@ source type and GitHub App and installation IDs are immutable. Only one project
 in the cluster may claim an installation; the earliest-created project retains
 the claim, and later duplicates remain unconfigured until the owner is deleted.
 A `WorkflowRun` records provider-specific event data under its own immutable
-`spec.source` union. `status.source.github.checkRun` records the GitHub Check Run
-ID and the last report accepted by GitHub. For locally integrated pull requests,
+`spec.source` union. `status.source.github.commitStatus` records the state and
+digest of the last report accepted by GitHub. The controller reports
+the `Open Actions / <workflow path>` context for push, ordinary pull request,
+and merge-group runs. Contexts longer than 100 Unicode characters are shortened
+with a deterministic digest suffix. Short paths containing uppercase characters
+also receive a digest suffix so paths that differ only by case remain distinct
+under GitHub's case-insensitive context matching. Excluding scheduled and
+manually repeated triggers prevents stable-revision recurring workflows from
+consuming GitHub's per-commit, per-context status quota; those runs remain
+visible in the Console. A GitHub-facing model for the excluded trigger types is
+tracked in [issue #161](https://github.com/kelos-dev/open-actions/issues/161).
+A status target links directly to the run when
+the Console URL is configured. Queued and running workflows report `pending`,
+successful workflows report `success`, ordinary failures report `failure`, and
+cancelled or timed-out workflows report `error`. Descriptions are limited to
+140 Unicode characters. When distinct event or ref executions share a revision
+and status context, the controller aggregates their latest attempts. An error
+or failure remains visible even while another execution is pending; pending is
+reported when no execution has failed, and success is reported only after every
+matching execution succeeds. A later execution for the same event and ref, or
+the same pull request, supersedes its earlier execution. Repositories
+whose workflow path produces a shortened or case-disambiguated context must
+update required-check settings to that context. The suffix is ` / ` followed by
+the first 16 lowercase hexadecimal characters of the SHA-256 digest of the full
+unshortened context. When shortening is required, the controller retains the
+first 81 Unicode characters before that suffix.
+For locally integrated pull requests,
 `spec.source.github.revision.sha` identifies the deterministic integration
 commit used for execution. `baseSHA`, `headSHA`, and `mergeBaseSHA` pin its two
-parents and merge base; `headSHA` is also used for check reporting. Pull request
+parents and merge base; `headSHA` is also used for status reporting. Pull request
 runs without these integration inputs use the remote revision identified by
 `sha`. `status.identity` records the stable numeric run ID, per-workflow run
 number, attempt, and configured Console URL before jobs are planned. The
@@ -560,13 +604,11 @@ contract; other actions named `checkout` are unsupported.
 `spec.rerun` identifies a repeated attempt. `originalRunRef` anchors the
 attempt lineage, `previousRunRef` names the immediately preceding completed
 attempt, and `attempt` starts at 2. Both references include the WorkflowRun UID
-to reject names that were deleted and recreated. `requestID` is an optional
-idempotency identity and contains the webhook delivery ID for GitHub
-rerequests. `triggeringActor` is the optional GitHub login that requested this
-attempt; GitHub Check Run rerequests populate it. `jobIDs` is an optional set of
+to reject names that were deleted and recreated. `jobIDs` is an optional set of
 expanded WorkflowJob IDs; the selected jobs reuse the latest available results
-and outputs of prerequisites from earlier attempts. Omitting `jobIDs` reruns
-every job. The rerun fields are immutable.
+and outputs of prerequisites from
+earlier attempts. Omitting `jobIDs` reruns every job. The rerun fields are
+immutable.
 The controller also requires the project, source, workflow path, lineage, and
 attempt number to match the previous run before it executes a rerun. Workflows
 with jobs whose planning depends on `needs` require a full rerun with `jobIDs`
@@ -807,11 +849,11 @@ period does not extend the runner's cleanup deadline.
 
 A timed-out WorkflowJob has `status.result: failure` and a false `Succeeded`
 condition with reason `JobTimedOut`, while user cancellation has
-`status.result: cancelled`. A WorkflowRun containing a timed-out job uses
-reason `JobTimedOut` and reports the GitHub Check Run conclusion `timed_out`;
-ordinary failures use `JobFailed` and `failure`, and cancellations use
-`JobCancelled` and `cancelled`. When a run contains both timed-out and ordinarily
-failed jobs, `JobTimedOut` and `timed_out` take precedence in its summary.
+`status.result: cancelled`. A WorkflowRun containing a timed-out job uses reason
+`JobTimedOut` and reports the GitHub commit-status state `error`; ordinary
+failures use `JobFailed` and `failure`, and cancellations use `JobCancelled`
+and `error`. When a run contains both timed-out and ordinarily failed jobs,
+`JobTimedOut` and `error` take precedence in its status description.
 
 ### Conditions
 
@@ -865,7 +907,17 @@ Child resources carry `actions.kelos.dev/project-uid`, `runner-uid`,
 `runner-set-uid`, `workflow-run-uid`, and `workflow-job-uid` labels where
 applicable. WorkflowRun
 objects carry `actions.kelos.dev/workflow-run-root-uid`, which groups attempts
-in the same rerun lineage. The
+in the same rerun lineage. WorkflowRuns reported through commit statuses also
+carry `actions.kelos.dev/project-uid` and the opaque, controller-owned
+`actions.kelos.dev/github-status-key` label. The Project UID label anchors the
+immutable reporting boundary. Within that namespace and Project identity, the
+status key groups runs that target the same repository, revision, and
+case-insensitive status context. One run reports the aggregate state of the
+latest matching executions. Users must not set or modify either label on a
+WorkflowRun. A Project-owned ConfigMap records the current reporter and uses a
+short-lived lease to serialize GitHub status writes. When that run is deleted,
+a surviving matching run can become the reporter. The controller removes the
+record when the last matching WorkflowRun is deleted. The
 `actions.kelos.dev/workflow-job` label contains the workflow job ID when it is a
 valid Kubernetes label value, or the full SHA-256 digest encoded as lowercase
 unpadded base32 otherwise. The original job ID, user-facing job display name,
@@ -1047,8 +1099,8 @@ The `job` context supplies `status`, `workflow_ref`, `workflow_sha`,
 `workflow_repository`, and `workflow_file_path`. `status` reflects the job's
 current `success`, `failure`, or `cancelled` state. Job containers and services
 are unsupported, so `job.container` and `job.services` are unavailable. Open
-Actions reports one Check Run for the workflow rather than one per job and does
-not supply `job.check_run_id`.
+Actions reports one commit-status context for the workflow rather than one per
+job and does not supply `job.check_run_id`.
 
 For each expanded matrix job, `strategy` supplies numeric `job-index`,
 `job-total`, and `max-parallel` values and Boolean `fail-fast`; `matrix`
@@ -1097,9 +1149,9 @@ namespace and Project name, and a one-based `run_number` for its repository and
 workflow path. The counters persist independently of retained WorkflowRuns and
 Project recreation. They are stored in namespace-scoped ConfigMaps whose names
 start with `open-actions-run-sequence-`; preserve those ConfigMaps in backups
-and while retaining WorkflowRuns to prevent reused IDs and numbers. A GitHub
-Check Run rerequest creates a new immutable WorkflowRun resource in the same
-lineage, reuses both values, and increments only `run_attempt`. Ordinary
+and while retaining WorkflowRuns to prevent reused IDs and numbers. A Console
+rerun creates a new immutable WorkflowRun resource in the same lineage, reuses
+both values, and increments only `run_attempt`. Ordinary
 webhook deliveries, manual dispatches, schedules,
 reusable-workflow calls, and concurrency replacements create new lineages and
 therefore receive new IDs and numbers. Controller retries and restarts do not
@@ -1109,9 +1161,7 @@ Webhook runs use the signed payload's `sender.login` as `actor`. Direct
 `workflow_dispatch` and `workflow_call` resources use
 `spec.source.github.actor`; it defaults to `open-actions` when the caller does
 not supply an identity. Scheduled runs use `open-actions`. Reruns preserve the
-first attempt's actor, matching GitHub's `github.actor` behavior. For GitHub
-Check Run rerequests, `github.triggering_actor` identifies the user who
-requested the current attempt; otherwise it matches `github.actor`.
+first attempt's actor, and `github.triggering_actor` matches `github.actor`.
 
 The values are available during planning and runner execution:
 
@@ -1155,8 +1205,8 @@ GitHub's Actions REST endpoints under
 `/repos/{owner}/{repo}/actions/runs`, including workflow-specific listings,
 jobs, logs, cancellation, and rerun endpoints, contain only GitHub Actions
 workflow-run records. They never contain Open Actions WorkflowRuns. GitHub's
-Checks endpoints can return the Check Runs reported by Open Actions, but the
-Console query above is the supported stale-run contract.
+commit-status endpoints can return reports from Open Actions, but the Console
+query above is the supported stale-run contract.
 
 ### Step and job outputs
 
@@ -1315,11 +1365,11 @@ ordinary `pull_request` workflows use a deterministic integration revision. This
 differs from GitHub Actions, which loads native `pull_request_target` workflows
 from the repository's default branch. Review and review-comment events discover
 and execute workflows only from the trusted default branch, so a maintainer
-action cannot execute a fork-controlled workflow definition. Checks for review
-events are reported on the trusted default-branch revision,
-`pull_request_target` checks are reported on the trusted base-branch revision,
-and ordinary `pull_request` checks are reported on the pull request head
-revision.
+action cannot execute a fork-controlled workflow definition. Commit statuses
+are reported for `push`, ordinary `pull_request`, and `merge_group` runs.
+Ordinary `pull_request` statuses are attached to the pull request head revision.
+Other trigger types, including `pull_request_target`, review events, schedules,
+and manual dispatches, are available in the Console without a commit status.
 
 Ordinary fork and Dependabot pull requests follow the Project's fork pull
 request policy. Their workflow definition comes from the pull request head and
@@ -1651,7 +1701,7 @@ never interpreted as literal values.
 Completed native Jobs and runner Pods are retained with their WorkflowRun.
 WorkflowRuns are retained indefinitely unless `spec.ttlSecondsAfterFinished` is
 set. When that TTL expires, the WorkflowRun, its Jobs and Pods, and their logs
-are deleted. GitHub reruns require the original and latest WorkflowRuns to
+are deleted. Console reruns require the original and latest WorkflowRuns to
 remain available. Failed-job reruns also require the WorkflowJobs that provide
 the selected jobs' latest prerequisite results and outputs. Open Actions does
 not archive logs outside Kubernetes, so cluster-level log rotation and node
@@ -1675,24 +1725,7 @@ Invalid fork-controlled workflow definitions and fork candidate fan-out limit
 violations skip the ordinary `pull_request` candidate without suppressing
 independently discovered `pull_request_target` runs.
 
-For a Check Run created by Open Actions, GitHub's **Re-run** action sends a
-`check_run.rerequested` delivery. Open Actions authenticates the delivery,
-verifies the App, repository, check ID, external ID, and reported commit, and
-creates a new immutable WorkflowRun attempt. A run that failed because one or
-more jobs failed reruns the failed expanded job IDs, matrix combinations
-cancelled by fail-fast, and their transitive dependents. The new attempt reuses
-the latest results and outputs of prerequisite jobs from earlier attempts.
-Static matrix failures rerun failed and fail-fast-cancelled combinations; a
-dependent of the logical matrix job evaluates the combined results of rerun and
-retained combinations. A successful or cancelled run, or a run that failed
-before job results were available, reruns every job. The new attempt clears any
-prior cancellation request, updates the original GitHub Check Run instead of
-creating another check, and points its details URL to the new attempt. Open
-Actions does not call GitHub's Actions rerun API because these jobs are executed
-as Open Actions resources rather than GitHub Actions jobs.
-
 Queued deliveries are processed asynchronously. Invalid or unsupported workflow
 definitions fail the whole delivery before any `WorkflowRun` resources are
 created. Repeated deliveries with the same signed body are deduplicated for 24
-hours. Check rerun deliveries are deduplicated by `X-GitHub-Delivery`, so two
-separate user rerequests remain distinct intents.
+hours.

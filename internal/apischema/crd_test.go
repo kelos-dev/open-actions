@@ -38,19 +38,19 @@ func TestProjectAcceptsValueSources(t *testing.T) {
 	validateSample(t, crd, "actions_v1alpha1_project-values.yaml")
 }
 
-func TestWorkflowRunAcceptsTimedOutCheckConclusion(t *testing.T) {
+func TestWorkflowRunAcceptsCommitStatusErrorState(t *testing.T) {
 	crd, _ := loadCRD(t, "actions.kelos.dev_workflowruns.yaml")
 	object := loadSample(t, "actions_v1alpha1_workflowrun.yaml")
 	normalizeWorkflowRunCELIntegers(object)
 	object["status"] = map[string]any{
 		"source": map[string]any{
 			"github": map[string]any{
-				"checkRun": map[string]any{"id": int64(1), "status": "completed", "conclusion": "timed_out"},
+				"commitStatus": map[string]any{"state": "error"},
 			},
 		},
 	}
 	if errs := validateObject(t, crd, object, nil); len(errs) > 0 {
-		t.Fatalf("timed_out check conclusion was rejected: %v", errs.ToAggregate())
+		t.Fatalf("commit status error state was rejected: %v", errs.ToAggregate())
 	}
 }
 
@@ -185,7 +185,6 @@ func TestWorkflowRunRerunContract(t *testing.T) {
 		"originalRunRef": map[string]any{"name": "ci-original", "uid": "original-uid"},
 		"previousRunRef": map[string]any{"name": "ci-original", "uid": "original-uid"},
 		"attempt":        int64(2),
-		"requestID":      "delivery-123",
 		"jobIDs":         []any{"unit-matrix-2", "integration"},
 	}
 	if errs := validateObject(t, crd, original, nil); len(errs) > 0 {
@@ -654,24 +653,24 @@ func TestWorkflowRunAcceptsManagedUserOwner(t *testing.T) {
 	}
 }
 
-func TestWorkflowRunAcceptsGitHubCheckRunStatusContract(t *testing.T) {
+func TestWorkflowRunAcceptsGitHubCommitStatusContract(t *testing.T) {
 	crd, _ := loadCRD(t, "actions.kelos.dev_workflowruns.yaml")
 	object := loadSample(t, "actions_v1alpha1_workflowrun.yaml")
-	object["status"] = map[string]any{"source": map[string]any{"github": map[string]any{"checkRun": map[string]any{
-		"id": int64(17), "status": "completed", "conclusion": "success", "reportDigest": strings.Repeat("a", 64),
+	object["status"] = map[string]any{"source": map[string]any{"github": map[string]any{"commitStatus": map[string]any{
+		"state": "success", "reportDigest": strings.Repeat("a", 64),
 	}}}}
 	if errs := validateObject(t, crd, object, nil); len(errs) > 0 {
-		t.Fatalf("valid GitHub check-run status was rejected: %v", errs.ToAggregate())
+		t.Fatalf("valid GitHub commit status was rejected: %v", errs.ToAggregate())
 	}
-	delete(object["status"].(map[string]any)["source"].(map[string]any)["github"].(map[string]any)["checkRun"].(map[string]any), "conclusion")
+	commitStatus := object["status"].(map[string]any)["source"].(map[string]any)["github"].(map[string]any)["commitStatus"].(map[string]any)
+	commitStatus["state"] = "cancelled"
 	if errs := validateObject(t, crd, object, nil); len(errs) == 0 {
-		t.Fatal("completed GitHub check-run status without a conclusion was accepted")
+		t.Fatal("GitHub commit status with an invalid state was accepted")
 	}
-	checkRun := object["status"].(map[string]any)["source"].(map[string]any)["github"].(map[string]any)["checkRun"].(map[string]any)
-	checkRun["conclusion"] = "success"
-	checkRun["reportDigest"] = "invalid"
+	commitStatus["state"] = "success"
+	commitStatus["reportDigest"] = "invalid"
 	if errs := validateObject(t, crd, object, nil); len(errs) == 0 {
-		t.Fatal("GitHub check-run status with an invalid report digest was accepted")
+		t.Fatal("GitHub commit status with an invalid report digest was accepted")
 	}
 }
 

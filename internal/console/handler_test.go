@@ -3,6 +3,7 @@ package console
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -15,6 +16,7 @@ import (
 	"time"
 
 	actionsv1alpha1 "github.com/kelos-dev/open-actions/api/v1alpha1"
+	"github.com/kelos-dev/open-actions/internal/eventsnapshot"
 	githubclient "github.com/kelos-dev/open-actions/internal/github"
 	"github.com/kelos-dev/open-actions/internal/projectvalue"
 	"github.com/kelos-dev/open-actions/internal/workflowrun"
@@ -39,6 +41,21 @@ type testLogSource struct {
 type testRepositoryResolver struct {
 	repository actionsv1alpha1.GitHubRepository
 	err        error
+}
+
+type createWorkflowRunThenErrorClient struct {
+	client.Client
+	err error
+}
+
+func (c *createWorkflowRunThenErrorClient) Create(ctx context.Context, object client.Object, options ...client.CreateOption) error {
+	if err := c.Client.Create(ctx, object, options...); err != nil {
+		return err
+	}
+	if run, ok := object.(*actionsv1alpha1.WorkflowRun); ok && run.Spec.Rerun != nil {
+		return c.err
+	}
+	return nil
 }
 
 func (r *testRepositoryResolver) Resolve(_ context.Context, _ *actionsv1alpha1.Project, owner, name string) (actionsv1alpha1.GitHubRepository, error) {
@@ -671,7 +688,20 @@ func TestConsoleRerunsCompletedWorkflow(t *testing.T) {
 	run.Status.Conditions = []metav1.Condition{{
 		Type: actionsv1alpha1.WorkflowRunConditionSucceeded, Status: metav1.ConditionTrue, Reason: "JobsSucceeded",
 	}}
+	run.Annotations[eventsnapshot.Annotation] = "event-snapshot"
 	if err := handler.client.Update(context.Background(), run); err != nil {
+		t.Fatal(err)
+	}
+	immutable := true
+	eventSnapshot := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "event-snapshot", Namespace: run.Namespace},
+		Immutable:  &immutable,
+		Data:       map[string][]byte{eventsnapshot.DataKey: []byte(`{"ref":"refs/heads/main"}`)},
+	}
+	if err := controllerutil.SetControllerReference(run, eventSnapshot, handler.client.Scheme()); err != nil {
+		t.Fatal(err)
+	}
+	if err := handler.client.Create(context.Background(), eventSnapshot); err != nil {
 		t.Fatal(err)
 	}
 
@@ -735,6 +765,19 @@ func TestConsoleRerunsCompletedWorkflow(t *testing.T) {
 	if rerun.Spec.CancelRequested || rerun.Labels[actionsv1alpha1.LabelWorkflowRunRootUID] != string(run.UID) {
 		t.Fatalf("rerun = %#v", rerun)
 	}
+	if rerun.Annotations[eventsnapshot.Annotation] != "event-snapshot" {
+		t.Fatalf("rerun event snapshot = %q", rerun.Annotations[eventsnapshot.Annotation])
+	}
+	protectedRoot := &actionsv1alpha1.WorkflowRun{}
+	if err := handler.client.Get(context.Background(), client.ObjectKeyFromObject(run), protectedRoot); err != nil {
+		t.Fatal(err)
+	}
+	if !controllerutil.ContainsFinalizer(protectedRoot, eventsnapshot.RerunProtectionFinalizer) || protectedRoot.Annotations[eventsnapshot.RerunTargetAnnotation] != rerun.Name || protectedRoot.Annotations[eventsnapshot.RerunDeadlineAnnotation] == "" {
+		t.Fatalf("rerun event snapshot protection = finalizers %v, annotations %#v", protectedRoot.Finalizers, protectedRoot.Annotations)
+	}
+	if err := handler.releaseRerunEventSnapshotProtection(context.Background(), protectedRoot, rerun.Name); err != nil {
+		t.Fatal(err)
+	}
 
 	rerun.UID = "rerun-uid"
 	rerun.Status.Conditions = []metav1.Condition{{
@@ -758,6 +801,58 @@ func TestConsoleRerunsCompletedWorkflow(t *testing.T) {
 	}
 	if third.Spec.Rerun == nil || third.Spec.Rerun.Attempt != 3 || third.Spec.Rerun.PreviousRunRef.Name != rerun.Name || third.Spec.Rerun.PreviousRunRef.UID != rerun.UID {
 		t.Fatalf("third attempt spec = %#v", third.Spec.Rerun)
+	}
+}
+
+func TestConsoleRecoversRerunAfterAmbiguousCreateError(t *testing.T) {
+	handler := newTestHandler(t, false)
+	run := &actionsv1alpha1.WorkflowRun{}
+	if err := handler.client.Get(context.Background(), client.ObjectKey{Namespace: "default", Name: "ci"}, run); err != nil {
+		t.Fatal(err)
+	}
+	run.Status.Conditions = []metav1.Condition{{
+		Type: actionsv1alpha1.WorkflowRunConditionSucceeded, Status: metav1.ConditionTrue, Reason: "JobsSucceeded",
+	}}
+	run.Annotations[eventsnapshot.Annotation] = "event-snapshot"
+	if err := handler.client.Update(context.Background(), run); err != nil {
+		t.Fatal(err)
+	}
+	immutable := true
+	eventSnapshot := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "event-snapshot", Namespace: run.Namespace},
+		Immutable:  &immutable,
+		Data:       map[string][]byte{eventsnapshot.DataKey: []byte(`{"ref":"refs/heads/main"}`)},
+	}
+	if err := controllerutil.SetControllerReference(run, eventSnapshot, handler.client.Scheme()); err != nil {
+		t.Fatal(err)
+	}
+	if err := handler.client.Create(context.Background(), eventSnapshot); err != nil {
+		t.Fatal(err)
+	}
+	handler.client = &createWorkflowRunThenErrorClient{Client: handler.client, err: errors.New("response was lost")}
+
+	form := url.Values{"csrf": {handler.csrfToken}, "jobs": {"all"}}
+	request := httptest.NewRequest(http.MethodPost, "/runs/default/ci/rerun", strings.NewReader(form.Encode()))
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.Header.Set("Authorization", "Bearer "+testConsoleToken)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	rerunName := workflowrun.RerunName(run, 2)
+	if response.Code != http.StatusSeeOther || response.Header().Get("Location") != "/runs/default/"+rerunName {
+		t.Fatalf("rerun response = %d, %q, body %q", response.Code, response.Header().Get("Location"), response.Body.String())
+	}
+	rerun := &actionsv1alpha1.WorkflowRun{}
+	if err := handler.client.Get(context.Background(), client.ObjectKey{Namespace: run.Namespace, Name: rerunName}, rerun); err != nil {
+		t.Fatal(err)
+	}
+	if !matchingConsoleRerun(rerun, workflowrun.NewRerun(run, run, 2, nil)) {
+		t.Fatalf("persisted rerun = %#v", rerun)
+	}
+	if err := handler.client.Get(context.Background(), client.ObjectKeyFromObject(run), run); err != nil {
+		t.Fatal(err)
+	}
+	if !controllerutil.ContainsFinalizer(run, eventsnapshot.RerunProtectionFinalizer) || run.Annotations[eventsnapshot.RerunTargetAnnotation] != rerunName {
+		t.Fatalf("event snapshot protection = finalizers %v, annotations %#v", run.Finalizers, run.Annotations)
 	}
 }
 
@@ -852,7 +947,7 @@ func TestConsoleSelectiveRerunShowsEffectiveJobs(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	rerun := workflowrun.NewRerun(root, root, 2, "", []string{"build"})
+	rerun := workflowrun.NewRerun(root, root, 2, []string{"build"})
 	rerun.UID = "rerun-uid"
 	rerun.Status.WorkflowName = "CI"
 	if err := clusterClient.Create(context.Background(), rerun); err != nil {
@@ -915,7 +1010,7 @@ func TestConsoleShowsRerunWhenOriginalWorkflowRunIsGone(t *testing.T) {
 	if err := handler.client.Get(context.Background(), client.ObjectKey{Namespace: "default", Name: "ci"}, root); err != nil {
 		t.Fatal(err)
 	}
-	rerun := workflowrun.NewRerun(root, root, 2, "", nil)
+	rerun := workflowrun.NewRerun(root, root, 2, nil)
 	rerun.UID = "rerun-uid"
 	rerun.Status.WorkflowName = "CI rerun"
 	if err := handler.client.Create(context.Background(), rerun); err != nil {
