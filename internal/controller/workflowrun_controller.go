@@ -2,8 +2,10 @@ package controller
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base32"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -58,7 +60,7 @@ const (
 	workflowJobDisplayNameMaxLength  = 256
 	workflowJobIDMaxLength           = 256
 	workflowRunCancellationFinalizer = "actions.kelos.dev/concurrency-cancellation"
-	workflowRunCheckFinalizer        = "actions.kelos.dev/github-check"
+	workflowRunGitHubStatusFinalizer = "actions.kelos.dev/github-status"
 	workflowRunScheduleFinalizer     = "actions.kelos.dev/schedule-idempotency"
 	defaultJobTimeout                = time.Duration(workflow.DefaultJobTimeoutMinutes) * time.Minute
 	defaultMaxJobTimeout             = 6 * time.Hour
@@ -66,11 +68,18 @@ const (
 	workflowRunSequenceScopeKey      = "scope"
 	workflowRunSequenceNextKey       = "next"
 	maxGitHubCompatibleNumber        = int64(9_007_199_254_740_991)
+	maxCommitStatusDescriptionRunes  = 140
+	maxCommitStatusContextRunes      = 100
+	githubStatusOwnerPrefix          = "ghso-"
+	githubStatusOwnerDataKey         = "owner.json"
+	githubStatusLeaseDuration        = 5 * time.Minute
 	deferredJobResultRunsOn          = "deferred-planning"
 	matrixEvaluationResultRunsOn     = "matrix-evaluation"
 )
 
 var digestEncoding = base32.StdEncoding.WithPadding(base32.NoPadding)
+
+var errGitHubProjectIdentityMismatch = errors.New("GitHub reporting Project identity changed")
 
 type planningFailureDisposition uint8
 
@@ -147,7 +156,21 @@ func (r *WorkflowRunReconciler) Reconcile(ctx context.Context, request ctrl.Requ
 			if !errors.As(err, &terminal) {
 				return ctrl.Result{}, err
 			}
+			if releaseErr := r.releaseRerunEventSnapshotProtection(ctx, run); releaseErr != nil {
+				return ctrl.Result{}, errors.Join(err, releaseErr)
+			}
 			return r.planningFailed(ctx, run, "RerunInvalid", err, planningFailureTerminal)
+		}
+		planned := meta.FindStatusCondition(run.Status.Conditions, actionsv1alpha1.WorkflowRunConditionPlanned)
+		if run.Annotations[eventsnapshot.Annotation] != "" && run.Status.Jobs == nil && (planned == nil || planned.Status != metav1.ConditionTrue) {
+			if _, err := r.githubEventSnapshot(ctx, run); err != nil {
+				disposition := planningFailureRetry
+				terminal := &terminalPlanningError{}
+				if errors.As(err, &terminal) {
+					disposition = planningFailureTerminal
+				}
+				return r.planningFailed(ctx, run, "EventSnapshotUnavailable", err, disposition)
+			}
 		}
 	}
 	if run.DeletionTimestamp.IsZero() {
@@ -166,24 +189,20 @@ func (r *WorkflowRunReconciler) Reconcile(ctx context.Context, request ctrl.Requ
 			}
 		}
 	}
-	if r.githubCheckEnabled(run) && run.DeletionTimestamp.IsZero() && !controllerutil.ContainsFinalizer(run, workflowRunCheckFinalizer) {
-		before := run.DeepCopy()
-		controllerutil.AddFinalizer(run, workflowRunCheckFinalizer)
-		if err := r.Patch(ctx, run, client.MergeFrom(before)); err != nil {
-			return ctrl.Result{}, err
-		}
+	if err := r.ensureWorkflowRunGitHubStatusFinalizer(ctx, run); err != nil {
+		return ctrl.Result{}, err
 	}
 	if !run.DeletionTimestamp.IsZero() {
 		return r.finalizeCanceledWorkflowRun(ctx, run)
 	}
-	reportError := r.reconcileGitHubCheck(ctx, run)
+	reportError := r.reconcileGitHubStatus(ctx, run)
 	result, reconcileError := r.reconcileWorkflowRun(ctx, run)
 	if reconcileError != nil {
 		return result, errors.Join(reportError, reconcileError)
 	}
 	if reportError != nil {
 		if !terminalRun(run) && (result.Requeue || result.RequeueAfter > 0) {
-			ctrl.LoggerFrom(ctx).Error(reportError, "GitHub Check reporting failed while workflow reconciliation is pending")
+			ctrl.LoggerFrom(ctx).Error(reportError, "GitHub reporting failed while workflow reconciliation is pending")
 			if delay, limited := githubclient.RetryDelay(reportError, r.now()); limited {
 				result.Requeue = false
 				result.RequeueAfter = max(result.RequeueAfter, delay)
@@ -193,6 +212,15 @@ func (r *WorkflowRunReconciler) Reconcile(ctx context.Context, request ctrl.Requ
 		return result, reportError
 	}
 	return result, nil
+}
+
+func (r *WorkflowRunReconciler) ensureWorkflowRunGitHubStatusFinalizer(ctx context.Context, run *actionsv1alpha1.WorkflowRun) error {
+	if !run.DeletionTimestamp.IsZero() || !r.githubStatusEnabled(run) || controllerutil.ContainsFinalizer(run, workflowRunGitHubStatusFinalizer) {
+		return nil
+	}
+	before := run.DeepCopy()
+	controllerutil.AddFinalizer(run, workflowRunGitHubStatusFinalizer)
+	return r.Patch(ctx, run, client.MergeFrom(before))
 }
 
 func (r *WorkflowRunReconciler) ensureWorkflowRunIdentity(ctx context.Context, run *actionsv1alpha1.WorkflowRun, project *actionsv1alpha1.Project, rerunPrevious *actionsv1alpha1.WorkflowRun) error {
@@ -304,12 +332,20 @@ func (r *WorkflowRunReconciler) ensureWorkflowRunLineageLabel(ctx context.Contex
 	return r.Patch(ctx, run, client.MergeFrom(before))
 }
 
-func (r *WorkflowRunReconciler) githubCheckEnabled(run *actionsv1alpha1.WorkflowRun) bool {
+func (r *WorkflowRunReconciler) githubStatusEnabled(run *actionsv1alpha1.WorkflowRun) bool {
 	planned := meta.FindStatusCondition(run.Status.Conditions, actionsv1alpha1.WorkflowRunConditionPlanned)
 	if run.Spec.Rerun != nil && planned != nil && planned.Status == metav1.ConditionFalse && planned.Reason == "RerunInvalid" {
 		return false
 	}
-	return r.GitHub != nil && run.Spec.Source.Type == actionsv1alpha1.SourceTypeGitHub && run.Spec.Source.GitHub != nil && run.UID != ""
+	if r.GitHub == nil || run.Spec.Source.Type != actionsv1alpha1.SourceTypeGitHub || run.Spec.Source.GitHub == nil || run.UID == "" {
+		return false
+	}
+	switch run.Spec.Source.GitHub.Event.Name {
+	case actionsv1alpha1.GitHubEventNamePush, actionsv1alpha1.GitHubEventNamePullRequest, actionsv1alpha1.GitHubEventNameMergeGroup:
+		return true
+	default:
+		return false
+	}
 }
 
 func (r *WorkflowRunReconciler) validateWorkflowRunRerun(ctx context.Context, run *actionsv1alpha1.WorkflowRun) (*actionsv1alpha1.WorkflowRun, error) {
@@ -699,242 +735,592 @@ func resolvePlanningEvent(run *actionsv1alpha1.WorkflowRun, definition *workflow
 	return planningRun, matchedEvent, nil
 }
 
-type checkRunReport struct {
-	Status      string
-	Conclusion  string
-	StartedAt   string
-	CompletedAt string
-	Output      githubclient.CheckRunOutput
+type commitStatusReport struct {
+	State       string
+	Description string
 }
 
-func (r *WorkflowRunReconciler) reconcileGitHubCheck(ctx context.Context, run *actionsv1alpha1.WorkflowRun) error {
+type githubStatusOwner struct {
+	UID        string `json:"uid"`
+	RootUID    string `json:"rootUID"`
+	Attempt    int32  `json:"attempt"`
+	CreatedAt  int64  `json:"createdAt"`
+	IdentityID int64  `json:"identityID,omitempty"`
+	LeaseToken string `json:"leaseToken,omitempty"`
+	LeaseUntil int64  `json:"leaseUntil,omitempty"`
+}
+
+func (r *WorkflowRunReconciler) reconcileGitHubStatus(ctx context.Context, run *actionsv1alpha1.WorkflowRun) error {
 	githubSource := run.Spec.Source.GitHub
-	if !r.githubCheckEnabled(run) {
+	if !r.githubStatusEnabled(run) {
 		return nil
 	}
-	report := workflowRunCheckReport(run)
 	project := &actionsv1alpha1.Project{}
 	projectKey := client.ObjectKey{Namespace: run.Namespace, Name: run.Spec.ProjectRef.Name}
 	if err := r.APIReader.Get(ctx, projectKey, project); err != nil {
-		return fmt.Errorf("get Project %q for GitHub check: %w", projectKey.Name, err)
+		return fmt.Errorf("get Project %q for GitHub status: %w", projectKey.Name, err)
 	}
-	githubConfig := project.Spec.Source.GitHub
-	checkHeadSHA := githubSource.Revision.SHA
-	if githubSource.Event.Name == actionsv1alpha1.GitHubEventNamePullRequest && githubSource.Revision.HeadSHA != "" {
-		checkHeadSHA = githubSource.Revision.HeadSHA
-	}
-	detailsURL := ""
-	if r.ConsoleURL != "" {
-		detailsURL = workflowRunConsoleURL(r.ConsoleURL, run)
-	}
-	name := "Open Actions / " + run.Spec.WorkflowPath
-	externalID := workflowRunCheckExternalID(run)
-	createRequest := githubclient.CreateCheckRunRequest{
-		Name:        name,
-		HeadSHA:     checkHeadSHA,
-		DetailsURL:  detailsURL,
-		ExternalID:  externalID,
-		Status:      report.Status,
-		Conclusion:  report.Conclusion,
-		StartedAt:   report.StartedAt,
-		CompletedAt: report.CompletedAt,
-		Output:      &report.Output,
-	}
-	reportDigest := checkRunReportDigest(createRequest)
-	current := workflowRunCheckRunStatus(run)
-	if current != nil && current.Status == report.Status && current.Conclusion == report.Conclusion && current.ReportDigest == reportDigest {
-		return nil
-	}
-	currentAttempt, err := r.githubCheckCurrentAttempt(ctx, run)
+	statusKey := githubStatusKey(project.UID, run)
+	projectMatches, err := r.ensureGitHubStatusIdentityLabels(ctx, run, project.UID, statusKey)
 	if err != nil {
 		return err
 	}
-	if !currentAttempt {
+	if !projectMatches {
 		return nil
 	}
-
-	privateKey, err := secretValue(ctx, r.APIReader, project.Namespace, githubConfig.PrivateKeySecretRef)
+	report, targetRun, err := r.aggregateGitHubCommitStatusReport(ctx, run, statusKey)
 	if err != nil {
-		return fmt.Errorf("read credentials for GitHub check: %w", err)
+		return err
 	}
-	installation, err := r.GitHub.CachedInstallation(ctx, githubConfig.AppID, githubConfig.InstallationID, privateKey, githubSource.Repository.Name, githubclient.InstallationPermissions{"checks": "write"})
+	githubConfig := project.Spec.Source.GitHub
+	revision := githubStatusRevision(githubSource)
+	requestFor := func(report commitStatusReport, targetRun *actionsv1alpha1.WorkflowRun) githubclient.CreateCommitStatusRequest {
+		targetURL := ""
+		if r.ConsoleURL != "" {
+			targetURL = workflowRunConsoleURL(r.ConsoleURL, targetRun)
+		}
+		return githubclient.CreateCommitStatusRequest{
+			State:       report.State,
+			TargetURL:   targetURL,
+			Description: report.Description,
+			Context:     githubStatusContext(run.Spec.WorkflowPath),
+		}
+	}
+	request := requestFor(report, targetRun)
+	reportDigest := commitStatusReportDigest(request)
+	current := workflowRunCommitStatus(run)
+	if current != nil && current.State == actionsv1alpha1.GitHubCommitStatusState(report.State) && current.ReportDigest == reportDigest {
+		owned, err := r.githubStatusOwnershipMatchesRun(ctx, run, project, statusKey)
+		if err != nil {
+			return err
+		}
+		if owned {
+			return nil
+		}
+	}
+	currentOwner, leaseToken, err := r.githubStatusCurrentOwner(ctx, run, project, statusKey)
 	if err != nil {
-		return fmt.Errorf("authenticate GitHub check reporter: %w", err)
+		return err
 	}
-
-	var checkRun *githubclient.CheckRun
-	if current == nil {
-		checkRun, err = installation.FindCheckRun(ctx, githubSource.Repository.Owner, githubSource.Repository.Name, checkHeadSHA, githubConfig.AppID, externalID)
+	if !currentOwner {
+		return nil
+	}
+	report, targetRun, err = r.aggregateGitHubCommitStatusReport(ctx, run, statusKey)
+	if err != nil {
+		return errors.Join(err, r.releaseGitHubStatusLease(ctx, run.Namespace, statusKey, leaseToken))
+	}
+	request = requestFor(report, targetRun)
+	reportDigest = commitStatusReportDigest(request)
+	reportError := func() error {
+		privateKey, err := secretValue(ctx, r.APIReader, project.Namespace, githubConfig.PrivateKeySecretRef)
+		if err != nil {
+			return fmt.Errorf("read credentials for GitHub status: %w", err)
+		}
+		installation, err := r.GitHub.CachedInstallation(ctx, githubConfig.AppID, githubConfig.InstallationID, privateKey, githubSource.Repository.Name, githubclient.InstallationPermissions{"statuses": "write"})
+		if err != nil {
+			return fmt.Errorf("authenticate GitHub status reporter: %w", err)
+		}
+		statuses, err := installation.ListCommitStatuses(ctx, githubSource.Repository.Owner, githubSource.Repository.Name, revision)
 		if err != nil {
 			return err
 		}
-	}
-	if current == nil && checkRun == nil {
-		checkRun, err = installation.CreateCheckRun(ctx, githubSource.Repository.Owner, githubSource.Repository.Name, createRequest)
+		for index := range statuses {
+			status := &statuses[index]
+			if !strings.EqualFold(status.Context, request.Context) {
+				continue
+			}
+			if !commitStatusMatches(status, request) {
+				break
+			}
+			appBotLogin, err := r.GitHub.AppBotLogin(ctx, githubConfig.AppID, privateKey)
+			if err != nil {
+				return fmt.Errorf("identify GitHub status reporter: %w", err)
+			}
+			if !strings.EqualFold(status.Creator.Login, appBotLogin) {
+				break
+			}
+			if status.ID < 1 {
+				return errors.New("GitHub returned an invalid commit-status ID")
+			}
+			return r.recordGitHubCommitStatus(ctx, run, report.State, reportDigest)
+		}
+		status, err := installation.CreateCommitStatus(ctx, githubSource.Repository.Owner, githubSource.Repository.Name, revision, request)
 		if err != nil {
 			return err
 		}
-	} else {
-		var id int64
-		if current != nil {
-			id = current.ID
-		} else {
-			id = checkRun.ID
+		if status == nil || status.ID < 1 {
+			return errors.New("GitHub returned an invalid commit-status ID")
 		}
-		if id < 1 {
-			return errors.New("GitHub returned an invalid check-run ID")
-		}
-		checkRun, err = installation.UpdateCheckRun(ctx, githubSource.Repository.Owner, githubSource.Repository.Name, id, githubclient.UpdateCheckRunRequest{
-			Name:        name,
-			DetailsURL:  detailsURL,
-			ExternalID:  externalID,
-			Status:      report.Status,
-			Conclusion:  report.Conclusion,
-			StartedAt:   report.StartedAt,
-			CompletedAt: report.CompletedAt,
-			Output:      &report.Output,
-		})
-		if err != nil {
-			return err
-		}
-	}
-	if checkRun == nil || checkRun.ID < 1 {
-		return errors.New("GitHub returned an invalid check-run ID")
-	}
-	return r.recordGitHubCheckRun(ctx, run, checkRun.ID, report.Status, report.Conclusion, reportDigest)
+		return r.recordGitHubCommitStatus(ctx, run, report.State, reportDigest)
+	}()
+	return errors.Join(reportError, r.releaseGitHubStatusLease(ctx, run.Namespace, statusKey, leaseToken))
 }
 
-func (r *WorkflowRunReconciler) githubCheckCurrentAttempt(ctx context.Context, run *actionsv1alpha1.WorkflowRun) (bool, error) {
-	rootUID := run.UID
-	rootName := run.Name
-	attempt := int32(1)
-	if run.Spec.Rerun != nil {
-		rootUID = run.Spec.Rerun.OriginalRunRef.UID
-		rootName = run.Spec.Rerun.OriginalRunRef.Name
-		attempt = run.Spec.Rerun.Attempt
-	}
+func commitStatusMatches(status *githubclient.CommitStatus, request githubclient.CreateCommitStatusRequest) bool {
+	return strings.EqualFold(status.Context, request.Context) && status.State == request.State && status.TargetURL == request.TargetURL && status.Description == request.Description
+}
+
+func (r *WorkflowRunReconciler) aggregateGitHubCommitStatusReport(ctx context.Context, run *actionsv1alpha1.WorkflowRun, statusKey string) (commitStatusReport, *actionsv1alpha1.WorkflowRun, error) {
 	runs := &actionsv1alpha1.WorkflowRunList{}
-	if err := r.APIReader.List(ctx, runs, client.InNamespace(run.Namespace), client.MatchingLabels{actionsv1alpha1.LabelWorkflowRunRootUID: string(rootUID)}); err != nil {
+	if err := r.APIReader.List(ctx, runs, client.InNamespace(run.Namespace), client.MatchingLabels{actionsv1alpha1.LabelGitHubStatusKey: statusKey}); err != nil {
+		return commitStatusReport{}, nil, err
+	}
+	report, targetRun := aggregateGitHubCommitStatusReports(run, runs.Items)
+	return report, targetRun, nil
+}
+
+func aggregateGitHubCommitStatusReports(run *actionsv1alpha1.WorkflowRun, runs []actionsv1alpha1.WorkflowRun) (commitStatusReport, *actionsv1alpha1.WorkflowRun) {
+	latestByExecution := map[string]*actionsv1alpha1.WorkflowRun{}
+	for index := range runs {
+		candidate := &runs[index]
+		if candidate.UID == run.UID {
+			candidate = run
+		}
+		if !githubStatusKeyMatches(candidate, run) {
+			continue
+		}
+		execution := githubStatusExecutionIdentity(candidate)
+		if current := latestByExecution[execution]; current == nil || workflowRunIsNewer(candidate, current) {
+			latestByExecution[execution] = candidate
+		}
+	}
+	if len(latestByExecution) == 0 {
+		return workflowRunCommitStatusReport(run), run
+	}
+	if len(latestByExecution) == 1 {
+		for _, selected := range latestByExecution {
+			return workflowRunCommitStatusReport(selected), selected
+		}
+	}
+
+	state := "success"
+	targetRun := run
+	targetPriority := -1
+	for _, selected := range latestByExecution {
+		selectedState := workflowRunCommitStatusReport(selected).State
+		priority := 0
+		switch selectedState {
+		case "error":
+			state = "error"
+			priority = 3
+		case "failure":
+			if state != "error" {
+				state = "failure"
+			}
+			priority = 2
+		case "pending":
+			if state == "success" {
+				state = "pending"
+			}
+			priority = 1
+		}
+		if priority > targetPriority || priority == targetPriority && workflowRunIsNewer(selected, targetRun) {
+			targetRun = selected
+			targetPriority = priority
+		}
+	}
+	count := len(latestByExecution)
+	description := fmt.Sprintf("All %d matching workflow runs succeeded", count)
+	switch state {
+	case "error":
+		description = fmt.Sprintf("%d matching workflow runs include an error", count)
+	case "failure":
+		description = fmt.Sprintf("%d matching workflow runs include a failure", count)
+	case "pending":
+		description = fmt.Sprintf("%d matching workflow runs are pending", count)
+	}
+	return commitStatusReport{State: state, Description: description}, targetRun
+}
+
+func githubStatusExecutionIdentity(run *actionsv1alpha1.WorkflowRun) string {
+	source := run.Spec.Source.GitHub
+	if source.Event.Name == actionsv1alpha1.GitHubEventNamePullRequest && source.Event.PullRequest != nil {
+		return fmt.Sprintf("%s\x00%d", source.Event.Name, source.Event.PullRequest.Number)
+	}
+	return fmt.Sprintf("%s\x00%s", source.Event.Name, source.Revision.Ref)
+}
+
+func (r *WorkflowRunReconciler) ensureGitHubStatusIdentityLabels(ctx context.Context, run *actionsv1alpha1.WorkflowRun, projectUID types.UID, statusKey string) (bool, error) {
+	if labeledProjectUID := run.Labels[actionsv1alpha1.LabelProjectUID]; labeledProjectUID != "" && labeledProjectUID != string(projectUID) {
+		return false, fmt.Errorf("%w for WorkflowRun %q", errGitHubProjectIdentityMismatch, run.Name)
+	}
+	if run.Labels[actionsv1alpha1.LabelProjectUID] == string(projectUID) && run.Labels[actionsv1alpha1.LabelGitHubStatusKey] == statusKey {
+		return true, nil
+	}
+	before := run.DeepCopy()
+	if run.Labels == nil {
+		run.Labels = map[string]string{}
+	}
+	run.Labels[actionsv1alpha1.LabelProjectUID] = string(projectUID)
+	run.Labels[actionsv1alpha1.LabelGitHubStatusKey] = statusKey
+	return true, r.Patch(ctx, run, client.MergeFrom(before))
+}
+
+func (r *WorkflowRunReconciler) githubStatusCurrentOwner(ctx context.Context, run *actionsv1alpha1.WorkflowRun, project *actionsv1alpha1.Project, statusKey string) (bool, string, error) {
+	runs := &actionsv1alpha1.WorkflowRunList{}
+	if err := r.APIReader.List(ctx, runs, client.InNamespace(run.Namespace), client.MatchingLabels{actionsv1alpha1.LabelGitHubStatusKey: statusKey}); err != nil {
+		return false, "", err
+	}
+	for index := range runs.Items {
+		candidate := &runs.Items[index]
+		if githubStatusKeyMatches(candidate, run) && workflowRunIsNewer(candidate, run) {
+			return false, "", nil
+		}
+	}
+	return r.claimGitHubStatusOwnership(ctx, run, project, statusKey)
+}
+
+func (r *WorkflowRunReconciler) claimGitHubStatusOwnership(ctx context.Context, run *actionsv1alpha1.WorkflowRun, project *actionsv1alpha1.Project, statusKey string) (bool, string, error) {
+	desiredOwner := githubStatusOwnerForRun(run)
+	leaseToken, err := newGitHubStatusLeaseToken()
+	if err != nil {
+		return false, "", err
+	}
+	desiredOwner.LeaseToken = leaseToken
+	desiredOwner.LeaseUntil = r.now().Add(githubStatusLeaseDuration).UnixNano()
+	data, err := json.Marshal(desiredOwner)
+	if err != nil {
+		return false, "", err
+	}
+	key := client.ObjectKey{Namespace: run.Namespace, Name: githubStatusOwnerPrefix + statusKey}
+	current := false
+	err = retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		object := &corev1.ConfigMap{}
+		if err := r.APIReader.Get(ctx, key, object); err != nil {
+			if !apierrors.IsNotFound(err) {
+				return err
+			}
+			object = &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: key.Name, Namespace: key.Namespace}, Data: map[string]string{githubStatusOwnerDataKey: string(data)}}
+			if err := controllerutil.SetControllerReference(project, object, r.Scheme()); err != nil {
+				return err
+			}
+			if err := r.Create(ctx, object); err != nil {
+				if apierrors.IsAlreadyExists(err) {
+					return apierrors.NewConflict(corev1.Resource("configmaps"), key.Name, err)
+				}
+				return err
+			}
+			current = true
+			return nil
+		}
+		if !metav1.IsControlledBy(object, project) {
+			return fmt.Errorf("GitHub status ownership ConfigMap %q is not owned by Project %q", object.Name, project.Name)
+		}
+		storedOwner := githubStatusOwner{}
+		if err := json.Unmarshal([]byte(object.Data[githubStatusOwnerDataKey]), &storedOwner); err != nil || storedOwner.UID == "" || storedOwner.RootUID == "" || storedOwner.Attempt < 1 {
+			return fmt.Errorf("GitHub status ownership ConfigMap %q is invalid", object.Name)
+		}
+		if storedOwner.UID != desiredOwner.UID && githubStatusOwnerIsNewer(storedOwner, desiredOwner) {
+			live, err := r.githubStatusOwnerHasLiveRun(ctx, run, statusKey, storedOwner.UID)
+			if err != nil {
+				return err
+			}
+			if live {
+				current = false
+				return nil
+			}
+		}
+		if storedOwner.LeaseToken != "" && storedOwner.LeaseUntil > r.now().UnixNano() {
+			return apierrors.NewConflict(corev1.Resource("configmaps"), object.Name, errors.New("GitHub status reporting is already in progress"))
+		}
+		before := object.DeepCopy()
+		object.Data[githubStatusOwnerDataKey] = string(data)
+		if err := r.Patch(ctx, object, client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{})); err != nil {
+			return err
+		}
+		current = true
+		return nil
+	})
+	if err != nil || !current {
+		return current, "", err
+	}
+	return true, leaseToken, nil
+}
+
+func (r *WorkflowRunReconciler) githubStatusOwnerHasLiveRun(ctx context.Context, run *actionsv1alpha1.WorkflowRun, statusKey, ownerUID string) (bool, error) {
+	runs := &actionsv1alpha1.WorkflowRunList{}
+	if err := r.APIReader.List(ctx, runs, client.InNamespace(run.Namespace), client.MatchingLabels{actionsv1alpha1.LabelGitHubStatusKey: statusKey}); err != nil {
 		return false, err
 	}
 	for index := range runs.Items {
 		candidate := &runs.Items[index]
-		candidateAttempt := int32(1)
-		if candidate.UID != rootUID {
-			if candidate.Spec.Rerun == nil || candidate.Spec.Rerun.OriginalRunRef.Name != rootName || candidate.Spec.Rerun.OriginalRunRef.UID != rootUID {
-				continue
-			}
-			candidateAttempt = candidate.Spec.Rerun.Attempt
-		}
-		if candidateAttempt > attempt && candidate.Spec.ProjectRef == run.Spec.ProjectRef && candidate.Spec.WorkflowPath == run.Spec.WorkflowPath && apiEquality.Semantic.DeepEqual(candidate.Spec.Source, run.Spec.Source) {
-			return false, nil
+		if string(candidate.UID) == ownerUID && candidate.DeletionTimestamp.IsZero() && githubStatusKeyMatches(candidate, run) {
+			return true, nil
 		}
 	}
-	return true, nil
+	return false, nil
 }
 
-func checkRunReportDigest(request githubclient.CreateCheckRunRequest) string {
+func (r *WorkflowRunReconciler) githubStatusOwnershipMatchesRun(ctx context.Context, run *actionsv1alpha1.WorkflowRun, project *actionsv1alpha1.Project, statusKey string) (bool, error) {
+	object := &corev1.ConfigMap{}
+	key := client.ObjectKey{Namespace: run.Namespace, Name: githubStatusOwnerPrefix + statusKey}
+	if err := r.APIReader.Get(ctx, key, object); err != nil {
+		return false, client.IgnoreNotFound(err)
+	}
+	if !metav1.IsControlledBy(object, project) {
+		return false, fmt.Errorf("GitHub status ownership ConfigMap %q is not owned by Project %q", object.Name, project.Name)
+	}
+	owner := githubStatusOwner{}
+	if err := json.Unmarshal([]byte(object.Data[githubStatusOwnerDataKey]), &owner); err != nil || owner.UID == "" || owner.RootUID == "" || owner.Attempt < 1 {
+		return false, fmt.Errorf("GitHub status ownership ConfigMap %q is invalid", object.Name)
+	}
+	return owner.UID == string(run.UID), nil
+}
+
+func newGitHubStatusLeaseToken() (string, error) {
+	value := [16]byte{}
+	if _, err := rand.Read(value[:]); err != nil {
+		return "", fmt.Errorf("create GitHub status lease token: %w", err)
+	}
+	return hex.EncodeToString(value[:]), nil
+}
+
+func (r *WorkflowRunReconciler) releaseGitHubStatusLease(ctx context.Context, namespace, statusKey, leaseToken string) error {
+	key := client.ObjectKey{Namespace: namespace, Name: githubStatusOwnerPrefix + statusKey}
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		object := &corev1.ConfigMap{}
+		if err := r.APIReader.Get(ctx, key, object); err != nil {
+			return client.IgnoreNotFound(err)
+		}
+		owner := githubStatusOwner{}
+		if err := json.Unmarshal([]byte(object.Data[githubStatusOwnerDataKey]), &owner); err != nil {
+			return fmt.Errorf("decode GitHub status ownership ConfigMap %q: %w", object.Name, err)
+		}
+		if owner.LeaseToken != leaseToken {
+			return nil
+		}
+		owner.LeaseToken = ""
+		owner.LeaseUntil = 0
+		data, err := json.Marshal(owner)
+		if err != nil {
+			return err
+		}
+		before := object.DeepCopy()
+		object.Data[githubStatusOwnerDataKey] = string(data)
+		return r.Patch(ctx, object, client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{}))
+	})
+}
+
+func (r *WorkflowRunReconciler) releaseGitHubStatusLeaseForRun(ctx context.Context, run *actionsv1alpha1.WorkflowRun, statusKey string) error {
+	object := &corev1.ConfigMap{}
+	key := client.ObjectKey{Namespace: run.Namespace, Name: githubStatusOwnerPrefix + statusKey}
+	if err := r.APIReader.Get(ctx, key, object); err != nil {
+		return client.IgnoreNotFound(err)
+	}
+	owner := githubStatusOwner{}
+	if err := json.Unmarshal([]byte(object.Data[githubStatusOwnerDataKey]), &owner); err != nil {
+		return fmt.Errorf("decode GitHub status ownership ConfigMap %q: %w", object.Name, err)
+	}
+	if owner.UID != string(run.UID) || owner.LeaseToken == "" {
+		return nil
+	}
+	return r.releaseGitHubStatusLease(ctx, run.Namespace, statusKey, owner.LeaseToken)
+}
+
+func githubStatusOwnerForRun(run *actionsv1alpha1.WorkflowRun) githubStatusOwner {
+	rootUID, attempt := workflowRunLineage(run)
+	owner := githubStatusOwner{UID: string(run.UID), RootUID: string(rootUID), Attempt: attempt, CreatedAt: run.CreationTimestamp.UnixNano()}
+	if run.Status.Identity != nil {
+		owner.IdentityID = run.Status.Identity.ID
+	}
+	return owner
+}
+
+func githubStatusOwnerIsNewer(candidate, current githubStatusOwner) bool {
+	if candidate.UID == current.UID {
+		return false
+	}
+	if candidate.RootUID == current.RootUID && candidate.Attempt != current.Attempt {
+		return candidate.Attempt > current.Attempt
+	}
+	if candidate.CreatedAt != current.CreatedAt {
+		return candidate.CreatedAt > current.CreatedAt
+	}
+	if candidate.IdentityID != 0 && current.IdentityID != 0 && candidate.IdentityID != current.IdentityID {
+		return candidate.IdentityID > current.IdentityID
+	}
+	return candidate.UID > current.UID
+}
+
+func (r *WorkflowRunReconciler) releaseGitHubStatusOwnershipIfUnused(ctx context.Context, run *actionsv1alpha1.WorkflowRun) error {
+	statusKey := run.Labels[actionsv1alpha1.LabelGitHubStatusKey]
+	if statusKey == "" {
+		return nil
+	}
+	matchingRunRemains := func() (bool, error) {
+		runs := &actionsv1alpha1.WorkflowRunList{}
+		if err := r.APIReader.List(ctx, runs, client.InNamespace(run.Namespace), client.MatchingLabels{actionsv1alpha1.LabelGitHubStatusKey: statusKey}); err != nil {
+			return false, err
+		}
+		for index := range runs.Items {
+			candidate := &runs.Items[index]
+			if candidate.UID != run.UID && candidate.DeletionTimestamp.IsZero() && githubStatusKeyMatches(candidate, run) {
+				return true, nil
+			}
+		}
+		return false, nil
+	}
+	remaining, err := matchingRunRemains()
+	if err != nil || remaining {
+		return err
+	}
+	object := &corev1.ConfigMap{}
+	key := client.ObjectKey{Namespace: run.Namespace, Name: githubStatusOwnerPrefix + statusKey}
+	if err := r.APIReader.Get(ctx, key, object); err != nil {
+		return client.IgnoreNotFound(err)
+	}
+	owner := githubStatusOwner{}
+	if err := json.Unmarshal([]byte(object.Data[githubStatusOwnerDataKey]), &owner); err != nil {
+		return fmt.Errorf("decode GitHub status ownership ConfigMap %q: %w", object.Name, err)
+	}
+	if owner.UID == "" {
+		return fmt.Errorf("GitHub status ownership ConfigMap %q is invalid", object.Name)
+	}
+	if owner.UID != string(run.UID) && owner.LeaseToken != "" && owner.LeaseUntil > r.now().UnixNano() {
+		return nil
+	}
+	remaining, err = matchingRunRemains()
+	if err != nil || remaining {
+		return err
+	}
+	resourceVersion := object.ResourceVersion
+	return client.IgnoreNotFound(r.Delete(ctx, object, &client.DeleteOptions{
+		Preconditions: &metav1.Preconditions{ResourceVersion: &resourceVersion},
+	}))
+}
+
+func githubStatusKeyMatches(left, right *actionsv1alpha1.WorkflowRun) bool {
+	leftSource := left.Spec.Source.GitHub
+	rightSource := right.Spec.Source.GitHub
+	return leftSource != nil && rightSource != nil &&
+		left.Namespace == right.Namespace && left.Spec.ProjectRef == right.Spec.ProjectRef &&
+		left.Labels[actionsv1alpha1.LabelProjectUID] != "" && left.Labels[actionsv1alpha1.LabelProjectUID] == right.Labels[actionsv1alpha1.LabelProjectUID] &&
+		leftSource.Repository.ID == rightSource.Repository.ID &&
+		githubStatusRevision(leftSource) == githubStatusRevision(rightSource) &&
+		strings.EqualFold(githubStatusContext(left.Spec.WorkflowPath), githubStatusContext(right.Spec.WorkflowPath))
+}
+
+func workflowRunIsNewer(candidate, current *actionsv1alpha1.WorkflowRun) bool {
+	if candidate.UID == current.UID {
+		return false
+	}
+	candidateRoot, candidateAttempt := workflowRunLineage(candidate)
+	currentRoot, currentAttempt := workflowRunLineage(current)
+	if candidateRoot != "" && candidateRoot == currentRoot {
+		return candidateAttempt > currentAttempt
+	}
+	if !candidate.CreationTimestamp.Equal(&current.CreationTimestamp) {
+		return candidate.CreationTimestamp.After(current.CreationTimestamp.Time)
+	}
+	if candidate.Namespace == current.Namespace && candidate.Spec.ProjectRef == current.Spec.ProjectRef &&
+		candidate.Status.Identity != nil && current.Status.Identity != nil && candidate.Status.Identity.ID != current.Status.Identity.ID {
+		return candidate.Status.Identity.ID > current.Status.Identity.ID
+	}
+	return string(candidate.UID) > string(current.UID)
+}
+
+func workflowRunLineage(run *actionsv1alpha1.WorkflowRun) (types.UID, int32) {
+	if run.Spec.Rerun != nil {
+		return run.Spec.Rerun.OriginalRunRef.UID, run.Spec.Rerun.Attempt
+	}
+	return run.UID, 1
+}
+
+func githubStatusRevision(source *actionsv1alpha1.GitHubWorkflowRunSource) string {
+	if source.Event.Name == actionsv1alpha1.GitHubEventNamePullRequest && source.Revision.HeadSHA != "" {
+		return source.Revision.HeadSHA
+	}
+	return source.Revision.SHA
+}
+
+func githubStatusContext(workflowPath string) string {
+	context := "Open Actions / " + workflowPath
+	digest := sha256.Sum256([]byte(context))
+	suffix := fmt.Sprintf(" / %x", digest[:8])
+	runes := []rune(context)
+	if workflowPath == strings.ToLower(workflowPath) && len(runes) <= maxCommitStatusContextRunes {
+		return context
+	}
+	if len(runes)+len(suffix) <= maxCommitStatusContextRunes {
+		return context + suffix
+	}
+	return string(runes[:maxCommitStatusContextRunes-len(suffix)]) + suffix
+}
+
+func githubStatusKey(projectUID types.UID, run *actionsv1alpha1.WorkflowRun) string {
+	source := run.Spec.Source.GitHub
+	if source == nil {
+		return ""
+	}
+	switch source.Event.Name {
+	case actionsv1alpha1.GitHubEventNamePush, actionsv1alpha1.GitHubEventNamePullRequest, actionsv1alpha1.GitHubEventNameMergeGroup:
+	default:
+		return ""
+	}
+	key := fmt.Sprintf("%s\x00%d\x00%s\x00%s", projectUID, source.Repository.ID, githubStatusRevision(source), strings.ToLower(githubStatusContext(run.Spec.WorkflowPath)))
+	digest := sha256.Sum256([]byte(key))
+	return strings.ToLower(digestEncoding.EncodeToString(digest[:]))
+}
+
+func commitStatusReportDigest(request githubclient.CreateCommitStatusRequest) string {
 	data, _ := json.Marshal(request)
 	digest := sha256.Sum256(data)
 	return fmt.Sprintf("%x", digest)
 }
 
-func workflowRunCheckExternalID(run *actionsv1alpha1.WorkflowRun) string {
-	if run.Spec.Rerun != nil {
-		return string(run.Spec.Rerun.OriginalRunRef.UID)
-	}
-	return string(run.UID)
-}
-
-func workflowRunCheckReport(run *actionsv1alpha1.WorkflowRun) checkRunReport {
-	title := run.Status.WorkflowName
-	if title == "" {
-		title = run.Spec.WorkflowPath
-	}
-	report := checkRunReport{
-		Status: "queued",
-		Output: githubclient.CheckRunOutput{
-			Title:   title,
-			Summary: "The workflow is queued.",
-		},
-	}
+func workflowRunCommitStatusReport(run *actionsv1alpha1.WorkflowRun) commitStatusReport {
+	report := commitStatusReport{State: "pending", Description: "The workflow is queued"}
 	if policy := run.Spec.ForkPullRequest; policy != nil && policy.RequireApproval && !policy.Approved {
-		report.Output.Summary = "The workflow is waiting for approval before jobs are created."
+		report.Description = "The workflow is waiting for approval"
 	}
 	succeeded := meta.FindStatusCondition(run.Status.Conditions, actionsv1alpha1.WorkflowRunConditionSucceeded)
 	switch {
 	case succeeded != nil && succeeded.Status == metav1.ConditionTrue:
-		report.Status = "completed"
-		report.Conclusion = "success"
-		report.summaryFromCondition(succeeded)
+		report.State = "success"
+		report.Description = commitStatusDescription(succeeded.Message, "The workflow succeeded")
 	case succeeded != nil && succeeded.Status == metav1.ConditionFalse:
-		report.Status = "completed"
+		report.State = "failure"
 		switch succeeded.Reason {
-		case "JobCancelled", "RevisionSuperseded":
-			report.Conclusion = "cancelled"
-		case "JobTimedOut":
-			report.Conclusion = "timed_out"
-		default:
-			report.Conclusion = "failure"
+		case "JobCancelled", "JobTimedOut", "RevisionSuperseded":
+			report.State = "error"
 		}
-		report.summaryFromCondition(succeeded)
+		report.Description = commitStatusDescription(succeeded.Message, "The workflow failed")
 	case !run.DeletionTimestamp.IsZero():
-		report.Status = "completed"
-		report.Conclusion = "cancelled"
-		report.Output.Summary = "The workflow was cancelled."
+		report.State = "error"
+		report.Description = "The workflow was cancelled"
 	case run.Status.StartTime != nil:
-		report.Status = "in_progress"
-		report.Output.Summary = "The workflow is running."
+		report.Description = "The workflow is running"
 	default:
 		planned := meta.FindStatusCondition(run.Status.Conditions, actionsv1alpha1.WorkflowRunConditionPlanned)
 		if planned != nil && planned.Message != "" {
-			report.Output.Summary = planned.Message
+			report.Description = commitStatusDescription(planned.Message, report.Description)
 		}
-	}
-	if run.Status.StartTime != nil {
-		report.StartedAt = run.Status.StartTime.UTC().Format(time.RFC3339)
-	}
-	if run.Status.CompletionTime != nil {
-		report.CompletedAt = run.Status.CompletionTime.UTC().Format(time.RFC3339)
-	} else if !run.DeletionTimestamp.IsZero() {
-		report.CompletedAt = run.DeletionTimestamp.UTC().Format(time.RFC3339)
-	} else if report.Status == "completed" && succeeded != nil {
-		report.CompletedAt = succeeded.LastTransitionTime.UTC().Format(time.RFC3339)
-	}
-	if run.Status.Jobs != nil {
-		jobs := run.Status.Jobs
-		report.Output.Text = fmt.Sprintf("Jobs: %d total, %d waiting, %d queued, %d active, %d succeeded, %d failed, %d timed out, %d skipped, %d cancelled.", jobs.Total, jobs.Waiting, jobs.Queued, jobs.Active, jobs.Succeeded, jobs.Failed, jobs.TimedOut, jobs.Skipped, jobs.Cancelled)
 	}
 	if run.Spec.Rerun != nil {
-		report.Output.Title = fmt.Sprintf("%s (attempt %d)", title, run.Spec.Rerun.Attempt)
-		selection := "all jobs"
-		if count := len(run.Spec.Rerun.JobIDs); count > 0 {
-			selection = fmt.Sprintf("%d requested jobs", count)
-		}
-		attempt := fmt.Sprintf("Attempt %d reruns %s.", run.Spec.Rerun.Attempt, selection)
-		if report.Output.Text == "" {
-			report.Output.Text = attempt
-		} else {
-			report.Output.Text = attempt + "\n\n" + report.Output.Text
-		}
+		report.Description = commitStatusDescription(fmt.Sprintf("Attempt %d: %s", run.Spec.Rerun.Attempt, report.Description), report.Description)
 	}
 	return report
 }
 
-func (r *checkRunReport) summaryFromCondition(condition *metav1.Condition) {
-	if condition.Message != "" {
-		r.Output.Summary = condition.Message
+func commitStatusDescription(description, fallback string) string {
+	if description == "" {
+		description = fallback
 	}
+	runes := []rune(description)
+	if len(runes) > maxCommitStatusDescriptionRunes {
+		description = string(runes[:maxCommitStatusDescriptionRunes])
+	}
+	return description
 }
 
-func workflowRunCheckRunStatus(run *actionsv1alpha1.WorkflowRun) *actionsv1alpha1.GitHubCheckRunStatus {
+func workflowRunCommitStatus(run *actionsv1alpha1.WorkflowRun) *actionsv1alpha1.GitHubCommitStatus {
 	if run.Status.Source == nil || run.Status.Source.GitHub == nil {
 		return nil
 	}
-	return run.Status.Source.GitHub.CheckRun
+	return run.Status.Source.GitHub.CommitStatus
 }
 
-func (r *WorkflowRunReconciler) recordGitHubCheckRun(ctx context.Context, run *actionsv1alpha1.WorkflowRun, id int64, status, conclusion, reportDigest string) error {
+func (r *WorkflowRunReconciler) recordGitHubCommitStatus(ctx context.Context, run *actionsv1alpha1.WorkflowRun, state, reportDigest string) error {
 	before := run.DeepCopy()
 	if run.Status.Source == nil {
 		run.Status.Source = &actionsv1alpha1.WorkflowRunSourceStatus{}
@@ -942,7 +1328,7 @@ func (r *WorkflowRunReconciler) recordGitHubCheckRun(ctx context.Context, run *a
 	if run.Status.Source.GitHub == nil {
 		run.Status.Source.GitHub = &actionsv1alpha1.GitHubWorkflowRunStatus{}
 	}
-	run.Status.Source.GitHub.CheckRun = &actionsv1alpha1.GitHubCheckRunStatus{ID: id, Status: status, Conclusion: conclusion, ReportDigest: reportDigest}
+	run.Status.Source.GitHub.CommitStatus = &actionsv1alpha1.GitHubCommitStatus{State: actionsv1alpha1.GitHubCommitStatusState(state), ReportDigest: reportDigest}
 	return r.Status().Patch(ctx, run, client.MergeFrom(before))
 }
 
@@ -1620,7 +2006,7 @@ func (r *WorkflowRunReconciler) jobExpressionContext(run *actionsv1alpha1.Workfl
 		RunNumber:         runNumber,
 		ServerURL:         r.GitHubServerURL,
 		SHA:               githubSource.Revision.SHA,
-		TriggeringActor:   workflowRunTriggeringActor(run),
+		TriggeringActor:   githubSourceActor(githubSource),
 		WorkflowName:      workflowName,
 		WorkflowPath:      run.Spec.WorkflowPath,
 	})
@@ -1759,16 +2145,26 @@ func (r *WorkflowRunReconciler) githubEventSnapshot(ctx context.Context, run *ac
 	if err := r.APIReader.Get(ctx, client.ObjectKey{Namespace: run.Namespace, Name: name}, secret); err != nil {
 		return nil, fmt.Errorf("get GitHub event snapshot Secret %q for WorkflowRun %q: %w", name, run.Name, err)
 	}
-	owned := false
-	for _, owner := range secret.OwnerReferences {
-		if owner.APIVersion == actionsv1alpha1.GroupVersion.String() && owner.Kind == "WorkflowRun" && owner.Name == run.Name && owner.UID == run.UID {
-			owned = true
-			break
-		}
-	}
 	data, found := secret.Data[eventsnapshot.DataKey]
+	owned := eventSnapshotOwnedByWorkflowRun(secret, run.Name, run.UID)
+	if !owned && run.Spec.Rerun != nil && eventSnapshotOwnedByWorkflowRun(secret, run.Spec.Rerun.OriginalRunRef.Name, run.Spec.Rerun.OriginalRunRef.UID) {
+		if secret.Immutable == nil || !*secret.Immutable || !found {
+			return nil, &terminalPlanningError{cause: fmt.Errorf("GitHub event snapshot Secret %q is invalid for WorkflowRun %q", name, run.Name)}
+		}
+		before := secret.DeepCopy()
+		secret.OwnerReferences = append(secret.OwnerReferences, metav1.OwnerReference{
+			APIVersion: actionsv1alpha1.GroupVersion.String(), Kind: "WorkflowRun", Name: run.Name, UID: run.UID,
+		})
+		if err := r.Patch(ctx, secret, client.MergeFrom(before)); err != nil {
+			return nil, fmt.Errorf("preserve GitHub event snapshot Secret %q for WorkflowRun %q: %w", name, run.Name, err)
+		}
+		owned = true
+	}
 	if !owned {
 		return nil, fmt.Errorf("GitHub event snapshot Secret %q is not owned by WorkflowRun %q", name, run.Name)
+	}
+	if err := r.releaseRerunEventSnapshotProtection(ctx, run); err != nil {
+		return nil, err
 	}
 	if secret.Immutable == nil || !*secret.Immutable || !found {
 		return nil, &terminalPlanningError{cause: fmt.Errorf("GitHub event snapshot Secret %q is invalid for WorkflowRun %q", name, run.Name)}
@@ -1778,6 +2174,38 @@ func (r *WorkflowRunReconciler) githubEventSnapshot(ctx context.Context, run *ac
 		return nil, &terminalPlanningError{cause: fmt.Errorf("GitHub event snapshot Secret %q is invalid for WorkflowRun %q: %w", name, run.Name, err)}
 	}
 	return payload, nil
+}
+
+func eventSnapshotOwnedByWorkflowRun(secret *corev1.Secret, name string, uid types.UID) bool {
+	for _, owner := range secret.OwnerReferences {
+		if owner.APIVersion == actionsv1alpha1.GroupVersion.String() && owner.Kind == "WorkflowRun" && owner.Name == name && owner.UID == uid {
+			return true
+		}
+	}
+	return false
+}
+
+func (r *WorkflowRunReconciler) releaseRerunEventSnapshotProtection(ctx context.Context, run *actionsv1alpha1.WorkflowRun) error {
+	if run.Spec.Rerun == nil {
+		return nil
+	}
+	root := &actionsv1alpha1.WorkflowRun{}
+	key := client.ObjectKey{Namespace: run.Namespace, Name: run.Spec.Rerun.OriginalRunRef.Name}
+	if err := r.APIReader.Get(ctx, key, root); err != nil {
+		return client.IgnoreNotFound(err)
+	}
+	if root.UID != run.Spec.Rerun.OriginalRunRef.UID || root.Annotations[eventsnapshot.RerunTargetAnnotation] != run.Name || !controllerutil.ContainsFinalizer(root, eventsnapshot.RerunProtectionFinalizer) {
+		return nil
+	}
+	return r.clearRerunEventSnapshotProtection(ctx, root)
+}
+
+func (r *WorkflowRunReconciler) clearRerunEventSnapshotProtection(ctx context.Context, root *actionsv1alpha1.WorkflowRun) error {
+	before := root.DeepCopy()
+	delete(root.Annotations, eventsnapshot.RerunTargetAnnotation)
+	delete(root.Annotations, eventsnapshot.RerunDeadlineAnnotation)
+	controllerutil.RemoveFinalizer(root, eventsnapshot.RerunProtectionFinalizer)
+	return r.Patch(ctx, root, client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{}))
 }
 
 func githubEventExpressionValue(source *actionsv1alpha1.GitHubWorkflowRunSource, inputValues map[string]any, eventPayload map[string]any) map[string]any {
@@ -2139,7 +2567,7 @@ func (r *WorkflowRunReconciler) jobPlan(run *actionsv1alpha1.WorkflowRun, workfl
 		Inputs:  inputValues,
 		Run: runner.Run{
 			ID: identity.ID, Number: identity.Number, Attempt: identity.Attempt,
-			Actor: githubSourceActor(githubSource), TriggeringActor: workflowRunTriggeringActor(run), URL: identity.URL,
+			Actor: githubSourceActor(githubSource), TriggeringActor: githubSourceActor(githubSource), URL: identity.URL,
 			QueryURL: workflowRunQueryURL(r.ConsoleURL, run),
 		},
 		Repository: runner.Repository{
@@ -2182,13 +2610,6 @@ func (r *WorkflowRunReconciler) jobPlan(run *actionsv1alpha1.WorkflowRun, workfl
 		CleanupTimeoutSeconds:  int64(runner.CleanupTimeout / time.Second),
 		Steps:                  steps,
 	}, nil
-}
-
-func workflowRunTriggeringActor(run *actionsv1alpha1.WorkflowRun) string {
-	if run.Spec.Rerun != nil && run.Spec.Rerun.TriggeringActor != "" {
-		return run.Spec.Rerun.TriggeringActor
-	}
-	return githubSourceActor(run.Spec.Source.GitHub)
 }
 
 func githubTokenPermissions(run *actionsv1alpha1.WorkflowRun, permissions workflow.Permissions) map[string]string {
@@ -3580,15 +4001,21 @@ func (r *WorkflowRunReconciler) cancelWorkflowRun(ctx context.Context, run *acti
 }
 
 func (r *WorkflowRunReconciler) finalizeCanceledWorkflowRun(ctx context.Context, run *actionsv1alpha1.WorkflowRun) (ctrl.Result, error) {
+	if controllerutil.ContainsFinalizer(run, eventsnapshot.RerunProtectionFinalizer) {
+		return r.finalizeRerunEventSnapshotProtection(ctx, run)
+	}
 	cancellationFinalizer := controllerutil.ContainsFinalizer(run, workflowRunCancellationFinalizer)
-	checkFinalizer := controllerutil.ContainsFinalizer(run, workflowRunCheckFinalizer)
+	statusFinalizer := controllerutil.ContainsFinalizer(run, workflowRunGitHubStatusFinalizer)
 	scheduleFinalizer := controllerutil.ContainsFinalizer(run, workflowRunScheduleFinalizer)
-	if !cancellationFinalizer && !checkFinalizer && !scheduleFinalizer {
+	if !cancellationFinalizer && !statusFinalizer && !scheduleFinalizer {
 		return ctrl.Result{}, nil
 	}
 	var reportError error
-	if checkFinalizer {
-		reportError = r.reconcileGitHubCheck(ctx, run)
+	if statusFinalizer {
+		reportError = r.reconcileGitHubStatus(ctx, run)
+	}
+	if statusFinalizer && reportError == nil {
+		reportError = r.releaseGitHubStatusOwnershipIfUnused(ctx, run)
 	}
 	if cancellationFinalizer {
 		remaining, err := r.executionWorkloadsRemain(ctx, run)
@@ -3597,7 +4024,7 @@ func (r *WorkflowRunReconciler) finalizeCanceledWorkflowRun(ctx context.Context,
 		}
 		if remaining {
 			if reportError != nil {
-				ctrl.LoggerFrom(ctx).Error(reportError, "GitHub Check reporting failed while workflow cleanup is pending")
+				ctrl.LoggerFrom(ctx).Error(reportError, "GitHub reporting failed while workflow cleanup is pending")
 			}
 			return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
 		}
@@ -3612,18 +4039,23 @@ func (r *WorkflowRunReconciler) finalizeCanceledWorkflowRun(ctx context.Context,
 		}
 	}
 	retryReport := false
-	if checkFinalizer {
+	if statusFinalizer {
 		switch {
 		case reportError == nil:
-			controllerutil.RemoveFinalizer(run, workflowRunCheckFinalizer)
-		case r.githubCheckReportPermanentlyUnavailable(ctx, run, reportError):
-			ctrl.LoggerFrom(ctx).Info("Skipping terminal GitHub Check report because reporting is unavailable", "error", reportError)
-			controllerutil.RemoveFinalizer(run, workflowRunCheckFinalizer)
+			controllerutil.RemoveFinalizer(run, workflowRunGitHubStatusFinalizer)
+		case r.githubReportPermanentlyUnavailable(ctx, run, reportError):
+			if err := r.releaseGitHubStatusOwnershipIfUnused(ctx, run); err != nil {
+				reportError = errors.Join(reportError, fmt.Errorf("release GitHub status ownership: %w", err))
+				retryReport = true
+				break
+			}
+			ctrl.LoggerFrom(ctx).Info("Skipping terminal GitHub report because reporting is unavailable", "error", reportError)
+			controllerutil.RemoveFinalizer(run, workflowRunGitHubStatusFinalizer)
 		default:
 			retryReport = true
 		}
 	}
-	finalizersChanged := cancellationFinalizer || (scheduleFinalizer && scheduleRemaining <= 0) || (checkFinalizer && !retryReport)
+	finalizersChanged := cancellationFinalizer || (scheduleFinalizer && scheduleRemaining <= 0) || (statusFinalizer && !retryReport)
 	if finalizersChanged {
 		if err := r.Patch(ctx, run, client.MergeFrom(before)); err != nil {
 			return ctrl.Result{}, err
@@ -3638,6 +4070,42 @@ func (r *WorkflowRunReconciler) finalizeCanceledWorkflowRun(ctx context.Context,
 	return ctrl.Result{}, nil
 }
 
+func (r *WorkflowRunReconciler) finalizeRerunEventSnapshotProtection(ctx context.Context, root *actionsv1alpha1.WorkflowRun) (ctrl.Result, error) {
+	targetName := root.Annotations[eventsnapshot.RerunTargetAnnotation]
+	deadline, deadlineErr := time.Parse(time.RFC3339Nano, root.Annotations[eventsnapshot.RerunDeadlineAnnotation])
+	if targetName == "" || deadlineErr != nil {
+		if err := r.clearRerunEventSnapshotProtection(ctx, root); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{Requeue: true}, nil
+	}
+	target := &actionsv1alpha1.WorkflowRun{}
+	if err := r.APIReader.Get(ctx, client.ObjectKey{Namespace: root.Namespace, Name: targetName}, target); err != nil {
+		if apierrors.IsNotFound(err) {
+			now := r.now()
+			if !now.Before(deadline) {
+				if err := r.clearRerunEventSnapshotProtection(ctx, root); err != nil {
+					return ctrl.Result{}, err
+				}
+				return ctrl.Result{Requeue: true}, nil
+			}
+			return ctrl.Result{RequeueAfter: min(2*time.Second, deadline.Sub(now))}, nil
+		}
+		return ctrl.Result{}, err
+	}
+	rerun := target.Spec.Rerun
+	if rerun == nil || rerun.OriginalRunRef.Name != root.Name || rerun.OriginalRunRef.UID != root.UID || target.Annotations[eventsnapshot.Annotation] != root.Annotations[eventsnapshot.Annotation] || !target.DeletionTimestamp.IsZero() {
+		if err := r.clearRerunEventSnapshotProtection(ctx, root); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{Requeue: true}, nil
+	}
+	if _, err := r.githubEventSnapshot(ctx, target); err != nil {
+		return ctrl.Result{}, err
+	}
+	return ctrl.Result{Requeue: true}, nil
+}
+
 func (r *WorkflowRunReconciler) scheduleFinalizerRemaining(run *actionsv1alpha1.WorkflowRun) time.Duration {
 	if run.CreationTimestamp.IsZero() {
 		return 0
@@ -3646,9 +4114,12 @@ func (r *WorkflowRunReconciler) scheduleFinalizerRemaining(run *actionsv1alpha1.
 	return deadline.Sub(r.now().UTC())
 }
 
-func (r *WorkflowRunReconciler) githubCheckReportPermanentlyUnavailable(ctx context.Context, run *actionsv1alpha1.WorkflowRun, reportError error) bool {
+func (r *WorkflowRunReconciler) githubReportPermanentlyUnavailable(ctx context.Context, run *actionsv1alpha1.WorkflowRun, reportError error) bool {
 	if _, limited := githubclient.RetryDelay(reportError, r.now()); limited {
 		return false
+	}
+	if errors.Is(reportError, errGitHubProjectIdentityMismatch) {
+		return true
 	}
 	apiError := &githubclient.APIError{}
 	if errors.As(reportError, &apiError) && apiError.StatusCode >= 400 && apiError.StatusCode < 500 && apiError.StatusCode != 408 && apiError.StatusCode != 409 && apiError.StatusCode != 429 {
@@ -3809,8 +4280,34 @@ func (r *WorkflowRunReconciler) SetupWithManager(manager ctrl.Manager) error {
 			DeleteFunc:  func(event.DeleteEvent) bool { return false },
 			GenericFunc: func(event.GenericEvent) bool { return false },
 		})).
+		Watches(&actionsv1alpha1.WorkflowRun{}, handler.EnqueueRequestsFromMapFunc(r.workflowRunsSharingGitHubStatus)).
 		Owns(&actionsv1alpha1.WorkflowJob{}).
 		Complete(r)
+}
+
+func (r *WorkflowRunReconciler) workflowRunsSharingGitHubStatus(ctx context.Context, object client.Object) []reconcile.Request {
+	run, ok := object.(*actionsv1alpha1.WorkflowRun)
+	if !ok {
+		return nil
+	}
+	statusKey := run.Labels[actionsv1alpha1.LabelGitHubStatusKey]
+	if statusKey == "" {
+		return nil
+	}
+	runs := &actionsv1alpha1.WorkflowRunList{}
+	if err := r.APIReader.List(ctx, runs, client.InNamespace(run.Namespace), client.MatchingLabels{actionsv1alpha1.LabelGitHubStatusKey: statusKey}); err != nil {
+		ctrl.LoggerFrom(ctx).Error(err, "List WorkflowRuns sharing GitHub status", "workflow_run", run.Name)
+		return nil
+	}
+	requests := make([]reconcile.Request, 0, len(runs.Items))
+	for index := range runs.Items {
+		candidate := &runs.Items[index]
+		if candidate.UID == run.UID || !candidate.DeletionTimestamp.IsZero() || !githubStatusKeyMatches(candidate, run) {
+			continue
+		}
+		requests = append(requests, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(candidate)})
+	}
+	return requests
 }
 
 func (r *WorkflowRunReconciler) workflowRunsSupersededByForkPullRequestRevision(ctx context.Context, object client.Object) []reconcile.Request {

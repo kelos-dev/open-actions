@@ -467,30 +467,25 @@ func TestListRepositoriesStopsAtLimit(t *testing.T) {
 	}
 }
 
-func TestCheckRunLifecycleAndRepositoryAccess(t *testing.T) {
+func TestCommitStatusAndRepositoryAccess(t *testing.T) {
 	revision := strings.Repeat("a", 40)
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		switch {
-		case request.Method == http.MethodGet && request.URL.Path == "/repos/acme/example/commits/"+revision+"/check-runs":
-			if request.URL.Query().Get("app_id") != "7" || request.URL.Query().Get("filter") != "all" {
-				http.Error(writer, "unexpected query", http.StatusBadRequest)
+		case request.Method == http.MethodGet && request.URL.Path == "/app":
+			fmt.Fprint(writer, `{"id":1,"slug":"open-actions"}`)
+		case request.Method == http.MethodGet && request.URL.Path == "/repos/acme/example/commits/"+revision+"/statuses":
+			if request.URL.Query().Get("page") != "1" || request.URL.Query().Get("per_page") != "100" {
+				http.Error(writer, "unexpected status query", http.StatusBadRequest)
 				return
 			}
-			fmt.Fprint(writer, `{"total_count":1,"check_runs":[{"id":11,"external_id":"run-uid","status":"queued"}]}`)
-		case request.Method == http.MethodPost && request.URL.Path == "/repos/acme/example/check-runs":
-			requestBody := CreateCheckRunRequest{}
-			if err := json.NewDecoder(request.Body).Decode(&requestBody); err != nil || requestBody.ExternalID != "other-run" || requestBody.Status != "queued" {
-				http.Error(writer, "unexpected create request", http.StatusBadRequest)
+			fmt.Fprint(writer, `[{"id":11,"state":"pending","context":"Open Actions / ci.yaml","creator":{"login":"open-actions[bot]"}}]`)
+		case request.Method == http.MethodPost && request.URL.Path == "/repos/acme/example/statuses/"+revision:
+			requestBody := CreateCommitStatusRequest{}
+			if err := json.NewDecoder(request.Body).Decode(&requestBody); err != nil || requestBody.State != "success" || requestBody.TargetURL != "https://actions.example/runs/default/ci" || requestBody.Description != "The workflow succeeded" || requestBody.Context != "Open Actions / ci.yaml" {
+				http.Error(writer, "unexpected status request", http.StatusBadRequest)
 				return
 			}
-			fmt.Fprint(writer, `{"id":12,"external_id":"other-run","status":"queued"}`)
-		case request.Method == http.MethodPatch && request.URL.Path == "/repos/acme/example/check-runs/12":
-			requestBody := UpdateCheckRunRequest{}
-			if err := json.NewDecoder(request.Body).Decode(&requestBody); err != nil || requestBody.Conclusion != "success" {
-				http.Error(writer, "unexpected update request", http.StatusBadRequest)
-				return
-			}
-			fmt.Fprint(writer, `{"id":12,"external_id":"other-run","status":"completed","conclusion":"success"}`)
+			fmt.Fprint(writer, `{"id":12,"state":"success","target_url":"https://actions.example/runs/default/ci","description":"The workflow succeeded","context":"Open Actions / ci.yaml"}`)
 		default:
 			http.NotFound(writer, request)
 		}
@@ -501,17 +496,19 @@ func TestCheckRunLifecycleAndRepositoryAccess(t *testing.T) {
 		t.Fatal(err)
 	}
 	installation := &InstallationClient{client: client, token: "token"}
-	found, err := installation.FindCheckRun(context.Background(), "acme", "example", revision, 7, "run-uid")
-	if err != nil || found == nil || found.ID != 11 {
-		t.Fatalf("FindCheckRun() = %#v, %v", found, err)
+	botLogin, err := client.AppBotLogin(context.Background(), 1, testPrivateKey(t))
+	if err != nil || botLogin != "open-actions[bot]" {
+		t.Fatalf("AppBotLogin() = %q, %v", botLogin, err)
 	}
-	created, err := installation.CreateCheckRun(context.Background(), "acme", "example", CreateCheckRunRequest{Name: "CI", HeadSHA: revision, ExternalID: "other-run", Status: "queued"})
-	if err != nil || created.ID != 12 {
-		t.Fatalf("CreateCheckRun() = %#v, %v", created, err)
+	statuses, err := installation.ListCommitStatuses(context.Background(), "acme", "example", revision)
+	if err != nil || len(statuses) != 1 || statuses[0].ID != 11 || statuses[0].State != "pending" || statuses[0].Creator.Login != "open-actions[bot]" {
+		t.Fatalf("ListCommitStatuses() = %#v, %v", statuses, err)
 	}
-	updated, err := installation.UpdateCheckRun(context.Background(), "acme", "example", created.ID, UpdateCheckRunRequest{Status: "completed", Conclusion: "success"})
-	if err != nil || updated.Conclusion != "success" {
-		t.Fatalf("UpdateCheckRun() = %#v, %v", updated, err)
+	created, err := installation.CreateCommitStatus(context.Background(), "acme", "example", revision, CreateCommitStatusRequest{
+		State: "success", TargetURL: "https://actions.example/runs/default/ci", Description: "The workflow succeeded", Context: "Open Actions / ci.yaml",
+	})
+	if err != nil || created.ID != 12 || created.State != "success" {
+		t.Fatalf("CreateCommitStatus() = %#v, %v", created, err)
 	}
 }
 

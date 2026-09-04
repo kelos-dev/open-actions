@@ -5,8 +5,22 @@ import (
 	"testing"
 
 	actionsv1alpha1 "github.com/kelos-dev/open-actions/api/v1alpha1"
+	"github.com/kelos-dev/open-actions/internal/eventsnapshot"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
+
+func TestNewRerunPreservesGitHubEventSnapshot(t *testing.T) {
+	root := &actionsv1alpha1.WorkflowRun{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "ci", Namespace: "default", UID: "root-uid",
+			Annotations: map[string]string{eventsnapshot.Annotation: "event-snapshot"},
+		},
+	}
+	desired := NewRerun(root, root, 2, nil)
+	if desired.Annotations[eventsnapshot.Annotation] != "event-snapshot" {
+		t.Fatalf("rerun annotations = %#v", desired.Annotations)
+	}
+}
 
 func TestFailedJobIDsIncludesMatrixFailFastCancellations(t *testing.T) {
 	run := &actionsv1alpha1.WorkflowRun{

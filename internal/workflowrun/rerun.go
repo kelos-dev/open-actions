@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	actionsv1alpha1 "github.com/kelos-dev/open-actions/api/v1alpha1"
+	"github.com/kelos-dev/open-actions/internal/eventsnapshot"
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -115,7 +116,7 @@ func matrixFailFastCancelled(job *actionsv1alpha1.WorkflowJob) bool {
 }
 
 // NewRerun creates the immutable object for the next WorkflowRun attempt.
-func NewRerun(root, previous *actionsv1alpha1.WorkflowRun, attempt int32, requestID string, jobIDs []string) *actionsv1alpha1.WorkflowRun {
+func NewRerun(root, previous *actionsv1alpha1.WorkflowRun, attempt int32, jobIDs []string) *actionsv1alpha1.WorkflowRun {
 	desired := &actionsv1alpha1.WorkflowRun{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: RerunName(root, attempt), Namespace: root.Namespace,
@@ -123,12 +124,14 @@ func NewRerun(root, previous *actionsv1alpha1.WorkflowRun, attempt int32, reques
 		},
 		Spec: *previous.Spec.DeepCopy(),
 	}
+	if snapshotName := root.Annotations[eventsnapshot.Annotation]; snapshotName != "" {
+		desired.Annotations = map[string]string{eventsnapshot.Annotation: snapshotName}
+	}
 	desired.Spec.CancelRequested = false
 	desired.Spec.Rerun = &actionsv1alpha1.WorkflowRunRerun{
 		OriginalRunRef: actionsv1alpha1.WorkflowRunReference{Name: root.Name, UID: root.UID},
 		PreviousRunRef: actionsv1alpha1.WorkflowRunReference{Name: previous.Name, UID: previous.UID},
 		Attempt:        attempt,
-		RequestID:      requestID,
 		JobIDs:         append([]string(nil), jobIDs...),
 	}
 	return desired

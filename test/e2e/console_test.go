@@ -66,15 +66,16 @@ var _ = Describe("Console", func() {
 			if stored.Status.Source.GitHub == nil {
 				return
 			}
-			checkRun := stored.Status.Source.GitHub.CheckRun
-			g.Expect(checkRun).NotTo(BeNil())
-			if checkRun != nil {
-				g.Expect(checkRun.Status).To(Equal("completed"))
-				g.Expect(checkRun.Conclusion).To(Equal("success"))
+			commitStatus := stored.Status.Source.GitHub.CommitStatus
+			g.Expect(commitStatus).NotTo(BeNil())
+			if commitStatus != nil {
+				g.Expect(commitStatus.State).To(Equal(actionsv1alpha1.GitHubCommitStatusStateSuccess))
 			}
 		}, 180*time.Second, time.Second).Should(Succeed())
+		runPath := "/runs/" + url.PathEscape(run.Namespace) + "/" + url.PathEscape(run.Name)
+		targetURL := consoleURL + runPath
 		Eventually(func(g Gomega) {
-			response, err := http.Get(fixtureURL + "/fixture/check-runs/" + url.PathEscape(string(run.UID)))
+			response, err := http.Get(fixtureURL + "/fixture/commit-status?target_url=" + url.QueryEscape(targetURL))
 			g.Expect(err).NotTo(HaveOccurred())
 			if err != nil {
 				return
@@ -85,15 +86,16 @@ var _ = Describe("Console", func() {
 				return
 			}
 			report := struct {
-				DetailsURL string `json:"details_url"`
-				Status     string `json:"status"`
-				Conclusion string `json:"conclusion"`
+				State       string `json:"state"`
+				TargetURL   string `json:"target_url"`
+				Description string `json:"description"`
+				Context     string `json:"context"`
 			}{}
 			g.Expect(json.NewDecoder(response.Body).Decode(&report)).To(Succeed())
-			runPath := "/runs/" + url.PathEscape(run.Namespace) + "/" + url.PathEscape(run.Name)
-			g.Expect(report.DetailsURL).To(Equal(consoleURL + runPath))
-			g.Expect(report.Status).To(Equal("completed"))
-			g.Expect(report.Conclusion).To(Equal("success"))
+			g.Expect(report.TargetURL).To(Equal(targetURL))
+			g.Expect(report.State).To(Equal("success"))
+			g.Expect(report.Description).To(Equal("All required WorkflowJobs succeeded"))
+			g.Expect(report.Context).To(Equal("Open Actions / " + workflowPath))
 		}, 30*time.Second, time.Second).Should(Succeed())
 
 		var workflowJob actionsv1alpha1.WorkflowJob
@@ -123,7 +125,6 @@ var _ = Describe("Console", func() {
 		)))
 		Expect(loginResponse.Body.Close()).To(Succeed())
 
-		runPath := "/runs/" + url.PathEscape(run.Namespace) + "/" + url.PathEscape(run.Name)
 		mainPage := getConsolePage(webClient, consoleURL+"/", http.StatusOK)
 		Expect(mainPage).To(ContainSubstring("Workflow runs"))
 		Expect(mainPage).To(ContainSubstring(`href="` + runPath + `"`))

@@ -131,45 +131,43 @@ func (p InstallationPermissions) validate() error {
 	return nil
 }
 
-// CheckRun is the GitHub representation needed to reconcile a workflow check.
-type CheckRun struct {
-	ID         int64  `json:"id"`
-	ExternalID string `json:"external_id"`
-	HTMLURL    string `json:"html_url"`
-	Status     string `json:"status"`
-	Conclusion string `json:"conclusion"`
+// CommitStatus is the GitHub representation needed after reporting a workflow
+// result.
+type CommitStatus struct {
+	ID          int64  `json:"id"`
+	State       string `json:"state"`
+	TargetURL   string `json:"target_url"`
+	Description string `json:"description"`
+	Context     string `json:"context"`
+	Creator     struct {
+		Login string `json:"login"`
+	} `json:"creator"`
 }
 
-// CheckRunOutput is the user-visible content of a check run.
-type CheckRunOutput struct {
-	Title   string `json:"title"`
-	Summary string `json:"summary"`
-	Text    string `json:"text,omitempty"`
+// CreateCommitStatusRequest describes a commit status report.
+type CreateCommitStatusRequest struct {
+	State       string `json:"state"`
+	TargetURL   string `json:"target_url,omitempty"`
+	Description string `json:"description,omitempty"`
+	Context     string `json:"context"`
 }
 
-// CreateCheckRunRequest describes a new check run.
-type CreateCheckRunRequest struct {
-	Name        string          `json:"name"`
-	HeadSHA     string          `json:"head_sha"`
-	DetailsURL  string          `json:"details_url,omitempty"`
-	ExternalID  string          `json:"external_id"`
-	Status      string          `json:"status"`
-	Conclusion  string          `json:"conclusion,omitempty"`
-	StartedAt   string          `json:"started_at,omitempty"`
-	CompletedAt string          `json:"completed_at,omitempty"`
-	Output      *CheckRunOutput `json:"output,omitempty"`
-}
-
-// UpdateCheckRunRequest describes mutable check-run fields.
-type UpdateCheckRunRequest struct {
-	Name        string          `json:"name,omitempty"`
-	DetailsURL  string          `json:"details_url,omitempty"`
-	ExternalID  string          `json:"external_id,omitempty"`
-	Status      string          `json:"status,omitempty"`
-	Conclusion  string          `json:"conclusion,omitempty"`
-	StartedAt   string          `json:"started_at,omitempty"`
-	CompletedAt string          `json:"completed_at,omitempty"`
-	Output      *CheckRunOutput `json:"output,omitempty"`
+// ListCommitStatuses returns commit statuses in reverse chronological order.
+func (c *InstallationClient) ListCommitStatuses(ctx context.Context, owner, repository, revision string) ([]CommitStatus, error) {
+	const perPage = 100
+	statuses := []CommitStatus{}
+	requestPath := "repos/" + owner + "/" + repository + "/commits/" + revision + "/statuses"
+	for page := 1; ; page++ {
+		response := []CommitStatus{}
+		query := url.Values{"page": []string{strconv.Itoa(page)}, "per_page": []string{strconv.Itoa(perPage)}}
+		if err := c.doJSONWithQuery(ctx, http.MethodGet, requestPath, query, &response); err != nil {
+			return nil, fmt.Errorf("list commit statuses for %s/%s at revision %q: %w", owner, repository, revision, err)
+		}
+		statuses = append(statuses, response...)
+		if len(response) < perPage {
+			return statuses, nil
+		}
+	}
 }
 
 // APIError describes a non-success response from the GitHub API.
@@ -292,6 +290,29 @@ func NewClient(baseURL string, httpClient *http.Client) (*Client, error) {
 func ValidatePrivateKey(data []byte) error {
 	_, err := parsePrivateKey(data)
 	return err
+}
+
+// AppBotLogin returns the bot login associated with a GitHub App.
+func (c *Client) AppBotLogin(ctx context.Context, appID int64, privateKey []byte) (string, error) {
+	key, err := parsePrivateKey(privateKey)
+	if err != nil {
+		return "", err
+	}
+	token, err := signJWT(key, appID, c.now())
+	if err != nil {
+		return "", err
+	}
+	response := struct {
+		ID   int64  `json:"id"`
+		Slug string `json:"slug"`
+	}{}
+	if err := c.doJSONWithQueryForInstallation(ctx, 0, http.MethodGet, "app", nil, token, &response); err != nil {
+		return "", fmt.Errorf("get authenticated GitHub App: %w", err)
+	}
+	if response.ID != appID || response.Slug == "" {
+		return "", errors.New("GitHub returned an invalid App identity")
+	}
+	return response.Slug + "[bot]", nil
 }
 
 func (c *Client) Installation(ctx context.Context, appID, installationID int64, privateKey []byte, repository string, permissions InstallationPermissions) (*InstallationClient, error) {
@@ -583,52 +604,14 @@ func (c *InstallationClient) ResolveMergeBase(ctx context.Context, owner, reposi
 	return sha, nil
 }
 
-// CreateCheckRun creates a check run for a repository commit.
-func (c *InstallationClient) CreateCheckRun(ctx context.Context, owner, repository string, request CreateCheckRunRequest) (*CheckRun, error) {
-	result := &CheckRun{}
-	requestPath := "repos/" + owner + "/" + repository + "/check-runs"
+// CreateCommitStatus reports a status for a repository commit.
+func (c *InstallationClient) CreateCommitStatus(ctx context.Context, owner, repository, revision string, request CreateCommitStatusRequest) (*CommitStatus, error) {
+	result := &CommitStatus{}
+	requestPath := "repos/" + owner + "/" + repository + "/statuses/" + revision
 	if err := c.doJSONWithBody(ctx, http.MethodPost, requestPath, request, result); err != nil {
-		return nil, fmt.Errorf("create check run for %s/%s: %w", owner, repository, err)
+		return nil, fmt.Errorf("create commit status for %s/%s at revision %q: %w", owner, repository, revision, err)
 	}
 	return result, nil
-}
-
-// UpdateCheckRun updates a check run created by the authenticated GitHub App.
-func (c *InstallationClient) UpdateCheckRun(ctx context.Context, owner, repository string, id int64, request UpdateCheckRunRequest) (*CheckRun, error) {
-	result := &CheckRun{}
-	requestPath := "repos/" + owner + "/" + repository + "/check-runs/" + strconv.FormatInt(id, 10)
-	if err := c.doJSONWithBody(ctx, http.MethodPatch, requestPath, request, result); err != nil {
-		return nil, fmt.Errorf("update check run %d for %s/%s: %w", id, owner, repository, err)
-	}
-	return result, nil
-}
-
-// FindCheckRun returns the check run with an external ID for an app and commit.
-func (c *InstallationClient) FindCheckRun(ctx context.Context, owner, repository, revision string, appID int64, externalID string) (*CheckRun, error) {
-	requestPath := "repos/" + owner + "/" + repository + "/commits/" + revision + "/check-runs"
-	for page := 1; ; page++ {
-		response := struct {
-			TotalCount int        `json:"total_count"`
-			CheckRuns  []CheckRun `json:"check_runs"`
-		}{}
-		query := url.Values{
-			"app_id":   []string{strconv.FormatInt(appID, 10)},
-			"filter":   []string{"all"},
-			"page":     []string{strconv.Itoa(page)},
-			"per_page": []string{"100"},
-		}
-		if err := c.doJSONWithQuery(ctx, http.MethodGet, requestPath, query, &response); err != nil {
-			return nil, fmt.Errorf("list check runs for %s/%s at revision %q: %w", owner, repository, revision, err)
-		}
-		for index := range response.CheckRuns {
-			if response.CheckRuns[index].ExternalID == externalID {
-				return &response.CheckRuns[index], nil
-			}
-		}
-		if len(response.CheckRuns) == 0 || page*100 >= response.TotalCount {
-			return nil, nil
-		}
-	}
 }
 
 func (c *Client) doJSONWithQueryForInstallation(ctx context.Context, installationID int64, method, requestPath string, query url.Values, token string, destination any) error {

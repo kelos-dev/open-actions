@@ -110,9 +110,6 @@ func TestWebhookEventUsesBoundedLabels(t *testing.T) {
 	if got := webhookEvent("user-controlled-event"); got != "unknown" {
 		t.Fatalf("webhook event label = %q, want unknown", got)
 	}
-	if got := webhookEvent("check_run"); got != "check_run" {
-		t.Fatalf("check run event label = %q", got)
-	}
 }
 
 func TestWorkflowJobConclusionUsesCancelledResult(t *testing.T) {

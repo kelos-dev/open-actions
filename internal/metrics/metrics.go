@@ -223,9 +223,6 @@ func webhookEvent(event string) string {
 		actionsv1alpha1.GitHubEventNameRelease:
 		return event
 	}
-	if event == "check_run" {
-		return event
-	}
 	return "unknown"
 }
 

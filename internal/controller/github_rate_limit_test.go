@@ -37,7 +37,7 @@ func TestRequeueAfterGitHubRateLimit(t *testing.T) {
 	}
 }
 
-func TestGitHubCheckRateLimitIsRetryable(t *testing.T) {
+func TestGitHubStatusRateLimitIsRetryable(t *testing.T) {
 	now := time.Date(2026, time.August, 23, 12, 0, 0, 0, time.UTC)
 	reconciler := &WorkflowRunReconciler{Now: func() time.Time { return now }}
 	err := &githubclient.APIError{
@@ -45,7 +45,7 @@ func TestGitHubCheckRateLimitIsRetryable(t *testing.T) {
 		Status:     "403 Forbidden",
 		RetryAfter: 30 * time.Second,
 	}
-	if reconciler.githubCheckReportPermanentlyUnavailable(t.Context(), &actionsv1alpha1.WorkflowRun{}, err) {
-		t.Fatal("rate-limited GitHub Check report was treated as permanently unavailable")
+	if reconciler.githubReportPermanentlyUnavailable(t.Context(), &actionsv1alpha1.WorkflowRun{}, err) {
+		t.Fatal("rate-limited GitHub status report was treated as permanently unavailable")
 	}
 }

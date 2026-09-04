@@ -7,7 +7,6 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -301,80 +300,6 @@ func TestNormalizeSkipsUnsupportedActivityTypes(t *testing.T) {
 	_, supported, err := normalize("issues", event)
 	if err != nil || supported {
 		t.Fatalf("unsupported activity supported = %v, error = %v", supported, err)
-	}
-}
-
-func TestNormalizeRerunAcceptsOnlyProjectCheckRuns(t *testing.T) {
-	project := &actionsv1alpha1.Project{Spec: actionsv1alpha1.ProjectSpec{Source: actionsv1alpha1.ProjectSource{
-		Type:   actionsv1alpha1.SourceTypeGitHub,
-		GitHub: &actionsv1alpha1.GitHubAppConfiguration{AppID: 17},
-	}}}
-	event := &payload{Action: "rerequested"}
-	event.CheckRun.ID = 42
-	event.CheckRun.App.ID = 17
-	event.CheckRun.ExternalID = "workflow-run-uid"
-	event.CheckRun.HeadSHA = strings.Repeat("a", 40)
-	event.Sender.Login = "octocat"
-
-	rerun, supported, err := normalizeRerun(project, event)
-	if err != nil || !supported || rerun.CheckRunID != 42 || rerun.RootRunUID != "workflow-run-uid" || rerun.HeadSHA != event.CheckRun.HeadSHA || rerun.TriggeringActor != "octocat" {
-		t.Fatalf("normalized rerun = %#v, supported = %v, error = %v", rerun, supported, err)
-	}
-	event.Action = "completed"
-	if _, supported, err := normalizeRerun(project, event); err != nil || supported {
-		t.Fatalf("completed check run supported = %v, error = %v", supported, err)
-	}
-	event.Action = "rerequested"
-	event.CheckRun.App.ID = 18
-	if _, _, err := normalizeRerun(project, event); err == nil {
-		t.Fatal("check run from another app was accepted")
-	}
-}
-
-func TestGitHubHandlerQueuesCheckRerequestByDeliveryID(t *testing.T) {
-	scheme := runtime.NewScheme()
-	if err := actionsv1alpha1.AddToScheme(scheme); err != nil {
-		t.Fatal(err)
-	}
-	if err := corev1.AddToScheme(scheme); err != nil {
-		t.Fatal(err)
-	}
-	project := &actionsv1alpha1.Project{
-		ObjectMeta: metav1.ObjectMeta{Name: "project", Namespace: "default", UID: "project-uid", Generation: 1},
-		Spec: actionsv1alpha1.ProjectSpec{Source: actionsv1alpha1.ProjectSource{Type: actionsv1alpha1.SourceTypeGitHub, GitHub: &actionsv1alpha1.GitHubAppConfiguration{
-			AppID: 17, InstallationID: 23,
-			WebhookSecretRef: corev1.SecretKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: "github"}, Key: "webhook-secret"},
-		}}},
-		Status: actionsv1alpha1.ProjectStatus{Conditions: []metav1.Condition{{Type: actionsv1alpha1.ProjectConditionConfigured, Status: metav1.ConditionTrue, ObservedGeneration: 1}}},
-	}
-	secretValue := []byte("secret")
-	secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "github", Namespace: project.Namespace}, Data: map[string][]byte{"webhook-secret": secretValue}}
-	clusterClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(project, secret).Build()
-	handler := &GitHubHandler{Client: clusterClient, APIReader: clusterClient, Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
-	body := []byte(`{"action":"rerequested","installation":{"id":23},"repository":{"id":1,"name":"example","owner":{"login":"acme"}},"check_run":{"id":42,"head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","external_id":"root-uid","app":{"id":17}}}`)
-	digest := hmac.New(sha256.New, secretValue)
-	digest.Write(body)
-	request := httptest.NewRequest(http.MethodPost, "/", bytes.NewReader(body))
-	request.Header.Set("X-GitHub-Event", "check_run")
-	request.Header.Set("X-GitHub-Delivery", "delivery-123")
-	request.Header.Set("X-Hub-Signature-256", "sha256="+hex.EncodeToString(digest.Sum(nil)))
-	response := httptest.NewRecorder()
-
-	handler.ServeHTTP(response, request)
-	if response.Code != http.StatusAccepted {
-		t.Fatalf("response status = %d, body = %s", response.Code, response.Body.String())
-	}
-	queued := &corev1.ConfigMap{}
-	key := client.ObjectKey{Namespace: project.Namespace, Name: webhookDeliveryName([]byte("delivery-123"))}
-	if err := clusterClient.Get(context.Background(), key, queued); err != nil {
-		t.Fatal(err)
-	}
-	delivery := &queuedDelivery{}
-	if err := json.Unmarshal([]byte(queued.Data[deliveryDataKey]), delivery); err != nil {
-		t.Fatal(err)
-	}
-	if delivery.Rerun == nil || delivery.Rerun.CheckRunID != 42 || delivery.Rerun.RootRunUID != "root-uid" {
-		t.Fatalf("queued rerun = %#v", delivery.Rerun)
 	}
 }
 

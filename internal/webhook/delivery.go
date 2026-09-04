@@ -22,7 +22,6 @@ import (
 	"github.com/kelos-dev/open-actions/internal/gitrepository"
 	actionmetrics "github.com/kelos-dev/open-actions/internal/metrics"
 	"github.com/kelos-dev/open-actions/internal/workflow"
-	"github.com/kelos-dev/open-actions/internal/workflowrun"
 	corev1 "k8s.io/api/core/v1"
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -52,7 +51,6 @@ const (
 	maxDeliveryBytes          = 900_000
 	maxWorkflowFiles          = 100
 	maxWorkflowJobs           = 1000
-	rerunRootWaitTimeout      = 2 * time.Minute
 	resourceNameMaxLength     = 63
 	workflowRunDigestLength   = 20
 	deliveryRetention         = 24 * time.Hour
@@ -65,7 +63,6 @@ type queuedDelivery struct {
 	Repository    deliveryRepository `json:"repository"`
 	Event         normalizedEvent    `json:"event"`
 	EventSnapshot string             `json:"eventSnapshot,omitempty"`
-	Rerun         *normalizedRerun   `json:"rerun,omitempty"`
 	ReplayID      string             `json:"replayID"`
 	DeliveryID    string             `json:"deliveryID"`
 }
@@ -84,7 +81,6 @@ func (delivery *queuedDelivery) UnmarshalJSON(data []byte) error {
 		Payload       *payload           `json:"payload"`
 		Event         normalizedEvent    `json:"event"`
 		EventSnapshot string             `json:"eventSnapshot,omitempty"`
-		Rerun         *normalizedRerun   `json:"rerun,omitempty"`
 		ReplayID      string             `json:"replayID"`
 		DeliveryID    string             `json:"deliveryID"`
 	}{}
@@ -106,7 +102,7 @@ func (delivery *queuedDelivery) UnmarshalJSON(data []byte) error {
 	}
 	*delivery = queuedDelivery{
 		ProjectName: document.ProjectName, ProjectUID: document.ProjectUID, Repository: document.Repository,
-		Event: document.Event, EventSnapshot: document.EventSnapshot, Rerun: document.Rerun, ReplayID: document.ReplayID, DeliveryID: document.DeliveryID,
+		Event: document.Event, EventSnapshot: document.EventSnapshot, ReplayID: document.ReplayID, DeliveryID: document.DeliveryID,
 	}
 	return nil
 }
@@ -143,21 +139,6 @@ func (h *GitHubHandler) enqueueDelivery(ctx context.Context, project *actionsv1a
 		DeliveryID:    deliveryID,
 	}
 	return h.enqueueQueuedDelivery(ctx, project, delivery, signedBody, signedBody)
-}
-
-func (h *GitHubHandler) enqueueRerunDelivery(ctx context.Context, project *actionsv1alpha1.Project, event *payload, rerun *normalizedRerun, deliveryID string) error {
-	identity := []byte(deliveryID)
-	delivery := queuedDelivery{
-		ProjectName: project.Name,
-		ProjectUID:  string(project.UID),
-		Repository: deliveryRepository{
-			ID: event.Repository.ID, Owner: event.Repository.Owner.Login, Name: event.Repository.Name,
-		},
-		Rerun:      rerun,
-		ReplayID:   webhookReplayID(identity),
-		DeliveryID: deliveryID,
-	}
-	return h.enqueueQueuedDelivery(ctx, project, delivery, identity, nil)
 }
 
 func (h *GitHubHandler) enqueueQueuedDelivery(ctx context.Context, project *actionsv1alpha1.Project, delivery queuedDelivery, identity, eventSnapshot []byte) error {
@@ -364,9 +345,6 @@ func (r *DeliveryReconciler) Reconcile(ctx context.Context, request ctrl.Request
 	}
 	if string(project.UID) != delivery.ProjectUID || !metav1.IsControlledBy(object, project) {
 		return ctrl.Result{}, r.finish(ctx, object, deliveryStateFailed, 0, "Project was recreated")
-	}
-	if delivery.Rerun != nil {
-		return r.reconcileRerun(ctx, object, project, &delivery)
 	}
 	githubConfig := project.Spec.Source.GitHub
 	privateKey, err := readSecretValue(ctx, reader, project.Namespace, githubConfig.PrivateKeySecretRef)
@@ -640,200 +618,6 @@ func terminalWorkflowRunCreationError(err error) bool {
 	return apierrors.IsConflict(err) || apierrors.IsInvalid(err)
 }
 
-func (r *DeliveryReconciler) reconcileRerun(ctx context.Context, object *corev1.ConfigMap, project *actionsv1alpha1.Project, delivery *queuedDelivery) (ctrl.Result, error) {
-	runs := &actionsv1alpha1.WorkflowRunList{}
-	if err := r.APIReader.List(ctx, runs, client.InNamespace(project.Namespace), client.MatchingLabels{actionsv1alpha1.LabelWorkflowRunRootUID: delivery.Rerun.RootRunUID}); err != nil {
-		return ctrl.Result{}, err
-	}
-	root := workflowRunByUID(runs.Items, delivery.Rerun.RootRunUID)
-	if root == nil {
-		age := r.deliveryAge(object)
-		if age < rerunRootWaitTimeout {
-			retryAfter := 2 * time.Second
-			if remaining := rerunRootWaitTimeout - age; remaining < retryAfter {
-				retryAfter = remaining
-			}
-			return ctrl.Result{RequeueAfter: retryAfter}, nil
-		}
-		return ctrl.Result{}, r.finish(ctx, object, deliveryStateFailed, 0, fmt.Sprintf("original WorkflowRun with UID %q is unavailable", delivery.Rerun.RootRunUID))
-	}
-	if err := validateRerunCheck(project, delivery, root); err != nil {
-		return ctrl.Result{}, r.finish(ctx, object, deliveryStateFailed, 0, err.Error())
-	}
-	latest, err := latestWorkflowRunAttempt(root, runs.Items)
-	if err != nil {
-		return ctrl.Result{}, r.finish(ctx, object, deliveryStateFailed, 0, err.Error())
-	}
-	if existing := workflowRunAttemptForRequest(root, runs.Items, delivery.DeliveryID); existing != nil {
-		if err := r.ensureEventSnapshotOwner(ctx, existing); err != nil {
-			return ctrl.Result{}, err
-		}
-		return ctrl.Result{}, r.finish(ctx, object, deliveryStateCompleted, 1, "")
-	}
-	if !workflowRunTerminal(latest) {
-		return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
-	}
-	if latest.Spec.Rerun != nil && latest.Spec.Rerun.Attempt == 2147483647 {
-		return ctrl.Result{}, r.finish(ctx, object, deliveryStateFailed, 0, "WorkflowRun rerun attempt limit reached")
-	}
-
-	jobIDs, err := r.rerunWorkflowJobIDs(ctx, latest)
-	if err != nil {
-		return ctrl.Result{}, r.finish(ctx, object, deliveryStateFailed, 0, err.Error())
-	}
-	attempt := int32(2)
-	if latest.Spec.Rerun != nil {
-		attempt = latest.Spec.Rerun.Attempt + 1
-	}
-	if err := r.createRerunWorkflowRun(ctx, root, latest, attempt, delivery.DeliveryID, delivery.Rerun.TriggeringActor, jobIDs); err != nil {
-		if errors.Is(err, errRerunAttemptClaimed) {
-			return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
-		}
-		if terminalWorkflowRunCreationError(err) {
-			return ctrl.Result{}, r.finish(ctx, object, deliveryStateFailed, 0, err.Error())
-		}
-		return ctrl.Result{}, err
-	}
-	r.Logger.Info("created WorkflowRun rerun", "delivery_id", delivery.DeliveryID, "original_run", root.Name, "previous_run", latest.Name, "attempt", attempt, "jobs", len(jobIDs))
-	return ctrl.Result{}, r.finish(ctx, object, deliveryStateCompleted, 1, "")
-}
-
-var errRerunAttemptClaimed = errors.New("rerun attempt was claimed by another request")
-
-func workflowRunByUID(runs []actionsv1alpha1.WorkflowRun, uid string) *actionsv1alpha1.WorkflowRun {
-	for index := range runs {
-		if string(runs[index].UID) == uid {
-			return &runs[index]
-		}
-	}
-	return nil
-}
-
-func workflowRunAttemptForRequest(root *actionsv1alpha1.WorkflowRun, runs []actionsv1alpha1.WorkflowRun, requestID string) *actionsv1alpha1.WorkflowRun {
-	for index := range runs {
-		candidate := &runs[index]
-		if candidate.Spec.Rerun != nil && candidate.Spec.Rerun.RequestID == requestID &&
-			candidate.Spec.Rerun.OriginalRunRef.Name == root.Name && candidate.Spec.Rerun.OriginalRunRef.UID == root.UID {
-			return candidate
-		}
-	}
-	return nil
-}
-
-func validateRerunCheck(project *actionsv1alpha1.Project, delivery *queuedDelivery, root *actionsv1alpha1.WorkflowRun) error {
-	if root.Spec.Rerun != nil {
-		return fmt.Errorf("WorkflowRun %q is not an original attempt", root.Name)
-	}
-	if root.Spec.ProjectRef.Name != project.Name || root.Spec.Source.Type != actionsv1alpha1.SourceTypeGitHub || root.Spec.Source.GitHub == nil {
-		return fmt.Errorf("WorkflowRun %q does not belong to Project %q", root.Name, project.Name)
-	}
-	source := root.Spec.Source.GitHub
-	repository := delivery.Repository
-	if source.Repository.ID != repository.ID || source.Repository.Owner != repository.Owner || source.Repository.Name != repository.Name {
-		return fmt.Errorf("WorkflowRun %q does not match the check-run repository", root.Name)
-	}
-	headSHA := source.Revision.SHA
-	if source.Event.Name == actionsv1alpha1.GitHubEventNamePullRequest && source.Revision.HeadSHA != "" {
-		headSHA = source.Revision.HeadSHA
-	}
-	if headSHA != delivery.Rerun.HeadSHA {
-		return fmt.Errorf("WorkflowRun %q does not match the check-run revision", root.Name)
-	}
-	if root.Status.Source == nil || root.Status.Source.GitHub == nil || root.Status.Source.GitHub.CheckRun == nil || root.Status.Source.GitHub.CheckRun.ID != delivery.Rerun.CheckRunID {
-		return fmt.Errorf("WorkflowRun %q does not identify GitHub check run %d", root.Name, delivery.Rerun.CheckRunID)
-	}
-	return nil
-}
-
-func latestWorkflowRunAttempt(root *actionsv1alpha1.WorkflowRun, runs []actionsv1alpha1.WorkflowRun) (*actionsv1alpha1.WorkflowRun, error) {
-	return workflowrun.LatestAttempt(root, runs)
-}
-
-func workflowRunTerminal(run *actionsv1alpha1.WorkflowRun) bool {
-	return workflowrun.Terminal(run)
-}
-
-func (r *DeliveryReconciler) rerunWorkflowJobIDs(ctx context.Context, run *actionsv1alpha1.WorkflowRun) ([]string, error) {
-	if !workflowrun.Failed(run) {
-		return nil, nil
-	}
-	jobs := &actionsv1alpha1.WorkflowJobList{}
-	if err := r.APIReader.List(ctx, jobs, client.InNamespace(run.Namespace), client.MatchingLabels{actionsv1alpha1.LabelWorkflowRunUID: string(run.UID)}); err != nil {
-		return nil, err
-	}
-	return workflowrun.FailedJobIDs(run, jobs.Items)
-}
-
-func (r *DeliveryReconciler) createRerunWorkflowRun(ctx context.Context, root, previous *actionsv1alpha1.WorkflowRun, attempt int32, requestID, triggeringActor string, jobIDs []string) error {
-	snapshotName, err := r.rerunEventSnapshot(ctx, root)
-	if err != nil {
-		return err
-	}
-	desired := workflowrun.NewRerun(root, previous, attempt, requestID, jobIDs)
-	desired.Spec.Rerun.TriggeringActor = triggeringActor
-	if snapshotName != "" {
-		desired.Annotations = map[string]string{eventsnapshot.Annotation: snapshotName}
-	}
-	if err := r.Create(ctx, desired); err != nil {
-		if !apierrors.IsAlreadyExists(err) {
-			return err
-		}
-		existing := &actionsv1alpha1.WorkflowRun{}
-		if err := r.APIReader.Get(ctx, client.ObjectKeyFromObject(desired), existing); err != nil {
-			return err
-		}
-		if matchingRerunRequest(existing, desired) {
-			return errRerunAttemptClaimed
-		}
-		if err := matchingWorkflowRun(existing, desired); err != nil {
-			return err
-		}
-		return r.ensureEventSnapshotOwner(ctx, existing)
-	}
-	return r.ensureEventSnapshotOwner(ctx, desired)
-}
-
-func (r *DeliveryReconciler) rerunEventSnapshot(ctx context.Context, root *actionsv1alpha1.WorkflowRun) (string, error) {
-	name := root.Annotations[eventsnapshot.Annotation]
-	if name == "" {
-		return "", nil
-	}
-	secret := &corev1.Secret{}
-	if err := r.APIReader.Get(ctx, client.ObjectKey{Namespace: root.Namespace, Name: name}, secret); err != nil {
-		return "", fmt.Errorf("get GitHub event snapshot Secret %q for WorkflowRun %q: %w", name, root.Name, err)
-	}
-	owned := false
-	for _, owner := range secret.OwnerReferences {
-		if owner.APIVersion == actionsv1alpha1.GroupVersion.String() && owner.Kind == "WorkflowRun" && owner.Name == root.Name && owner.UID == root.UID {
-			owned = true
-			break
-		}
-	}
-	data, found := secret.Data[eventsnapshot.DataKey]
-	if !owned || secret.Immutable == nil || !*secret.Immutable || !found {
-		return "", fmt.Errorf("GitHub event snapshot Secret %q is invalid for WorkflowRun %q", name, root.Name)
-	}
-	if _, err := eventsnapshot.Decode(data); err != nil {
-		return "", fmt.Errorf("GitHub event snapshot Secret %q is invalid for WorkflowRun %q: %w", name, root.Name, err)
-	}
-	return name, nil
-}
-
-func matchingRerunRequest(existing, desired *actionsv1alpha1.WorkflowRun) bool {
-	if existing.Spec.Rerun == nil || desired.Spec.Rerun == nil || existing.Spec.Rerun.RequestID == desired.Spec.Rerun.RequestID {
-		return false
-	}
-	existingCopy := existing.DeepCopy()
-	desiredCopy := desired.DeepCopy()
-	existingCopy.Spec.Rerun.RequestID = desiredCopy.Spec.Rerun.RequestID
-	existingCopy.Spec.Rerun.TriggeringActor = desiredCopy.Spec.Rerun.TriggeringActor
-	return matchingWorkflowRun(existingCopy, desiredCopy) == nil
-}
-
-func rerunWorkflowRunName(root *actionsv1alpha1.WorkflowRun, attempt int32) string {
-	return workflowrun.RerunName(root, attempt)
-}
-
 func (r *DeliveryReconciler) createWorkflowRun(ctx context.Context, project *actionsv1alpha1.Project, delivery *queuedDelivery, selection workflowSelection) error {
 	replayID := delivery.ReplayID
 	if selection.Event.Name == "pull_request_target" {
@@ -1048,12 +832,8 @@ func (r *DeliveryReconciler) finish(ctx context.Context, object *corev1.ConfigMa
 	if r.Metrics != nil && before.Data[deliveryStateKey] == "" && !object.CreationTimestamp.IsZero() {
 		delivery := queuedDelivery{}
 		_ = json.Unmarshal([]byte(object.Data[deliveryDataKey]), &delivery)
-		event := delivery.Event.Name
-		if delivery.Rerun != nil {
-			event = "check_run"
-		}
 		r.Metrics.WebhookDelivery(
-			object.Namespace, delivery.ProjectName, event, strings.ToLower(state), finishedAt.Sub(object.CreationTimestamp.Time),
+			object.Namespace, delivery.ProjectName, delivery.Event.Name, strings.ToLower(state), finishedAt.Sub(object.CreationTimestamp.Time),
 		)
 	}
 	return nil

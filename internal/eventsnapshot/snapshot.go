@@ -9,9 +9,12 @@ import (
 )
 
 const (
-	Annotation = "actions.kelos.dev/github-event-snapshot"
-	DataKey    = "event.json"
-	MaxBytes   = 900_000
+	Annotation               = "actions.kelos.dev/github-event-snapshot"
+	RerunProtectionFinalizer = "actions.kelos.dev/rerun-event-snapshot"
+	RerunTargetAnnotation    = "actions.kelos.dev/rerun-event-snapshot-target"
+	RerunDeadlineAnnotation  = "actions.kelos.dev/rerun-event-snapshot-deadline"
+	DataKey                  = "event.json"
+	MaxBytes                 = 900_000
 )
 
 func Decode(data []byte) (map[string]any, error) {

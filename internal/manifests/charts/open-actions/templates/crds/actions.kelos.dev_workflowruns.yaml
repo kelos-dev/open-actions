@@ -186,22 +186,6 @@ spec:
                     - name
                     - uid
                     type: object
-                  requestID:
-                    description: |-
-                      RequestID is an optional idempotency identity for the request that created
-                      this attempt. GitHub rerequests use the webhook delivery ID.
-                    maxLength: 128
-                    minLength: 1
-                    pattern: ^[A-Za-z0-9-]+$
-                    type: string
-                  triggeringActor:
-                    description: |-
-                      TriggeringActor is the GitHub login that requested this attempt. It is
-                      omitted when the rerun source cannot identify a GitHub user.
-                    maxLength: 100
-                    minLength: 1
-                    pattern: ^[A-Za-z0-9][A-Za-z0-9_-]*(\[bot\])?$
-                    type: string
                 required:
                 - attempt
                 - originalRunRef
@@ -626,9 +610,9 @@ spec:
                                 && !self.contains(''@{'') && !self.matches(''^[0-9A-Fa-f]{40}$'')'
                           headSHA:
                             description: |-
-                              HeadSHA is the pull request head commit used for GitHub check reporting.
+                              HeadSHA is the pull request head commit used for GitHub status reporting.
                               It may differ from SHA when the workflow executes an integration commit.
-                              When absent, GitHub checks are reported on SHA.
+                              When absent, GitHub statuses are reported on SHA.
                             pattern: ^[0-9a-f]{40}$
                             type: string
                           mergeBaseSHA:
@@ -1016,48 +1000,28 @@ spec:
                     description: GitHub contains observations for a GitHub workflow
                       source.
                     properties:
-                      checkRun:
-                        description: CheckRun is the GitHub check that reports this
-                          WorkflowRun.
+                      commitStatus:
+                        description: CommitStatus is the GitHub commit status that
+                          reports this WorkflowRun.
                         properties:
-                          conclusion:
-                            description: Conclusion is the terminal result accepted
-                              by GitHub.
-                            enum:
-                            - success
-                            - failure
-                            - cancelled
-                            - timed_out
-                            type: string
-                          id:
-                            description: ID is GitHub's check-run identifier.
-                            format: int64
-                            maximum: 9007199254740991
-                            minimum: 1
-                            type: integer
                           reportDigest:
                             description: |-
-                              ReportDigest is the SHA-256 digest of the check-run fields last accepted
-                              by GitHub.
+                              ReportDigest is the SHA-256 digest of the commit-status fields last
+                              accepted by GitHub.
                             pattern: ^[0-9a-f]{64}$
                             type: string
-                          status:
-                            description: Status is the last check-run status accepted
+                          state:
+                            description: State is the last commit-status state accepted
                               by GitHub.
                             enum:
-                            - queued
-                            - in_progress
-                            - completed
+                            - error
+                            - failure
+                            - pending
+                            - success
                             type: string
                         required:
-                        - id
-                        - status
+                        - state
                         type: object
-                        x-kubernetes-validations:
-                        - message: conclusion must be specified exactly when status
-                            is completed
-                          rule: 'self.status == ''completed'' ? has(self.conclusion)
-                            : !has(self.conclusion)'
                     type: object
                 type: object
               startTime:
