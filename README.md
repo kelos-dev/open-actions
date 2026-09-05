@@ -19,10 +19,9 @@ constraints. Unsupported workflows fail explicitly.
 
 The controller receives GitHub webhooks, creates `WorkflowRun` and `WorkflowJob`
 resources, schedules jobs on matching `Runner` resources, and reports status
-through GitHub commit statuses for push, pull request, and merge-group runs.
-These workflow-level statuses do not populate a pull request's Checks tab or
-publish per-job checks. This GitHub Actions compatibility gap is tracked in
-[issue #162](https://github.com/kelos-dev/open-actions/issues/162).
+through an aggregate workflow commit status and a commit status for each job on
+push, pull request, and merge-group runs. Each status links directly to the
+corresponding workflow or job in the Console.
 Runners execute steps in Kubernetes Jobs and use the standalone artifact service
 for workflow artifact uploads and downloads. The Console shows runs, jobs, and
 live logs. Each `Project` defines an execution domain and its GitHub App

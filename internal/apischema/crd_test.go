@@ -674,6 +674,27 @@ func TestWorkflowRunAcceptsGitHubCommitStatusContract(t *testing.T) {
 	}
 }
 
+func TestWorkflowJobAcceptsGitHubCommitStatusContract(t *testing.T) {
+	crd, _ := loadCRD(t, "actions.kelos.dev_workflowjobs.yaml")
+	object := loadWorkflowJobSample(t)
+	object["status"] = map[string]any{"source": map[string]any{"github": map[string]any{"commitStatus": map[string]any{
+		"state": "success", "reportDigest": strings.Repeat("b", 64),
+	}}}}
+	if errs := validateObject(t, crd, object, nil); len(errs) > 0 {
+		t.Fatalf("valid WorkflowJob GitHub commit status was rejected: %v", errs.ToAggregate())
+	}
+	commitStatus := object["status"].(map[string]any)["source"].(map[string]any)["github"].(map[string]any)["commitStatus"].(map[string]any)
+	commitStatus["state"] = "cancelled"
+	if errs := validateObject(t, crd, object, nil); len(errs) == 0 {
+		t.Fatal("WorkflowJob GitHub commit status with an invalid state was accepted")
+	}
+	commitStatus["state"] = "success"
+	commitStatus["reportDigest"] = "invalid"
+	if errs := validateObject(t, crd, object, nil); len(errs) == 0 {
+		t.Fatal("WorkflowJob GitHub commit status with an invalid report digest was accepted")
+	}
+}
+
 func TestRunnerAcceptsQualifiedResourceNames(t *testing.T) {
 	crd, _ := loadCRD(t, "actions.kelos.dev_runners.yaml")
 	object := loadSample(t, "actions_v1alpha1_runner.yaml")

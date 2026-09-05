@@ -545,8 +545,7 @@ const (
 	GitHubCommitStatusStateSuccess GitHubCommitStatusState = "success"
 )
 
-// GitHubCommitStatus records the GitHub commit status that reports this
-// WorkflowRun.
+// GitHubCommitStatus records a GitHub commit status managed by Open Actions.
 type GitHubCommitStatus struct {
 	// State is the last commit-status state accepted by GitHub.
 	// +kubebuilder:validation:Enum=error;failure;pending;success

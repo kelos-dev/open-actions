@@ -106,6 +106,17 @@ var _ = Describe("Console", func() {
 			})).To(Succeed())
 			g.Expect(jobs.Items).To(HaveLen(2))
 			for index := range jobs.Items {
+				g.Expect(jobs.Items[index].Status.Source).NotTo(BeNil())
+				if jobs.Items[index].Status.Source != nil {
+					g.Expect(jobs.Items[index].Status.Source.GitHub).NotTo(BeNil())
+					if jobs.Items[index].Status.Source.GitHub != nil {
+						commitStatus := jobs.Items[index].Status.Source.GitHub.CommitStatus
+						g.Expect(commitStatus).NotTo(BeNil())
+						if commitStatus != nil {
+							g.Expect(commitStatus.State).To(Equal(actionsv1alpha1.GitHubCommitStatusStateSuccess))
+						}
+					}
+				}
 				if jobs.Items[index].Spec.JobID == "test" {
 					workflowJob = jobs.Items[index]
 				}
@@ -140,6 +151,28 @@ var _ = Describe("Console", func() {
 		Expect(runPage).To(ContainSubstring(">runner-1</span>"))
 
 		jobPath := runPath + "/jobs/" + url.PathEscape(workflowJob.Name)
+		Eventually(func(g Gomega) {
+			response, err := http.Get(fixtureURL + "/fixture/commit-status?target_url=" + url.QueryEscape(consoleURL+jobPath))
+			g.Expect(err).NotTo(HaveOccurred())
+			if err != nil {
+				return
+			}
+			defer response.Body.Close()
+			g.Expect(response.StatusCode).To(Equal(http.StatusOK))
+			if response.StatusCode != http.StatusOK {
+				return
+			}
+			report := struct {
+				State       string `json:"state"`
+				TargetURL   string `json:"target_url"`
+				Description string `json:"description"`
+				Context     string `json:"context"`
+			}{}
+			g.Expect(json.NewDecoder(response.Body).Decode(&report)).To(Succeed())
+			g.Expect(report.TargetURL).To(Equal(consoleURL + jobPath))
+			g.Expect(report.State).To(Equal("success"))
+			g.Expect(report.Context).To(Equal("Open Actions / " + workflowPath + " / test"))
+		}, 30*time.Second, time.Second).Should(Succeed())
 		jobPage := getConsolePage(webClient, consoleURL+jobPath, http.StatusOK)
 		Expect(jobPage).To(ContainSubstring("<h1>test</h1>"))
 		Expect(jobPage).NotTo(ContainSubstring("Show debug"))
