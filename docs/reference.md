@@ -38,11 +38,14 @@ defaults to the GitHub server URL and is used only to fetch external action
 repositories. Set it explicitly when actions are hosted on another server. The
 controller's optional `--console-url` sets the direct target link on GitHub
 commit statuses for push, pull request, and merge-group runs and supplies
-workflow run and stale-query URLs to job contexts.
-Open Actions publishes one workflow-level commit status per workflow path, not
-per-job checks. Unlike GitHub Actions checks, these statuses do not populate a
-pull request's Checks tab. This unsupported compatibility gap is tracked in
+workflow run and stale-query URLs to job contexts. Open Actions publishes one
+aggregate commit-status context per workflow path and one commit-status context
+for each expanded WorkflowJob. Each status targets the corresponding workflow
+or job in the Console. This is narrower than GitHub Actions' check suite and
+per-job check-run model, and does not populate a pull request's Checks tab. This
+compatibility gap is tracked in
 [issue #162](https://github.com/kelos-dev/open-actions/issues/162).
+
 `--max-job-timeout` is the cluster-wide upper bound for workflow job execution
 and defaults to `6h`. It must be a positive whole number of minutes. The Helm
 chart configures it through `controller.maxJobTimeout`.
@@ -261,31 +264,55 @@ in the cluster may claim an installation; the earliest-created project retains
 the claim, and later duplicates remain unconfigured until the owner is deleted.
 A `WorkflowRun` records provider-specific event data under its own immutable
 `spec.source` union. `status.source.github.commitStatus` records the state and
-digest of the last report accepted by GitHub. The controller reports
-the `Open Actions / <workflow path>` context for push, ordinary pull request,
-and merge-group runs. Contexts longer than 100 Unicode characters are shortened
-with a deterministic digest suffix. Short paths containing uppercase characters
-also receive a digest suffix so paths that differ only by case remain distinct
-under GitHub's case-insensitive context matching. Excluding scheduled and
-manually repeated triggers prevents stable-revision recurring workflows from
-consuming GitHub's per-commit, per-context status quota; those runs remain
-visible in the Console. A GitHub-facing model for the excluded trigger types is
-tracked in [issue #161](https://github.com/kelos-dev/open-actions/issues/161).
-A status target links directly to the run when
-the Console URL is configured. Queued and running workflows report `pending`,
-successful workflows report `success`, ordinary failures report `failure`, and
-cancelled or timed-out workflows report `error`. Descriptions are limited to
-140 Unicode characters. When distinct event or ref executions share a revision
-and status context, the controller aggregates their latest attempts. An error
-or failure remains visible even while another execution is pending; pending is
-reported when no execution has failed, and success is reported only after every
-matching execution succeeds. A later execution for the same event and ref, or
-the same pull request, supersedes its earlier execution. Repositories
-whose workflow path produces a shortened or case-disambiguated context must
-update required-check settings to that context. The suffix is ` / ` followed by
-the first 16 lowercase hexadecimal characters of the SHA-256 digest of the full
-unshortened context. When shortening is required, the controller retains the
-first 81 Unicode characters before that suffix.
+digest of the last commit status accepted by GitHub. Each WorkflowJob records
+its GitHub commit status under `status.source.github.commitStatus`. The
+controller reports the `Open Actions / <workflow path>` context for push,
+ordinary pull request, and merge-group runs. Job contexts use
+`Open Actions / <workflow path> / <job display name>` and include the job ID when
+it differs from the display name. Matrix contexts use
+`spec.matrix.logicalJobID` for this component rather than the index-derived
+expanded JobID. For example, the `build` combination with `node: 18` and
+`os: ubuntu` uses
+`Open Actions / .open-actions/workflows/ci.yaml / Build (node=18, os=ubuntu) / build`.
+When matrix values are too long to include in the display name, their sorted
+description is replaced by a deterministic digest. A workflow status target
+opens the run when the Console URL is configured, and each job status targets
+its job's Console output.
+
+Commit-status contexts longer than 100 Unicode characters are shortened with a
+deterministic digest suffix. Workflow contexts whose path contains uppercase
+characters, and job contexts whose path or logical job ID
+(`spec.matrix.logicalJobID` for matrix jobs, otherwise `spec.jobID`) contains
+uppercase characters, also receive this suffix so case-distinct contexts
+remain distinct under GitHub's case-insensitive matching. The suffix is ` / `
+followed by the first 16 lowercase hexadecimal characters of the SHA-256 digest
+of the full unshortened context. When shortening is required, the controller
+retains the first 81 Unicode characters before that suffix. Repositories whose
+required context is shortened or case-disambiguated must configure branch
+protection with the resulting context.
+
+The aggregate workflow status and each job status are `pending` until
+completion, then report `success`, `failure`, or `error`. A running job remains
+`pending` because the GitHub commit-status API has no `in_progress` state; its
+description reports that the job is running. Commit-status descriptions are
+limited to 140 Unicode characters. When distinct event or ref executions share
+a revision and workflow status context, the controller aggregates their latest
+attempts. An error or failure remains visible even while another execution is
+pending; pending is reported when no execution has failed, and success is
+reported only after every matching execution succeeds. The newest matching
+WorkflowRun owns the per-job contexts, so reports from older executions cannot
+replace its job statuses. A later execution for the same event and ref, or the
+same pull request, supersedes its earlier execution.
+
+Scheduled and manually repeated triggers do not publish commit statuses because
+stable-revision recurring workflows could consume GitHub's per-commit,
+per-context status quota; those runs remain visible in the Console.
+Each expanded job normally publishes queued, running, and terminal status
+updates, so large matrices increase GitHub API write volume in proportion to
+their number of combinations. A GitHub-facing model for scheduled and manually
+repeated triggers is tracked in
+[issue #161](https://github.com/kelos-dev/open-actions/issues/161).
+
 For locally integrated pull requests,
 `spec.source.github.revision.sha` identifies the deterministic integration
 commit used for execution. `baseSHA`, `headSHA`, and `mergeBaseSHA` pin its two
@@ -849,11 +876,14 @@ period does not extend the runner's cleanup deadline.
 
 A timed-out WorkflowJob has `status.result: failure` and a false `Succeeded`
 condition with reason `JobTimedOut`, while user cancellation has
-`status.result: cancelled`. A WorkflowRun containing a timed-out job uses reason
-`JobTimedOut` and reports the GitHub commit-status state `error`; ordinary
-failures use `JobFailed` and `failure`, and cancellations use `JobCancelled`
-and `error`. When a run contains both timed-out and ordinarily failed jobs,
-`JobTimedOut` and `error` take precedence in its status description.
+`status.result: cancelled`. Per-job commit statuses report `error` for timeouts
+and cancellations, `failure` for ordinary failures, and `success` for skipped
+jobs. A WorkflowRun containing a timed-out job uses reason `JobTimedOut` and
+reports the aggregate GitHub commit-status state `error`. Ordinary workflow
+failures use `JobFailed` and `failure`, while cancellations use `JobCancelled`
+and `error`.
+When a run contains both timed-out and ordinarily failed jobs, `JobTimedOut` and
+`error` take precedence in its status description.
 
 ### Conditions
 
@@ -1099,8 +1129,9 @@ The `job` context supplies `status`, `workflow_ref`, `workflow_sha`,
 `workflow_repository`, and `workflow_file_path`. `status` reflects the job's
 current `success`, `failure`, or `cancelled` state. Job containers and services
 are unsupported, so `job.container` and `job.services` are unavailable. Open
-Actions reports one commit-status context for the workflow rather than one per
-job and does not supply `job.check_run_id`.
+Actions reports a commit-status context for the workflow and each expanded job.
+It does not supply `job.check_run_id`; each job status links to the Console for
+logs.
 
 For each expanded matrix job, `strategy` supplies numeric `job-index`,
 `job-total`, and `max-parallel` values and Boolean `fail-fast`; `matrix`

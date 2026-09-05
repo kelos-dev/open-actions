@@ -131,8 +131,7 @@ func (p InstallationPermissions) validate() error {
 	return nil
 }
 
-// CommitStatus is the GitHub representation needed after reporting a workflow
-// result.
+// CommitStatus is the GitHub representation needed after reporting a status.
 type CommitStatus struct {
 	ID          int64  `json:"id"`
 	State       string `json:"state"`

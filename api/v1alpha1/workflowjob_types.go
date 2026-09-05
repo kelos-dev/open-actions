@@ -172,6 +172,20 @@ type WorkflowJobMatrix struct {
 	FailFast *bool `json:"failFast,omitempty"`
 }
 
+// GitHubWorkflowJobStatus contains GitHub observations for a WorkflowJob.
+type GitHubWorkflowJobStatus struct {
+	// CommitStatus is the GitHub commit status that reports this WorkflowJob.
+	// +optional
+	CommitStatus *GitHubCommitStatus `json:"commitStatus,omitempty"`
+}
+
+// WorkflowJobSourceStatus contains provider-specific observations.
+type WorkflowJobSourceStatus struct {
+	// GitHub contains observations for a GitHub workflow source.
+	// +optional
+	GitHub *GitHubWorkflowJobStatus `json:"github,omitempty"`
+}
+
 // WorkflowJobStatus contains observations made while executing a workflow job.
 // +kubebuilder:validation:XValidation:rule="!has(oldSelf.runnerRef) || self.runnerRef == oldSelf.runnerRef",message="runnerRef is immutable after assignment"
 // +kubebuilder:validation:XValidation:rule="!has(oldSelf.result) || self.result == oldSelf.result",message="result is immutable after completion"
@@ -213,6 +227,10 @@ type WorkflowJobStatus struct {
 	// lifetime.
 	// +optional
 	Concurrency *ConcurrencyStatus `json:"concurrency,omitempty"`
+
+	// Source contains provider-specific reporting state.
+	// +optional
+	Source *WorkflowJobSourceStatus `json:"source,omitempty"`
 
 	// Conditions describe dependency readiness, concurrency acquisition, Runner
 	// assignment, cancellation, and the terminal result. When present, Ready is
