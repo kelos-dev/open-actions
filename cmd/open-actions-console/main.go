@@ -36,6 +36,7 @@ func runConsole(ctx context.Context, arguments []string) error {
 	bindAddress := flags.String("bind-address", ":8080", "Address used by the Console HTTP server")
 	githubAPIURL := flags.String("github-api-url", "https://api.github.com/", "Base URL for the GitHub API")
 	tokenFile := flags.String("token-file", "", "File containing the Console administrator token")
+	allowAnonymousWorkflowRuns := flags.Bool("allow-anonymous-workflow-runs", false, "Allow unauthenticated visitors to manually dispatch and rerun workflows")
 	secretManagementNamespace := flags.String("secret-management-namespace", "", "Namespace in which Console administrators may manage Project Secrets")
 	var workflowRunTTLSecondsAfterFinished *int32
 	flags.Func("workflow-run-ttl-seconds-after-finished", "Default spec.ttlSecondsAfterFinished for Console-generated WorkflowRuns; omit the flag to retain them indefinitely", func(value string) error {
@@ -110,7 +111,8 @@ func runConsole(ctx context.Context, arguments []string) error {
 	handler, err := console.New(console.Config{
 		Client: kubernetesClient, WorkflowRuns: workflowRuns, Logs: console.NewKubernetesLogSource(clientset), Repositories: repositories,
 		Token: token, SecretManagementNamespace: *secretManagementNamespace, WorkflowRunTTLSecondsAfterFinished: workflowRunTTLSecondsAfterFinished,
-		SecureCookie: *secureCookie, Logger: logger,
+		AllowAnonymousWorkflowRuns: *allowAnonymousWorkflowRuns,
+		SecureCookie:               *secureCookie, Logger: logger,
 	})
 	if err != nil {
 		return fmt.Errorf("configure Console: %w", err)

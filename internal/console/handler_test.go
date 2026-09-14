@@ -1662,7 +1662,7 @@ func TestSafeNextRejectsExternalURLs(t *testing.T) {
 	}
 }
 
-func newTestHandler(t testing.TB, secureCookie bool) *Handler {
+func newTestHandler(t testing.TB, secureCookie bool, configure ...func(*Config)) *Handler {
 	t.Helper()
 	scheme := runtime.NewScheme()
 	if err := actionsv1alpha1.AddToScheme(scheme); err != nil {
@@ -1755,11 +1755,15 @@ jobs:
 	clusterClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(run, newerRun, job, workflowFile, project, secret).Build()
 	workflowRunTTLSecondsAfterFinished := int32(604800)
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	handler, err := New(Config{
+	config := Config{
 		Client: clusterClient, WorkflowRuns: readyWorkflowRunStore(logger, run, newerRun), Logs: &testLogSource{pod: pod, logs: "build output\n"}, Repositories: &testRepositoryResolver{}, Token: testConsoleToken,
 		SecretManagementNamespace: "default", WorkflowRunTTLSecondsAfterFinished: &workflowRunTTLSecondsAfterFinished,
 		SecureCookie: secureCookie, Logger: logger,
-	})
+	}
+	for _, apply := range configure {
+		apply(&config)
+	}
+	handler, err := New(config)
 	if err != nil {
 		t.Fatal(err)
 	}

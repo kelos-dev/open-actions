@@ -60,6 +60,8 @@ const (
 	maxRerunAttempt     = int32(2147483647)
 	maxDispatchInputs   = 25
 	maxDispatchPayload  = 65_535
+
+	anonymousCookieName = "open_actions_console_anonymous"
 )
 
 var errLogsUnavailable = errors.New("logs are no longer available")
@@ -86,6 +88,7 @@ type Config struct {
 	Logs                               LogSource
 	Repositories                       RepositoryResolver
 	Token                              string
+	AllowAnonymousWorkflowRuns         bool
 	SecretManagementNamespace          string
 	WorkflowRunTTLSecondsAfterFinished *int32
 	SecureCookie                       bool
@@ -101,6 +104,7 @@ type Handler struct {
 	tokenDigest                        [sha256.Size]byte
 	sessionValue                       string
 	csrfToken                          string
+	allowAnonymousWorkflowRuns         bool
 	secretManagementNamespace          string
 	workflowRunTTLSecondsAfterFinished *int32
 	secureCookie                       bool
@@ -324,13 +328,14 @@ func New(config Config) (*Handler, error) {
 	return &Handler{
 		client: config.Client, workflowRuns: config.WorkflowRuns, logs: config.Logs, repositories: config.Repositories, tokenDigest: tokenDigest,
 		sessionValue: sessionValue(config.Token), csrfToken: csrfValue(config.Token), secretManagementNamespace: config.SecretManagementNamespace,
+		allowAnonymousWorkflowRuns:         config.AllowAnonymousWorkflowRuns,
 		workflowRunTTLSecondsAfterFinished: workflowRunTTLSecondsAfterFinished,
 		secureCookie:                       config.SecureCookie, logger: config.Logger,
 		loginPage: loginPage, mainPage: mainPage, projectsPage: projectsPage, projectPage: projectPage, dispatchPage: dispatchPage, runPage: runPage, logPage: logPage,
 	}, nil
 }
 
-// ServeHTTP routes public read requests and authenticated administration requests.
+// ServeHTTP routes public views, workflow actions, and authenticated administration requests.
 func (h *Handler) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	writer.Header().Set("Cache-Control", "no-store")
 	writer.Header().Set("Referrer-Policy", "no-referrer")
@@ -345,7 +350,7 @@ func (h *Handler) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	}
 	parts := splitPath(request.URL.Path)
 	if request.URL.Path == "/dispatch" {
-		if !h.authenticated(request) {
+		if !h.allowAnonymousWorkflowRuns && !h.authenticated(request) {
 			h.redirectToLogin(writer, request)
 			return
 		}
@@ -380,7 +385,7 @@ func (h *Handler) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	}
 	if request.Method == http.MethodPost && len(parts) == 4 && parts[0] == "runs" && parts[3] == "rerun" {
 		next := "/runs/" + url.PathEscape(parts[1]) + "/" + url.PathEscape(parts[2])
-		if !h.authenticated(request) {
+		if !h.allowAnonymousWorkflowRuns && !h.authenticated(request) {
 			http.Redirect(writer, request, "/login?next="+url.QueryEscape(next), http.StatusFound)
 			return
 		}
@@ -574,6 +579,39 @@ func (h *Handler) validCSRF(token string) bool {
 	return hmac.Equal([]byte(token), []byte(h.csrfToken))
 }
 
+func (h *Handler) workflowActionCSRF(writer http.ResponseWriter, request *http.Request) string {
+	if h.authenticated(request) {
+		return h.csrfToken
+	}
+	cookie, err := request.Cookie(anonymousCookieName)
+	if err != nil || cookie.Value == "" {
+		cookie = &http.Cookie{
+			Name: anonymousCookieName, Value: rand.Text(), Path: "/", MaxAge: int(sessionLifetime.Seconds()),
+			HttpOnly: true, Secure: h.secureCookie, SameSite: http.SameSiteLaxMode,
+		}
+		http.SetCookie(writer, cookie)
+	}
+	return h.anonymousCSRFValue(cookie.Value)
+}
+
+func (h *Handler) anonymousCSRFValue(cookieValue string) string {
+	mac := hmac.New(sha256.New, h.tokenDigest[:])
+	_, _ = mac.Write([]byte("open-actions/console/anonymous/csrf\x00" + cookieValue))
+	return base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+}
+
+func (h *Handler) validWorkflowActionCSRF(request *http.Request) bool {
+	token := request.PostForm.Get("csrf")
+	if h.authenticated(request) {
+		return h.validCSRF(token)
+	}
+	if !h.allowAnonymousWorkflowRuns || http.NewCrossOriginProtection().Check(request) != nil {
+		return false
+	}
+	cookie, err := request.Cookie(anonymousCookieName)
+	return err == nil && cookie.Value != "" && hmac.Equal([]byte(token), []byte(h.anonymousCSRFValue(cookie.Value)))
+}
+
 func (h *Handler) main(writer http.ResponseWriter, request *http.Request) {
 	if !h.workflowRuns.Synced() {
 		http.Error(writer, "Console run index is not ready", http.StatusServiceUnavailable)
@@ -681,7 +719,7 @@ func (h *Handler) workflowDispatchPage(writer http.ResponseWriter, request *http
 		h.writeResolutionError(writer, request, err)
 		return
 	}
-	data.CSRFToken = h.csrfToken
+	data.CSRFToken = h.workflowActionCSRF(writer, request)
 	data.RequestID, err = newDispatchRequestID()
 	if err != nil {
 		h.writeResolutionError(writer, request, fmt.Errorf("create workflow dispatch request ID: %w", err))
@@ -804,7 +842,7 @@ func (h *Handler) submitWorkflowDispatch(writer http.ResponseWriter, request *ht
 		http.Error(writer, "invalid workflow dispatch", http.StatusBadRequest)
 		return
 	}
-	if !h.validCSRF(request.PostForm.Get("csrf")) {
+	if !h.validWorkflowActionCSRF(request) {
 		http.Error(writer, "invalid CSRF token", http.StatusForbidden)
 		return
 	}
@@ -874,7 +912,7 @@ func (h *Handler) submitWorkflowDispatch(writer http.ResponseWriter, request *ht
 	data := dispatchPageData{
 		SelectedProject: namespacedValue(namespace, projectName), RepositoryOwner: repositoryOwner, RepositoryName: repositoryName,
 		RefType: refType, RefName: strings.TrimSpace(request.PostForm.Get("ref-name")), Revision: revision, WorkflowPath: workflowPath,
-		CSRFToken: h.csrfToken, RequestID: requestID,
+		CSRFToken: request.PostForm.Get("csrf"), RequestID: requestID,
 	}
 	sameSelection := request.PostForm.Get("loaded-selection") == data.SelectionKey()
 	if action != "load" && !sameSelection {
@@ -1215,10 +1253,10 @@ func (h *Handler) runDetails(writer http.ResponseWriter, request *http.Request, 
 		h.logger.Warn("Unable to load WorkflowRun lineage", "namespace", run.Namespace, "workflow_run", run.Name, "error", err)
 	} else if workflowrun.Terminal(latest) && (latest.Spec.Rerun == nil || latest.Spec.Rerun.Attempt < maxRerunAttempt) {
 		data.RerunURL = runPath(run) + "/rerun"
-		if authenticated {
+		if authenticated || h.allowAnonymousWorkflowRuns {
 			data.CanRerun = true
 			data.CanRerunFailed = workflowrun.Failed(latest)
-			data.CSRFToken = h.csrfToken
+			data.CSRFToken = h.workflowActionCSRF(writer, request)
 		} else {
 			data.LoginURL = "/login?next=" + url.QueryEscape(runPath(run))
 		}
@@ -1330,7 +1368,7 @@ func (h *Handler) rerunWorkflow(writer http.ResponseWriter, request *http.Reques
 		http.Error(writer, "invalid rerun request", http.StatusBadRequest)
 		return
 	}
-	if !h.validCSRF(request.PostForm.Get("csrf")) {
+	if !h.validWorkflowActionCSRF(request) {
 		http.Error(writer, "invalid CSRF token", http.StatusForbidden)
 		return
 	}

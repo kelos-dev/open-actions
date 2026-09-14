@@ -26,6 +26,13 @@ func TestRunConsoleRejectsInvalidGitHubAPIURL(t *testing.T) {
 	}
 }
 
+func TestRunConsoleRequiresTokenForAnonymousWorkflowRuns(t *testing.T) {
+	err := runConsole(context.Background(), []string{"--allow-anonymous-workflow-runs=true"})
+	if err == nil || !strings.Contains(err.Error(), "Console token file is required") {
+		t.Fatalf("runConsole() error = %v", err)
+	}
+}
+
 func TestReadTokenRejectsInvalidConfiguration(t *testing.T) {
 	emptyPath := filepath.Join(t.TempDir(), "empty-token")
 	if err := os.WriteFile(emptyPath, nil, 0o600); err != nil {
