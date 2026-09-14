@@ -45,6 +45,7 @@ artifacts:
 
 console:
   enabled: true
+  allowAnonymousWorkflowRuns: false
   replicas: 1
   publicURL: http://localhost:8080
   secretName: ""

@@ -77,6 +77,45 @@ func TestConsoleUsesConfiguredGitHubAPIURL(t *testing.T) {
 	t.Fatalf("Console arguments = %#v", podSpec.Containers[0].Args)
 }
 
+func TestConsoleAnonymousWorkflowConfiguration(t *testing.T) {
+	chart := Chart()
+	valuesData, err := fs.ReadFile(chart, "values.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		name    string
+		enabled bool
+	}{
+		{name: "default"},
+		{name: "omitted"},
+		{name: "enabled", enabled: true},
+		{name: "disabled"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var values map[string]any
+			if err := yaml.Unmarshal(valuesData, &values); err != nil {
+				t.Fatal(err)
+			}
+			if test.name == "omitted" {
+				delete(values["console"].(map[string]any), "allowAnonymousWorkflowRuns")
+			} else if test.name != "default" {
+				values["console"].(map[string]any)["allowAnonymousWorkflowRuns"] = test.enabled
+			}
+			podSpec := renderWorkloadPodSpec(t, chart, "templates/console-deployment.yaml", values)
+			found := false
+			for _, argument := range podSpec.Containers[0].Args {
+				if argument == "--allow-anonymous-workflow-runs=true" {
+					found = true
+				}
+			}
+			if found != test.enabled {
+				t.Fatalf("Console arguments = %#v, want anonymous workflow runs = %v", podSpec.Containers[0].Args, test.enabled)
+			}
+		})
+	}
+}
+
 func TestConsoleCanReadProjectPrivateKeys(t *testing.T) {
 	chart := Chart()
 	data, err := fs.ReadFile(chart, "templates/console-rbac.yaml")

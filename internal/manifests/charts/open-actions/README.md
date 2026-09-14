@@ -27,6 +27,16 @@ identity before creating a manual run. Set
 an externally managed Secret from the release namespace instead;
 `console.tokenKey` selects its token key.
 
+Set `console.allowAnonymousWorkflowRuns=true` to allow anyone with Console
+access to manually dispatch workflows and rerun all jobs or failed jobs from
+completed workflows. Visitors can choose the repository, revision, and inputs
+for manual dispatch. The option defaults to `false` and applies across
+namespaces. Use it only for a trusted audience: workflows consume runner
+capacity and may deploy or publish with configured credentials. Cancellation,
+approval, and Secret management still require sign-in. See the
+[Console reference](../../../../docs/reference.md#controller-and-console) for the
+access policies and their differences from GitHub permissions.
+
 Generated WorkflowRuns omit `spec.ttlSecondsAfterFinished` by default and are
 retained indefinitely. Set `controller.workflowRunTTLSecondsAfterFinished` to
 populate that field on new runs. For example, `604800` retains each new run for
@@ -114,6 +124,7 @@ controller:
 | `artifacts.persistence.accessModes` | `[ReadWriteOnce]` | Access modes for the StatefulSet-managed claim |
 | `artifacts.persistence.size` | `20Gi` | Requested capacity for the StatefulSet-managed claim |
 | `console.enabled` | `true` | Deploy the Open Actions Console |
+| `console.allowAnonymousWorkflowRuns` | `false` | Allow anyone with Console access to manually dispatch and rerun workflows without signing in |
 | `console.replicas` | `1` | Console replica count |
 | `console.publicURL` | `http://localhost:8080` | Public Console URL used by GitHub commit-status links |
 | `console.secretName` | `""` | Existing Console administrator Secret; the chart creates `open-actions-console-auth` when empty |

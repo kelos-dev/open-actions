@@ -122,6 +122,7 @@
       "properties": {
         "enabled": {"type": "boolean"},
         "replicas": {"type": "integer", "minimum": 1, "maximum": 100},
+        "allowAnonymousWorkflowRuns": {"type": "boolean"},
         "publicURL": {"type": "string", "maxLength": 2048},
         "secretName": {
           "type": "string",

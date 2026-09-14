@@ -64,6 +64,12 @@ verify:
 		exit 1; \
 	fi
 	$(HELM) template open-actions $(CHART_DIR) --namespace open-actions-system --set console.publicURL=https://actions.example >/dev/null
+	$(HELM) template open-actions $(CHART_DIR) --namespace open-actions-system --set console.allowAnonymousWorkflowRuns=true >/dev/null
+	$(HELM) template open-actions $(CHART_DIR) --namespace open-actions-system --set console.allowAnonymousWorkflowRuns=null >/dev/null
+	@if $(HELM) template open-actions $(CHART_DIR) --namespace open-actions-system --set-string console.allowAnonymousWorkflowRuns=true >/dev/null 2>&1; then \
+		echo "Helm accepted a non-boolean anonymous workflow run setting" >&2; \
+		exit 1; \
+	fi
 	$(HELM) template open-actions $(CHART_DIR) --namespace open-actions-system --set controller.maxJobTimeout=1h30m >/dev/null
 	@if $(HELM) template open-actions $(CHART_DIR) --namespace open-actions-system --set controller.maxJobTimeout=90s >/dev/null 2>&1; then \
 		echo "Helm accepted a maximum job timeout that is not a whole number of minutes" >&2; \

@@ -28,6 +28,12 @@ behavior, and security rules.
 - Kubernetes-specific features must not change the meaning of a valid GitHub
   Actions workflow.
 
+The Console's `--allow-anonymous-workflow-runs` opt-in is an intentional
+exception to GitHub's repository-write requirement for initiating manual
+dispatch and reruns, tracked in [issue #175](https://github.com/kelos-dev/open-actions/issues/175).
+It defaults to disabled and does not relax workflow validation, cancellation,
+fork pull request approval, or Project Secret management authorization.
+
 ## Tests
 
 - Do not use Gomega's global `Expect()` inside `Eventually` polling blocks. Use `Eventually(func(g Gomega) { ... })` when assertions should be retried, or return a value or error for `Eventually` to evaluate.

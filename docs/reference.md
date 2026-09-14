@@ -61,7 +61,8 @@ dispatches. It serves its read-only views without authentication. Anyone who can
 reach the Console can read Project and workflow metadata, the exact workflow
 file retained after it is fetched and validated for a run, and runner logs. The
 required `--token-file` authenticates workflow dispatches, cancellation,
-reruns, and Project Secret management. Set
+fork pull request approval, reruns, and Project Secret management. Reruns and
+manual dispatch can optionally allow anonymous access as described below. Set
 `--secure-cookie` when the Console is served through HTTPS. The Helm chart
 configures the administrator token and cookie security from its configured
 Secret and `console.publicURL`.
@@ -137,7 +138,7 @@ GitHub commit statuses do not provide a rerun action; request reruns from the
 Console. GitHub UI and CLI reruns for Open Actions reports are unsupported and
 tracked in [issue #160](https://github.com/kelos-dev/open-actions/issues/160).
 
-An administrator can use **Run workflow** to create a `workflow_dispatch`
+By default, an administrator can use **Run workflow** to create a `workflow_dispatch`
 WorkflowRun in any configured Project namespace. The form accepts a repository,
 workflow path, branch or tag, pinned commit SHA, and declared workflow inputs.
 Choose **Load workflow** to read the workflow at that commit and display its
@@ -159,6 +160,33 @@ immutable workflow file snapshot. If that snapshot is unavailable, choose
 run's input values must be entered again. Each form instance carries a request
 ID, so resubmitting the same dispatch is idempotent and redirects to the existing
 run.
+
+Set `--allow-anonymous-workflow-runs=true`, or Helm value
+`console.allowAnonymousWorkflowRuns=true`, to let anyone who can reach the
+Console manually dispatch workflows and rerun all jobs or failed jobs without
+signing in. The default is `false`, and the option applies across Console
+namespaces. Omitting the Helm value also disables anonymous runs, including
+upgrades that reuse saved release values. For manual dispatch, visitors can
+choose the Project, repository, workflow path, revision, branch or tag, and
+inputs using the same form and validation as administrators. They can select
+repositories accessible to the chosen Project's GitHub App installation,
+across all configured Project namespaces. Reruns preserve the source, inputs,
+actor, and fork pull request policy of the existing run; they cannot grant
+approval or select a different revision.
+
+Anonymous workflow forms require a browser cookie and a matching CSRF token,
+and requests identified as cross-origin are rejected. Cancellation, fork pull
+request approval, and Project Secret management still require administrator
+authentication, and `--token-file` remains required with this option enabled.
+Enable this option only when everyone with Console access is trusted to
+execute the available workflows with the Project's configured credentials.
+Workflows can consume runner capacity, deploy, or publish; anonymous dispatch
+also lets visitors choose different revisions and inputs. There is no
+anonymous-specific rate limit. This is an opt-in Open Actions extension to
+GitHub's [rerun](https://docs.github.com/en/actions/how-tos/manage-workflow-runs/re-run-workflows-and-jobs)
+and [manual dispatch](https://docs.github.com/en/actions/how-tos/manage-workflow-runs/manually-run-a-workflow)
+permission models, which require repository write permission. This authorization
+exception is tracked in [issue #175](https://github.com/kelos-dev/open-actions/issues/175).
 
 The Projects page lists Project configuration across all namespaces. A Project
 detail page lists the names, but never the values, of keys in its referenced
