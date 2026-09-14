@@ -153,7 +153,7 @@ func TestConsoleAnonymousWorkflowCSRF(t *testing.T) {
 func TestConsoleAnonymousWorkflowActionsDoNotAuthorizeAdministration(t *testing.T) {
 	handler, _ := anonymousWorkflowFixture(t, false)
 	cookie, token := anonymousRerunPage(t, handler)
-	for _, path := range []string{"/runs/default/ci/cancel", "/runs/default/ci/approve", "/projects/default/project/secrets"} {
+	for _, path := range []string{"/runs/default/ci/cancel", "/runs/default/ci/approve", "/projects/default/project/secrets", "/projects/default/project/variables"} {
 		for _, authenticated := range []bool{false, true} {
 			t.Run(path+"/authenticated="+strconv.FormatBool(authenticated), func(t *testing.T) {
 				form := url.Values{"csrf": {token}}

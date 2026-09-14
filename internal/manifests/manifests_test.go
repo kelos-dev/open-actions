@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -116,7 +117,7 @@ func TestConsoleAnonymousWorkflowConfiguration(t *testing.T) {
 	}
 }
 
-func TestConsoleCanReadProjectPrivateKeys(t *testing.T) {
+func TestConsoleCanManageProjectValuesAcrossNamespaces(t *testing.T) {
 	chart := Chart()
 	data, err := fs.ReadFile(chart, "templates/console-rbac.yaml")
 	if err != nil {
@@ -137,12 +138,26 @@ func TestConsoleCanReadProjectPrivateKeys(t *testing.T) {
 	if err := yaml.Unmarshal(bytes.Split(output.Bytes(), []byte("---"))[0], &clusterRole); err != nil {
 		t.Fatal(err)
 	}
-	for _, rule := range clusterRole.Rules {
-		if len(rule.APIGroups) == 1 && rule.APIGroups[0] == "" && len(rule.Resources) == 1 && rule.Resources[0] == "secrets" && len(rule.Verbs) == 1 && rule.Verbs[0] == "get" {
-			return
+	for _, resource := range []string{"secrets", "configmaps"} {
+		for _, verb := range []string{"get", "create", "update"} {
+			allowed := false
+			for _, rule := range clusterRole.Rules {
+				if slices.Contains(rule.APIGroups, "") && slices.Contains(rule.Resources, resource) && slices.Contains(rule.Verbs, verb) && len(rule.ResourceNames) == 0 {
+					allowed = true
+				}
+			}
+			if !allowed {
+				t.Fatalf("Console ClusterRole does not grant %s access to %s: %#v", verb, resource, clusterRole.Rules)
+			}
 		}
 	}
-	t.Fatalf("Console ClusterRole does not grant get access to Secrets: %#v", clusterRole.Rules)
+	binding := rbacv1.ClusterRoleBinding{}
+	if err := yaml.Unmarshal(bytes.Split(output.Bytes(), []byte("---"))[1], &binding); err != nil {
+		t.Fatal(err)
+	}
+	if binding.RoleRef.Kind != "ClusterRole" || binding.RoleRef.Name != clusterRole.Name || len(binding.Subjects) != 1 || binding.Subjects[0].Kind != "ServiceAccount" || binding.Subjects[0].Name != "open-actions-console" || binding.Subjects[0].Namespace != "open-actions-system" {
+		t.Fatalf("Console ClusterRoleBinding = %#v", binding)
+	}
 }
 
 func TestConsoleCanWatchWorkflowRuns(t *testing.T) {
