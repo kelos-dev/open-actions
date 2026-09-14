@@ -1473,14 +1473,6 @@ func TestConsoleManagesReferencedProjectSecretWithoutDisplayingValues(t *testing
 		t.Fatalf("created Secret data = %#v", secret.Data)
 	}
 
-	otherNamespaceRequest := httptest.NewRequest(http.MethodPost, "/projects/other/project/secrets", strings.NewReader(set.Encode()))
-	otherNamespaceRequest.Header.Set("Authorization", "Bearer "+testConsoleToken)
-	otherNamespaceRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	otherNamespaceResponse := httptest.NewRecorder()
-	handler.ServeHTTP(otherNamespaceResponse, otherNamespaceRequest)
-	if otherNamespaceResponse.Code != http.StatusForbidden {
-		t.Fatalf("other namespace response = %d, %q", otherNamespaceResponse.Code, otherNamespaceResponse.Body.String())
-	}
 }
 
 func TestConsoleAcceptsEncodingHeavySecretAtValueLimit(t *testing.T) {
@@ -1757,8 +1749,8 @@ jobs:
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	config := Config{
 		Client: clusterClient, WorkflowRuns: readyWorkflowRunStore(logger, run, newerRun), Logs: &testLogSource{pod: pod, logs: "build output\n"}, Repositories: &testRepositoryResolver{}, Token: testConsoleToken,
-		SecretManagementNamespace: "default", WorkflowRunTTLSecondsAfterFinished: &workflowRunTTLSecondsAfterFinished,
-		SecureCookie: secureCookie, Logger: logger,
+		WorkflowRunTTLSecondsAfterFinished: &workflowRunTTLSecondsAfterFinished,
+		SecureCookie:                       secureCookie, Logger: logger,
 	}
 	for _, apply := range configure {
 		apply(&config)

@@ -61,9 +61,9 @@ dispatches. It serves its read-only views without authentication. Anyone who can
 reach the Console can read Project and workflow metadata, the exact workflow
 file retained after it is fetched and validated for a run, and runner logs. The
 required `--token-file` authenticates workflow dispatches, cancellation,
-fork pull request approval, reruns, and Project Secret management. Reruns and
-manual dispatch can optionally allow anonymous access as described below. Set
-`--secure-cookie` when the Console is served through HTTPS. The Helm chart
+fork pull request approval, reruns, and Project secret and variable management.
+Reruns and manual dispatch can optionally allow anonymous access as described
+below. Set `--secure-cookie` when the Console is served through HTTPS. The Helm chart
 configures the administrator token and cookie security from its configured
 Secret and `console.publicURL`.
 
@@ -176,8 +176,9 @@ approval or select a different revision.
 
 Anonymous workflow forms require a browser cookie and a matching CSRF token,
 and requests identified as cross-origin are rejected. Cancellation, fork pull
-request approval, and Project Secret management still require administrator
-authentication, and `--token-file` remains required with this option enabled.
+request approval, and Project secret and variable management still require
+administrator authentication, and `--token-file` remains required with this
+option enabled.
 Enable this option only when everyone with Console access is trusted to
 execute the available workflows with the Project's configured credentials.
 Workflows can consume runner capacity, deploy, or publish; anonymous dispatch
@@ -189,15 +190,27 @@ permission models, which require repository write permission. This authorization
 exception is tracked in [issue #175](https://github.com/kelos-dev/open-actions/issues/175).
 
 The Projects page lists Project configuration across all namespaces. A Project
-detail page lists the names, but never the values, of keys in its referenced
-workflow Secret. An administrator can sign in with the Console token to add,
-replace, and delete those keys only when the Project is in the Console's
-`--secret-management-namespace`. The Helm chart sets that namespace to its
-release namespace and grants the Console `create` and `update` access to Secrets
-only there. The Console has cluster-wide `get` access so it can read each
-Project's GitHub App private key when resolving repositories for manual
-dispatches. Direct Kubernetes clients and external secret controllers can manage
-the same Secret.
+detail page lists workflow secret names without exposing their values, and
+workflow variable names and values. These views are available without signing
+in. An administrator can sign in with the Console token to add, replace, and
+delete shared Project secrets and variables in any namespace. Configure
+`spec.secrets.secretRef` or `spec.variables.configMapRef` on the Project first;
+adding the first value creates the referenced Secret or ConfigMap if it is
+missing. Repository-specific overrides remain configured through
+`spec.repositories` and their referenced Kubernetes resources.
+
+The Console stores names in uppercase and enforces the Project value naming,
+size, and count limits described below. Variable values are editable, including
+multiline and empty values. The Console normalizes submitted CRLF line endings
+to LF before checking the variable size limit and storing the value. Existing
+secret values are never returned to the browser. Updates require administrator
+authentication and a matching CSRF token.
+The Helm chart grants the Console cluster-wide `get`, `create`, and `update`
+access to Secrets and ConfigMaps. Console edits target only the value sources
+referenced by the selected Project in that Project's namespace. The Console also
+reads each Project's GitHub App private key when resolving repositories for
+manual dispatches. Direct Kubernetes clients and external controllers can manage
+the same resources.
 
 The runner accepts `::command::` and bracket-form `##[command]` syntax, with
 the property delimiters and escape rules defined for each form. It consumes

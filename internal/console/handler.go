@@ -89,7 +89,6 @@ type Config struct {
 	Repositories                       RepositoryResolver
 	Token                              string
 	AllowAnonymousWorkflowRuns         bool
-	SecretManagementNamespace          string
 	WorkflowRunTTLSecondsAfterFinished *int32
 	SecureCookie                       bool
 	Logger                             *slog.Logger
@@ -105,7 +104,6 @@ type Handler struct {
 	sessionValue                       string
 	csrfToken                          string
 	allowAnonymousWorkflowRuns         bool
-	secretManagementNamespace          string
 	workflowRunTTLSecondsAfterFinished *int32
 	secureCookie                       bool
 	logger                             *slog.Logger
@@ -146,6 +144,7 @@ type projectPageData struct {
 	Name              string
 	Namespace         string
 	SecretsURL        string
+	VariablesURL      string
 	Installation      int64
 	Status            string
 	StatusClass       string
@@ -154,9 +153,10 @@ type projectPageData struct {
 	SecretName        string
 	SecretNames       []string
 	SecretMissing     bool
-	CanReadSecrets    bool
-	CanManageSecrets  bool
-	ManagementNotice  string
+	ConfigMapName     string
+	Variables         []projectVariable
+	VariablesMissing  bool
+	CanManageValues   bool
 	LoginURL          string
 	CSRFToken         string
 }
@@ -327,7 +327,7 @@ func New(config Config) (*Handler, error) {
 	}
 	return &Handler{
 		client: config.Client, workflowRuns: config.WorkflowRuns, logs: config.Logs, repositories: config.Repositories, tokenDigest: tokenDigest,
-		sessionValue: sessionValue(config.Token), csrfToken: csrfValue(config.Token), secretManagementNamespace: config.SecretManagementNamespace,
+		sessionValue: sessionValue(config.Token), csrfToken: csrfValue(config.Token),
 		allowAnonymousWorkflowRuns:         config.AllowAnonymousWorkflowRuns,
 		workflowRunTTLSecondsAfterFinished: workflowRunTTLSecondsAfterFinished,
 		secureCookie:                       config.SecureCookie, logger: config.Logger,
@@ -392,13 +392,17 @@ func (h *Handler) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 		h.rerunWorkflow(writer, request, parts[1], parts[2])
 		return
 	}
-	if request.Method == http.MethodPost && len(parts) == 4 && parts[0] == "projects" && parts[3] == "secrets" {
+	if request.Method == http.MethodPost && len(parts) == 4 && parts[0] == "projects" && (parts[3] == "secrets" || parts[3] == "variables") {
 		if !h.authenticated(request) {
 			next := "/projects/" + url.PathEscape(parts[1]) + "/" + url.PathEscape(parts[2])
 			http.Redirect(writer, request, "/login?next="+url.QueryEscape(next), http.StatusFound)
 			return
 		}
-		h.updateProjectSecret(writer, request, parts[1], parts[2])
+		if parts[3] == "secrets" {
+			h.updateProjectSecret(writer, request, parts[1], parts[2])
+		} else {
+			h.updateProjectVariable(writer, request, parts[1], parts[2])
+		}
 		return
 	}
 	if request.Method != http.MethodGet {
@@ -666,7 +670,9 @@ func (h *Handler) projectDetails(writer http.ResponseWriter, request *http.Reque
 	data := projectPageData{
 		Name: project.Name, Namespace: project.Namespace, Status: status, StatusClass: statusClass, StatusMessage: statusMessage,
 		SecretsURL:        "/projects/" + url.PathEscape(project.Namespace) + "/" + url.PathEscape(project.Name) + "/secrets",
+		VariablesURL:      "/projects/" + url.PathEscape(project.Namespace) + "/" + url.PathEscape(project.Name) + "/variables",
 		WorkflowDirectory: project.Spec.WorkflowDirectory,
+		CanManageValues:   h.authenticated(request),
 	}
 	if project.Spec.Source.GitHub != nil {
 		data.Installation = project.Spec.Source.GitHub.InstallationID
@@ -674,35 +680,36 @@ func (h *Handler) projectDetails(writer http.ResponseWriter, request *http.Reque
 	if data.WorkflowDirectory == "" {
 		data.WorkflowDirectory = ".open-actions/workflows"
 	}
-	if project.Spec.Secrets == nil {
-		data.ManagementNotice = "Configure spec.secrets.secretRef before managing workflow secrets."
-		h.writeHTML(writer, h.projectPage, data)
-		return
-	}
-	data.SecretName = project.Spec.Secrets.SecretRef.Name
-	if project.Namespace != h.secretManagementNamespace {
-		data.ManagementNotice = "Secret management is not enabled for this Project namespace."
-		h.writeHTML(writer, h.projectPage, data)
-		return
-	}
-	data.CanReadSecrets = true
-	data.CanManageSecrets = h.authenticated(request)
-	if data.CanManageSecrets {
+	if data.CanManageValues {
 		data.CSRFToken = h.csrfToken
 	} else {
 		data.LoginURL = "/login?next=" + url.QueryEscape(request.URL.RequestURI())
 	}
-	secret := &corev1.Secret{}
-	if err := h.client.Get(request.Context(), types.NamespacedName{Namespace: project.Namespace, Name: data.SecretName}, secret); err != nil {
-		if apierrors.IsNotFound(err) {
-			data.SecretMissing = true
-			h.writeHTML(writer, h.projectPage, data)
+	if project.Spec.Secrets != nil {
+		data.SecretName = project.Spec.Secrets.SecretRef.Name
+		secret := &corev1.Secret{}
+		err := h.client.Get(request.Context(), types.NamespacedName{Namespace: project.Namespace, Name: data.SecretName}, secret)
+		if err != nil && !apierrors.IsNotFound(err) {
+			h.writeResolutionError(writer, request, fmt.Errorf("load Project %q Secret %q: %w", project.Name, data.SecretName, err))
 			return
 		}
-		h.writeResolutionError(writer, request, fmt.Errorf("load Project %q Secret %q: %w", project.Name, data.SecretName, err))
-		return
+		data.SecretMissing = apierrors.IsNotFound(err)
+		data.SecretNames = sortedSecretDataNames(secret.Data)
 	}
-	data.SecretNames = sortedSecretDataNames(secret.Data)
+	if project.Spec.Variables != nil {
+		data.ConfigMapName = project.Spec.Variables.ConfigMapRef.Name
+		configMap := &corev1.ConfigMap{}
+		err := h.client.Get(request.Context(), types.NamespacedName{Namespace: project.Namespace, Name: data.ConfigMapName}, configMap)
+		if err != nil && !apierrors.IsNotFound(err) {
+			h.writeResolutionError(writer, request, fmt.Errorf("load Project %q ConfigMap %q: %w", project.Name, data.ConfigMapName, err))
+			return
+		}
+		data.VariablesMissing = apierrors.IsNotFound(err)
+		for name, value := range configMap.Data {
+			data.Variables = append(data.Variables, projectVariable{Name: name, Value: value})
+		}
+		sort.Slice(data.Variables, func(i, j int) bool { return data.Variables[i].Name < data.Variables[j].Name })
+	}
 	h.writeHTML(writer, h.projectPage, data)
 }
 
@@ -1122,17 +1129,13 @@ func (h *Handler) updateProjectSecret(writer http.ResponseWriter, request *http.
 		http.Error(writer, "invalid CSRF token", http.StatusForbidden)
 		return
 	}
-	if namespace != h.secretManagementNamespace {
-		http.Error(writer, "secret management is not enabled for this namespace", http.StatusForbidden)
-		return
-	}
 	project := &actionsv1alpha1.Project{}
 	if err := h.client.Get(request.Context(), types.NamespacedName{Namespace: namespace, Name: name}, project); err != nil {
 		h.writeResolutionError(writer, request, err)
 		return
 	}
 	if project.Spec.Secrets == nil {
-		http.Error(writer, "Project does not reference a workflow Secret", http.StatusConflict)
+		http.Error(writer, fmt.Sprintf("Project %q does not reference a workflow Secret", project.Name), http.StatusConflict)
 		return
 	}
 	action := request.PostForm.Get("action")

@@ -94,7 +94,7 @@ const projectPageTemplate = `<!doctype html>
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>{{.Name}} · Projects · Open Actions</title>
   <style>
-    :root{color-scheme:dark;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#0d1117;color:#f0f6fc}*{box-sizing:border-box}body{margin:0;background:#0d1117;color:#f0f6fc;font-size:14px}a{color:#58a6ff;text-decoration:none}a:hover{text-decoration:underline}.topbar{height:64px;display:flex;align-items:center;gap:24px;padding:0 24px;border-bottom:1px solid #21262d;background:#010409}.brand{display:flex;align-items:center;gap:10px;color:#f0f6fc;font-weight:600}.brand:hover{text-decoration:none}.brand-mark{display:grid;place-items:center;width:30px;height:30px;border:1px solid #30363d;border-radius:7px;color:#58a6ff;font-size:12px;font-weight:800}.page{width:min(900px,100%);margin:0 auto;padding:28px 32px 56px}.breadcrumbs{display:flex;gap:8px;margin-bottom:22px;color:#8b949e}.heading{display:flex;align-items:flex-start;justify-content:space-between;gap:20px;margin-bottom:24px}.heading h1{margin:0 0 6px;font-size:24px}.muted{color:#8b949e}.pill{display:flex;align-items:center;gap:7px}.status-mark{width:12px;height:12px;border:2px solid currentColor;border-radius:50%}.status-mark.succeeded{color:#3fb950}.status-mark.failed{color:#f85149}.status-mark.queued{color:#8b949e}.summary,.panel{padding:20px;border:1px solid #30363d;border-radius:6px}.summary{display:grid;grid-template-columns:170px 1fr;gap:12px 20px;margin-bottom:28px}.summary dt{color:#8b949e}.summary dd{margin:0;overflow-wrap:anywhere}.panel h2{margin:0 0 6px;font-size:18px}.hint{margin:0 0 18px;color:#8b949e;line-height:1.5}.notice{padding:12px;border:1px solid #30363d;border-radius:6px;background:#161b22;color:#c9d1d9}.secret-list{margin:0 0 22px;padding:0;list-style:none;border:1px solid #30363d;border-radius:6px}.secret-row{display:flex;align-items:center;justify-content:space-between;gap:16px;min-height:48px;padding:8px 12px;border-bottom:1px solid #21262d}.secret-row:last-child{border-bottom:0}.secret-row code{font:13px ui-monospace,SFMono-Regular,Consolas,monospace}.secret-row form{margin:0}.form{display:grid;grid-template-columns:minmax(180px,.7fr) minmax(220px,1fr) auto;align-items:end;gap:12px}.field label{display:block;margin-bottom:7px;font-size:13px;font-weight:600}.field input{width:100%;height:34px;padding:5px 10px;border:1px solid #30363d;border-radius:6px;background:#0d1117;color:#f0f6fc;font:inherit}.field input:focus{border-color:#2f81f7;outline:none;box-shadow:0 0 0 3px #2f81f74d}button{height:34px;padding:0 14px;border:1px solid #2ea043;border-radius:6px;background:#238636;color:#fff;font-weight:600;cursor:pointer}.delete{border-color:#da3633;background:#b62324}.empty{padding:18px;color:#8b949e;text-align:center}@media(max-width:800px){.topbar{padding:0 16px}}@media(max-width:680px){.page{padding:22px 16px}.heading{display:block}.pill{margin-top:12px}.summary{grid-template-columns:1fr}.summary dd{margin-bottom:8px}.form{grid-template-columns:1fr}}
+    :root{color-scheme:dark;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#0d1117;color:#f0f6fc}*{box-sizing:border-box}body{margin:0;background:#0d1117;color:#f0f6fc;font-size:14px}a{color:#58a6ff;text-decoration:none}a:hover{text-decoration:underline}.topbar{height:64px;display:flex;align-items:center;gap:24px;padding:0 24px;border-bottom:1px solid #21262d;background:#010409}.brand{display:flex;align-items:center;gap:10px;color:#f0f6fc;font-weight:600}.brand:hover{text-decoration:none}.brand-mark{display:grid;place-items:center;width:30px;height:30px;border:1px solid #30363d;border-radius:7px;color:#58a6ff;font-size:12px;font-weight:800}.page{width:min(900px,100%);margin:0 auto;padding:28px 32px 56px}.breadcrumbs{display:flex;gap:8px;margin-bottom:22px;color:#8b949e}.heading{display:flex;align-items:flex-start;justify-content:space-between;gap:20px;margin-bottom:24px}.heading h1{margin:0 0 6px;font-size:24px}.muted{color:#8b949e}.pill{display:flex;align-items:center;gap:7px}.status-mark{width:12px;height:12px;border:2px solid currentColor;border-radius:50%}.status-mark.succeeded{color:#3fb950}.status-mark.failed{color:#f85149}.status-mark.queued{color:#8b949e}.summary,.panel{padding:20px;border:1px solid #30363d;border-radius:6px}.summary{display:grid;grid-template-columns:170px 1fr;gap:12px 20px;margin-bottom:28px}.summary dt{color:#8b949e}.summary dd{margin:0;overflow-wrap:anywhere}.panel+.panel{margin-top:28px}.panel h2{margin:0 0 6px;font-size:18px}.hint{margin:0 0 18px;color:#8b949e;line-height:1.5}.notice{padding:12px;border:1px solid #30363d;border-radius:6px;background:#161b22;color:#c9d1d9}.secret-list{margin:0 0 22px;padding:0;list-style:none;border:1px solid #30363d;border-radius:6px}.secret-row{display:flex;align-items:center;justify-content:space-between;gap:16px;min-height:48px;padding:8px 12px;border-bottom:1px solid #21262d}.secret-row:last-child{border-bottom:0}.secret-row code{font:13px ui-monospace,SFMono-Regular,Consolas,monospace}.secret-row form{margin:0}.form{display:grid;grid-template-columns:minmax(180px,.7fr) minmax(220px,1fr) auto;align-items:end;gap:12px}.field label{display:block;margin-bottom:7px;font-size:13px;font-weight:600}.field input,.field textarea{width:100%;height:34px;padding:5px 10px;border:1px solid #30363d;border-radius:6px;background:#0d1117;color:#f0f6fc;font:inherit}.field input:focus,.field textarea:focus{border-color:#2f81f7;outline:none;box-shadow:0 0 0 3px #2f81f74d}.field textarea{height:auto;min-height:70px;resize:vertical}.variable-list{display:grid;gap:16px;margin:0 0 22px}.variable-row{border-bottom:1px solid #21262d;padding-bottom:16px}.variable-row code{overflow-wrap:anywhere}.variable-row pre{white-space:pre-wrap;overflow-wrap:anywhere}.variable-row .field{margin:10px 0}.variable-actions{display:flex;gap:8px}button{height:34px;padding:0 14px;border:1px solid #2ea043;border-radius:6px;background:#238636;color:#fff;font-weight:600;cursor:pointer}.delete{border-color:#da3633;background:#b62324}.empty{padding:18px;color:#8b949e;text-align:center}@media(max-width:800px){.topbar{padding:0 16px}}@media(max-width:680px){.page{padding:22px 16px}.heading{display:block}.pill{margin-top:12px}.summary{grid-template-columns:1fr}.summary dd{margin-bottom:8px}.form{grid-template-columns:1fr}}
   </style>
 </head>
 <body>
@@ -106,17 +106,18 @@ const projectPageTemplate = `<!doctype html>
       <dt>Installation</dt><dd>{{.Installation}}</dd>
       <dt>Workflow directory</dt><dd><code>{{.WorkflowDirectory}}</code></dd>
       <dt>Secret</dt><dd>{{if .SecretName}}<code>{{.SecretName}}</code>{{else}}Not configured{{end}}</dd>
+      <dt>Variables ConfigMap</dt><dd>{{if .ConfigMapName}}<code>{{.ConfigMapName}}</code>{{else}}Not configured{{end}}</dd>
       <dt>Configuration</dt><dd>{{.StatusMessage}}</dd>
     </dl>
     <section class="panel" aria-label="Workflow secrets">
       <h2>Workflow secrets</h2>
       <p class="hint">Secret values are write-only. Existing values are never returned to the browser.</p>
-      {{if .CanReadSecrets}}
+      {{if .SecretName}}
         {{if .SecretMissing}}<p class="notice">The referenced Secret does not exist. Adding the first value will create it.</p>{{end}}
         <ul class="secret-list">
-          {{range .SecretNames}}<li class="secret-row"><code>{{.}}</code>{{if $.CanManageSecrets}}<form method="post" action="{{$.SecretsURL}}" onsubmit="return confirm('Delete this workflow secret?')"><input type="hidden" name="csrf" value="{{$.CSRFToken}}"><input type="hidden" name="action" value="delete"><input type="hidden" name="name" value="{{.}}"><button class="delete" type="submit">Delete</button></form>{{end}}</li>{{else}}<li class="empty">No workflow secrets are configured.</li>{{end}}
+          {{range .SecretNames}}<li class="secret-row"><code>{{.}}</code>{{if $.CanManageValues}}<form method="post" action="{{$.SecretsURL}}" onsubmit="return confirm('Delete this workflow secret?')"><input type="hidden" name="csrf" value="{{$.CSRFToken}}"><input type="hidden" name="action" value="delete"><input type="hidden" name="name" value="{{.}}"><button class="delete" type="submit">Delete</button></form>{{end}}</li>{{else}}<li class="empty">No workflow secrets are configured.</li>{{end}}
         </ul>
-        {{if .CanManageSecrets}}
+        {{if .CanManageValues}}
           <form class="form" method="post" action="{{.SecretsURL}}">
             <input type="hidden" name="csrf" value="{{.CSRFToken}}"><input type="hidden" name="action" value="set">
             <div class="field"><label for="secret-name">Name</label><input id="secret-name" name="name" pattern="[A-Za-z_][A-Za-z0-9_]*" maxlength="255" autocomplete="off" required></div>
@@ -124,7 +125,32 @@ const projectPageTemplate = `<!doctype html>
             <button type="submit">Add or replace</button>
           </form>
         {{else}}<p class="notice"><a href="{{.LoginURL}}">Sign in as an administrator</a> to add, replace, or delete workflow secrets.</p>{{end}}
-      {{else}}<p class="notice">{{.ManagementNotice}}</p>{{end}}
+      {{else}}<p class="notice">Configure <code>spec.secrets.secretRef</code> before managing workflow secrets.</p>{{end}}
+    </section>
+    <section class="panel" aria-label="Workflow variables">
+      <h2>Workflow variables</h2>
+      <p class="hint">Variables are available through the vars context. Their values are visible to anyone with Console access.</p>
+      {{if .ConfigMapName}}
+        {{if .VariablesMissing}}<p class="notice">The referenced ConfigMap does not exist. Adding the first variable will create it.</p>{{end}}
+        <div class="variable-list">
+          {{range $index, $variable := .Variables}}<div class="variable-row">
+            {{if $.CanManageValues}}<form method="post" action="{{$.VariablesURL}}">
+              <input type="hidden" name="csrf" value="{{$.CSRFToken}}"><input type="hidden" name="name" value="{{$variable.Name}}">
+              <div class="field"><label for="variable-{{$index}}"><code>{{$variable.Name}}</code></label><textarea id="variable-{{$index}}" name="value" rows="2" spellcheck="false">
+{{$variable.Value}}</textarea></div>
+              <div class="variable-actions"><button type="submit" name="action" value="set">Save</button><button class="delete" type="submit" name="action" value="delete" formnovalidate onclick="return confirm('Delete this workflow variable?')">Delete</button></div>
+            </form>{{else}}<code>{{$variable.Name}}</code><pre>{{$variable.Value}}</pre>{{end}}
+          </div>{{else}}<p class="empty">No workflow variables are configured.</p>{{end}}
+        </div>
+        {{if .CanManageValues}}
+          <form class="form" method="post" action="{{.VariablesURL}}">
+            <input type="hidden" name="csrf" value="{{.CSRFToken}}"><input type="hidden" name="action" value="set">
+            <div class="field"><label for="variable-name">Name</label><input id="variable-name" name="name" pattern="[A-Za-z_][A-Za-z0-9_]*" maxlength="255" autocomplete="off" required></div>
+            <div class="field"><label for="variable-value">Value</label><textarea id="variable-value" name="value" rows="2" spellcheck="false"></textarea></div>
+            <button type="submit">Add or replace</button>
+          </form>
+        {{else}}<p class="notice"><a href="{{.LoginURL}}">Sign in as an administrator</a> to add, replace, or delete workflow variables.</p>{{end}}
+      {{else}}<p class="notice">Configure <code>spec.variables.configMapRef</code> before managing workflow variables.</p>{{end}}
     </section>
   </main>
 </body>

@@ -13,14 +13,16 @@ release does not delete Open Actions resources.
 The default Console URL supports access through `kubectl port-forward
 service/open-actions-console 8080:80 --namespace open-actions-system`. Set
 `console.publicURL` to the public HTTPS origin when exposing the Service. The
-Console serves Project and workflow metadata, workflow file snapshots, and
-runner Pod logs without authentication, so expose it only to the intended
-audience. The chart creates
+Console serves Project and workflow metadata, workflow variable values,
+workflow file snapshots, and runner Pod logs without authentication, so expose
+it only to the intended audience. The chart creates
 and preserves an administrator token in the `open-actions-console-auth` Secret.
 Retrieve the `token` key and enter it on the Console login page to manage
-Project Secrets in the release namespace and initiate manual workflow runs.
+Project secrets and variables across all namespaces and initiate manual
+workflow runs.
 The Console uses its own Deployment and ServiceAccount with read access to
-workflow resources and create access to WorkflowRuns. It can read Secrets so it
+workflow resources, create access to WorkflowRuns, and get, create, and update
+access to Secrets and ConfigMaps across all namespaces. It can read Secrets so it
 can use each selected Project's GitHub App private key to resolve repository
 identity before creating a manual run. Set
 `console.enabled=false` to omit the Console. Set `console.secretName` to mount
@@ -33,7 +35,7 @@ completed workflows. Visitors can choose the repository, revision, and inputs
 for manual dispatch. The option defaults to `false` and applies across
 namespaces. Use it only for a trusted audience: workflows consume runner
 capacity and may deploy or publish with configured credentials. Cancellation,
-approval, and Secret management still require sign-in. See the
+approval, and secret and variable management still require sign-in. See the
 [Console reference](../../../../docs/reference.md#controller-and-console) for the
 access policies and their differences from GitHub permissions.
 
@@ -123,7 +125,7 @@ controller:
 | `artifacts.persistence.storageClass` | `null` | Storage class for the StatefulSet-managed claim; `null` uses the cluster default |
 | `artifacts.persistence.accessModes` | `[ReadWriteOnce]` | Access modes for the StatefulSet-managed claim |
 | `artifacts.persistence.size` | `20Gi` | Requested capacity for the StatefulSet-managed claim |
-| `console.enabled` | `true` | Deploy the Open Actions Console |
+| `console.enabled` | `true` | Deploy the Open Actions Console; its ServiceAccount can read, create, and update every Secret and ConfigMap in the cluster |
 | `console.allowAnonymousWorkflowRuns` | `false` | Allow anyone with Console access to manually dispatch and rerun workflows without signing in |
 | `console.replicas` | `1` | Console replica count |
 | `console.publicURL` | `http://localhost:8080` | Public Console URL used by GitHub commit-status links |
