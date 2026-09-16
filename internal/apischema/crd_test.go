@@ -77,19 +77,26 @@ func TestProjectRepositoryValueSourcesContract(t *testing.T) {
 	}
 }
 
-func TestWorkflowRunAcceptsCommitStatusErrorState(t *testing.T) {
+func TestWorkflowRunGitHubValidationStatusContract(t *testing.T) {
 	crd, _ := loadCRD(t, "actions.kelos.dev_workflowruns.yaml")
 	object := loadSample(t, "actions_v1alpha1_workflowrun.yaml")
 	normalizeWorkflowRunCELIntegers(object)
-	object["status"] = map[string]any{
-		"source": map[string]any{
-			"github": map[string]any{
-				"commitStatus": map[string]any{"state": "error"},
-			},
-		},
+	status := map[string]any{"state": "failure", "reportDigest": strings.Repeat("b", 64)}
+	object["status"] = map[string]any{"source": map[string]any{"github": map[string]any{"validationStatus": status}}}
+	for _, state := range []string{"error", "failure", "pending", "success"} {
+		status["state"] = state
+		if errs := validateObject(t, crd, object, nil); len(errs) > 0 {
+			t.Fatalf("valid WorkflowRun validation status %q was rejected: %v", state, errs.ToAggregate())
+		}
 	}
-	if errs := validateObject(t, crd, object, nil); len(errs) > 0 {
-		t.Fatalf("commit status error state was rejected: %v", errs.ToAggregate())
+	status["state"] = "cancelled"
+	if errs := validateObject(t, crd, object, nil); len(errs) == 0 {
+		t.Fatal("WorkflowRun validation status with an invalid state was accepted")
+	}
+	status["state"] = "success"
+	status["reportDigest"] = "invalid"
+	if errs := validateObject(t, crd, object, nil); len(errs) == 0 {
+		t.Fatal("WorkflowRun validation status with an invalid report digest was accepted")
 	}
 }
 

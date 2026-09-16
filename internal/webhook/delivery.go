@@ -441,6 +441,18 @@ candidateLoop:
 		}
 		for _, cachedWorkflow := range cachedRevision.Workflows {
 			workflowPath := cachedWorkflow.Path
+			if cachedWorkflow.Error != "" {
+				r.Logger.Warn("discovered invalid workflow", "path", workflowPath, "error", cachedWorkflow.Error)
+				switch candidate.Name {
+				case "push", "merge_group":
+					candidateSelections = append(candidateSelections, workflowSelection{Path: workflowPath, Event: candidate})
+				case "pull_request":
+					if candidate.Action == "opened" || candidate.Action == "synchronize" || candidate.Action == "reopened" {
+						candidateSelections = append(candidateSelections, workflowSelection{Path: workflowPath, Event: candidate})
+					}
+				}
+				continue
+			}
 			definition := cachedWorkflow.Definition
 			_, matched, err := workflow.Match(definition.On, workflow.Event{
 				Name: candidate.Name, Action: candidate.Action, Ref: candidate.Ref,
@@ -464,14 +476,6 @@ candidateLoop:
 				}
 				candidateSelections = append(candidateSelections, workflowSelection{Path: workflowPath, Event: candidate})
 			}
-		}
-		if cachedRevision.InvalidPath != "" {
-			message := fmt.Sprintf("invalid workflow %q: %s", cachedRevision.InvalidPath, cachedRevision.InvalidError)
-			if r.skipForkPullRequestDiscovery(candidate, &delivery, message) {
-				continue candidateLoop
-			}
-			r.Logger.Warn("rejected invalid workflow", "path", cachedRevision.InvalidPath, "error", cachedRevision.InvalidError)
-			return ctrl.Result{}, r.finish(ctx, object, deliveryStateFailed, 0, message)
 		}
 		seenFiles = candidateSeenFiles
 		workflowJobs = candidateWorkflowJobs
@@ -603,12 +607,11 @@ func (r *DeliveryReconciler) cachedWorkflowRevision(ctx context.Context, project
 			}
 			result.Size += len(data)
 			definition, err := workflow.Parse(data)
+			item := revisionWorkflow{Path: workflowPath, Definition: definition}
 			if err != nil {
-				result.InvalidPath = workflowPath
-				result.InvalidError = err.Error()
-				return result, nil
+				item.Error = err.Error()
 			}
-			result.Workflows = append(result.Workflows, revisionWorkflow{Path: workflowPath, Definition: definition})
+			result.Workflows = append(result.Workflows, item)
 		}
 		return result, nil
 	})

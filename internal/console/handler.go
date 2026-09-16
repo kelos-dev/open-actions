@@ -215,6 +215,7 @@ type runPageData struct {
 	WorkflowPath    string
 	WorkflowFile    string
 	HasWorkflowFile bool
+	ValidationError string
 	Revision        string
 	ShortRevision   string
 	RefName         string
@@ -1226,6 +1227,10 @@ func (h *Handler) runDetails(writer http.ResponseWriter, request *http.Request, 
 	if err != nil {
 		h.writeResolutionError(writer, request, err)
 		return
+	}
+	if planned := meta.FindStatusCondition(run.Status.Conditions, actionsv1alpha1.WorkflowRunConditionPlanned); planned != nil && planned.Status == metav1.ConditionFalse &&
+		(planned.Reason == "WorkflowInvalid" || planned.Reason == "TriggerInvalid") {
+		data.ValidationError = planned.Message
 	}
 	data.WorkflowFile, data.HasWorkflowFile, err = h.loadWorkflowFile(request.Context(), run)
 	if err != nil {

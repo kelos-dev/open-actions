@@ -565,6 +565,21 @@ type WorkflowRunIdentityStatus struct {
 	URL string `json:"url,omitempty"`
 }
 
+// GitHubWorkflowRunStatus contains GitHub observations for a WorkflowRun.
+type GitHubWorkflowRunStatus struct {
+	// ValidationStatus records the last GitHub report accepted for the
+	// Open Actions validation context. Job results are reported on WorkflowJobs.
+	// +optional
+	ValidationStatus *GitHubCommitStatus `json:"validationStatus,omitempty"`
+}
+
+// WorkflowRunSourceStatus contains provider-specific observations.
+type WorkflowRunSourceStatus struct {
+	// GitHub contains observations for a GitHub workflow source.
+	// +optional
+	GitHub *GitHubWorkflowRunStatus `json:"github,omitempty"`
+}
+
 // WorkflowRunStatus contains observations made while executing a workflow.
 type WorkflowRunStatus struct {
 	// ObservedGeneration is the most recent generation observed by the
@@ -599,6 +614,10 @@ type WorkflowRunStatus struct {
 	// Jobs summarizes WorkflowJobs owned by this run.
 	// +optional
 	Jobs *WorkflowRunJobStatus `json:"jobs,omitempty"`
+
+	// Source contains provider-specific reporting state.
+	// +optional
+	Source *WorkflowRunSourceStatus `json:"source,omitempty"`
 
 	// StartTime is when the first child WorkflowJob's runner container started.
 	// +optional

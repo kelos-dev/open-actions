@@ -20,7 +20,9 @@ constraints. Unsupported workflows fail explicitly.
 The controller receives GitHub webhooks, creates `WorkflowRun` and `WorkflowJob`
 resources, schedules jobs on matching `Runner` resources, and reports status
 through a commit status for each job on push, pull request, and merge-group
-runs. Each status links directly to the corresponding job in the Console.
+runs. Each job status links directly to the corresponding job in the Console.
+Invalid workflows receive separate validation failures linking to the run page,
+while valid sibling workflows continue independently.
 Runners execute steps in Kubernetes Jobs and use the standalone artifact service
 for workflow artifact uploads and downloads. The Console shows runs, jobs, and
 live logs. Each `Project` defines an execution domain and its GitHub App

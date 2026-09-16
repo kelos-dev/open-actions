@@ -623,10 +623,200 @@ func TestDeliveryCachesWorkflowsAcrossEventsAtAnImmutableRevision(t *testing.T) 
 	}
 }
 
+// GitHub creates a failed run for an invalid workflow on each new commit:
+// https://docs.github.com/en/actions/how-tos/monitor-workflows/use-workflow-run-logs
+func TestDeliveryIsolatesInvalidWorkflows(t *testing.T) {
+	valid := "on: push\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - run: true\n"
+	files := []struct{ path, data string }{
+		{"a-valid.yaml", valid},
+		{"b-malformed.yaml", "on: ["},
+		{"c-valid.yaml", valid},
+		{"d-invalid-job.yaml", "on: push\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n        run: true\n"},
+		{"e-unmatched.yaml", strings.Replace(valid, "on: push", "on: workflow_dispatch", 1)},
+	}
+	const directory = ".open-actions/workflows/"
+	fileCalls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/app/installations/2/access_tokens":
+			fmt.Fprint(writer, `{"token":"installation-token"}`)
+		case "/repos/acme/example/contents/.open-actions/workflows":
+			contents := make([]map[string]string, 0, len(files))
+			for _, file := range files {
+				contents = append(contents, map[string]string{"name": file.path, "path": directory + file.path, "type": "file"})
+			}
+			_ = json.NewEncoder(writer).Encode(contents)
+		default:
+			for _, file := range files {
+				if request.URL.Path == "/repos/acme/example/contents/"+directory+file.path {
+					fileCalls++
+					_ = json.NewEncoder(writer).Encode(map[string]string{"encoding": "base64", "content": base64.StdEncoding.EncodeToString([]byte(file.data))})
+					return
+				}
+			}
+			http.NotFound(writer, request)
+		}
+	}))
+	defer server.Close()
+	now := time.Now()
+	clusterClient, reconciler, handler, project := newPullRequestDeliveryTest(t, server, now)
+	for index, revision := range []string{strings.Repeat("a", 40), strings.Repeat("a", 40), strings.Repeat("b", 40)} {
+		body := []byte(fmt.Sprintf(`{"delivery":%d}`, index))
+		delivery := queuedDelivery{
+			ProjectName: project.Name, ProjectUID: string(project.UID),
+			Repository: deliveryRepository{ID: 1, Owner: "acme", Name: "example"},
+			Event:      normalizedEvent{Name: "push", SHA: revision, Ref: "refs/heads/main"},
+			ReplayID:   webhookReplayID(body), DeliveryID: fmt.Sprint(index),
+			EventSnapshot: eventSnapshotName(webhookReplayID(body)),
+		}
+		for range 2 {
+			if err := handler.enqueueQueuedDelivery(t.Context(), project, delivery, body, body); err != nil {
+				t.Fatal(err)
+			}
+			key := client.ObjectKey{Namespace: project.Namespace, Name: webhookDeliveryName(body)}
+			if _, err := reconciler.Reconcile(t.Context(), ctrl.Request{NamespacedName: key}); err != nil {
+				t.Fatal(err)
+			}
+			stored := &corev1.ConfigMap{}
+			if err := clusterClient.Get(t.Context(), key, stored); err != nil {
+				t.Fatal(err)
+			}
+			if stored.Data[deliveryStateKey] != deliveryStateCompleted || stored.Data[deliveryRunCountKey] != "4" {
+				t.Fatalf("delivery data = %#v", stored.Data)
+			}
+		}
+		runs := &actionsv1alpha1.WorkflowRunList{}
+		if err := clusterClient.List(t.Context(), runs); err != nil {
+			t.Fatal(err)
+		}
+		if len(runs.Items) != (index+1)*4 {
+			t.Fatalf("WorkflowRuns = %d, want %d", len(runs.Items), (index+1)*4)
+		}
+		for _, file := range files[:4] {
+			name := workflowRunName(directory+file.path, string(project.UID), delivery.ReplayID)
+			run := &actionsv1alpha1.WorkflowRun{}
+			if err := clusterClient.Get(t.Context(), client.ObjectKey{Namespace: project.Namespace, Name: name}, run); err != nil {
+				t.Fatal(err)
+			}
+			if run.Spec.WorkflowPath != directory+file.path || run.Spec.Source.GitHub.Revision.SHA != revision {
+				t.Fatalf("WorkflowRun source = %#v", run.Spec)
+			}
+		}
+	}
+	if fileCalls != 2*len(files) {
+		t.Fatalf("workflow fetches = %d, want %d", fileCalls, 2*len(files))
+	}
+}
+
+func TestDeliveryCreatesInvalidWorkflowRunsOnlyForCommitEvents(t *testing.T) {
+	for _, test := range []struct {
+		event, action string
+		wantInvalid   bool
+	}{
+		{"push", "", true},
+		{"pull_request", "opened", true},
+		{"pull_request", "synchronize", true},
+		{"pull_request", "reopened", true},
+		{"pull_request", "labeled", false},
+		{"pull_request", "edited", false},
+		{"pull_request", "review_requested", false},
+		{"pull_request", "auto_merge_enabled", false},
+		{"pull_request", "closed", false},
+		{"merge_group", "checks_requested", true},
+		{"issues", "opened", false},
+		{"issue_comment", "created", false},
+		{"pull_request_review", "submitted", false},
+		{"pull_request_review_comment", "created", false},
+		{"release", "published", false},
+		{"pull_request_target", "opened", false},
+		{"workflow_run", "completed", false},
+	} {
+		t.Run(test.event+"/"+test.action, func(t *testing.T) {
+			const directory = ".open-actions/workflows/"
+			trigger := test.event
+			if trigger == "workflow_run" {
+				trigger = "\n  workflow_run:\n    workflows: [CI]\n    types: [completed]"
+			} else if trigger == "pull_request" {
+				trigger = "\n  pull_request:\n    types: [" + test.action + "]"
+			}
+			valid := "on: " + trigger + "\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - run: true\n"
+			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+				switch request.URL.Path {
+				case "/app/installations/2/access_tokens":
+					fmt.Fprint(writer, `{"token":"installation-token"}`)
+				case "/repos/acme/example/contents/.open-actions/workflows":
+					_ = json.NewEncoder(writer).Encode([]map[string]string{
+						{"name": "invalid.yaml", "path": directory + "invalid.yaml", "type": "file"},
+						{"name": "valid.yaml", "path": directory + "valid.yaml", "type": "file"},
+					})
+				case "/repos/acme/example/contents/" + directory + "invalid.yaml":
+					_ = json.NewEncoder(writer).Encode(map[string]string{"encoding": "base64", "content": base64.StdEncoding.EncodeToString([]byte("on: ["))})
+				case "/repos/acme/example/contents/" + directory + "valid.yaml":
+					_ = json.NewEncoder(writer).Encode(map[string]string{"encoding": "base64", "content": base64.StdEncoding.EncodeToString([]byte(valid))})
+				default:
+					http.NotFound(writer, request)
+				}
+			}))
+			defer server.Close()
+			clusterClient, reconciler, handler, project := newPullRequestDeliveryTest(t, server, time.Now())
+			body := []byte(`{"delivery":"event-scope"}`)
+			delivery := queuedDelivery{
+				ProjectName: project.Name, ProjectUID: string(project.UID),
+				Repository: deliveryRepository{ID: 1, Owner: "acme", Name: "example"},
+				Event:      normalizedEvent{Name: test.event, Action: test.action, SHA: strings.Repeat("a", 40), Ref: "refs/heads/main", MergeRevision: true, WorkflowName: "CI"},
+				ReplayID:   webhookReplayID(body), DeliveryID: "event-scope", EventSnapshot: eventSnapshotName(webhookReplayID(body)),
+			}
+			if err := handler.enqueueQueuedDelivery(t.Context(), project, delivery, body, body); err != nil {
+				t.Fatal(err)
+			}
+			key := client.ObjectKey{Namespace: project.Namespace, Name: webhookDeliveryName(body)}
+			if _, err := reconciler.Reconcile(t.Context(), ctrl.Request{NamespacedName: key}); err != nil {
+				t.Fatal(err)
+			}
+			stored := &corev1.ConfigMap{}
+			if err := clusterClient.Get(t.Context(), key, stored); err != nil {
+				t.Fatal(err)
+			}
+			wantRuns := 1
+			if test.wantInvalid {
+				wantRuns++
+			}
+			if stored.Data[deliveryStateKey] != deliveryStateCompleted || stored.Data[deliveryRunCountKey] != fmt.Sprint(wantRuns) {
+				t.Fatalf("delivery data = %#v, want %d runs", stored.Data, wantRuns)
+			}
+			runs := &actionsv1alpha1.WorkflowRunList{}
+			if err := clusterClient.List(t.Context(), runs); err != nil {
+				t.Fatal(err)
+			}
+			if len(runs.Items) != wantRuns {
+				t.Fatalf("WorkflowRuns = %d, want %d", len(runs.Items), wantRuns)
+			}
+			validFound := false
+			for _, run := range runs.Items {
+				if run.Spec.WorkflowPath == directory+"valid.yaml" {
+					validFound = true
+				}
+			}
+			if !validFound {
+				t.Fatal("valid sibling was not created")
+			}
+		})
+	}
+}
+
 func TestInvalidForkWorkflowDoesNotSuppressPullRequestTarget(t *testing.T) {
 	now := time.Date(2026, 8, 23, 14, 0, 0, 0, time.UTC)
 	baseWorkflowData := []byte("name: Trusted\non: pull_request_target\njobs:\n  check:\n    runs-on: ubuntu-latest\n    steps:\n      - run: make check\n")
-	gitRoot, revision := testPullRequestGitRepository(t, baseWorkflowData, []byte("not a workflow\n"), false)
+	gitRoot, revision := testPullRequestGitRepository(t, baseWorkflowData, nil, false)
+	work := filepath.Join(gitRoot, "work")
+	runTestGit(t, work, "merge", "--quiet", "base", "-m", "integrate base")
+	revision.MergeBaseSHA = revision.BaseSHA
+	writeTestFile(t, work, ".open-actions/workflows/ci.yaml", "not a workflow\n")
+	writeTestFile(t, work, ".open-actions/workflows/valid.yaml", "on: pull_request\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - run: true\n")
+	runTestGit(t, work, "add", ".")
+	runTestGit(t, work, "commit", "--quiet", "-m", "valid workflow")
+	revision.HeadSHA = strings.TrimSpace(runTestGit(t, work, "rev-parse", "HEAD"))
+	runTestGit(t, work, "push", "--quiet", filepath.Join(gitRoot, "acme", "example"), "head")
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		switch request.URL.Path {
 		case "/app/installations/2/access_tokens":
@@ -653,15 +843,32 @@ func TestInvalidForkWorkflowDoesNotSuppressPullRequestTarget(t *testing.T) {
 	if err := clusterClient.Get(context.Background(), deliveryKey, stored); err != nil {
 		t.Fatal(err)
 	}
-	if stored.Data[deliveryStateKey] != deliveryStateCompleted || stored.Data[deliveryRunCountKey] != "1" {
+	if stored.Data[deliveryStateKey] != deliveryStateCompleted || stored.Data[deliveryRunCountKey] != "3" {
 		t.Fatalf("delivery data = %#v", stored.Data)
 	}
 	runs := &actionsv1alpha1.WorkflowRunList{}
 	if err := clusterClient.List(context.Background(), runs); err != nil {
 		t.Fatal(err)
 	}
-	if len(runs.Items) != 1 || runs.Items[0].Spec.Source.GitHub.Event.Name != actionsv1alpha1.GitHubEventNamePullRequestTarget {
+	if len(runs.Items) != 3 {
 		t.Fatalf("WorkflowRuns = %#v", runs.Items)
+	}
+	targetRuns, forkRuns := 0, 0
+	for _, run := range runs.Items {
+		if run.Spec.Source.GitHub.Event.Name == actionsv1alpha1.GitHubEventNamePullRequestTarget {
+			targetRuns++
+			if run.Spec.Source.GitHub.Revision.SHA != revision.BaseSHA || run.Spec.ForkPullRequest != nil {
+				t.Fatalf("target run = %#v", run.Spec)
+			}
+		} else {
+			forkRuns++
+			if run.Spec.ForkPullRequest == nil || !run.Spec.ForkPullRequest.RequireApproval || run.Spec.ForkPullRequest.Approved {
+				t.Fatalf("fork run approval policy = %#v", run.Spec.ForkPullRequest)
+			}
+		}
+	}
+	if targetRuns != 1 || forkRuns != 2 {
+		t.Fatalf("target runs = %d, fork runs = %d", targetRuns, forkRuns)
 	}
 }
 

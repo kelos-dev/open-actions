@@ -44,6 +44,8 @@ corresponding job in the Console. This is narrower than GitHub Actions' check
 suite and per-job check-run model, and does not populate a pull request's Checks
 tab. This compatibility gap is tracked in
 [issue #162](https://github.com/kelos-dev/open-actions/issues/162).
+Workflow validation failures publish a workflow-level status linking to the run
+in the Console only when they occur before any jobs are created.
 
 GitHub job statuses are reported asynchronously. Slow status requests and
 reporting retries do not delay dependency readiness or workflow cancellation.
@@ -355,6 +357,23 @@ can overwrite each other. The controller records a
 `GitHubStatusContextCollision` Warning event on the WorkflowRun when it detects
 this configuration.
 
+If workflow validation fails before any jobs are created, the WorkflowRun
+publishes a `failure` status with description
+`Workflow validation failed` and context
+`Open Actions validation / <workflow path>`.
+Successful planning clears an existing failure under the same context and
+commit, provided the failure was published by the same GitHub App. The clearing
+status is `success` with description `Workflow validation passed`. Healthy
+workflows do not otherwise publish validation statuses. Do not configure this
+validation context as a required status check: healthy commits may never receive
+it, leaving merges blocked. The status targets the run's Console page, where
+validation errors are available.
+`WorkflowRun.status.source.github.validationStatus` records the last accepted
+validation report's state and digest; job results remain on WorkflowJobs.
+This report uses the same push, pull request,
+and merge-group event restrictions as job reports. The context is shortened
+and case-disambiguated using the workflow path under the rules below.
+
 Commit-status contexts longer than 100 Unicode characters are shortened with a
 deterministic digest suffix. Job contexts whose workflow path or logical job ID
 (`spec.matrix.logicalJobID` for matrix jobs, otherwise `spec.jobID`) contains
@@ -379,9 +398,9 @@ description format. These summaries follow GitHub Actions' check presentation;
 the [status and conclusion semantics](https://docs.github.com/en/pull-requests/reference/status-checks#check-statuses-and-conclusions)
 are mapped to the commit-status API's available states.
 
-The newest matching WorkflowRun owns the per-job contexts, so reports from older
-executions cannot replace its job statuses. A later execution for the same event
-and ref, or the same pull request, supersedes its earlier execution.
+The newest matching WorkflowRun owns the job and validation contexts, so reports
+from older executions cannot replace its statuses. A later execution for the
+same event and ref, or the same pull request, supersedes its earlier execution.
 
 Scheduled and manually repeated triggers do not publish commit statuses because
 stable-revision recurring workflows could consume GitHub's per-commit,
@@ -1718,6 +1737,27 @@ skipped for scheduled discovery while other repositories continue.
 A repository without the configured workflow directory is accepted with zero
 runs. For a deleted branch or tag, trigger matching uses the deleted ref, while
 `github.sha` contains the current commit of the repository's default branch.
+
+Webhook discovery handles each workflow file independently. For `push`,
+`pull_request`, and `merge_group` events, a file that fails parsing or validation
+still receives a WorkflowRun for the delivered event. For `pull_request`, this
+is limited to the default activity types `opened`, `synchronize`, and `reopened`.
+Other pull request activity types skip invalid files. Planning records
+`Planned=False` and `Succeeded=False` with reason
+`WorkflowInvalid` and the file path and validation error, without creating jobs.
+Invalid files cannot supply trustworthy trigger filters, so their validation
+runs are created even when their intended trigger cannot be determined. Valid
+files still use their configured trigger filters. Invalid files do not prevent
+other matching workflows from starting, including `pull_request_target`
+workflows read from the trusted base revision. Fork runs retain their configured
+approval requirement before planning. Authentication, repository access, and
+delivery-wide resource limits still apply to discovery.
+
+This follows GitHub's documented
+[failed runs for invalid workflow files on new commits](https://docs.github.com/en/actions/how-tos/monitor-workflows/use-workflow-run-logs).
+Other webhook events and scheduled discovery skip invalid files and continue
+with valid matching workflows; they do not create validation runs for invalid
+files.
 
 ### Validation limits
 

@@ -157,7 +157,7 @@ func TestJobContinueOnErrorGitHubReporting(t *testing.T) {
 							t.Fatalf("run status = %#v", run.Status)
 						}
 						reporter := &GitHubStatusReconciler{Client: clusterClient, APIReader: clusterClient, GitHub: github, ConsoleURL: reconciler.ConsoleURL}
-						if err := reporter.reconcileGitHubJobStatuses(ctx, run); err != nil {
+						if err := reporter.reconcileGitHubStatuses(ctx, run); err != nil {
 							t.Fatal(err)
 						}
 						if len(reports) != 2 {

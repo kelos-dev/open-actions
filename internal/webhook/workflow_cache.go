@@ -23,14 +23,13 @@ type workflowRevisionKey struct {
 type revisionWorkflow struct {
 	Path       string
 	Definition *workflow.Definition
+	Error      string
 }
 
 type workflowRevision struct {
-	Paths        []string
-	Workflows    []revisionWorkflow
-	InvalidPath  string
-	InvalidError string
-	Size         int
+	Paths     []string
+	Workflows []revisionWorkflow
+	Size      int
 }
 
 type workflowRevisionCache struct {

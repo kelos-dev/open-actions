@@ -993,6 +993,38 @@ spec:
                   controller.
                 format: int64
                 type: integer
+              source:
+                description: Source contains provider-specific reporting state.
+                properties:
+                  github:
+                    description: GitHub contains observations for a GitHub workflow
+                      source.
+                    properties:
+                      validationStatus:
+                        description: |-
+                          ValidationStatus records the last GitHub report accepted for the
+                          Open Actions validation context. Job results are reported on WorkflowJobs.
+                        properties:
+                          reportDigest:
+                            description: |-
+                              ReportDigest is the SHA-256 digest of the commit-status fields last
+                              accepted by GitHub.
+                            pattern: ^[0-9a-f]{64}$
+                            type: string
+                          state:
+                            description: State is the last commit-status state accepted
+                              by GitHub.
+                            enum:
+                            - error
+                            - failure
+                            - pending
+                            - success
+                            type: string
+                        required:
+                        - state
+                        type: object
+                    type: object
+                type: object
               startTime:
                 description: StartTime is when the first child WorkflowJob's runner
                   container started.

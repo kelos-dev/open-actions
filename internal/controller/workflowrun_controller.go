@@ -495,7 +495,8 @@ func (r *WorkflowRunReconciler) reconcileWorkflowRun(ctx context.Context, run *a
 	}
 	definition, err := workflow.Parse(workflowData)
 	if err != nil {
-		return r.planningFailed(ctx, run, "WorkflowInvalid", err, planningFailureTerminal)
+		run.Status.WorkflowName = run.Spec.WorkflowPath
+		return r.planningFailed(ctx, run, "WorkflowInvalid", fmt.Errorf("invalid workflow %q for WorkflowRun %q: %w", run.Spec.WorkflowPath, run.Name, err), planningFailureTerminal)
 	}
 	if definition.Name == "" {
 		definition.Name = run.Spec.WorkflowPath
@@ -503,6 +504,7 @@ func (r *WorkflowRunReconciler) reconcileWorkflowRun(ctx context.Context, run *a
 	if err := r.ensureWorkflowFileSnapshot(ctx, run, workflowData); err != nil {
 		return r.planningFailed(ctx, run, "ChildCreationFailed", err, childCreationFailureDisposition(err))
 	}
+	run.Status.WorkflowName = definition.Name
 	planningRun, planningEvent, err := resolvePlanningEvent(run, definition, eventPayload)
 	if err != nil {
 		return r.planningFailed(ctx, run, "TriggerInvalid", err, planningFailureTerminal)
@@ -542,7 +544,6 @@ func (r *WorkflowRunReconciler) reconcileWorkflowRun(ctx context.Context, run *a
 		return r.planningFailed(ctx, run, "RerunInvalid", err, disposition)
 	}
 	jobCount := int32(len(plannedJobs) + len(deferredJobs))
-	run.Status.WorkflowName = definition.Name
 	run.Status.Jobs = &actionsv1alpha1.WorkflowRunJobStatus{Total: jobCount}
 	if len(deferredJobs) > 0 {
 		if err := r.ensureWorkflowPlan(ctx, run, project, plannedJobs, deferredJobs, definition); err != nil {
@@ -3713,7 +3714,7 @@ func (r *WorkflowRunReconciler) planningEvaluationFailed(ctx context.Context, ru
 	if errors.As(cause, &unavailable) {
 		return r.planningFailed(ctx, run, "ProjectValuesUnavailable", cause, planningFailureRetry)
 	}
-	return r.planningFailed(ctx, run, "WorkflowInvalid", cause, planningFailureTerminal)
+	return r.planningFailed(ctx, run, "WorkflowInvalid", fmt.Errorf("invalid workflow %q for WorkflowRun %q: %w", run.Spec.WorkflowPath, run.Name, cause), planningFailureTerminal)
 }
 
 func childCreationFailureDisposition(err error) planningFailureDisposition {
