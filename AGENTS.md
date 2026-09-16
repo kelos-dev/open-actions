@@ -55,3 +55,5 @@ fork pull request approval, or Project Secret management authorization.
 - Choose exactly one `/kind` label from `api`, `bug`, `docs`, or `feature`.
 - Include a `release-note` block. Write `NONE` when there is no user-facing change; otherwise describe the user-visible change.
 - Use `/kind api` for new API fields, CRD changes, or changes to user-facing API behavior.
+- When a PR includes UI changes, include clearly labeled before and after screenshots in the PR description. Use recordings when needed to show interaction changes, and capture the same view and state so reviewers can compare them directly.
+- Do not commit screenshots or recordings used only in PR descriptions to the repository. Upload them as PR attachments.
