@@ -231,6 +231,8 @@ const runPageTemplate = `<!doctype html>
         <div class="summary-meta"><span>{{.RefName}}</span><code title="{{.Revision}}">{{.ShortRevision}}</code>{{if .Started}}<time data-time="{{.Started}}">{{.Started}}</time>{{end}}{{if .Duration}}<span>{{.Duration}}</span>{{end}}</div>
       </div>
     </section>
+    {{if .ValidationError}}<h2 class="section-title">Workflow validation failed</h2>
+    <section class="workflow-file" aria-label="Workflow validation error"><pre class="workflow-source">{{.ValidationError}}</pre></section>{{end}}
     <h2 class="section-title">Jobs <span class="count">{{len .Jobs}}</span></h2>
     <section class="jobs" aria-label="Jobs">
       {{range .Jobs}}<div class="job">

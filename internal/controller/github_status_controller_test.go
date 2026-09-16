@@ -149,7 +149,7 @@ func TestGitHubWorkflowJobCommitStatusLifecycle(t *testing.T) {
 	}
 	clusterClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&actionsv1alpha1.WorkflowRun{}, &actionsv1alpha1.WorkflowJob{}).WithObjects(project, secret, run, build, lint).Build()
 	reconciler := &GitHubStatusReconciler{Client: clusterClient, APIReader: clusterClient, GitHub: github, ConsoleURL: "https://console.example"}
-	if err := reconciler.reconcileGitHubJobStatuses(context.Background(), run); err != nil {
+	if err := reconciler.reconcileGitHubStatuses(context.Background(), run); err != nil {
 		t.Fatal(err)
 	}
 	if len(reports) != 2 {
@@ -180,7 +180,7 @@ func TestGitHubWorkflowJobCommitStatusLifecycle(t *testing.T) {
 	}
 	listReader := &workflowRunAppearsReader{Reader: clusterClient}
 	reconciler.APIReader = listReader
-	if err := reconciler.reconcileGitHubJobStatuses(context.Background(), run); err != nil {
+	if err := reconciler.reconcileGitHubStatuses(context.Background(), run); err != nil {
 		t.Fatal(err)
 	}
 	if listReader.listCount != 0 {
@@ -198,7 +198,7 @@ func TestGitHubWorkflowJobCommitStatusLifecycle(t *testing.T) {
 	if err := clusterClient.Status().Update(context.Background(), storedBuild); err != nil {
 		t.Fatal(err)
 	}
-	if err := reconciler.reconcileGitHubJobStatuses(context.Background(), run); err != nil {
+	if err := reconciler.reconcileGitHubStatuses(context.Background(), run); err != nil {
 		t.Fatal(err)
 	}
 	if len(reports) != 3 || reports[2].State != "pending" || reports[2].Description != "In progress" || reports[2].TargetURL != "https://console.example/runs/default/ci/jobs/ci-build" {
@@ -214,7 +214,7 @@ func TestGitHubWorkflowJobCommitStatusLifecycle(t *testing.T) {
 	if err := clusterClient.Status().Update(context.Background(), storedBuild); err != nil {
 		t.Fatal(err)
 	}
-	if err := reconciler.reconcileGitHubJobStatuses(context.Background(), run); err != nil {
+	if err := reconciler.reconcileGitHubStatuses(context.Background(), run); err != nil {
 		t.Fatal(err)
 	}
 	if len(reports) != 4 || reports[3].State != "success" || reports[3].Description != "Successful in 22s" {
@@ -231,7 +231,7 @@ func TestGitHubWorkflowJobCommitStatusLifecycle(t *testing.T) {
 	if err := clusterClient.Status().Update(context.Background(), storedBuild); err != nil {
 		t.Fatal(err)
 	}
-	if err := reconciler.reconcileGitHubJobStatuses(context.Background(), run); err != nil {
+	if err := reconciler.reconcileGitHubStatuses(context.Background(), run); err != nil {
 		t.Fatal(err)
 	}
 	if err := clusterClient.Get(context.Background(), client.ObjectKeyFromObject(build), storedBuild); err != nil {
@@ -249,7 +249,7 @@ func TestGitHubWorkflowJobCommitStatusLifecycle(t *testing.T) {
 	if err := clusterClient.Status().Update(context.Background(), storedLint); err != nil {
 		t.Fatal(err)
 	}
-	if err := reconciler.reconcileGitHubJobStatuses(context.Background(), run); err != nil {
+	if err := reconciler.reconcileGitHubStatuses(context.Background(), run); err != nil {
 		t.Fatal(err)
 	}
 	if err := clusterClient.Get(context.Background(), client.ObjectKeyFromObject(lint), storedLint); err != nil {
@@ -275,7 +275,7 @@ func TestGitHubWorkflowJobCommitStatusLifecycle(t *testing.T) {
 	if err := clusterClient.Status().Update(context.Background(), storedLint); err != nil {
 		t.Fatal(err)
 	}
-	if err := reconciler.reconcileGitHubJobStatuses(context.Background(), run); err != nil {
+	if err := reconciler.reconcileGitHubStatuses(context.Background(), run); err != nil {
 		t.Fatal(err)
 	}
 	if len(reports) != 4 {
@@ -326,13 +326,13 @@ func TestGitHubWorkflowJobCommitStatusLifecycle(t *testing.T) {
 	if err := clusterClient.Create(context.Background(), sharedLint); err != nil {
 		t.Fatal(err)
 	}
-	if err := reconciler.reconcileGitHubJobStatuses(context.Background(), run); err != nil {
+	if err := reconciler.reconcileGitHubStatuses(context.Background(), run); err != nil {
 		t.Fatal(err)
 	}
 	if len(reports) != 4 {
 		t.Fatalf("older shared-revision run updated a job status; reports = %#v", reports)
 	}
-	if err := reconciler.reconcileGitHubJobStatuses(context.Background(), sharedRun); err != nil {
+	if err := reconciler.reconcileGitHubStatuses(context.Background(), sharedRun); err != nil {
 		t.Fatal(err)
 	}
 	wantTakeover := map[string]string{
@@ -367,6 +367,234 @@ func TestGitHubWorkflowJobCommitStatusLifecycle(t *testing.T) {
 	}
 	if report := reports[6]; report.Context != "Open Actions / CI / Lint / lint" || report.State != "error" || report.Description != "Cancelled" || report.TargetURL != "https://console.example/runs/default/ci-pull-request/jobs/ci-pull-request-lint" {
 		t.Fatalf("canceled job report = %#v", report)
+	}
+}
+
+func TestGitHubWorkflowValidationFailureReporting(t *testing.T) {
+	for _, test := range []struct {
+		name, reason string
+		event        actionsv1alpha1.GitHubEventName
+		consoleURL   string
+		wantReport   bool
+	}{
+		{name: "invalid workflow", reason: "WorkflowInvalid", event: actionsv1alpha1.GitHubEventNamePush, consoleURL: "https://console.example", wantReport: true},
+		{name: "pull request head", reason: "WorkflowInvalid", event: actionsv1alpha1.GitHubEventNamePullRequest, consoleURL: "https://console.example", wantReport: true},
+		{name: "invalid workflow without console", reason: "WorkflowInvalid", event: actionsv1alpha1.GitHubEventNamePush, wantReport: true},
+		{name: "unrelated planning failure", reason: "ChildCreationFailed", event: actionsv1alpha1.GitHubEventNamePush},
+		{name: "schedule", reason: "WorkflowInvalid", event: actionsv1alpha1.GitHubEventNameSchedule},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var reports []githubclient.CreateCommitStatusRequest
+			unavailable := true
+			var statusRevision string
+			reporter, _, clusterClient, run, build, dependent := githubStatusTestControllers(t, func(writer http.ResponseWriter, request *http.Request) {
+				if unavailable {
+					http.Error(writer, "temporarily unavailable", http.StatusServiceUnavailable)
+					return
+				}
+				statusRevision = strings.TrimPrefix(request.URL.Path, "/repos/acme/example/statuses/")
+				report := githubclient.CreateCommitStatusRequest{}
+				if err := json.NewDecoder(request.Body).Decode(&report); err != nil {
+					t.Error(err)
+				}
+				reports = append(reports, report)
+				fmt.Fprint(writer, `{"id":42}`)
+			}, func() []githubclient.CommitStatus {
+				statuses := make([]githubclient.CommitStatus, 0, len(reports))
+				for index := len(reports) - 1; index >= 0; index-- {
+					report := reports[index]
+					status := githubclient.CommitStatus{ID: int64(index + 1), State: report.State, Context: report.Context, TargetURL: report.TargetURL, Description: report.Description}
+					status.Creator.Login = "open-actions[bot]"
+					statuses = append(statuses, status)
+				}
+				return statuses
+			})
+			reporter.ConsoleURL = test.consoleURL
+			for _, job := range []*actionsv1alpha1.WorkflowJob{build, dependent} {
+				if err := clusterClient.Delete(t.Context(), job); err != nil {
+					t.Fatal(err)
+				}
+			}
+			key := client.ObjectKeyFromObject(run)
+			if err := clusterClient.Get(t.Context(), key, run); err != nil {
+				t.Fatal(err)
+			}
+			run.Spec.Source.GitHub.Event.Name = test.event
+			if test.event == actionsv1alpha1.GitHubEventNamePullRequest {
+				run.Spec.Source.GitHub.Revision.HeadSHA = strings.Repeat("b", 40)
+			}
+			if err := clusterClient.Update(t.Context(), run); err != nil {
+				t.Fatal(err)
+			}
+			completion := metav1.NewTime(time.Now().Truncate(time.Second))
+			run.Status = actionsv1alpha1.WorkflowRunStatus{WorkflowName: run.Spec.WorkflowPath, CompletionTime: &completion, Conditions: []metav1.Condition{
+				plannedCondition(metav1.ConditionFalse, test.reason),
+				{Type: actionsv1alpha1.WorkflowRunConditionSucceeded, Status: metav1.ConditionFalse, Reason: test.reason},
+			}}
+			if err := clusterClient.Status().Update(t.Context(), run); err != nil {
+				t.Fatal(err)
+			}
+			request := ctrl.Request{NamespacedName: key}
+			_, err := reporter.Reconcile(t.Context(), request)
+			if !test.wantReport {
+				if err != nil || len(reports) != 0 {
+					t.Fatalf("unexpected report: %#v, error = %v", reports, err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatal("transient reporting failure did not request a retry")
+			}
+			if err := clusterClient.Get(t.Context(), key, run); err != nil {
+				t.Fatal(err)
+			}
+			if workflowRunValidationStatus(run) != nil || !run.Status.CompletionTime.Equal(&completion) {
+				t.Fatalf("status after reporting failure = %#v", run.Status)
+			}
+			unavailable = false
+			for range 2 {
+				if _, err := reporter.Reconcile(t.Context(), request); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if len(reports) != 1 {
+				t.Fatalf("reports = %#v, want exactly one", reports)
+			}
+			wantURL := ""
+			if test.consoleURL != "" {
+				wantURL = test.consoleURL + "/runs/default/ci"
+			}
+			report := reports[0]
+			if report.State != "failure" || report.Description != "Workflow validation failed" || report.Context != "Open Actions validation / .open-actions/workflows/ci.yaml" || report.TargetURL != wantURL || statusRevision != githubStatusRevision(run.Spec.Source.GitHub) {
+				t.Fatalf("validation failure report = %#v, revision = %q", report, statusRevision)
+			}
+			if err := clusterClient.Get(t.Context(), key, run); err != nil {
+				t.Fatal(err)
+			}
+			status := workflowRunValidationStatus(run)
+			if status == nil || status.State != actionsv1alpha1.GitHubCommitStatusStateFailure || status.ReportDigest != commitStatusReportDigest(report) {
+				t.Fatalf("recorded workflow status = %#v", status)
+			}
+
+			later := run.DeepCopy()
+			later.Name, later.UID, later.ResourceVersion = "ci-later", "later-uid", ""
+			later.CreationTimestamp = metav1.Now()
+			later.Labels = map[string]string{actionsv1alpha1.LabelWorkflowRunRootUID: string(later.UID)}
+			later.Status = actionsv1alpha1.WorkflowRunStatus{WorkflowName: "CI", Conditions: []metav1.Condition{plannedCondition(metav1.ConditionTrue, "JobsPlanned")}}
+			if err := clusterClient.Create(t.Context(), later); err != nil {
+				t.Fatal(err)
+			}
+			job := &actionsv1alpha1.WorkflowJob{
+				ObjectMeta: metav1.ObjectMeta{Name: "later-build", Namespace: later.Namespace, UID: "later-build-uid", Labels: map[string]string{actionsv1alpha1.LabelWorkflowRunUID: string(later.UID)}},
+				Spec:       actionsv1alpha1.WorkflowJobSpec{WorkflowRunRef: corev1.LocalObjectReference{Name: later.Name}, JobID: "build"},
+			}
+			if err := clusterClient.Create(t.Context(), job); err != nil {
+				t.Fatal(err)
+			}
+			for range 2 {
+				if _, err := reporter.Reconcile(t.Context(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(later)}); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := reporter.Reconcile(t.Context(), request); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if len(reports) != 3 || reports[2].State != "pending" || reports[2].Context != "Open Actions / CI / build" || reports[1].State != "success" || reports[1].Context != report.Context || reports[1].Description != "Workflow validation passed" {
+				t.Fatalf("validation failure was not superseded: %#v", reports)
+			}
+		})
+	}
+}
+
+func TestGitHubValidationSuccessRequiresAnExistingAppReport(t *testing.T) {
+	for _, test := range []struct {
+		name, state, creator, targetURL string
+		wantWrite, wantRecorded, retry  bool
+	}{
+		{name: "no validation history"},
+		{name: "app failure", state: "failure", creator: "open-actions[bot]", wantWrite: true, wantRecorded: true, retry: true},
+		{name: "another reporter failure", state: "failure", creator: "another-app[bot]"},
+		{name: "app success for another run", state: "success", creator: "open-actions[bot]", targetURL: "https://console.example/runs/default/earlier"},
+		{name: "recover accepted success", state: "success", creator: "open-actions[bot]", targetURL: "https://console.example/runs/default/ci", wantRecorded: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			const validationContext = "Open Actions validation / .open-actions/workflows/ci.yaml"
+			var reports []githubclient.CreateCommitStatusRequest
+			listCalls := 0
+			failValidation := test.retry
+			reporter, _, clusterClient, run, build, dependent := githubStatusTestControllers(t, func(writer http.ResponseWriter, request *http.Request) {
+				var report githubclient.CreateCommitStatusRequest
+				if err := json.NewDecoder(request.Body).Decode(&report); err != nil {
+					t.Error(err)
+				}
+				if failValidation && report.Context == validationContext {
+					http.Error(writer, "temporarily unavailable", http.StatusServiceUnavailable)
+					return
+				}
+				reports = append(reports, report)
+				fmt.Fprint(writer, `{"id":42}`)
+			}, func() []githubclient.CommitStatus {
+				listCalls++
+				if test.state == "" {
+					return []githubclient.CommitStatus{}
+				}
+				status := githubclient.CommitStatus{ID: 1, Context: validationContext, State: test.state, TargetURL: test.targetURL, Description: "Workflow validation passed"}
+				status.Creator.Login = test.creator
+				return []githubclient.CommitStatus{status}
+			})
+			if err := clusterClient.Get(t.Context(), client.ObjectKeyFromObject(run), run); err != nil {
+				t.Fatal(err)
+			}
+			completion := metav1.NewTime(time.Now().Truncate(time.Second))
+			run.Status.CompletionTime = &completion
+			meta.SetStatusCondition(&run.Status.Conditions, metav1.Condition{Type: actionsv1alpha1.WorkflowRunConditionSucceeded, Status: metav1.ConditionTrue, Reason: "JobsSucceeded"})
+			if err := clusterClient.Status().Update(t.Context(), run); err != nil {
+				t.Fatal(err)
+			}
+			for _, job := range []*actionsv1alpha1.WorkflowJob{build, dependent} {
+				if err := clusterClient.Get(t.Context(), client.ObjectKeyFromObject(job), job); err != nil {
+					t.Fatal(err)
+				}
+				job.Status.Result = actionsv1alpha1.WorkflowJobResultSuccess
+				if err := clusterClient.Status().Update(t.Context(), job); err != nil {
+					t.Fatal(err)
+				}
+			}
+			request := ctrl.Request{NamespacedName: client.ObjectKeyFromObject(run)}
+			if test.retry {
+				if _, err := reporter.Reconcile(t.Context(), request); err == nil || len(reports) != 0 {
+					t.Fatalf("validation recovery failure did not preserve pending job reports: %#v, %v", reports, err)
+				}
+				failValidation = false
+			}
+			if _, err := reporter.Reconcile(t.Context(), request); err != nil {
+				t.Fatal(err)
+			}
+			wantReports := 2
+			if test.wantWrite {
+				wantReports++
+			}
+			if len(reports) != wantReports {
+				t.Fatalf("reports = %#v, want %d", reports, wantReports)
+			}
+			if test.wantWrite && (reports[0].Context != validationContext || reports[0].State != "success") {
+				t.Fatalf("validation recovery = %#v", reports)
+			}
+			if err := clusterClient.Get(t.Context(), request.NamespacedName, run); err != nil {
+				t.Fatal(err)
+			}
+			if status := workflowRunValidationStatus(run); (status != nil) != test.wantRecorded || (status != nil && status.State != actionsv1alpha1.GitHubCommitStatusStateSuccess) {
+				t.Fatalf("recorded validation status = %#v", status)
+			}
+			calls := listCalls
+			restarted := &GitHubStatusReconciler{Client: clusterClient, APIReader: clusterClient, GitHub: reporter.GitHub, ConsoleURL: reporter.ConsoleURL}
+			if _, err := restarted.Reconcile(t.Context(), request); err != nil {
+				t.Fatal(err)
+			}
+			if listCalls != calls || len(reports) != wantReports {
+				t.Fatalf("completed run repeated reporting after restart: lists %d -> %d, reports %#v", calls, listCalls, reports)
+			}
+		})
 	}
 }
 
@@ -1005,7 +1233,7 @@ func TestGitHubStatusRetriesDoNotDelayWorkflowReadiness(t *testing.T) {
 	}
 }
 
-func githubStatusTestControllers(t *testing.T, publish http.HandlerFunc) (*GitHubStatusReconciler, *WorkflowRunReconciler, client.Client, *actionsv1alpha1.WorkflowRun, *actionsv1alpha1.WorkflowJob, *actionsv1alpha1.WorkflowJob) {
+func githubStatusTestControllers(t *testing.T, publish http.HandlerFunc, statusHistory ...func() []githubclient.CommitStatus) (*GitHubStatusReconciler, *WorkflowRunReconciler, client.Client, *actionsv1alpha1.WorkflowRun, *actionsv1alpha1.WorkflowJob, *actionsv1alpha1.WorkflowJob) {
 	t.Helper()
 	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
@@ -1013,10 +1241,16 @@ func githubStatusTestControllers(t *testing.T, publish http.HandlerFunc) (*GitHu
 	}
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		switch {
+		case request.URL.Path == "/app":
+			fmt.Fprint(writer, `{"id":1,"slug":"open-actions"}`)
 		case request.URL.Path == "/app/installations/2/access_tokens":
 			fmt.Fprint(writer, `{"token":"statuses-token"}`)
 		case request.Method == http.MethodGet && strings.HasSuffix(request.URL.Path, "/statuses"):
-			fmt.Fprint(writer, `[]`)
+			if len(statusHistory) != 0 {
+				_ = json.NewEncoder(writer).Encode(statusHistory[0]())
+			} else {
+				fmt.Fprint(writer, `[]`)
+			}
 		case request.Method == http.MethodPost && strings.Contains(request.URL.Path, "/statuses/"):
 			publish(writer, request)
 		default:

@@ -4370,6 +4370,44 @@ func TestPlannedWorkflowRunWaitsForActiveWorkloadAfterChildIsLost(t *testing.T) 
 	}
 }
 
+func TestWorkflowValidationCreatesOnlyValidJobs(t *testing.T) {
+	for _, test := range []struct {
+		name, data string
+		wantJob    bool
+	}{
+		{name: "valid", data: "on: push\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - run: true\n", wantJob: true},
+		{name: "malformed YAML", data: "on: ["},
+		{name: "invalid job", data: "on: push\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n        run: true\n"},
+		{name: "invalid concurrency value", data: "on: push\nconcurrency: ${{ fromJSON('invalid') }}\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - run: true\n"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newDeferredRerunFixture(t, test.data)
+			run := fixture.root
+			jobs := fixture.jobs(run)
+			if test.wantJob {
+				job, found := jobs["test"]
+				if len(jobs) != 1 || !found || job.Spec.WorkflowRunRef.Name != run.Name || !slices.Equal(job.Spec.RunsOn, []string{"ubuntu-latest"}) {
+					t.Fatalf("planned jobs = %#v", jobs)
+				}
+				return
+			}
+			planned := meta.FindStatusCondition(run.Status.Conditions, actionsv1alpha1.WorkflowRunConditionPlanned)
+			succeeded := meta.FindStatusCondition(run.Status.Conditions, actionsv1alpha1.WorkflowRunConditionSucceeded)
+			if len(jobs) != 0 || run.Status.WorkflowName != run.Spec.WorkflowPath || run.Status.CompletionTime == nil || planned == nil || planned.Status != metav1.ConditionFalse || planned.Reason != "WorkflowInvalid" || succeeded == nil || succeeded.Status != metav1.ConditionFalse {
+				t.Fatalf("invalid workflow status = %#v, jobs = %#v", run.Status, jobs)
+			}
+			if !strings.HasPrefix(planned.Message, fmt.Sprintf("invalid workflow %q for WorkflowRun %q: ", run.Spec.WorkflowPath, run.Name)) {
+				t.Fatalf("validation error = %q", planned.Message)
+			}
+			completion := run.Status.CompletionTime.DeepCopy()
+			fixture.reconcile(run)
+			if !run.Status.CompletionTime.Equal(completion) || len(fixture.jobs(run)) != 0 {
+				t.Fatalf("terminal workflow was replanned: %#v", run.Status)
+			}
+		})
+	}
+}
+
 func TestInvalidWorkflowPlanningDoesNotRetry(t *testing.T) {
 	scheme := runtime.NewScheme()
 	if err := actionsv1alpha1.AddToScheme(scheme); err != nil {

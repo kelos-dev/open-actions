@@ -667,6 +667,33 @@ func TestConsoleCancelsActiveWorkflow(t *testing.T) {
 	}
 }
 
+func TestConsoleShowsWorkflowValidationError(t *testing.T) {
+	for _, reason := range []string{"WorkflowInvalid", "TriggerInvalid"} {
+		t.Run(reason, func(t *testing.T) {
+			handler := newTestHandler(t, false)
+			run := &actionsv1alpha1.WorkflowRun{}
+			key := client.ObjectKey{Namespace: "default", Name: "ci"}
+			if err := handler.client.Get(t.Context(), key, run); err != nil {
+				t.Fatal(err)
+			}
+			delete(run.Annotations, actionsv1alpha1.AnnotationWorkflowFile)
+			run.Status.Conditions = []metav1.Condition{
+				{Type: actionsv1alpha1.WorkflowRunConditionPlanned, Status: metav1.ConditionFalse, Reason: reason, Message: "invalid workflow ci.yaml: unexpected <script>alert(1)</script>"},
+				{Type: actionsv1alpha1.WorkflowRunConditionSucceeded, Status: metav1.ConditionFalse, Reason: reason},
+			}
+			if err := handler.client.Update(t.Context(), run); err != nil {
+				t.Fatal(err)
+			}
+			page := httptest.NewRecorder()
+			handler.ServeHTTP(page, httptest.NewRequest(http.MethodGet, "/runs/default/ci", nil))
+			body := page.Body.String()
+			if page.Code != http.StatusOK || !strings.Contains(body, `<h2 class="section-title">Workflow validation failed</h2>`) || !strings.Contains(body, `<pre class="workflow-source">invalid workflow ci.yaml: unexpected &lt;script&gt;alert(1)&lt;/script&gt;</pre>`) || strings.Contains(body, "<script>alert(1)</script>") {
+				t.Fatalf("validation failure page = %d, %s", page.Code, body)
+			}
+		})
+	}
+}
+
 func TestConsoleApprovesForkPullRequestRevision(t *testing.T) {
 	handler := newTestHandler(t, false)
 	run := &actionsv1alpha1.WorkflowRun{}

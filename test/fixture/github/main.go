@@ -891,54 +891,63 @@ func main() {
 	})
 	commitStatusMutex := sync.RWMutex{}
 	commitStatuses := map[string]map[string]any{}
-	commitStatusHistory := []map[string]any{}
-	mux.HandleFunc("/repos/acme/example/commits/", func(writer http.ResponseWriter, request *http.Request) {
-		if request.Method != http.MethodGet || !strings.HasSuffix(request.URL.Path, "/statuses") {
-			http.NotFound(writer, request)
-			return
-		}
-		page, err := strconv.Atoi(request.URL.Query().Get("page"))
-		if err != nil || page < 1 || request.URL.Query().Get("per_page") != "100" {
-			http.Error(writer, "invalid commit status page", http.StatusBadRequest)
-			return
-		}
-		commitStatusMutex.RLock()
-		start := (page - 1) * 100
-		end := min(start+100, len(commitStatusHistory))
-		statuses := []map[string]any{}
-		if start < len(commitStatusHistory) {
-			for index := len(commitStatusHistory) - 1 - start; index >= len(commitStatusHistory)-end; index-- {
-				statuses = append(statuses, commitStatusHistory[index])
+	commitStatusHistory := map[string][]map[string]any{}
+	commitStatusID := 0
+	for _, repository := range []string{"example", "invalid-trigger", "invalid-field"} {
+		prefix := "/repos/acme/" + repository
+		mux.HandleFunc(prefix+"/commits/", func(writer http.ResponseWriter, request *http.Request) {
+			if request.Method != http.MethodGet || !strings.HasSuffix(request.URL.Path, "/statuses") {
+				http.NotFound(writer, request)
+				return
 			}
-		}
-		commitStatusMutex.RUnlock()
-		writeJSON(writer, statuses)
-	})
-	mux.HandleFunc("/repos/acme/example/statuses/", func(writer http.ResponseWriter, request *http.Request) {
-		if request.Method != http.MethodPost {
-			http.Error(writer, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		body := struct {
-			State       string `json:"state"`
-			TargetURL   string `json:"target_url"`
-			Description string `json:"description"`
-			Context     string `json:"context"`
-		}{}
-		if err := json.NewDecoder(request.Body).Decode(&body); err != nil || body.TargetURL == "" || body.Context == "" {
-			http.Error(writer, "invalid commit status", http.StatusBadRequest)
-			return
-		}
-		commitStatusMutex.Lock()
-		result := map[string]any{
-			"id": len(commitStatusHistory) + 1, "state": body.State, "target_url": body.TargetURL,
-			"description": body.Description, "context": body.Context, "creator": map[string]string{"login": "open-actions[bot]"},
-		}
-		commitStatuses[body.TargetURL] = result
-		commitStatusHistory = append(commitStatusHistory, result)
-		commitStatusMutex.Unlock()
-		writeJSON(writer, result)
-	})
+			page, err := strconv.Atoi(request.URL.Query().Get("page"))
+			if err != nil || page < 1 || request.URL.Query().Get("per_page") != "100" {
+				http.Error(writer, "invalid commit status page", http.StatusBadRequest)
+				return
+			}
+			commitStatusMutex.RLock()
+			revision := strings.TrimSuffix(strings.TrimPrefix(request.URL.Path, prefix+"/commits/"), "/statuses")
+			history := commitStatusHistory[repository+"/"+revision]
+			start := (page - 1) * 100
+			end := min(start+100, len(history))
+			statuses := []map[string]any{}
+			if start < len(history) {
+				for index := len(history) - 1 - start; index >= len(history)-end; index-- {
+					statuses = append(statuses, history[index])
+				}
+			}
+			commitStatusMutex.RUnlock()
+			writeJSON(writer, statuses)
+		})
+		mux.HandleFunc(prefix+"/statuses/", func(writer http.ResponseWriter, request *http.Request) {
+			if request.Method != http.MethodPost {
+				http.Error(writer, "method not allowed", http.StatusMethodNotAllowed)
+				return
+			}
+			body := struct {
+				State       string `json:"state"`
+				TargetURL   string `json:"target_url"`
+				Description string `json:"description"`
+				Context     string `json:"context"`
+			}{}
+			if err := json.NewDecoder(request.Body).Decode(&body); err != nil || body.TargetURL == "" || body.Context == "" {
+				http.Error(writer, "invalid commit status", http.StatusBadRequest)
+				return
+			}
+			commitStatusMutex.Lock()
+			commitStatusID++
+			result := map[string]any{
+				"id": commitStatusID, "state": body.State, "target_url": body.TargetURL,
+				"description": body.Description, "context": body.Context, "creator": map[string]string{"login": "open-actions[bot]"},
+			}
+			commitStatuses[body.TargetURL] = result
+			revision := strings.TrimPrefix(request.URL.Path, prefix+"/statuses/")
+			key := repository + "/" + revision
+			commitStatusHistory[key] = append(commitStatusHistory[key], result)
+			commitStatusMutex.Unlock()
+			writeJSON(writer, result)
+		})
+	}
 	for repository, data := range map[string]string{
 		"invalid-trigger": unsupportedTriggerWorkflowData,
 		"invalid-field":   unsupportedFieldWorkflowData,
@@ -946,10 +955,16 @@ func main() {
 		repository := repository
 		data := data
 		mux.HandleFunc("/repos/acme/"+repository+"/contents/.open-actions/workflows", func(writer http.ResponseWriter, _ *http.Request) {
-			writeJSON(writer, []map[string]string{{"name": "ci.yaml", "path": workflowPath, "type": "file"}})
+			writeJSON(writer, []map[string]string{
+				{"name": "ci.yaml", "path": workflowPath, "type": "file"},
+				{"name": "valid.yaml", "path": ".open-actions/workflows/valid.yaml", "type": "file"},
+			})
 		})
 		mux.HandleFunc("/repos/acme/"+repository+"/contents/"+workflowPath, func(writer http.ResponseWriter, _ *http.Request) {
 			writeJSON(writer, map[string]string{"encoding": "base64", "content": base64.StdEncoding.EncodeToString([]byte(data))})
+		})
+		mux.HandleFunc("/repos/acme/"+repository+"/contents/.open-actions/workflows/valid.yaml", func(writer http.ResponseWriter, _ *http.Request) {
+			writeJSON(writer, map[string]string{"encoding": "base64", "content": base64.StdEncoding.EncodeToString([]byte(workflowData))})
 		})
 	}
 	mux.HandleFunc("/fixture/revisions", func(writer http.ResponseWriter, _ *http.Request) {
