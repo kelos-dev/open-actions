@@ -100,6 +100,31 @@ func TestWorkflowRunStoreReportsInformerSync(t *testing.T) {
 	}
 }
 
+func TestWorkflowRunStoreProjectsExecutionTiming(t *testing.T) {
+	store := readyWorkflowRunStore(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	now := time.Now().Truncate(time.Second)
+	run := testWorkflowRun("default", "ci", now.Add(-time.Hour))
+	start := metav1.NewTime(now.Add(-125 * time.Second))
+	run.Status.StartTime = &start
+	run.Status.Conditions = []metav1.Condition{{Type: actionsv1alpha1.WorkflowRunConditionSucceeded, Status: metav1.ConditionUnknown}}
+	store.upsert(run)
+	runs, _ := store.Recent(1)
+	duration := runs[0].Duration
+	if !runs[0].Active || !duration.Running || duration.Seconds == nil || *duration.Seconds < 125 || *duration.Seconds > int64(time.Since(start.Time)/time.Second) {
+		t.Fatalf("running duration = %#v", duration)
+	}
+
+	completion := metav1.NewTime(start.Add(75 * time.Second))
+	run.Status.CompletionTime = &completion
+	run.Status.Conditions[0].Status = metav1.ConditionTrue
+	store.upsert(run)
+	completion.Time = completion.Add(time.Hour)
+	runs, _ = store.Recent(1)
+	if runs[0].Active || runs[0].Duration.Running || runs[0].Duration.String() != "1m 15s" {
+		t.Fatalf("completed duration = %#v", runs[0].Duration)
+	}
+}
+
 func TestWorkflowRunStoreConsumesInformerEvents(t *testing.T) {
 	informer := &controllertest.FakeInformer{}
 	store, err := NewWorkflowRunStore(informer, slog.New(slog.NewTextHandler(io.Discard, nil)))

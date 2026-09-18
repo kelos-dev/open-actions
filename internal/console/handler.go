@@ -121,9 +121,11 @@ type loginRequest struct {
 }
 
 type mainPageData struct {
-	Runs      []WorkflowRunSummary
-	Limit     int
-	Truncated bool
+	Runs         []WorkflowRunSummary
+	Limit        int
+	Truncated    bool
+	Durations    durationsResponse
+	DurationsURL string
 }
 
 type projectsPageData struct {
@@ -222,9 +224,11 @@ type runPageData struct {
 	Status          string
 	StatusClass     string
 	Started         string
-	Duration        string
+	Duration        executionDuration
 	DispatchURL     string
 	Jobs            []jobPageData
+	Durations       durationsResponse
+	DurationsURL    string
 }
 
 type runIdentityResponse struct {
@@ -244,14 +248,14 @@ type newerRunResponse struct {
 }
 
 type jobPageData struct {
+	Name        string
 	ID          string
 	DisplayName string
 	Runner      string
 	Status      string
 	StatusClass string
 	URL         string
-	Started     string
-	Duration    string
+	Duration    executionDuration
 	Selected    bool
 }
 
@@ -261,16 +265,19 @@ type effectiveWorkflowJob struct {
 }
 
 type logPageData struct {
-	Repository    string
-	WorkflowName  string
-	ShortRevision string
-	Status        string
-	JobName       string
-	Runner        string
-	Duration      string
-	RunURL        string
-	StreamURL     string
-	Jobs          []jobPageData
+	Repository      string
+	WorkflowName    string
+	ShortRevision   string
+	Status          string
+	JobName         string
+	JobResourceName string
+	Runner          string
+	Duration        executionDuration
+	RunURL          string
+	StreamURL       string
+	Jobs            []jobPageData
+	Durations       durationsResponse
+	DurationsURL    string
 }
 
 type logRead struct {
@@ -415,6 +422,10 @@ func (h *Handler) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 		h.main(writer, request)
 		return
 	}
+	if request.URL.Path == "/durations" {
+		h.runListDurations(writer, request)
+		return
+	}
 	if request.URL.Path == "/projects" {
 		h.projects(writer, request)
 		return
@@ -444,6 +455,8 @@ func (h *Handler) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	switch {
 	case len(parts) == 3:
 		h.runDetails(writer, request, run)
+	case len(parts) == 4 && parts[3] == "durations":
+		h.runDurations(writer, request, run)
 	case len(parts) == 5 && parts[3] == "jobs":
 		h.jobLogs(writer, request, run, parts[4])
 	case len(parts) == 6 && parts[3] == "jobs" && parts[5] == "stream":
@@ -627,7 +640,11 @@ func (h *Handler) main(writer http.ResponseWriter, request *http.Request) {
 
 func (h *Handler) loadMainPageData() mainPageData {
 	runs, truncated := h.workflowRuns.Recent(mainPageRunLimit)
-	return mainPageData{Runs: runs, Limit: mainPageRunLimit, Truncated: truncated}
+	query := url.Values{}
+	for _, run := range runs {
+		query.Add("run", namespacedValue(run.Namespace, run.Name))
+	}
+	return mainPageData{Runs: runs, Limit: mainPageRunLimit, Truncated: truncated, Durations: workflowRunListDurations(runs), DurationsURL: "/durations?" + query.Encode()}
 }
 
 func (h *Handler) projects(writer http.ResponseWriter, request *http.Request) {
@@ -1566,6 +1583,8 @@ func (h *Handler) loadRunPageData(ctx context.Context, run *actionsv1alpha1.Work
 		ShortRevision: shortRevision(run.Spec.Source.GitHub.Revision.SHA),
 		RefName:       shortRef(run.Spec.Source.GitHub.Revision.Ref),
 		Status:        workflowstatus.Run(run),
+		Durations:     workflowRunDurations(run, jobs, time.Now()),
+		DurationsURL:  runPath(run) + "/durations",
 	}
 	if ref := run.Spec.Source.GitHub.Revision.Ref; strings.HasPrefix(ref, "refs/heads/") || strings.HasPrefix(ref, "refs/tags/") {
 		data.DispatchURL = "/dispatch?source=" + url.QueryEscape(namespacedValue(run.Namespace, run.Name))
@@ -1577,10 +1596,10 @@ func (h *Handler) loadRunPageData(ctx context.Context, run *actionsv1alpha1.Work
 	if run.Status.StartTime != nil {
 		data.Started = run.Status.StartTime.UTC().Format(time.RFC3339)
 	}
-	data.Duration = elapsedTime(run.Status.StartTime, run.Status.CompletionTime)
+	data.Duration = data.Durations.Values[runPath(run)]
 	for index := range jobs {
 		job := &jobs[index].job
-		item := jobPageData{ID: job.Spec.JobID, DisplayName: job.Spec.DisplayName, Status: workflowstatus.Job(job), URL: runPath(run) + "/jobs/" + url.PathEscape(job.Name)}
+		item := jobPageData{Name: job.Name, ID: job.Spec.JobID, DisplayName: job.Spec.DisplayName, Status: workflowstatus.Job(job), URL: runPath(run) + "/jobs/" + url.PathEscape(job.Name)}
 		if item.DisplayName == "" {
 			item.DisplayName = item.ID
 		}
@@ -1588,10 +1607,7 @@ func (h *Handler) loadRunPageData(ctx context.Context, run *actionsv1alpha1.Work
 		if job.Status.RunnerRef != nil {
 			item.Runner = job.Status.RunnerRef.Name
 		}
-		if job.Status.StartTime != nil {
-			item.Started = job.Status.StartTime.UTC().Format(time.RFC3339)
-		}
-		item.Duration = elapsedTime(job.Status.StartTime, job.Status.CompletionTime)
+		item.Duration = data.Durations.Values[job.Name]
 		data.Jobs = append(data.Jobs, item)
 	}
 	return data, nil
@@ -1703,8 +1719,9 @@ func (h *Handler) jobLogs(writer http.ResponseWriter, request *http.Request, run
 	h.writeHTML(writer, h.logPage, logPageData{
 		Repository: runData.Repository, WorkflowName: runData.WorkflowName,
 		ShortRevision: runData.ShortRevision, Status: jobStatus,
-		JobName: displayName, Runner: runnerName, Duration: elapsedTime(job.Status.StartTime, job.Status.CompletionTime),
+		JobName: displayName, JobResourceName: job.Name, Runner: runnerName, Duration: runData.Durations.Values[job.Name], Durations: runData.Durations,
 		RunURL: path, StreamURL: path + "/jobs/" + url.PathEscape(job.Name) + "/stream", Jobs: runData.Jobs,
+		DurationsURL: runData.DurationsURL,
 	})
 }
 
@@ -1963,17 +1980,6 @@ func shortRef(ref string) string {
 		}
 	}
 	return ref
-}
-
-func elapsedTime(start, completion *metav1.Time) string {
-	if start == nil || completion == nil || completion.Time.Before(start.Time) {
-		return ""
-	}
-	duration := completion.Time.Sub(start.Time).Round(time.Second)
-	if duration < time.Second {
-		return "<1s"
-	}
-	return duration.String()
 }
 
 func (h *Handler) writeHTML(writer http.ResponseWriter, page *template.Template, data any) {

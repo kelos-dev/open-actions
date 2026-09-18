@@ -96,6 +96,16 @@ workflow cannot retain unbounded Console memory. Lines longer than 4,096
 characters initially render as previews; users can expand and collapse the
 complete retained line in place.
 
+The workflow run list, run summary, job list, log header, and log sidebar show
+execution durations in hours, minutes, and seconds. Job durations start when
+the runner container starts; workflow run durations start when the first job's
+runner container starts. Active durations update every second; the Console
+checks for completion every five seconds and fixes durations at the recorded
+completion time. Runs and jobs without execution timestamps show a dash,
+including queued runs and skipped jobs.
+The run list keeps updating durations for its displayed runs even when newer
+runs arrive.
+
 After signing in with the Console administrator token, an administrator can
 gracefully cancel an active workflow attempt. The Console sets that
 WorkflowRun's `spec.cancelRequested` field, after which ordinary jobs stop while

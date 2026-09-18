@@ -10,6 +10,7 @@ import (
 	"time"
 
 	actionsv1alpha1 "github.com/kelos-dev/open-actions/api/v1alpha1"
+	"github.com/kelos-dev/open-actions/internal/workflowrun"
 	"github.com/kelos-dev/open-actions/internal/workflowstatus"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -23,6 +24,7 @@ type WorkflowRunSummary struct {
 	Repository    string
 	WorkflowName  string
 	Namespace     string
+	Name          string
 	Project       string
 	Event         string
 	RefName       string
@@ -31,12 +33,16 @@ type WorkflowRunSummary struct {
 	Status        string
 	StatusClass   string
 	Created       string
-	Duration      string
+	Duration      executionDuration
+	Active        bool
+	start         *metav1.Time
+	completion    *metav1.Time
 }
 
-// RecentWorkflowRuns provides the Console's ordered WorkflowRun list.
+// RecentWorkflowRuns provides recent and selected WorkflowRuns for the Console.
 type RecentWorkflowRuns interface {
 	Recent(limit int) ([]WorkflowRunSummary, bool)
+	Find(keys []types.NamespacedName) []WorkflowRunSummary
 	Synced() bool
 }
 
@@ -143,10 +149,28 @@ func (s *WorkflowRunStore) Recent(limit int) ([]WorkflowRunSummary, bool) {
 	}
 	count := min(limit, len(s.ordered))
 	runs := make([]WorkflowRunSummary, count)
+	now := time.Now()
 	for index := 0; index < count; index++ {
 		runs[index] = s.ordered[index].summary
+		runs[index].Duration = elapsedDuration(runs[index].start, runs[index].completion, runs[index].Active, now)
 	}
 	return runs, len(s.ordered) > limit
+}
+
+// Find returns summaries for the requested WorkflowRuns that are still cached.
+func (s *WorkflowRunStore) Find(keys []types.NamespacedName) []WorkflowRunSummary {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	runs := make([]WorkflowRunSummary, 0, len(keys))
+	now := time.Now()
+	for _, key := range keys {
+		if entry := s.byKey[key]; entry != nil {
+			summary := entry.summary
+			summary.Duration = elapsedDuration(summary.start, summary.completion, summary.Active, now)
+			runs = append(runs, summary)
+		}
+	}
+	return runs
 }
 
 // Synced reports whether the store has consumed the informer's initial list.
@@ -247,10 +271,11 @@ func workflowRunSummary(run *actionsv1alpha1.WorkflowRun) (WorkflowRunSummary, b
 	status := workflowstatus.Run(run)
 	summary := WorkflowRunSummary{
 		URL: runPath(run), Repository: github.Repository.Owner + "/" + github.Repository.Name,
-		WorkflowName: workflowName, Namespace: run.Namespace, Project: run.Spec.ProjectRef.Name,
+		WorkflowName: workflowName, Namespace: run.Namespace, Name: run.Name, Project: run.Spec.ProjectRef.Name,
 		Event: strings.ReplaceAll(string(github.Event.Name), "_", " "), RefName: refName,
 		Revision: github.Revision.SHA, ShortRevision: shortRevision(github.Revision.SHA),
-		Status: status, StatusClass: statusClass(status), Duration: elapsedTime(run.Status.StartTime, run.Status.CompletionTime),
+		Status: status, StatusClass: statusClass(status), Active: !workflowrun.Terminal(run) && run.Status.CompletionTime == nil,
+		start: run.Status.StartTime.DeepCopy(), completion: run.Status.CompletionTime.DeepCopy(),
 	}
 	if !run.CreationTimestamp.IsZero() {
 		summary.Created = run.CreationTimestamp.UTC().Format(time.RFC3339)

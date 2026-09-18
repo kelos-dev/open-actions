@@ -594,6 +594,15 @@ func TestConsoleMainPageLimitsWorkflowRuns(t *testing.T) {
 	if strings.Contains(body, oldestName) {
 		t.Fatalf("main page contains truncated WorkflowRun %q", oldestName)
 	}
+	durations := httptest.NewRecorder()
+	handler.ServeHTTP(durations, httptest.NewRequest(http.MethodGet, durationURLFromPage(t, body), nil))
+	var timings durationsResponse
+	if err := json.Unmarshal(durations.Body.Bytes(), &timings); err != nil {
+		t.Fatal(err)
+	}
+	if durations.Code != http.StatusOK || len(timings.Values) != mainPageRunLimit || strings.Contains(durations.Body.String(), oldestName) {
+		t.Fatalf("run list durations are not limited: %d, %s", durations.Code, durations.Body.String())
+	}
 }
 
 func TestConsoleCancelsActiveWorkflow(t *testing.T) {
@@ -1032,10 +1041,12 @@ func TestConsoleSelectiveRerunShowsEffectiveJobs(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	start := metav1.NewTime(time.Now().Add(-5 * time.Minute))
+	completion := metav1.NewTime(start.Add(75 * time.Second))
 	retained := &actionsv1alpha1.WorkflowJob{
 		ObjectMeta: metav1.ObjectMeta{Name: "lint", Namespace: root.Namespace, UID: "lint-job-uid", Labels: map[string]string{actionsv1alpha1.LabelWorkflowRunUID: string(root.UID)}},
 		Spec:       actionsv1alpha1.WorkflowJobSpec{WorkflowRunRef: corev1.LocalObjectReference{Name: root.Name}, JobID: "lint"},
-		Status:     actionsv1alpha1.WorkflowJobStatus{Result: actionsv1alpha1.WorkflowJobResultSuccess},
+		Status:     actionsv1alpha1.WorkflowJobStatus{Result: actionsv1alpha1.WorkflowJobResultSuccess, StartTime: &start, CompletionTime: &completion},
 	}
 	if err := controllerutil.SetControllerReference(root, retained, scheme); err != nil {
 		t.Fatal(err)
@@ -1079,6 +1090,18 @@ func TestConsoleSelectiveRerunShowsEffectiveJobs(t *testing.T) {
 	handler.ServeHTTP(retainedLogs, httptest.NewRequest(http.MethodGet, runURL+"/jobs/lint", nil))
 	if retainedLogs.Code != http.StatusOK || !strings.Contains(retainedLogs.Body.String(), `body data-stream-url="`+runURL+`/jobs/lint/stream"`) {
 		t.Fatalf("retained job log page = %d, %q", retainedLogs.Code, retainedLogs.Body.String())
+	}
+	if strings.Count(retainedLogs.Body.String(), `data-duration="lint" title="Job duration">1m 15s</span>`) != 2 {
+		t.Fatalf("retained job duration is missing from the header or sidebar: %s", retainedLogs.Body.String())
+	}
+	durations := httptest.NewRecorder()
+	handler.ServeHTTP(durations, httptest.NewRequest(http.MethodGet, runURL+"/durations", nil))
+	var timing durationsResponse
+	if err := json.Unmarshal(durations.Body.Bytes(), &timing); err != nil {
+		t.Fatal(err)
+	}
+	if durations.Code != http.StatusOK || !timing.Active || len(timing.Values) != 3 || timing.Values["lint"].String() != "1m 15s" || timing.Values["lint"].Running || timing.Values["build-attempt-2"].Seconds != nil {
+		t.Fatalf("selective rerun durations = %d, %s", durations.Code, durations.Body.String())
 	}
 
 	replacedLogs := httptest.NewRecorder()
