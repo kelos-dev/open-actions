@@ -249,18 +249,21 @@ Use that same release tag for each RunnerSet's runner image instead of
 values](internal/manifests/charts/open-actions/README.md#values) to configure
 storage, resources, image pull policies, or an externally exposed Console.
 
-## Inspecting workflow runs
+## Inspecting and controlling workflow runs
 
-The CLI reads workflow runs and runner logs through the Kubernetes API using the
-active kubeconfig context. It defaults to that context's namespace; use
-`--namespace` to select another namespace or `--all-namespaces` when listing
-runs.
+The CLI works with workflow runs through the Kubernetes API using the active
+kubeconfig context, in the style of the GitHub CLI's `gh run` commands. It
+defaults to that context's namespace; use `--namespace` to select another
+namespace or `--all-namespaces` when listing runs.
 
 ```console
 open-actions run list --namespace open-actions
 open-actions run view RUN --namespace open-actions
+open-actions run watch RUN --namespace open-actions
 open-actions run logs RUN --job JOB --namespace open-actions
 open-actions run logs RUN --job JOB --follow --namespace open-actions
+open-actions run cancel RUN --namespace open-actions
+open-actions run rerun RUN --failed --namespace open-actions
 ```
 
 `JOB` may be the workflow-local job ID shown by `run view` or the WorkflowJob
@@ -268,6 +271,13 @@ resource name. An exact resource-name match takes precedence over a job ID.
 `--job` may be omitted when the run contains exactly one job.
 Completed native Jobs and runner Pods are retained with their WorkflowRun, so
 runner logs remain available until that run is deleted.
+
+`run watch` refreshes the run until it completes and can fail the command on an
+unsuccessful run with `--exit-status`. `run cancel` requests graceful
+cancellation, and `run rerun` creates the next attempt of a completed run, either
+in full or, with `--failed`, for the failed jobs and their dependents. Cancelling
+and rerunning write to the cluster with the permissions of the selected
+kubeconfig user.
 
 ## API reference
 
