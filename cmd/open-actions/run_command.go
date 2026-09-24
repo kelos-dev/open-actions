@@ -41,6 +41,7 @@ type runClientFactory func(runKubeOptions) (*runClients, error)
 
 type runClients struct {
 	reader           client.Reader
+	writer           client.Writer
 	logs             runLogSource
 	defaultNamespace string
 }
@@ -65,13 +66,14 @@ func (s *kubernetesRunLogSource) Stream(ctx context.Context, namespace, name str
 func newRunCommand(dependencies commandDependencies) *cobra.Command {
 	command := &cobra.Command{
 		Use:   "run",
-		Short: "Inspect workflow runs and runner logs",
+		Short: "Create and inspect workflow runs and runner logs",
 		Args:  cobra.NoArgs,
 		RunE: func(command *cobra.Command, _ []string) error {
 			return command.Help()
 		},
 	}
 	command.AddCommand(
+		newRunCreateCommand(dependencies),
 		newRunListCommand(dependencies),
 		newRunViewCommand(dependencies),
 		newRunLogsCommand(dependencies),
@@ -237,6 +239,7 @@ func newKubernetesRunClients(options runKubeOptions) (*runClients, error) {
 	}
 	return &runClients{
 		reader:           reader,
+		writer:           reader,
 		logs:             &kubernetesRunLogSource{client: clientset},
 		defaultNamespace: namespace,
 	}, nil

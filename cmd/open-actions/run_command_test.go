@@ -170,7 +170,7 @@ func TestRunCommandHelpDoesNotLoadKubernetesConfiguration(t *testing.T) {
 	if err := runWithDependencies(context.Background(), []string{"run", "--help"}, &stdout, &bytes.Buffer{}, dependencies); err != nil {
 		t.Fatalf("run help error = %v", err)
 	}
-	for _, command := range []string{"list", "view", "logs"} {
+	for _, command := range []string{"create", "list", "view", "logs"} {
 		if !strings.Contains(stdout.String(), command) {
 			t.Fatalf("run help output does not contain %q: %q", command, stdout.String())
 		}
@@ -185,7 +185,7 @@ func testRunDependencies(t *testing.T, logs runLogSource, objects ...client.Obje
 	}
 	reader := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objects...).Build()
 	return commandDependencies{newRunClients: func(runKubeOptions) (*runClients, error) {
-		return &runClients{reader: reader, logs: logs, defaultNamespace: "default"}, nil
+		return &runClients{reader: reader, writer: reader, logs: logs, defaultNamespace: "default"}, nil
 	}}
 }
 

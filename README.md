@@ -249,12 +249,28 @@ Use that same release tag for each RunnerSet's runner image instead of
 values](internal/manifests/charts/open-actions/README.md#values) to configure
 storage, resources, image pull policies, or an externally exposed Console.
 
-## Inspecting workflow runs
+## Creating and inspecting workflow runs
 
 The CLI reads workflow runs and runner logs through the Kubernetes API using the
 active kubeconfig context. It defaults to that context's namespace; use
 `--namespace` to select another namespace or `--all-namespaces` when listing
 runs.
+
+To start a manual workflow, authenticate the [GitHub CLI](https://cli.github.com/)
+with an account that has repository write access, then run:
+
+```console
+open-actions run create .open-actions/workflows/deploy.yaml \
+  --project default --repo owner/repo --ref main \
+  -f environment=staging --namespace open-actions
+```
+
+The workflow must be a direct child of the Project's `spec.workflowDirectory`
+and declare `workflow_dispatch` on the default branch and the selected branch
+or tag. The CLI resolves the ref to a commit, validates inputs, and prints the
+created WorkflowRun name. Use that name with `run view` or `run logs`. Omit
+`--ref` to use the repository's default branch. Kubernetes RBAC controls who can
+create WorkflowRuns; the GitHub write-access check is performed by this CLI.
 
 ```console
 open-actions run list --namespace open-actions
