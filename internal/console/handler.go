@@ -778,7 +778,6 @@ func (h *Handler) loadDispatchPageData(ctx context.Context, query url.Values) (d
 		data.SelectedProject = namespacedValue(run.Namespace, run.Spec.ProjectRef.Name)
 		data.RepositoryOwner = githubSource.Repository.Owner
 		data.RepositoryName = githubSource.Repository.Name
-		data.Revision = githubSource.Revision.SHA
 		data.WorkflowPath = run.Spec.WorkflowPath
 		switch {
 		case strings.HasPrefix(githubSource.Revision.Ref, "refs/heads/"):
@@ -799,6 +798,9 @@ func (h *Handler) loadDispatchPageData(ctx context.Context, query url.Values) (d
 			if trigger, found := definition.On.Events[string(actionsv1alpha1.GitHubEventNameWorkflowDispatch)]; found {
 				data.InputsFromWorkflow = true
 				data.Inputs = declaredDispatchInputs(trigger.Inputs, githubSource.Event.Inputs)
+				// The new run uses the latest commit, so inputs the source run omitted must keep that commit's defaults
+				// rather than the snapshot's.
+				includeOnlySuppliedInputs(data.Inputs, githubSource.Event.Inputs)
 			}
 		}
 	}
@@ -861,6 +863,14 @@ func declaredDispatchInputs(definitions map[string]workflow.WorkflowInput, suppl
 	return inputs
 }
 
+func includeOnlySuppliedInputs(inputs []dispatchInputPageData, supplied map[string]string) {
+	for index := range inputs {
+		input := &inputs[index]
+		_, included := supplied[input.Name]
+		input.Included = input.Required || included
+	}
+}
+
 func (h *Handler) submitWorkflowDispatch(writer http.ResponseWriter, request *http.Request) {
 	request.Body = http.MaxBytesReader(writer, request.Body, dispatchRequestSize)
 	if err := request.ParseForm(); err != nil {
@@ -915,17 +925,13 @@ func (h *Handler) submitWorkflowDispatch(writer http.ResponseWriter, request *ht
 		http.Error(writer, "invalid Git ref type", http.StatusBadRequest)
 		return
 	}
-	refPrefix := "refs/heads/"
-	if refType == "tag" {
-		refPrefix = "refs/tags/"
-	}
-	ref := refPrefix + strings.TrimSpace(request.PostForm.Get("ref-name"))
-	if !validGitRef(ref) {
+	refName := strings.TrimSpace(request.PostForm.Get("ref-name"))
+	if refName != "" && !validGitRef(dispatchRef(refType, refName)) {
 		http.Error(writer, "invalid Git ref", http.StatusBadRequest)
 		return
 	}
 	revision := strings.TrimSpace(request.PostForm.Get("revision"))
-	if !validGitSHA(revision) {
+	if revision != "" && !validGitSHA(revision) {
 		http.Error(writer, "revision must be a full lowercase Git SHA", http.StatusBadRequest)
 		return
 	}
@@ -936,7 +942,7 @@ func (h *Handler) submitWorkflowDispatch(writer http.ResponseWriter, request *ht
 	}
 	data := dispatchPageData{
 		SelectedProject: namespacedValue(namespace, projectName), RepositoryOwner: repositoryOwner, RepositoryName: repositoryName,
-		RefType: refType, RefName: strings.TrimSpace(request.PostForm.Get("ref-name")), Revision: revision, WorkflowPath: workflowPath,
+		RefType: refType, RefName: refName, Revision: revision, WorkflowPath: workflowPath,
 		CSRFToken: request.PostForm.Get("csrf"), RequestID: requestID,
 	}
 	sameSelection := request.PostForm.Get("loaded-selection") == data.SelectionKey()
@@ -944,7 +950,7 @@ func (h *Handler) submitWorkflowDispatch(writer http.ResponseWriter, request *ht
 		http.Error(writer, "load the selected workflow before running it", http.StatusConflict)
 		return
 	}
-	repository, err := h.repositories.Resolve(request.Context(), project, repositoryOwner, repositoryName)
+	repository, defaultBranch, err := h.repositories.Resolve(request.Context(), project, repositoryOwner, repositoryName)
 	if err != nil {
 		var apiError *githubclient.APIError
 		if errors.As(err, &apiError) && (apiError.StatusCode == http.StatusNotFound || apiError.StatusCode == http.StatusUnprocessableEntity) {
@@ -954,6 +960,24 @@ func (h *Handler) submitWorkflowDispatch(writer http.ResponseWriter, request *ht
 		}
 		h.writeResolutionError(writer, request, fmt.Errorf("resolve workflow dispatch repository %s/%s: %w", repositoryOwner, repositoryName, err))
 		return
+	}
+	if data.RefName == "" {
+		data.RefType, data.RefName = "branch", defaultBranch
+	}
+	ref := dispatchRef(data.RefType, data.RefName)
+	// Like GitHub, a dispatch without a pinned commit runs the ref's head when the run is created.
+	revisionFromRef := revision == ""
+	if revisionFromRef {
+		revision, err = h.repositories.ResolveRevision(request.Context(), project, repository.Owner, repository.Name, ref)
+		if err != nil {
+			var apiError *githubclient.APIError
+			if errors.As(err, &apiError) && (apiError.StatusCode == http.StatusNotFound || apiError.StatusCode == http.StatusUnprocessableEntity) {
+				http.Error(writer, fmt.Sprintf("%s %q in repository %s/%s is not accessible to Project %q", data.RefType, data.RefName, repository.Owner, repository.Name, project.Name), http.StatusBadRequest)
+				return
+			}
+			h.writeResolutionError(writer, request, fmt.Errorf("resolve %s %q for Project %q: %w", data.RefType, data.RefName, project.Name, err))
+			return
+		}
 	}
 	workflowFile, err := h.repositories.GetWorkflowFile(request.Context(), project, repository.Owner, repository.Name, workflowPath, revision)
 	if err != nil {
@@ -993,11 +1017,7 @@ func (h *Handler) submitWorkflowDispatch(writer http.ResponseWriter, request *ht
 		data.InputsFromWorkflow = true
 		data.Inputs = declaredDispatchInputs(trigger.Inputs, inputs)
 		if sameSelection {
-			for index := range data.Inputs {
-				input := &data.Inputs[index]
-				_, included := inputs[input.Name]
-				input.Included = input.Required || included
-			}
+			includeOnlySuppliedInputs(data.Inputs, inputs)
 		}
 		h.writeHTML(writer, h.dispatchPage, data)
 		return
@@ -1026,7 +1046,7 @@ func (h *Handler) submitWorkflowDispatch(writer http.ResponseWriter, request *ht
 				h.writeResolutionError(writer, request, fmt.Errorf("load existing WorkflowRun %q: %w", desired.Name, getErr))
 				return
 			}
-			if matchingWorkflowDispatch(existing, desired) {
+			if matchingWorkflowDispatch(existing, desired, revisionFromRef) {
 				http.Redirect(writer, request, runPath(existing), http.StatusSeeOther)
 				return
 			}
@@ -1096,14 +1116,26 @@ func dispatchInputs(names, values []string) (map[string]string, error) {
 	return inputs, nil
 }
 
-func matchingWorkflowDispatch(existing, desired *actionsv1alpha1.WorkflowRun) bool {
+// matchingWorkflowDispatch reports whether an existing run was created by the same dispatch form. When the form
+// did not pin a commit, a resubmission matches regardless of where the ref has moved since the run was created.
+func matchingWorkflowDispatch(existing, desired *actionsv1alpha1.WorkflowRun, revisionFromRef bool) bool {
 	existingSpec := existing.Spec.DeepCopy()
 	desiredSpec := desired.Spec.DeepCopy()
 	existingSpec.CancelRequested = false
 	desiredSpec.CancelRequested = false
 	existingSpec.TTLSecondsAfterFinished = nil
 	desiredSpec.TTLSecondsAfterFinished = nil
+	if revisionFromRef && existingSpec.Source.GitHub != nil {
+		existingSpec.Source.GitHub.Revision.SHA = desiredSpec.Source.GitHub.Revision.SHA
+	}
 	return apiequality.Semantic.DeepEqual(existingSpec, desiredSpec)
+}
+
+func dispatchRef(refType, refName string) string {
+	if refType == "tag" {
+		return "refs/tags/" + refName
+	}
+	return "refs/heads/" + refName
 }
 
 func validGitSHA(value string) bool {

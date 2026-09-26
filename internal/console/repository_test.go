@@ -50,7 +50,12 @@ func TestGitHubRepositoryResolverUsesProjectInstallation(t *testing.T) {
 				http.Error(writer, "missing installation token", http.StatusUnauthorized)
 				return
 			}
-			fmt.Fprint(writer, `{"id":123,"name":"Example","owner":{"login":"Acme"}}`)
+			fmt.Fprint(writer, `{"id":123,"name":"Example","default_branch":"trunk","owner":{"login":"Acme"}}`)
+		case request.Method == http.MethodGet && request.URL.Path == "/repos/Acme/Example/commits":
+			if request.Header.Get("Authorization") != "Bearer installation-token" || request.URL.Query().Get("sha") != "refs/heads/trunk" {
+				t.Errorf("revision request = %#v", request)
+			}
+			fmt.Fprintf(writer, `[{"sha":%q}]`, strings.Repeat("b", 40))
 		case request.Method == http.MethodGet && request.URL.Path == "/repos/Acme/Example/contents/.open-actions/workflows/deploy.yaml":
 			if request.Header.Get("Authorization") != "Bearer installation-token" || request.URL.Query().Get("ref") != strings.Repeat("b", 40) {
 				t.Errorf("workflow request = %#v", request)
@@ -78,15 +83,19 @@ func TestGitHubRepositoryResolverUsesProjectInstallation(t *testing.T) {
 		t.Fatal(err)
 	}
 	project := testGitHubProject()
-	repository, err := resolver.Resolve(context.Background(), project, "acme", "example")
+	repository, defaultBranch, err := resolver.Resolve(context.Background(), project, "acme", "example")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if repository.ID != 123 || repository.Owner != "Acme" || repository.Name != "Example" || requests != 2 {
-		t.Fatalf("Resolve() = %#v after %d requests", repository, requests)
+	if repository.ID != 123 || repository.Owner != "Acme" || repository.Name != "Example" || defaultBranch != "trunk" || requests != 2 {
+		t.Fatalf("Resolve() = %#v, %q after %d requests", repository, defaultBranch, requests)
 	}
-	workflowFile, err := resolver.GetWorkflowFile(context.Background(), project, repository.Owner, repository.Name, ".open-actions/workflows/deploy.yaml", strings.Repeat("b", 40))
-	if err != nil || string(workflowFile) != testDispatchWorkflow || requests != 4 {
+	revision, err := resolver.ResolveRevision(context.Background(), project, repository.Owner, repository.Name, "refs/heads/"+defaultBranch)
+	if err != nil || revision != strings.Repeat("b", 40) || requests != 4 {
+		t.Fatalf("ResolveRevision() = %q, %v after %d requests", revision, err, requests)
+	}
+	workflowFile, err := resolver.GetWorkflowFile(context.Background(), project, repository.Owner, repository.Name, ".open-actions/workflows/deploy.yaml", revision)
+	if err != nil || string(workflowFile) != testDispatchWorkflow || requests != 5 {
 		t.Fatalf("GetWorkflowFile() = %q, %v after %d requests", workflowFile, err, requests)
 	}
 }
@@ -144,7 +153,7 @@ func TestGitHubRepositoryResolverRejectsInvalidConfigurationAndIdentity(t *testi
 			if err != nil {
 				t.Fatal(err)
 			}
-			_, err = resolver.Resolve(context.Background(), test.project, "acme", "example")
+			_, _, err = resolver.Resolve(context.Background(), test.project, "acme", "example")
 			if err == nil || !strings.Contains(err.Error(), test.want) {
 				t.Fatalf("Resolve() error = %v, want %q", err, test.want)
 			}

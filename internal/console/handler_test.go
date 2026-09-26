@@ -39,9 +39,15 @@ type testLogSource struct {
 	logs string
 }
 
+var testHeadRevision = strings.Repeat("d", 40)
+
 type testRepositoryResolver struct {
 	repository       actionsv1alpha1.GitHubRepository
+	defaultBranch    string
 	err              error
+	revision         string
+	revisionErr      error
+	revisionRequests []string
 	workflowFile     string
 	workflowErr      error
 	workflowRequests []testWorkflowFileRequest
@@ -72,14 +78,29 @@ func (c *createWorkflowRunThenErrorClient) Create(ctx context.Context, object cl
 	return nil
 }
 
-func (r *testRepositoryResolver) Resolve(_ context.Context, _ *actionsv1alpha1.Project, owner, name string) (actionsv1alpha1.GitHubRepository, error) {
+func (r *testRepositoryResolver) Resolve(_ context.Context, _ *actionsv1alpha1.Project, owner, name string) (actionsv1alpha1.GitHubRepository, string, error) {
 	if r.err != nil {
-		return actionsv1alpha1.GitHubRepository{}, r.err
+		return actionsv1alpha1.GitHubRepository{}, "", r.err
+	}
+	defaultBranch := r.defaultBranch
+	if defaultBranch == "" {
+		defaultBranch = "main"
 	}
 	if r.repository.ID != 0 {
-		return r.repository, nil
+		return r.repository, defaultBranch, nil
 	}
-	return actionsv1alpha1.GitHubRepository{ID: 123, Owner: owner, Name: name}, nil
+	return actionsv1alpha1.GitHubRepository{ID: 123, Owner: owner, Name: name}, defaultBranch, nil
+}
+
+func (r *testRepositoryResolver) ResolveRevision(_ context.Context, _ *actionsv1alpha1.Project, _, _, ref string) (string, error) {
+	r.revisionRequests = append(r.revisionRequests, ref)
+	if r.revisionErr != nil {
+		return "", r.revisionErr
+	}
+	if r.revision != "" {
+		return r.revision, nil
+	}
+	return testHeadRevision, nil
 }
 
 func TestConsoleTopbarsUseConsistentSpacing(t *testing.T) {
@@ -1182,7 +1203,7 @@ func TestConsoleCreatesWorkflowDispatch(t *testing.T) {
 	page := httptest.NewRecorder()
 	handler.ServeHTTP(page, pageRequest)
 	pageBody := page.Body.String()
-	for _, expected := range []string{`value="default/project" selected`, `value="acme"`, `value="example"`, `value="main"`, `value="` + strings.Repeat("a", 40) + `"`, `value=".open-actions/workflows/ci.yaml"`} {
+	for _, expected := range []string{`value="default/project" selected`, `value="acme"`, `value="example"`, `id="ref-name" name="ref-name" value="main"`, `id="revision" name="revision" value=""`, `value=".open-actions/workflows/ci.yaml"`} {
 		if page.Code != http.StatusOK || !strings.Contains(pageBody, expected) {
 			t.Fatalf("dispatch page does not contain %q: %d, %s", expected, page.Code, pageBody)
 		}
@@ -1212,8 +1233,8 @@ func TestConsoleCreatesWorkflowDispatch(t *testing.T) {
 		t.Fatalf("dispatch page input order is invalid: %s", pageBody)
 	}
 	dryRunInput := pageBody[dryRunStart:environmentStart]
-	if !strings.Contains(dryRunInput, `data-input-toggle checked`) || !strings.Contains(dryRunInput, `value="dry-run" data-input-field>`) {
-		t.Fatalf("defaulted optional input is not included: %s", dryRunInput)
+	if strings.Contains(dryRunInput, `data-input-toggle checked`) || !strings.Contains(dryRunInput, `value="dry-run" data-input-field disabled>`) {
+		t.Fatalf("optional input omitted by the source run is included with the snapshot default: %s", dryRunInput)
 	}
 
 	requestID := "0123456789abcdefabcd"

@@ -115,7 +115,7 @@ func TestConsoleAnonymousDispatchValidatesWorkflowAndInputs(t *testing.T) {
 			cookie := responseCookie(t, page.Result(), anonymousCookieName)
 			form := dispatchForm(handler)
 			form.Set("workflow-path", ".open-actions/workflows/ci.yaml")
-			form.Set("revision", strings.Repeat("a", 40))
+			form.Set("revision", "")
 			for _, name := range []string{"csrf", "request-id", "loaded-selection"} {
 				form.Set(name, hiddenFormValue(t, page.Body.String(), name))
 			}
