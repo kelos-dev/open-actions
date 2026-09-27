@@ -130,10 +130,125 @@ func TestConsoleLoadsDispatchInputsWithoutPreviousRuns(t *testing.T) {
 	if !reflect.DeepEqual(resolver.workflowRequests, []testWorkflowFileRequest{wantRequest}) {
 		t.Fatalf("workflow file requests = %#v, want %#v", resolver.workflowRequests, wantRequest)
 	}
+	if len(resolver.revisionRequests) != 0 {
+		t.Fatalf("pinned commit resolved the ref: %#v", resolver.revisionRequests)
+	}
 	assertDispatchNotCreated(t, handler, form)
 }
 
-func TestConsoleDispatchesSnapshotFormWithoutLoading(t *testing.T) {
+func TestConsoleDispatchesRefHeadWithoutPinnedCommit(t *testing.T) {
+	// https://docs.github.com/en/actions/how-tos/manage-workflow-runs/manually-run-a-workflow
+	for _, test := range []struct {
+		name, refType, refName            string
+		wantRefType, wantRefName, wantRef string
+	}{
+		{name: "default branch", refType: "branch", wantRefType: "branch", wantRefName: "trunk", wantRef: "refs/heads/trunk"},
+		{name: "default branch with tag selected", refType: "tag", wantRefType: "branch", wantRefName: "trunk", wantRef: "refs/heads/trunk"},
+		{name: "branch", refType: "branch", refName: "feature/deploy", wantRefType: "branch", wantRefName: "feature/deploy", wantRef: "refs/heads/feature/deploy"},
+		{name: "tag", refType: "tag", refName: "v1.2.3", wantRefType: "tag", wantRefName: "v1.2.3", wantRef: "refs/tags/v1.2.3"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			handler := newTestHandler(t, false)
+			resolver := &testRepositoryResolver{defaultBranch: "trunk", workflowFile: testDispatchWorkflow}
+			handler.repositories = resolver
+			form := dispatchForm(handler)
+			form.Set("ref-type", test.refType)
+			form.Set("ref-name", test.refName)
+			form.Set("revision", "")
+			page := loadDispatchForm(t, handler, form)
+			for _, expected := range []string{
+				`<option value="` + test.wantRefType + `" selected>`,
+				`id="ref-name" name="ref-name" value="` + test.wantRefName + `"`,
+				`id="revision" name="revision" value=""`,
+			} {
+				if !strings.Contains(page, expected) {
+					t.Fatalf("loaded workflow does not contain %q: %s", expected, page)
+				}
+			}
+			form.Set("ref-type", test.wantRefType)
+			form.Set("ref-name", test.wantRefName)
+			if response := postDispatchForm(handler, form); response.Code != http.StatusSeeOther {
+				t.Fatalf("dispatch = %d, %s", response.Code, response.Body.String())
+			}
+			run := &actionsv1alpha1.WorkflowRun{}
+			if err := handler.client.Get(context.Background(), client.ObjectKey{Namespace: "default", Name: "dispatch-" + form.Get("request-id")}, run); err != nil {
+				t.Fatal(err)
+			}
+			if want := (actionsv1alpha1.GitRevision{SHA: testHeadRevision, Ref: test.wantRef}); run.Spec.Source.GitHub.Revision != want {
+				t.Fatalf("dispatched revision = %#v, want %#v", run.Spec.Source.GitHub.Revision, want)
+			}
+			if !reflect.DeepEqual(resolver.revisionRequests, []string{test.wantRef, test.wantRef}) {
+				t.Fatalf("revision requests = %#v, want %q for load and run", resolver.revisionRequests, test.wantRef)
+			}
+			wantRequest := testWorkflowFileRequest{client.ObjectKey{Namespace: "default", Name: "project"}, "acme", "example", form.Get("workflow-path"), testHeadRevision}
+			if !reflect.DeepEqual(resolver.workflowRequests, []testWorkflowFileRequest{wantRequest, wantRequest}) {
+				t.Fatalf("workflow requests = %#v, want %#v for load and run", resolver.workflowRequests, wantRequest)
+			}
+		})
+	}
+}
+
+func TestConsoleResubmittedRefHeadDispatchIsIdempotentAfterRefMoves(t *testing.T) {
+	handler := newTestHandler(t, false)
+	resolver := &testRepositoryResolver{workflowFile: testDispatchWorkflow}
+	handler.repositories = resolver
+	form := dispatchForm(handler)
+	form.Set("revision", "")
+	loadDispatchForm(t, handler, form)
+	wantLocation := "/runs/default/dispatch-" + form.Get("request-id")
+	if response := postDispatchForm(handler, form); response.Code != http.StatusSeeOther || response.Header().Get("Location") != wantLocation {
+		t.Fatalf("dispatch = %d, %s", response.Code, response.Body.String())
+	}
+	resolver.revision = strings.Repeat("e", 40)
+	if response := postDispatchForm(handler, form); response.Code != http.StatusSeeOther || response.Header().Get("Location") != wantLocation {
+		t.Fatalf("resubmitted dispatch after the ref moved = %d, %s", response.Code, response.Body.String())
+	}
+	run := &actionsv1alpha1.WorkflowRun{}
+	if err := handler.client.Get(context.Background(), client.ObjectKey{Namespace: "default", Name: "dispatch-" + form.Get("request-id")}, run); err != nil {
+		t.Fatal(err)
+	}
+	if run.Spec.Source.GitHub.Revision.SHA != testHeadRevision {
+		t.Fatalf("resubmission changed the dispatched revision to %q", run.Spec.Source.GitHub.Revision.SHA)
+	}
+	form["input-name"], form["input-value"] = []string{"environment"}, []string{"production"}
+	if response := postDispatchForm(handler, form); response.Code != http.StatusConflict || !strings.Contains(response.Body.String(), "already exists with different parameters") {
+		t.Fatalf("resubmitted dispatch with different inputs = %d, %s", response.Code, response.Body.String())
+	}
+}
+
+func TestConsoleRejectsUnavailableDispatchRefs(t *testing.T) {
+	for _, test := range []struct {
+		name, message string
+		err           error
+		status        int
+	}{
+		{name: "missing ref", err: &githubclient.APIError{StatusCode: http.StatusNotFound}, status: http.StatusBadRequest, message: `branch "main" in repository acme/example is not accessible to Project "project"`},
+		{name: "unavailable provider", err: errors.New("GitHub unavailable"), status: http.StatusServiceUnavailable, message: "Console request failed"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			handler := newTestHandler(t, false)
+			resolver := &testRepositoryResolver{workflowFile: testDispatchWorkflow}
+			handler.repositories = resolver
+			form := dispatchForm(handler)
+			form.Set("revision", "")
+			loadDispatchForm(t, handler, form)
+			resolver.revisionErr = test.err
+			for _, action := range []string{"load", ""} {
+				form.Set("action", action)
+				response := postDispatchForm(handler, form)
+				if response.Code != test.status || !strings.Contains(response.Body.String(), test.message) {
+					t.Fatalf("action %q = %d, %s, want %d containing %q", action, response.Code, response.Body.String(), test.status, test.message)
+				}
+				assertDispatchNotCreated(t, handler, form)
+			}
+			if len(resolver.workflowRequests) != 1 {
+				t.Fatalf("unresolved ref fetched a workflow: %#v", resolver.workflowRequests)
+			}
+		})
+	}
+}
+
+func TestConsoleDispatchesSnapshotFormAtRefHeadWithoutLoading(t *testing.T) {
 	for _, refType := range []string{"branch", "tag"} {
 		t.Run(refType, func(t *testing.T) {
 			handler := newTestHandler(t, false)
@@ -159,15 +274,15 @@ func TestConsoleDispatchesSnapshotFormWithoutLoading(t *testing.T) {
 			request.Header.Set("Authorization", "Bearer "+testConsoleToken)
 			page := httptest.NewRecorder()
 			handler.ServeHTTP(page, request)
-			if page.Code != http.StatusOK {
+			if page.Code != http.StatusOK || !strings.Contains(page.Body.String(), `value="dry-run" data-input-field disabled>`) {
 				t.Fatalf("source dispatch page = %d, %s", page.Code, page.Body.String())
 			}
 			form := url.Values{
 				"project":          {namespacedValue(source.Namespace, source.Spec.ProjectRef.Name)},
 				"repository-owner": {github.Repository.Owner}, "repository-name": {github.Repository.Name},
-				"ref-type": {refType}, "ref-name": {refName}, "revision": {github.Revision.SHA},
+				"ref-type": {refType}, "ref-name": {refName}, "revision": {""},
 				"workflow-path": {source.Spec.WorkflowPath},
-				"input-name":    {"environment", "dry-run"}, "input-value": {"production", "false"},
+				"input-name":    {"environment"}, "input-value": {"production"},
 			}
 			for _, name := range []string{"csrf", "request-id", "loaded-selection"} {
 				field := regexp.MustCompile(`name="` + regexp.QuoteMeta(name) + `" value="([^"]+)"`).FindStringSubmatch(page.Body.String())
@@ -184,10 +299,14 @@ func TestConsoleDispatchesSnapshotFormWithoutLoading(t *testing.T) {
 			if err := handler.client.Get(context.Background(), client.ObjectKey{Namespace: "default", Name: "dispatch-" + form.Get("request-id")}, created); err != nil {
 				t.Fatal(err)
 			}
-			if created.Spec.Source.GitHub.Revision != github.Revision || !reflect.DeepEqual(created.Spec.Source.GitHub.Event.Inputs, map[string]string{"environment": "production", "dry-run": "false"}) {
+			wantRevision := actionsv1alpha1.GitRevision{SHA: testHeadRevision, Ref: github.Revision.Ref}
+			if created.Spec.Source.GitHub.Revision != wantRevision || !reflect.DeepEqual(created.Spec.Source.GitHub.Event.Inputs, map[string]string{"environment": "production"}) {
 				t.Fatalf("created source = %#v", created.Spec.Source.GitHub)
 			}
-			wantRequest := testWorkflowFileRequest{client.ObjectKey{Namespace: source.Namespace, Name: source.Spec.ProjectRef.Name}, github.Repository.Owner, github.Repository.Name, source.Spec.WorkflowPath, github.Revision.SHA}
+			if !reflect.DeepEqual(resolver.revisionRequests, []string{github.Revision.Ref}) {
+				t.Fatalf("revision requests = %#v, want %q", resolver.revisionRequests, github.Revision.Ref)
+			}
+			wantRequest := testWorkflowFileRequest{client.ObjectKey{Namespace: source.Namespace, Name: source.Spec.ProjectRef.Name}, github.Repository.Owner, github.Repository.Name, source.Spec.WorkflowPath, testHeadRevision}
 			if !reflect.DeepEqual(resolver.workflowRequests, []testWorkflowFileRequest{wantRequest}) {
 				t.Fatalf("workflow requests = %#v, want %#v", resolver.workflowRequests, wantRequest)
 			}

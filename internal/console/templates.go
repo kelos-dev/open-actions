@@ -170,15 +170,15 @@ const dispatchPageTemplate = `<!doctype html>
 <body>
   <nav class="topbar" aria-label="Global"><a class="brand" href="/"><span class="brand-mark" aria-hidden="true">OA</span><span>Open Actions</span></a><a href="/projects">Projects</a><a href="/dispatch">Run workflow</a></nav>
   <main class="page">
-    <header class="heading"><h1>Run workflow</h1><div class="muted">Create a manual workflow run at a pinned branch or tag revision.</div></header>
+    <header class="heading"><h1>Run workflow</h1><div class="muted">Create a manual workflow run from a branch or tag.</div></header>
     {{if .Projects}}<form class="panel" method="post" action="/dispatch" autocomplete="off">
       <input type="hidden" name="csrf" value="{{.CSRFToken}}"><input type="hidden" name="request-id" value="{{.RequestID}}"><input type="hidden" id="loaded-selection" name="loaded-selection" value="{{if .InputsFromWorkflow}}{{.SelectionKey}}{{end}}">
       <div class="form-grid" id="workflow-selection">
         <div class="field full"><label for="project">Project</label><select id="project" name="project" required>{{range .Projects}}<option value="{{.Value}}"{{if .Selected}} selected{{end}}>{{.Label}}</option>{{end}}</select></div>
         <div class="field"><label for="repository-owner">Repository owner</label><input id="repository-owner" name="repository-owner" value="{{.RepositoryOwner}}" pattern="[A-Za-z0-9][A-Za-z0-9_-]*" maxlength="100" required></div>
         <div class="field"><label for="repository-name">Repository name</label><input id="repository-name" name="repository-name" value="{{.RepositoryName}}" pattern="[A-Za-z0-9._-]+" maxlength="100" required></div>
-        <div class="field full"><label for="revision">Commit SHA</label><input id="revision" name="revision" value="{{.Revision}}" pattern="[0-9a-f]{40}" maxlength="40" spellcheck="false" required></div>
-        <div class="field full"><label for="ref-name">Branch or tag</label><div class="ref"><select name="ref-type" aria-label="Git ref type"><option value="branch"{{if eq .RefType "branch"}} selected{{end}}>Branch</option><option value="tag"{{if eq .RefType "tag"}} selected{{end}}>Tag</option></select><input id="ref-name" name="ref-name" value="{{.RefName}}" maxlength="1013" placeholder="main" spellcheck="false" required></div></div>
+        <div class="field full"><label for="revision">Commit SHA</label><input id="revision" name="revision" value="{{.Revision}}" pattern="[0-9a-f]{40}" maxlength="40" placeholder="Latest commit on the branch or tag" spellcheck="false"></div>
+        <div class="field full"><label for="ref-name">Branch or tag</label><div class="ref"><select name="ref-type" aria-label="Git ref type"><option value="branch"{{if eq .RefType "branch"}} selected{{end}}>Branch</option><option value="tag"{{if eq .RefType "tag"}} selected{{end}}>Tag</option></select><input id="ref-name" name="ref-name" value="{{.RefName}}" maxlength="1013" placeholder="Default branch" spellcheck="false"></div></div>
         <div class="field full"><label for="workflow-path">Workflow path</label><input id="workflow-path" name="workflow-path" value="{{.WorkflowPath}}" maxlength="512" placeholder=".open-actions/workflows/deploy.yaml" spellcheck="false" required></div>
       </div>
       <button class="button secondary submit" type="submit" name="action" value="load" formnovalidate>Load workflow</button>
