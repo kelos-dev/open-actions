@@ -20,14 +20,39 @@ name taking precedence. The selector is optional for single-job runs. Pass
 `--follow` to wait for the runner Pod when necessary and continue streaming its
 logs.
 
+`open-actions run watch RUN` prints the run and its jobs until the run reaches a
+terminal status. `--interval` sets the time between refreshes and defaults to
+`3s`. Interactive terminals redraw in place; redirected output appends each
+refresh. Progress messages are written to standard error. `--exit-status` fails
+the command when the run does not succeed.
+
+`open-actions run cancel RUN` requests graceful cancellation by setting
+`spec.cancelRequested` on the WorkflowRun. It reports runs that already have
+cancellation requested and fails for runs that are already complete.
+
+`open-actions run rerun RUN` creates the next attempt of the run's lineage as a
+new WorkflowRun and prints its name. The latest attempt must be complete. Pass
+`--failed` to rerun only the failed jobs and the jobs that depend on them; those
+job IDs are printed with the new attempt. Each attempt executes the same revision
+and event payload as the original run.
+
 ```console
 open-actions run list --namespace team-ci
 open-actions run view ci-abc123 --namespace team-ci
+open-actions run watch ci-abc123 --interval 5s --namespace team-ci
 open-actions run logs ci-abc123 --job build --follow --namespace team-ci
+open-actions run cancel ci-abc123 --namespace team-ci
+open-actions run rerun ci-abc123 --failed --namespace team-ci
 ```
 
+Run status is reported with the GitHub CLI's markers: `✓` for a successful run or
+job, `X` for a failure or timeout, `-` for a cancelled or skipped one, and `*`
+while work is queued or in progress.
+
 The CLI accesses these resources with the permissions of the selected
-kubeconfig user. It does not use the Console administrator token.
+kubeconfig user. It does not use the Console administrator token. `run cancel`
+requires `update` and `run rerun` requires `create` permission on WorkflowRuns in
+the selected namespace.
 
 ### Controller and Console
 

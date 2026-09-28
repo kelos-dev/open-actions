@@ -902,7 +902,11 @@ func TestConsoleRerunsCompletedWorkflow(t *testing.T) {
 	if !controllerutil.ContainsFinalizer(protectedRoot, eventsnapshot.RerunProtectionFinalizer) || protectedRoot.Annotations[eventsnapshot.RerunTargetAnnotation] != rerun.Name || protectedRoot.Annotations[eventsnapshot.RerunDeadlineAnnotation] == "" {
 		t.Fatalf("rerun event snapshot protection = finalizers %v, annotations %#v", protectedRoot.Finalizers, protectedRoot.Annotations)
 	}
-	if err := handler.releaseRerunEventSnapshotProtection(context.Background(), protectedRoot, rerun.Name); err != nil {
+	// The controller releases the protection once it plans the attempt.
+	delete(protectedRoot.Annotations, eventsnapshot.RerunTargetAnnotation)
+	delete(protectedRoot.Annotations, eventsnapshot.RerunDeadlineAnnotation)
+	controllerutil.RemoveFinalizer(protectedRoot, eventsnapshot.RerunProtectionFinalizer)
+	if err := handler.client.Update(context.Background(), protectedRoot); err != nil {
 		t.Fatal(err)
 	}
 
@@ -972,7 +976,7 @@ func TestConsoleRecoversRerunAfterAmbiguousCreateError(t *testing.T) {
 	if err := handler.client.Get(context.Background(), client.ObjectKey{Namespace: run.Namespace, Name: rerunName}, rerun); err != nil {
 		t.Fatal(err)
 	}
-	if !matchingConsoleRerun(rerun, workflowrun.NewRerun(run, run, 2, nil)) {
+	if !workflowrun.MatchingRerun(rerun, workflowrun.NewRerun(run, run, 2, nil)) {
 		t.Fatalf("persisted rerun = %#v", rerun)
 	}
 	if err := handler.client.Get(context.Background(), client.ObjectKeyFromObject(run), run); err != nil {

@@ -7,11 +7,11 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
-	"text/tabwriter"
 	"time"
 
 	actionsv1alpha1 "github.com/kelos-dev/open-actions/api/v1alpha1"
 	"github.com/kelos-dev/open-actions/internal/runner"
+	"github.com/kelos-dev/open-actions/internal/workflowrun"
 	"github.com/kelos-dev/open-actions/internal/workflowstatus"
 	"github.com/spf13/cobra"
 	corev1 "k8s.io/api/core/v1"
@@ -19,12 +19,15 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/apimachinery/pkg/util/duration"
 	"k8s.io/client-go/kubernetes"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/tools/clientcmd"
+	"k8s.io/client-go/util/retry"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
+
+// defaultWatchInterval matches the GitHub CLI's workflow run refresh interval.
+const defaultWatchInterval = 3 * time.Second
 
 type runKubeOptions struct {
 	kubeconfig        string
@@ -40,7 +43,7 @@ type runCommandOptions struct {
 type runClientFactory func(runKubeOptions) (*runClients, error)
 
 type runClients struct {
-	reader           client.Reader
+	kube             client.Client
 	logs             runLogSource
 	defaultNamespace string
 }
@@ -65,7 +68,7 @@ func (s *kubernetesRunLogSource) Stream(ctx context.Context, namespace, name str
 func newRunCommand(dependencies commandDependencies) *cobra.Command {
 	command := &cobra.Command{
 		Use:   "run",
-		Short: "Inspect workflow runs and runner logs",
+		Short: "Inspect and control workflow runs",
 		Args:  cobra.NoArgs,
 		RunE: func(command *cobra.Command, _ []string) error {
 			return command.Help()
@@ -74,7 +77,10 @@ func newRunCommand(dependencies commandDependencies) *cobra.Command {
 	command.AddCommand(
 		newRunListCommand(dependencies),
 		newRunViewCommand(dependencies),
+		newRunWatchCommand(dependencies),
 		newRunLogsCommand(dependencies),
+		newRunCancelCommand(dependencies),
+		newRunRerunCommand(dependencies),
 	)
 	return command
 }
@@ -102,13 +108,13 @@ func newRunListCommand(dependencies commandDependencies) *cobra.Command {
 			if namespace != "" {
 				listOptions = append(listOptions, client.InNamespace(namespace))
 			}
-			if err := clients.reader.List(command.Context(), runs, listOptions...); err != nil {
+			if err := clients.kube.List(command.Context(), runs, listOptions...); err != nil {
 				return fmt.Errorf("list WorkflowRuns: %w", err)
 			}
 			sort.SliceStable(runs.Items, func(left, right int) bool {
 				return runs.Items[left].CreationTimestamp.After(runs.Items[right].CreationTimestamp.Time)
 			})
-			return writeWorkflowRunList(command.OutOrStdout(), runs.Items, allNamespaces)
+			return writeWorkflowRunList(command.OutOrStdout(), runs.Items, allNamespaces, time.Now())
 		},
 	}
 	addRunKubeFlags(command, &options, dependencies.defaultKubeconfig)
@@ -127,14 +133,134 @@ func newRunViewCommand(dependencies commandDependencies) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			run, jobs, err := getWorkflowRun(command.Context(), clients.reader, namespace, arguments[0])
+			run, jobs, err := getWorkflowRun(command.Context(), clients.kube, namespace, arguments[0])
 			if err != nil {
 				return err
 			}
-			return writeWorkflowRun(command.OutOrStdout(), run, jobs)
+			if err := writeWorkflowRun(command.OutOrStdout(), run, jobs, time.Now()); err != nil {
+				return err
+			}
+			if len(jobs) > 0 {
+				fmt.Fprintf(command.OutOrStdout(), "\nTo read runner logs, try: open-actions run logs %s --job %s --namespace %s\n", run.Name, jobs[0].Spec.JobID, namespace)
+			}
+			return nil
 		},
 	}
 	addRunKubeFlags(command, &options, dependencies.defaultKubeconfig)
+	return command
+}
+
+func newRunWatchCommand(dependencies commandDependencies) *cobra.Command {
+	options := runCommandOptions{}
+	interval := defaultWatchInterval
+	exitStatus := false
+	command := &cobra.Command{
+		Use:   "watch RUN",
+		Short: "Watch a workflow run until it completes",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(command *cobra.Command, arguments []string) error {
+			if interval <= 0 {
+				return fmt.Errorf("--interval must be positive")
+			}
+			clients, namespace, err := loadRunClients(dependencies, options)
+			if err != nil {
+				return err
+			}
+			return watchWorkflowRun(command, clients, namespace, arguments[0], interval, exitStatus)
+		},
+	}
+	addRunKubeFlags(command, &options, dependencies.defaultKubeconfig)
+	command.Flags().DurationVarP(&interval, "interval", "i", defaultWatchInterval, "Time to wait between workflow run refreshes")
+	command.Flags().BoolVar(&exitStatus, "exit-status", false, "Fail when the workflow run does not succeed")
+	return command
+}
+
+func newRunCancelCommand(dependencies commandDependencies) *cobra.Command {
+	options := runCommandOptions{}
+	command := &cobra.Command{
+		Use:   "cancel RUN",
+		Short: "Request cancellation of a workflow run",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(command *cobra.Command, arguments []string) error {
+			clients, namespace, err := loadRunClients(dependencies, options)
+			if err != nil {
+				return err
+			}
+			name := arguments[0]
+			alreadyRequested, completed := false, false
+			err = retry.RetryOnConflict(retry.DefaultRetry, func() error {
+				alreadyRequested, completed = false, false
+				run := &actionsv1alpha1.WorkflowRun{}
+				if err := clients.kube.Get(command.Context(), types.NamespacedName{Namespace: namespace, Name: name}, run); err != nil {
+					return err
+				}
+				switch {
+				case run.Spec.CancelRequested:
+					alreadyRequested = true
+					return nil
+				case workflowrun.Terminal(run):
+					completed = true
+					return nil
+				}
+				run.Spec.CancelRequested = true
+				return clients.kube.Update(command.Context(), run)
+			})
+			if err != nil {
+				return fmt.Errorf("request cancellation of WorkflowRun %q: %w", name, err)
+			}
+			if completed {
+				return fmt.Errorf("WorkflowRun %q is already complete", name)
+			}
+			if alreadyRequested {
+				fmt.Fprintf(command.OutOrStdout(), "%s Cancellation of WorkflowRun %q was already requested\n", markerActive, name)
+				return nil
+			}
+			fmt.Fprintf(command.OutOrStdout(), "%s Requested cancellation of WorkflowRun %q\n", markerSucceeded, name)
+			return nil
+		},
+	}
+	addRunKubeFlags(command, &options, dependencies.defaultKubeconfig)
+	return command
+}
+
+func newRunRerunCommand(dependencies commandDependencies) *cobra.Command {
+	options := runCommandOptions{}
+	failedJobs := false
+	command := &cobra.Command{
+		Use:   "rerun RUN",
+		Short: "Rerun the latest attempt of a workflow run",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(command *cobra.Command, arguments []string) error {
+			clients, namespace, err := loadRunClients(dependencies, options)
+			if err != nil {
+				return err
+			}
+			name := arguments[0]
+			run := &actionsv1alpha1.WorkflowRun{}
+			if err := clients.kube.Get(command.Context(), types.NamespacedName{Namespace: namespace, Name: name}, run); err != nil {
+				return fmt.Errorf("get WorkflowRun %q: %w", name, err)
+			}
+			selection := workflowrun.AllJobs
+			scope := ""
+			if failedJobs {
+				selection = workflowrun.FailedJobs
+				scope = " (failed jobs)"
+			}
+			rerun, err := workflowrun.CreateRerun(command.Context(), clients.kube, run, selection)
+			if err != nil {
+				return fmt.Errorf("rerun WorkflowRun %q: %w", name, err)
+			}
+			stdout := command.OutOrStdout()
+			fmt.Fprintf(stdout, "%s Requested rerun%s of WorkflowRun %q\n", markerSucceeded, scope, name)
+			fmt.Fprintf(stdout, "Attempt %d is WorkflowRun %q\n", rerun.Spec.Rerun.Attempt, rerun.Name)
+			if jobIDs := rerun.Spec.Rerun.JobIDs; len(jobIDs) > 0 {
+				fmt.Fprintf(stdout, "Selected jobs: %s\n", strings.Join(jobIDs, ", "))
+			}
+			return nil
+		},
+	}
+	addRunKubeFlags(command, &options, dependencies.defaultKubeconfig)
+	command.Flags().BoolVar(&failedJobs, "failed", false, "Rerun only the failed jobs and their dependents")
 	return command
 }
 
@@ -151,7 +277,7 @@ func newRunLogsCommand(dependencies commandDependencies) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			_, jobs, err := getWorkflowRun(command.Context(), clients.reader, namespace, arguments[0])
+			_, jobs, err := getWorkflowRun(command.Context(), clients.kube, namespace, arguments[0])
 			if err != nil {
 				return err
 			}
@@ -227,7 +353,7 @@ func newKubernetesRunClients(options runKubeOptions) (*runClients, error) {
 	if err := actionsv1alpha1.AddToScheme(scheme); err != nil {
 		return nil, fmt.Errorf("add actions API to scheme: %w", err)
 	}
-	reader, err := client.New(configuration, client.Options{Scheme: scheme})
+	kube, err := client.New(configuration, client.Options{Scheme: scheme})
 	if err != nil {
 		return nil, fmt.Errorf("create Kubernetes client: %w", err)
 	}
@@ -236,10 +362,50 @@ func newKubernetesRunClients(options runKubeOptions) (*runClients, error) {
 		return nil, fmt.Errorf("create Kubernetes clientset: %w", err)
 	}
 	return &runClients{
-		reader:           reader,
+		kube:             kube,
 		logs:             &kubernetesRunLogSource{client: clientset},
 		defaultNamespace: namespace,
 	}, nil
+}
+
+// watchWorkflowRun refreshes a workflow run until it completes. Interactive
+// output redraws in place; redirected output appends each refresh.
+func watchWorkflowRun(command *cobra.Command, clients *runClients, namespace, name string, interval time.Duration, exitStatus bool) error {
+	stdout := command.OutOrStdout()
+	redraw := terminalWriter(stdout)
+	announced := false
+	for refreshes := 0; ; refreshes++ {
+		run, jobs, err := getWorkflowRun(command.Context(), clients.kube, namespace, name)
+		if err != nil {
+			return err
+		}
+		switch {
+		case redraw:
+			fmt.Fprint(stdout, clearScreen)
+		case refreshes > 0:
+			fmt.Fprintln(stdout)
+		}
+		if err := writeWorkflowRun(stdout, run, jobs, time.Now()); err != nil {
+			return err
+		}
+		if workflowrun.Terminal(run) {
+			status := workflowstatus.Run(run)
+			if exitStatus && status != workflowstatus.Succeeded {
+				return fmt.Errorf("WorkflowRun %q completed with status %s", name, status)
+			}
+			fmt.Fprintf(stdout, "\n%s WorkflowRun %q completed with status %s\n", statusMarker(status), name, status)
+			return nil
+		}
+		if !announced {
+			fmt.Fprintf(command.ErrOrStderr(), "Refreshing WorkflowRun %q every %s; press Ctrl+C to stop\n", name, interval)
+			announced = true
+		}
+		select {
+		case <-command.Context().Done():
+			return command.Context().Err()
+		case <-time.After(interval):
+		}
+	}
 }
 
 func getWorkflowRun(ctx context.Context, reader client.Reader, namespace, name string) (*actionsv1alpha1.WorkflowRun, []actionsv1alpha1.WorkflowJob, error) {
@@ -332,124 +498,9 @@ func workflowJobPod(ctx context.Context, clients *runClients, job *actionsv1alph
 		case <-time.After(time.Second):
 		}
 		current := &actionsv1alpha1.WorkflowJob{}
-		if err := clients.reader.Get(ctx, client.ObjectKeyFromObject(job), current); err != nil {
+		if err := clients.kube.Get(ctx, client.ObjectKeyFromObject(job), current); err != nil {
 			return nil, fmt.Errorf("refresh WorkflowJob %q: %w", job.Name, err)
 		}
 		job = current
 	}
-}
-
-func writeWorkflowRunList(writer io.Writer, runs []actionsv1alpha1.WorkflowRun, allNamespaces bool) error {
-	table := tabwriter.NewWriter(writer, 0, 4, 2, ' ', 0)
-	if allNamespaces {
-		fmt.Fprintln(table, "NAMESPACE\tNAME\tWORKFLOW\tREPOSITORY\tEVENT\tSTATUS\tAGE")
-	} else {
-		fmt.Fprintln(table, "NAME\tWORKFLOW\tREPOSITORY\tEVENT\tSTATUS\tAGE")
-	}
-	for index := range runs {
-		run := &runs[index]
-		values := []string{
-			tableCell(run.Name),
-			tableCell(workflowRunName(run)),
-			tableCell(workflowRunRepository(run)),
-			tableCell(workflowRunEvent(run)),
-			workflowstatus.Run(run),
-			workflowRunAge(run),
-		}
-		if allNamespaces {
-			values = append([]string{tableCell(run.Namespace)}, values...)
-		}
-		fmt.Fprintln(table, strings.Join(values, "\t"))
-	}
-	return table.Flush()
-}
-
-func writeWorkflowRun(writer io.Writer, run *actionsv1alpha1.WorkflowRun, jobs []actionsv1alpha1.WorkflowJob) error {
-	table := tabwriter.NewWriter(writer, 0, 4, 2, ' ', 0)
-	fmt.Fprintf(table, "Name:\t%s\n", run.Name)
-	fmt.Fprintf(table, "Namespace:\t%s\n", run.Namespace)
-	fmt.Fprintf(table, "Workflow:\t%s\n", tableCell(workflowRunName(run)))
-	fmt.Fprintf(table, "Repository:\t%s\n", workflowRunRepository(run))
-	fmt.Fprintf(table, "Event:\t%s\n", workflowRunEvent(run))
-	fmt.Fprintf(table, "Revision:\t%s\n", workflowRunRevision(run))
-	fmt.Fprintf(table, "Status:\t%s\n", workflowstatus.Run(run))
-	fmt.Fprintf(table, "Started:\t%s\n", optionalTime(run.Status.StartTime))
-	fmt.Fprintf(table, "Completed:\t%s\n", optionalTime(run.Status.CompletionTime))
-	fmt.Fprintln(table)
-	fmt.Fprintln(table, "JOB\tRESOURCE\tDISPLAY NAME\tSTATUS\tRUNNER\tSTARTED\tCOMPLETED")
-	for index := range jobs {
-		job := &jobs[index]
-		displayName := job.Spec.DisplayName
-		if displayName == "" || displayName == job.Spec.JobID {
-			displayName = "-"
-		}
-		runnerName := "-"
-		if job.Status.RunnerRef != nil {
-			runnerName = job.Status.RunnerRef.Name
-		}
-		fmt.Fprintf(table, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
-			job.Spec.JobID,
-			job.Name,
-			tableCell(displayName),
-			workflowstatus.Job(job),
-			runnerName,
-			optionalTime(job.Status.StartTime),
-			optionalTime(job.Status.CompletionTime),
-		)
-	}
-	return table.Flush()
-}
-
-func workflowRunName(run *actionsv1alpha1.WorkflowRun) string {
-	if run.Status.WorkflowName != "" {
-		return run.Status.WorkflowName
-	}
-	return run.Spec.WorkflowPath
-}
-
-func workflowRunRepository(run *actionsv1alpha1.WorkflowRun) string {
-	if run.Spec.Source.GitHub == nil {
-		return "-"
-	}
-	return run.Spec.Source.GitHub.Repository.Owner + "/" + run.Spec.Source.GitHub.Repository.Name
-}
-
-func workflowRunEvent(run *actionsv1alpha1.WorkflowRun) string {
-	if run.Spec.Source.GitHub == nil {
-		return "-"
-	}
-	event := string(run.Spec.Source.GitHub.Event.Name)
-	if run.Spec.Source.GitHub.Event.Action != "" {
-		event += "/" + run.Spec.Source.GitHub.Event.Action
-	}
-	return event
-}
-
-func workflowRunRevision(run *actionsv1alpha1.WorkflowRun) string {
-	if run.Spec.Source.GitHub == nil {
-		return "-"
-	}
-	return run.Spec.Source.GitHub.Revision.SHA
-}
-
-func workflowRunAge(run *actionsv1alpha1.WorkflowRun) string {
-	if run.CreationTimestamp.IsZero() {
-		return "-"
-	}
-	age := time.Since(run.CreationTimestamp.Time)
-	if age < 0 {
-		age = 0
-	}
-	return duration.HumanDuration(age)
-}
-
-func optionalTime(value *metav1.Time) string {
-	if value == nil {
-		return "-"
-	}
-	return value.UTC().Format(time.RFC3339)
-}
-
-func tableCell(value string) string {
-	return strings.NewReplacer("\t", " ", "\r", " ", "\n", " ").Replace(value)
 }

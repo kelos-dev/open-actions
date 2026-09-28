@@ -24,7 +24,6 @@ import (
 	"unicode/utf8"
 
 	actionsv1alpha1 "github.com/kelos-dev/open-actions/api/v1alpha1"
-	"github.com/kelos-dev/open-actions/internal/eventsnapshot"
 	githubclient "github.com/kelos-dev/open-actions/internal/github"
 	"github.com/kelos-dev/open-actions/internal/projectvalue"
 	"github.com/kelos-dev/open-actions/internal/workflow"
@@ -41,7 +40,6 @@ import (
 	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/client-go/util/retry"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 )
 
 const (
@@ -57,7 +55,6 @@ const (
 	secretRequestSize   = 3*projectvalue.MaxValueBytes + (8 << 10)
 	adminRequestSize    = 8 << 10
 	dispatchRequestSize = 12*65_535 + (16 << 10)
-	maxRerunAttempt     = int32(2147483647)
 	maxDispatchInputs   = 25
 	maxDispatchPayload  = 65_535
 
@@ -1305,10 +1302,10 @@ func (h *Handler) runDetails(writer http.ResponseWriter, request *http.Request, 
 			data.LoginURL = "/login?next=" + url.QueryEscape(runPath(run))
 		}
 	}
-	_, latest, err := h.workflowRunLineage(request.Context(), run)
+	_, latest, err := workflowrun.Lineage(request.Context(), h.client, run)
 	if err != nil {
 		h.logger.Warn("Unable to load WorkflowRun lineage", "namespace", run.Namespace, "workflow_run", run.Name, "error", err)
-	} else if workflowrun.Terminal(latest) && (latest.Spec.Rerun == nil || latest.Spec.Rerun.Attempt < maxRerunAttempt) {
+	} else if workflowrun.Terminal(latest) && (latest.Spec.Rerun == nil || latest.Spec.Rerun.Attempt < workflowrun.MaxAttempt) {
 		data.RerunURL = runPath(run) + "/rerun"
 		if authenticated || h.allowAnonymousWorkflowRuns {
 			data.CanRerun = true
@@ -1429,8 +1426,8 @@ func (h *Handler) rerunWorkflow(writer http.ResponseWriter, request *http.Reques
 		http.Error(writer, "invalid CSRF token", http.StatusForbidden)
 		return
 	}
-	selection := request.PostForm.Get("jobs")
-	if selection != "all" && selection != "failed" {
+	selection := workflowrun.JobSelection(request.PostForm.Get("jobs"))
+	if selection != workflowrun.AllJobs && selection != workflowrun.FailedJobs {
 		http.Error(writer, "invalid rerun job selection", http.StatusBadRequest)
 		return
 	}
@@ -1439,166 +1436,18 @@ func (h *Handler) rerunWorkflow(writer http.ResponseWriter, request *http.Reques
 		h.writeResolutionError(writer, request, err)
 		return
 	}
-	root, latest, err := h.workflowRunLineage(request.Context(), run)
+	rerun, err := workflowrun.CreateRerun(request.Context(), h.client, run, selection)
 	if err != nil {
+		var conflict *workflowrun.ConflictError
+		if errors.As(err, &conflict) {
+			http.Error(writer, conflict.Error(), http.StatusConflict)
+			return
+		}
 		h.writeResolutionError(writer, request, err)
 		return
 	}
-	if !workflowrun.Terminal(latest) {
-		http.Error(writer, "the latest workflow attempt is not complete", http.StatusConflict)
-		return
-	}
-	attempt := int32(2)
-	if latest.Spec.Rerun != nil {
-		if latest.Spec.Rerun.Attempt == maxRerunAttempt {
-			http.Error(writer, "workflow rerun attempt limit reached", http.StatusConflict)
-			return
-		}
-		attempt = latest.Spec.Rerun.Attempt + 1
-	}
-	var jobIDs []string
-	if selection == "failed" {
-		if !workflowrun.Failed(latest) {
-			http.Error(writer, "the latest workflow attempt did not fail because of a job", http.StatusConflict)
-			return
-		}
-		jobs := &actionsv1alpha1.WorkflowJobList{}
-		if err := h.client.List(request.Context(), jobs, client.InNamespace(latest.Namespace), client.MatchingLabels{actionsv1alpha1.LabelWorkflowRunUID: string(latest.UID)}); err != nil {
-			h.writeResolutionError(writer, request, fmt.Errorf("load WorkflowJobs for WorkflowRun %q: %w", latest.Name, err))
-			return
-		}
-		jobIDs, err = workflowrun.FailedJobIDs(latest, jobs.Items)
-		if err != nil {
-			http.Error(writer, err.Error(), http.StatusConflict)
-			return
-		}
-	}
-	desired := workflowrun.NewRerun(root, latest, attempt, jobIDs)
-	if desired.Annotations[eventsnapshot.Annotation] != "" {
-		if err := h.protectRerunEventSnapshot(request.Context(), root, desired.Name); err != nil {
-			h.writeResolutionError(writer, request, fmt.Errorf("protect event snapshot for WorkflowRun %q rerun: %w", root.Name, err))
-			return
-		}
-	}
-	if err := h.client.Create(request.Context(), desired); err != nil {
-		if apierrors.IsAlreadyExists(err) {
-			http.Error(writer, "another workflow rerun was requested", http.StatusConflict)
-			return
-		}
-		recovered := false
-		persisted := &actionsv1alpha1.WorkflowRun{}
-		getErr := h.client.Get(request.Context(), client.ObjectKeyFromObject(desired), persisted)
-		switch {
-		case getErr == nil && matchingConsoleRerun(persisted, desired):
-			desired = persisted
-			recovered = true
-		case apierrors.IsNotFound(getErr):
-			if desired.Annotations[eventsnapshot.Annotation] != "" {
-				err = errors.Join(err, h.releaseRerunEventSnapshotProtection(request.Context(), root, desired.Name))
-			}
-		case getErr != nil:
-			err = errors.Join(err, fmt.Errorf("check rerun WorkflowRun %q after create error: %w", desired.Name, getErr))
-		default:
-			err = errors.Join(err, fmt.Errorf("WorkflowRun %q does not match the requested rerun", persisted.Name))
-		}
-		if !recovered {
-			h.writeResolutionError(writer, request, fmt.Errorf("create rerun WorkflowRun %q for WorkflowRun %q: %w", desired.Name, latest.Name, err))
-			return
-		}
-	}
-	h.logger.Info("Created WorkflowRun rerun", "namespace", desired.Namespace, "workflow_run", desired.Name, "previous_run", latest.Name, "attempt", attempt, "jobs", selection, "selected_jobs", len(jobIDs))
-	http.Redirect(writer, request, runPath(desired), http.StatusSeeOther)
-}
-
-func matchingConsoleRerun(existing, desired *actionsv1alpha1.WorkflowRun) bool {
-	return apiequality.Semantic.DeepEqual(existing.Spec, desired.Spec) &&
-		existing.Labels[actionsv1alpha1.LabelWorkflowRunRootUID] == desired.Labels[actionsv1alpha1.LabelWorkflowRunRootUID] &&
-		existing.Annotations[eventsnapshot.Annotation] == desired.Annotations[eventsnapshot.Annotation]
-}
-
-func (h *Handler) protectRerunEventSnapshot(ctx context.Context, root *actionsv1alpha1.WorkflowRun, rerunName string) error {
-	if !root.DeletionTimestamp.IsZero() {
-		return fmt.Errorf("WorkflowRun %q is being deleted", root.Name)
-	}
-	secret := &corev1.Secret{}
-	name := root.Annotations[eventsnapshot.Annotation]
-	if err := h.client.Get(ctx, client.ObjectKey{Namespace: root.Namespace, Name: name}, secret); err != nil {
-		return err
-	}
-	data, found := secret.Data[eventsnapshot.DataKey]
-	if !secret.DeletionTimestamp.IsZero() || !workflowRunOwnsEventSnapshot(secret, root.Name, root.UID) || secret.Immutable == nil || !*secret.Immutable || !found {
-		return fmt.Errorf("GitHub event snapshot Secret %q is invalid for WorkflowRun %q", name, root.Name)
-	}
-	if _, err := eventsnapshot.Decode(data); err != nil {
-		return fmt.Errorf("GitHub event snapshot Secret %q is invalid for WorkflowRun %q: %w", name, root.Name, err)
-	}
-	if target := root.Annotations[eventsnapshot.RerunTargetAnnotation]; target != "" && target != rerunName {
-		return fmt.Errorf("WorkflowRun %q is already creating rerun %q", root.Name, target)
-	}
-	if controllerutil.ContainsFinalizer(root, eventsnapshot.RerunProtectionFinalizer) && root.Annotations[eventsnapshot.RerunTargetAnnotation] == rerunName {
-		return nil
-	}
-	if root.Annotations == nil {
-		root.Annotations = map[string]string{}
-	}
-	root.Annotations[eventsnapshot.RerunTargetAnnotation] = rerunName
-	root.Annotations[eventsnapshot.RerunDeadlineAnnotation] = time.Now().UTC().Add(time.Minute).Format(time.RFC3339Nano)
-	controllerutil.AddFinalizer(root, eventsnapshot.RerunProtectionFinalizer)
-	return h.client.Update(ctx, root)
-}
-
-func (h *Handler) releaseRerunEventSnapshotProtection(ctx context.Context, root *actionsv1alpha1.WorkflowRun, rerunName string) error {
-	if root.Annotations[eventsnapshot.RerunTargetAnnotation] != rerunName {
-		return nil
-	}
-	delete(root.Annotations, eventsnapshot.RerunTargetAnnotation)
-	delete(root.Annotations, eventsnapshot.RerunDeadlineAnnotation)
-	controllerutil.RemoveFinalizer(root, eventsnapshot.RerunProtectionFinalizer)
-	return h.client.Update(ctx, root)
-}
-
-func workflowRunOwnsEventSnapshot(secret *corev1.Secret, name string, uid types.UID) bool {
-	for _, owner := range secret.OwnerReferences {
-		if owner.APIVersion == actionsv1alpha1.GroupVersion.String() && owner.Kind == "WorkflowRun" && owner.Name == name && owner.UID == uid {
-			return true
-		}
-	}
-	return false
-}
-
-func (h *Handler) workflowRunLineage(ctx context.Context, run *actionsv1alpha1.WorkflowRun) (*actionsv1alpha1.WorkflowRun, *actionsv1alpha1.WorkflowRun, error) {
-	root := run
-	if run.Spec.Rerun != nil {
-		root = &actionsv1alpha1.WorkflowRun{}
-		key := types.NamespacedName{Namespace: run.Namespace, Name: run.Spec.Rerun.OriginalRunRef.Name}
-		if err := h.client.Get(ctx, key, root); err != nil {
-			return nil, nil, fmt.Errorf("load original WorkflowRun %q for WorkflowRun %q: %w", key.Name, run.Name, err)
-		}
-		if root.UID != run.Spec.Rerun.OriginalRunRef.UID || root.Spec.Rerun != nil {
-			return nil, nil, fmt.Errorf("WorkflowRun %q does not have a valid original WorkflowRun", run.Name)
-		}
-	}
-	runs := &actionsv1alpha1.WorkflowRunList{}
-	if err := h.client.List(ctx, runs, client.InNamespace(root.Namespace), client.MatchingLabels{actionsv1alpha1.LabelWorkflowRunRootUID: string(root.UID)}); err != nil {
-		return nil, nil, fmt.Errorf("load rerun attempts for WorkflowRun %q: %w", root.Name, err)
-	}
-	if run.Spec.Rerun != nil {
-		found := false
-		for index := range runs.Items {
-			found = runs.Items[index].UID == run.UID
-			if found {
-				break
-			}
-		}
-		if !found {
-			runs.Items = append(runs.Items, *run.DeepCopy())
-		}
-	}
-	latest, err := workflowrun.LatestAttempt(root, runs.Items)
-	if err != nil {
-		return nil, nil, fmt.Errorf("resolve rerun attempts for WorkflowRun %q: %w", root.Name, err)
-	}
-	return root, latest, nil
+	h.logger.Info("Created WorkflowRun rerun", "namespace", rerun.Namespace, "workflow_run", rerun.Name, "previous_run", rerun.Spec.Rerun.PreviousRunRef.Name, "attempt", rerun.Spec.Rerun.Attempt, "jobs", selection, "selected_jobs", len(rerun.Spec.Rerun.JobIDs))
+	http.Redirect(writer, request, runPath(rerun), http.StatusSeeOther)
 }
 
 func (h *Handler) loadRunPageData(ctx context.Context, run *actionsv1alpha1.WorkflowRun) (runPageData, error) {
