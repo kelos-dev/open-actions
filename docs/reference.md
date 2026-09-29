@@ -105,6 +105,11 @@ completion time. Runs and jobs without execution timestamps show a dash,
 including queued runs and skipped jobs.
 The run list keeps updating durations for its displayed runs even when newer
 runs arrive.
+Step headings, including composite steps and post actions, show elapsed time
+from their start and end log timestamps. Running step durations update every
+second and remain visible when the step is collapsed or timestamps are hidden.
+Skipped steps and steps with missing timestamps show a dash; a step without an
+end timestamp also shows a dash once the log stream ends.
 
 After signing in with the Console administrator token, an administrator can
 gracefully cancel an active workflow attempt. The Console sets that
