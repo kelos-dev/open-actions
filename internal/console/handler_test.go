@@ -1876,7 +1876,7 @@ func TestConsoleSelectiveRerunReplacesDeferredPlaceholder(t *testing.T) {
 	if err := handler.client.Create(context.Background(), third); err != nil {
 		t.Fatal(err)
 	}
-	jobs, err := handler.effectiveWorkflowJobs(context.Background(), third)
+	jobs, err := handler.effectiveWorkflowJobs(context.Background(), third, false)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -205,13 +205,11 @@ type runPageData struct {
 	RunURL          string
 	ApproveURL      string
 	CancelURL       string
-	RerunURL        string
+	Rerun           rerunPageData
 	LoginURL        string
 	CSRFToken       string
 	CanApprove      bool
 	CanCancel       bool
-	CanRerun        bool
-	CanRerunFailed  bool
 	Repository      string
 	WorkflowName    string
 	WorkflowPath    string
@@ -257,6 +255,21 @@ type jobPageData struct {
 	URL         string
 	Duration    executionDuration
 	Selected    bool
+	Rerun       *jobRerunPageData
+}
+
+type rerunPageData struct {
+	URL       string
+	LoginURL  string
+	CSRFToken string
+	CanRerun  bool
+	HasFailed bool
+}
+
+type jobRerunPageData struct {
+	Run         rerunPageData
+	Name        string
+	DisplayName string
 }
 
 type effectiveWorkflowJob struct {
@@ -265,6 +278,8 @@ type effectiveWorkflowJob struct {
 }
 
 type logPageData struct {
+	Rerun           rerunPageData
+	JobRerun        *jobRerunPageData
 	Repository      string
 	WorkflowName    string
 	ShortRevision   string
@@ -1305,20 +1320,27 @@ func (h *Handler) runDetails(writer http.ResponseWriter, request *http.Request, 
 			data.LoginURL = "/login?next=" + url.QueryEscape(runPath(run))
 		}
 	}
+	data.Rerun, _ = h.loadRerunPageData(writer, request, run, runPath(run))
+	h.writeHTML(writer, h.runPage, data)
+}
+
+func (h *Handler) loadRerunPageData(writer http.ResponseWriter, request *http.Request, run *actionsv1alpha1.WorkflowRun, returnPath string) (rerunPageData, *actionsv1alpha1.WorkflowRun) {
 	_, latest, err := h.workflowRunLineage(request.Context(), run)
 	if err != nil {
 		h.logger.Warn("Unable to load WorkflowRun lineage", "namespace", run.Namespace, "workflow_run", run.Name, "error", err)
-	} else if workflowrun.Terminal(latest) && (latest.Spec.Rerun == nil || latest.Spec.Rerun.Attempt < maxRerunAttempt) {
-		data.RerunURL = runPath(run) + "/rerun"
-		if authenticated || h.allowAnonymousWorkflowRuns {
-			data.CanRerun = true
-			data.CanRerunFailed = workflowrun.Failed(latest)
-			data.CSRFToken = h.workflowActionCSRF(writer, request)
-		} else {
-			data.LoginURL = "/login?next=" + url.QueryEscape(runPath(run))
-		}
+		return rerunPageData{}, nil
 	}
-	h.writeHTML(writer, h.runPage, data)
+	if !workflowrun.Terminal(latest) || latest.Spec.Rerun != nil && latest.Spec.Rerun.Attempt >= maxRerunAttempt {
+		return rerunPageData{}, nil
+	}
+	data := rerunPageData{URL: runPath(run) + "/rerun", HasFailed: workflowrun.Failed(latest)}
+	if h.authenticated(request) || h.allowAnonymousWorkflowRuns {
+		data.CanRerun = true
+		data.CSRFToken = h.workflowActionCSRF(writer, request)
+	} else {
+		data.LoginURL = "/login?next=" + url.QueryEscape(returnPath)
+	}
+	return data, latest
 }
 
 func (h *Handler) approveWorkflow(writer http.ResponseWriter, request *http.Request, namespace, name string) {
@@ -1430,8 +1452,12 @@ func (h *Handler) rerunWorkflow(writer http.ResponseWriter, request *http.Reques
 		return
 	}
 	selection := request.PostForm.Get("jobs")
-	if selection != "all" && selection != "failed" {
+	if selection != "all" && selection != "failed" && selection != "selected" {
 		http.Error(writer, "invalid rerun job selection", http.StatusBadRequest)
+		return
+	}
+	if selection == "selected" && request.PostForm.Get("job") == "" {
+		http.Error(writer, "a WorkflowJob name is required", http.StatusBadRequest)
 		return
 	}
 	run, err := h.resolveRun(request.Context(), namespace, name)
@@ -1472,6 +1498,22 @@ func (h *Handler) rerunWorkflow(writer http.ResponseWriter, request *http.Reques
 			http.Error(writer, err.Error(), http.StatusConflict)
 			return
 		}
+	} else if selection == "selected" {
+		job, err := h.workflowJob(request.Context(), run, request.PostForm.Get("job"))
+		if err != nil {
+			h.writeResolutionError(writer, request, err)
+			return
+		}
+		jobIDs, err = h.selectedJobRerunIDs(request.Context(), latest, job)
+		if err != nil {
+			var conflict *workflowRerunConflictError
+			if errors.As(err, &conflict) {
+				http.Error(writer, conflict.Error(), http.StatusConflict)
+				return
+			}
+			h.writeResolutionError(writer, request, err)
+			return
+		}
 	}
 	desired := workflowrun.NewRerun(root, latest, attempt, jobIDs)
 	if desired.Annotations[eventsnapshot.Annotation] != "" {
@@ -1508,6 +1550,33 @@ func (h *Handler) rerunWorkflow(writer http.ResponseWriter, request *http.Reques
 	}
 	h.logger.Info("Created WorkflowRun rerun", "namespace", desired.Namespace, "workflow_run", desired.Name, "previous_run", latest.Name, "attempt", attempt, "jobs", selection, "selected_jobs", len(jobIDs))
 	http.Redirect(writer, request, runPath(desired), http.StatusSeeOther)
+}
+
+func (h *Handler) selectedJobRerunIDs(ctx context.Context, run *actionsv1alpha1.WorkflowRun, selected *actionsv1alpha1.WorkflowJob) ([]string, error) {
+	effective, err := h.effectiveWorkflowJobs(ctx, run, true)
+	if err != nil {
+		return nil, err
+	}
+	jobs := make([]actionsv1alpha1.WorkflowJob, 0, len(effective))
+	found := false
+	for _, item := range effective {
+		jobs = append(jobs, item.job)
+		if item.job.Name == selected.Name && item.job.UID == selected.UID && metav1.IsControlledBy(&item.job, item.run) {
+			found = true
+		}
+	}
+	if !found {
+		return nil, &workflowRerunConflictError{message: fmt.Sprintf("WorkflowJob %q is not retained in the latest WorkflowRun %q", selected.Name, run.Name)}
+	}
+	return workflowrun.JobAndDependentIDs(jobs, selected.Spec.JobID), nil
+}
+
+type workflowRerunConflictError struct {
+	message string
+}
+
+func (e *workflowRerunConflictError) Error() string {
+	return e.message
 }
 
 func matchingConsoleRerun(existing, desired *actionsv1alpha1.WorkflowRun) bool {
@@ -1602,7 +1671,7 @@ func (h *Handler) workflowRunLineage(ctx context.Context, run *actionsv1alpha1.W
 }
 
 func (h *Handler) loadRunPageData(ctx context.Context, run *actionsv1alpha1.WorkflowRun) (runPageData, error) {
-	jobs, err := h.effectiveWorkflowJobs(ctx, run)
+	jobs, err := h.effectiveWorkflowJobs(ctx, run, false)
 	if err != nil {
 		return runPageData{}, err
 	}
@@ -1645,7 +1714,7 @@ func (h *Handler) loadRunPageData(ctx context.Context, run *actionsv1alpha1.Work
 	return data, nil
 }
 
-func (h *Handler) effectiveWorkflowJobs(ctx context.Context, run *actionsv1alpha1.WorkflowRun) ([]effectiveWorkflowJob, error) {
+func (h *Handler) effectiveWorkflowJobs(ctx context.Context, run *actionsv1alpha1.WorkflowRun, requireComplete bool) ([]effectiveWorkflowJob, error) {
 	effectiveByID := make(map[string]effectiveWorkflowJob)
 	history := &workflowrun.JobHistory{}
 	visited := map[types.UID]struct{}{run.UID: {}}
@@ -1659,6 +1728,9 @@ func (h *Handler) effectiveWorkflowJobs(ctx context.Context, run *actionsv1alpha
 		jobs := &actionsv1alpha1.WorkflowJobList{}
 		if err := h.client.List(ctx, jobs, client.InNamespace(current.Namespace), client.MatchingLabels{actionsv1alpha1.LabelWorkflowRunUID: string(current.UID)}); err != nil {
 			return nil, fmt.Errorf("load WorkflowJobs for WorkflowRun %q: %w", current.Name, err)
+		}
+		if requireComplete && (current.Status.Jobs == nil || int32(len(jobs.Items)) != current.Status.Jobs.Total) {
+			return nil, &workflowRerunConflictError{message: fmt.Sprintf("WorkflowRun %q does not have its complete WorkflowJob history", current.Name)}
 		}
 		for _, job := range history.Add(current, jobs.Items) {
 			effectiveByID[job.Spec.JobID] = effectiveWorkflowJob{run: current, job: job}
@@ -1694,6 +1766,9 @@ func (h *Handler) effectiveWorkflowJobs(ctx context.Context, run *actionsv1alpha
 			break
 		}
 		current = previous
+	}
+	if requireComplete && current.Spec.Rerun != nil && len(current.Spec.Rerun.JobIDs) > 0 {
+		return nil, &workflowRerunConflictError{message: fmt.Sprintf("WorkflowRun %q does not have its complete WorkflowRun history", run.Name)}
 	}
 
 	jobs := make([]effectiveWorkflowJob, 0, len(effectiveByID))
@@ -1748,13 +1823,36 @@ func (h *Handler) jobLogs(writer http.ResponseWriter, request *http.Request, run
 	if job.Status.RunnerRef != nil {
 		runnerName = job.Status.RunnerRef.Name
 	}
-	h.writeHTML(writer, h.logPage, logPageData{
+	data := logPageData{
 		Repository: runData.Repository, WorkflowName: runData.WorkflowName,
 		ShortRevision: runData.ShortRevision, Status: jobStatus,
 		JobName: displayName, JobResourceName: job.Name, Runner: runnerName, Duration: runData.Durations.Values[job.Name], Durations: runData.Durations,
 		RunURL: path, StreamURL: path + "/jobs/" + url.PathEscape(job.Name) + "/stream", Jobs: runData.Jobs,
 		DurationsURL: runData.DurationsURL,
-	})
+	}
+	var latest *actionsv1alpha1.WorkflowRun
+	data.Rerun, latest = h.loadRerunPageData(writer, request, run, path+"/jobs/"+url.PathEscape(job.Name))
+	if latest != nil {
+		jobs, err := h.effectiveWorkflowJobs(request.Context(), latest, false)
+		if err != nil {
+			h.logger.Warn("Unable to load WorkflowJobs for rerun actions", "namespace", latest.Namespace, "workflow_run", latest.Name, "error", err)
+		} else {
+			retained := make(map[string]bool, len(jobs))
+			for _, item := range jobs {
+				retained[item.job.Name] = metav1.IsControlledBy(&item.job, item.run)
+			}
+			for index := range data.Jobs {
+				item := &data.Jobs[index]
+				if retained[item.Name] {
+					item.Rerun = &jobRerunPageData{Run: data.Rerun, Name: item.Name, DisplayName: item.DisplayName}
+					if item.Selected {
+						data.JobRerun = item.Rerun
+					}
+				}
+			}
+		}
+	}
+	h.writeHTML(writer, h.logPage, data)
 }
 
 func (h *Handler) streamJobLogs(writer http.ResponseWriter, request *http.Request, run *actionsv1alpha1.WorkflowRun, jobName string) {
@@ -1937,7 +2035,7 @@ func (h *Handler) workflowJob(ctx context.Context, run *actionsv1alpha1.Workflow
 		return job, nil
 	}
 	if run.Spec.Rerun != nil && len(run.Spec.Rerun.JobIDs) > 0 {
-		jobs, err := h.effectiveWorkflowJobs(ctx, run)
+		jobs, err := h.effectiveWorkflowJobs(ctx, run, false)
 		if err != nil {
 			return nil, err
 		}

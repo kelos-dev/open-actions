@@ -65,6 +65,33 @@ func TestFailedJobIDsIncludesMatrixFailFastCancellations(t *testing.T) {
 	}
 }
 
+// https://docs.github.com/en/rest/actions/workflow-runs#re-run-a-job-from-a-workflow-run
+func TestJobAndDependentIDs(t *testing.T) {
+	jobs := []actionsv1alpha1.WorkflowJob{
+		{Spec: actionsv1alpha1.WorkflowJobSpec{JobID: "deploy", Needs: []string{"report"}}},
+		{Spec: actionsv1alpha1.WorkflowJobSpec{JobID: "report", Needs: []string{"build"}}},
+		{Spec: actionsv1alpha1.WorkflowJobSpec{JobID: "build-matrix-1", Needs: []string{"prepare"}, Matrix: &actionsv1alpha1.WorkflowJobMatrix{LogicalJobID: "build", JobTotal: 2}}},
+		{Spec: actionsv1alpha1.WorkflowJobSpec{JobID: "build-matrix-2", Needs: []string{"prepare"}, Matrix: &actionsv1alpha1.WorkflowJobMatrix{LogicalJobID: "build", JobTotal: 2}}},
+		{Spec: actionsv1alpha1.WorkflowJobSpec{JobID: "prepare"}},
+		{Spec: actionsv1alpha1.WorkflowJobSpec{JobID: "lint"}},
+	}
+	for _, test := range []struct {
+		jobID string
+		want  []string
+	}{
+		{jobID: "build-matrix-1", want: []string{"build-matrix-1", "deploy", "report"}},
+		{jobID: "prepare", want: []string{"build-matrix-1", "build-matrix-2", "deploy", "prepare", "report"}},
+		{jobID: "report", want: []string{"deploy", "report"}},
+		{jobID: "lint", want: []string{"lint"}},
+	} {
+		t.Run(test.jobID, func(t *testing.T) {
+			if got := JobAndDependentIDs(jobs, test.jobID); !slices.Equal(got, test.want) {
+				t.Fatalf("selected job IDs = %v, want %v", got, test.want)
+			}
+		})
+	}
+}
+
 func TestJobHistoryReplacesDeferredExpansions(t *testing.T) {
 	matrix := func(id string, total int32) actionsv1alpha1.WorkflowJob {
 		return actionsv1alpha1.WorkflowJob{Spec: actionsv1alpha1.WorkflowJobSpec{JobID: id, Matrix: &actionsv1alpha1.WorkflowJobMatrix{LogicalJobID: "build", JobTotal: total}}}

@@ -70,18 +70,33 @@ func FailedJobIDs(run *actionsv1alpha1.WorkflowRun, jobs []actionsv1alpha1.Workf
 		return nil, fmt.Errorf("WorkflowRun %q does not have its complete WorkflowJob history", run.Name)
 	}
 	selected := make(map[string]struct{})
-	selectedLogicalIDs := make(map[string]struct{})
 	for index := range jobs {
 		job := &jobs[index]
 		succeeded := meta.FindStatusCondition(job.Status.Conditions, actionsv1alpha1.WorkflowJobConditionSucceeded)
 		failed := job.Status.Result == actionsv1alpha1.WorkflowJobResultFailure || (job.Status.Result == "" && succeeded != nil && succeeded.Status == metav1.ConditionFalse)
 		if failed || matrixFailFastCancelled(job) {
 			selected[job.Spec.JobID] = struct{}{}
-			selectedLogicalIDs[logicalJobID(job)] = struct{}{}
 		}
 	}
 	if len(selected) == 0 {
 		return nil, fmt.Errorf("WorkflowRun %q reports failed jobs but no failed WorkflowJobs are available", run.Name)
+	}
+	return jobIDsWithDependents(jobs, selected), nil
+}
+
+// JobAndDependentIDs selects an expanded job and its transitive dependents.
+// The selected job must be present in jobs.
+func JobAndDependentIDs(jobs []actionsv1alpha1.WorkflowJob, jobID string) []string {
+	return jobIDsWithDependents(jobs, map[string]struct{}{jobID: {}})
+}
+
+func jobIDsWithDependents(jobs []actionsv1alpha1.WorkflowJob, selected map[string]struct{}) []string {
+	selectedLogicalIDs := make(map[string]struct{})
+	for index := range jobs {
+		job := &jobs[index]
+		if _, found := selected[job.Spec.JobID]; found {
+			selectedLogicalIDs[logicalJobID(job)] = struct{}{}
+		}
 	}
 	for changed := true; changed; {
 		changed = false
@@ -100,7 +115,7 @@ func FailedJobIDs(run *actionsv1alpha1.WorkflowRun, jobs []actionsv1alpha1.Workf
 		jobIDs = append(jobIDs, id)
 	}
 	sort.Strings(jobIDs)
-	return jobIDs, nil
+	return jobIDs
 }
 
 func matrixFailFastCancelled(job *actionsv1alpha1.WorkflowJob) bool {
