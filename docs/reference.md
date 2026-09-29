@@ -123,6 +123,18 @@ An administrator can also rerun all jobs from the latest completed attempt in
 a workflow lineage. When the attempt failed because one or more jobs failed,
 the administrator can instead rerun the failed expanded job IDs, matrix
 combinations cancelled by fail-fast, and their transitive dependents.
+The run summary and job log views show a **Re-run jobs** menu when the latest
+completed attempt failed because of a job, with **Re-run failed jobs** and
+**Re-run all jobs** options. Otherwise, completed attempts show
+**Re-run all jobs** directly.
+In the job log view, a sync icon beside each retained job in the sidebar
+reruns that job; on small screens, the selected job's icon is beside its title.
+This reruns the selected job and its transitive dependents,
+including when the selected job succeeded, matching
+[GitHub's job rerun behavior](https://docs.github.com/en/rest/actions/workflow-runs#re-run-a-job-from-a-workflow-run).
+For a matrix job, only the selected combination and its dependents are rerun.
+The Console rejects the request if the job has been superseded or the job
+history needed to select its dependents is incomplete.
 Jobs in the new attempt reuse the latest results and outputs of prerequisites
 that completed in earlier attempts instead of executing those prerequisites
 again. This includes jobs whose matrix or configuration depends on `needs`.
@@ -188,10 +200,11 @@ without creating another run.
 
 Set `--allow-anonymous-workflow-runs=true`, or Helm value
 `console.allowAnonymousWorkflowRuns=true`, to let anyone who can reach the
-Console manually dispatch workflows and rerun all jobs or failed jobs without
-signing in. The default is `false`, and the option applies across Console
-namespaces. Omitting the Helm value also disables anonymous runs, including
-upgrades that reuse saved release values. For manual dispatch, visitors can
+Console manually dispatch workflows and rerun all jobs, failed jobs, or an
+individual job with its dependents without signing in. The default is `false`,
+and the option applies across Console namespaces. Omitting the Helm value also
+disables anonymous runs, including upgrades that reuse saved release values.
+For manual dispatch, visitors can
 choose the Project, repository, workflow path, revision, branch or tag, and
 inputs using the same form and validation as administrators. They can select
 repositories accessible to the chosen Project's GitHub App installation,
@@ -1956,7 +1969,7 @@ Completed native Jobs and runner Pods are retained with their WorkflowRun.
 WorkflowRuns are retained indefinitely unless `spec.ttlSecondsAfterFinished` is
 set. When that TTL expires, the WorkflowRun, its Jobs and Pods, and their logs
 are deleted. Console reruns require the original and latest WorkflowRuns to
-remain available. Failed-job reruns also require the WorkflowJobs that provide
+remain available. Selective reruns also require the WorkflowJobs that provide
 the selected jobs' latest prerequisite results and outputs. Open Actions does
 not archive logs outside Kubernetes, so cluster-level log rotation and node
 retention policies still apply.

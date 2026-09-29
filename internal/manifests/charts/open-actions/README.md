@@ -30,9 +30,10 @@ an externally managed Secret from the release namespace instead;
 `console.tokenKey` selects its token key.
 
 Set `console.allowAnonymousWorkflowRuns=true` to allow anyone with Console
-access to manually dispatch workflows and rerun all jobs or failed jobs from
-completed workflows. Visitors can choose the repository, revision, and inputs
-for manual dispatch. The option defaults to `false` and applies across
+access to manually dispatch workflows and rerun all jobs, failed jobs, or an
+individual job with its dependents from completed workflows. Visitors can choose
+the repository, revision, and inputs for manual dispatch. The option defaults to
+`false` and applies across
 namespaces. Use it only for a trusted audience: workflows consume runner
 capacity and may deploy or publish with configured credentials. Cancellation,
 approval, and secret and variable management still require sign-in. See the

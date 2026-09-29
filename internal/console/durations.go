@@ -72,7 +72,7 @@ func workflowRunDurations(run *actionsv1alpha1.WorkflowRun, jobs []effectiveWork
 }
 
 func (h *Handler) runDurations(writer http.ResponseWriter, request *http.Request, run *actionsv1alpha1.WorkflowRun) {
-	jobs, err := h.effectiveWorkflowJobs(request.Context(), run)
+	jobs, err := h.effectiveWorkflowJobs(request.Context(), run, false)
 	if err != nil {
 		h.writeResolutionError(writer, request, err)
 		return
