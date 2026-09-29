@@ -1212,10 +1212,11 @@ func TestConsoleCreatesWorkflowDispatch(t *testing.T) {
 		t.Fatalf("dispatch page asks for a repository ID: %s", pageBody)
 	}
 	for _, expected := range []string{
-		`<code>dry-run</code><span class="input-type">boolean</span>`,
+		`<label for="workflow-input-0"><code>dry-run</code> <span class="field-optional">(optional)</span></label><span class="input-type">boolean</span>`,
 		`Dry run without applying changes`,
 		`<option value="false" selected>false</option>`,
-		`<code>environment</code><span class="input-type">choice</span><span aria-label="required">Required</span>`,
+		`<label for="workflow-input-1"><code>environment</code> <span class="required-marker" aria-hidden="true">*</span></label><span class="input-type">choice</span>`,
+		`id="workflow-input-1-default">Load workflow to see the current default.</p>`,
 		`<option value="staging">staging</option>`,
 		`<option value="production" selected>production</option>`,
 		`value="notes" data-input-field disabled`,

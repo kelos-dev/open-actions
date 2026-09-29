@@ -177,7 +177,12 @@ and the WorkflowRun records the resolved commit. Enter a full commit SHA to pin
 the run to that commit instead.
 Choose **Load workflow** to read the workflow at the selected commit and display its
 declared inputs, descriptions, defaults, and choices, including for workflows
-with no previous runs. Changing the Project, repository, branch or tag, commit,
+with no previous runs. Required fields have an asterisk; optional fields are
+labeled. After loading, each input shows its declared default separately from the
+editable value, including empty strings, `false`, and `0`, or **No default** when none is
+declared. Unchecking **Include this input** omits an optional input so the
+workflow's default applies when defined.
+Changing the Project, repository, branch or tag, commit,
 or workflow path requires loading the workflow again before running it.
 Reloading the same selection preserves supplied input values and which optional
 inputs are included.
@@ -193,9 +198,10 @@ immutable workflow file snapshot. The commit SHA is left empty, so the new run
 uses the latest commit on that branch or tag, and its inputs are validated
 against the workflow at that commit. Only the inputs that the source run
 supplied, plus required inputs, are included, so omitted optional inputs use
-the defaults declared at the latest commit. Choose **Load workflow** to display
-the declarations at the latest commit instead of the snapshot. If that snapshot
-is unavailable, choose **Load workflow** to fetch the declarations and defaults
+the defaults declared at the latest commit. Until **Load workflow** is selected,
+default captions prompt you to load the current defaults. Choose **Load workflow**
+to display the declarations at the latest commit instead of the snapshot. If that
+snapshot is unavailable, choose **Load workflow** to fetch the declarations and defaults
 from GitHub; the source run's input values must be entered again. Each form
 instance carries a request ID, so resubmitting the same dispatch is idempotent
 and redirects to the existing run. Without a pinned commit, the redirect also
