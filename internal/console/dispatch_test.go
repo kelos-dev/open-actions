@@ -109,17 +109,43 @@ func TestConsoleLoadsDispatchInputsWithoutPreviousRuns(t *testing.T) {
 	if initial.Code != http.StatusOK || !strings.Contains(initial.Body.String(), `id="run-workflow" type="submit" disabled`) {
 		t.Fatalf("initial dispatch page = %d, %s", initial.Code, initial.Body.String())
 	}
+	for _, field := range []struct{ id, label string }{
+		{"project", "Project"}, {"repository-owner", "Repository owner"},
+		{"repository-name", "Repository name"}, {"workflow-path", "Workflow path"},
+	} {
+		label := `<label for="` + field.id + `">` + field.label + ` <span class="required-marker" aria-hidden="true">*</span></label>`
+		if !strings.Contains(initial.Body.String(), label) {
+			t.Errorf("required field label missing: %s", label)
+		}
+	}
+	for _, expected := range []string{
+		`<label for="revision">Commit SHA <span class="field-optional">(optional)</span></label>`,
+		`<label for="ref-name">Branch or tag <span class="field-optional">(optional)</span></label>`,
+		`aria-describedby="revision-hint"`,
+		`id="revision-hint">Leave blank to use the latest commit on the selected branch or tag.</p>`,
+		`aria-describedby="ref-hint"`,
+		`id="ref-hint">Leave blank to use the repository's default branch.</p>`,
+	} {
+		if !strings.Contains(initial.Body.String(), expected) {
+			t.Errorf("optional field metadata missing: %s", expected)
+		}
+	}
 	form := dispatchForm(handler)
 	page := loadDispatchForm(t, handler, form)
 	for _, expected := range []string{
-		`<code>environment</code><span class="input-type">choice</span><span aria-label="required">Required</span>`,
-		`<p class="input-description">Deployment environment</p>`,
+		`<label for="workflow-input-1"><code>environment</code> <span class="required-marker" aria-hidden="true">*</span></label><span class="input-type">choice</span>`,
+		`<p class="input-description" id="workflow-input-1-description">Deployment environment</p>`,
 		`<option value="staging" selected>staging</option>`,
 		`<option value="production">production</option>`,
 		`<option value="false" selected>false</option>`,
-		`id="workflow-input-2" name="input-value" maxlength="65535" data-input-field></textarea>`,
+		`id="workflow-input-0-default">Default: <code>false</code></p>`,
+		`id="workflow-input-1-default">Default: <code>staging</code></p>`,
+		`id="workflow-input-2-default">Default: (empty string)</p>`,
+		`id="workflow-input-3-default">No default</p>`,
+		`id="workflow-input-4-default">Default: <code>0</code></p>`,
+		`id="workflow-input-2" name="input-value" aria-describedby="workflow-input-2-default" maxlength="65535" data-input-field></textarea>`,
 		`value="notes" data-input-field disabled`,
-		`id="workflow-input-4" name="input-value" maxlength="65535" data-input-field>0</textarea>`,
+		`id="workflow-input-4" name="input-value" aria-describedby="workflow-input-4-default" maxlength="65535" data-input-field>0</textarea>`,
 		`id="run-workflow" type="submit">Run workflow</button>`,
 	} {
 		if !strings.Contains(page, expected) {
@@ -134,6 +160,61 @@ func TestConsoleLoadsDispatchInputsWithoutPreviousRuns(t *testing.T) {
 		t.Fatalf("pinned commit resolved the ref: %#v", resolver.revisionRequests)
 	}
 	assertDispatchNotCreated(t, handler, form)
+}
+
+func TestConsoleDispatchInputMetadata(t *testing.T) {
+	// https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax#onworkflow_dispatchinputs
+	for _, test := range []struct {
+		name, definition, control, defaultHTML string
+		required                               bool
+	}{
+		{name: "required string", definition: "type: string\n        required: true", control: "textarea", required: true},
+		{name: "required number", definition: "type: number\n        required: true", control: "textarea", required: true},
+		{name: "required boolean", definition: "type: boolean\n        required: true", control: "select", required: true},
+		{name: "required choice", definition: "type: choice\n        options: [staging, production]\n        required: true", control: "select", required: true},
+		{name: "optional boolean without default", definition: "type: boolean", control: "select"},
+		{name: "optional choice without default", definition: "type: choice\n        options: [staging, production]", control: "select"},
+		{name: "string default", definition: "type: string\n        default: '<release> & deploy'", control: "textarea", defaultHTML: `Default: <code>&lt;release&gt; &amp; deploy</code>`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			handler := newTestHandler(t, false)
+			handler.repositories = &testRepositoryResolver{workflowFile: `on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: Deployment target
+        ` + test.definition + `
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - run: make deploy
+`}
+			page := loadDispatchForm(t, handler, dispatchForm(handler))
+			marker := `<span class="field-optional">(optional)</span>`
+			if test.required {
+				marker = `<span class="required-marker" aria-hidden="true">*</span>`
+			}
+			label := `<label for="workflow-input-0"><code>target</code> ` + marker + `</label>`
+			if !strings.Contains(page, label) {
+				t.Errorf("input label missing: %s", label)
+			}
+			control := regexp.MustCompile(`<` + test.control + ` id="workflow-input-0"[^>]*>`).FindString(page)
+			if !strings.Contains(control, `aria-describedby="workflow-input-0-default workflow-input-0-description"`) {
+				t.Errorf("input does not reference its default and description: %s", control)
+			}
+			if strings.Contains(control, " required") != test.required {
+				t.Errorf("input required attribute does not match its label: %s", control)
+			}
+			defaultHTML := test.defaultHTML
+			if defaultHTML == "" {
+				defaultHTML = "No default"
+			}
+			if !strings.Contains(page, `id="workflow-input-0-default">`+defaultHTML+`</p>`) {
+				t.Errorf("input default caption missing: %s", defaultHTML)
+			}
+		})
+	}
 }
 
 func TestConsoleDispatchesRefHeadWithoutPinnedCommit(t *testing.T) {
@@ -327,14 +408,87 @@ func TestConsoleReloadPreservesSuppliedDispatchInputs(t *testing.T) {
 		`<option value="true" selected>true</option>`,
 		`value="message" data-input-field disabled`,
 		`value="notes" data-input-field>`,
-		`id="workflow-input-3" name="input-value" maxlength="65535" data-input-field>Release notes</textarea>`,
-		`id="workflow-input-4" name="input-value" maxlength="65535" data-input-field>2.5</textarea>`,
+		`id="workflow-input-3" name="input-value" aria-describedby="workflow-input-3-default" maxlength="65535" data-input-field>Release notes</textarea>`,
+		`id="workflow-input-4" name="input-value" aria-describedby="workflow-input-4-default" maxlength="65535" data-input-field>2.5</textarea>`,
+		`id="workflow-input-4-default">Default: <code>0</code></p>`,
 	} {
 		if !strings.Contains(page, expected) {
 			t.Fatalf("reloaded workflow does not contain %q: %s", expected, page)
 		}
 	}
 	assertDispatchNotCreated(t, handler, form)
+}
+
+func TestConsoleDispatchLoadsCurrentDefaultsForSnapshotInputs(t *testing.T) {
+	for _, test := range []struct {
+		name, workflowFile, caption string
+	}{
+		{
+			name:         "changed default",
+			workflowFile: strings.Replace(testDispatchWorkflow, "default: false", "default: true", 1),
+			caption:      `id="workflow-input-0-default">Default: <code>true</code></p>`,
+		},
+		{
+			name:         "removed default",
+			workflowFile: strings.Replace(testDispatchWorkflow, "        default: false\n", "", 1),
+			caption:      `id="workflow-input-0-default">No default</p>`,
+		},
+		{
+			name:         "added default",
+			workflowFile: strings.Replace(testDispatchWorkflow, "notes:\n        type: string", "notes:\n        type: string\n        default: Release notes", 1),
+			caption:      `id="workflow-input-3-default">Default: <code>Release notes</code></p>`,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			handler := newTestHandler(t, false)
+			resolver := &testRepositoryResolver{workflowFile: test.workflowFile}
+			handler.repositories = resolver
+			request := httptest.NewRequest(http.MethodGet, "/dispatch?source=default%2Fci", nil)
+			request.Header.Set("Authorization", "Bearer "+testConsoleToken)
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, request)
+			page := response.Body.String()
+			if response.Code != http.StatusOK {
+				t.Fatalf("source dispatch page = %d, %s", response.Code, page)
+			}
+			if !strings.Contains(page, `id="inputs-hint">Inputs from the source run. Load the workflow to see defaults at the latest commit.</span>`) {
+				t.Fatal("source dispatch page does not explain how to load the current defaults")
+			}
+			captions := regexp.MustCompile(`<p class="input-default"[^>]*>(.*?)</p>`).FindAllStringSubmatch(page, -1)
+			if len(captions) != 3 {
+				t.Fatalf("source input default captions = %d, want 3", len(captions))
+			}
+			for _, caption := range captions {
+				if caption[1] != "Load workflow to see the current default." {
+					t.Errorf("source input default caption = %q", caption[1])
+				}
+			}
+			form := dispatchForm(handler)
+			form.Set("revision", "")
+			form.Set("workflow-path", ".open-actions/workflows/ci.yaml")
+			form.Set("input-name", "environment")
+			form.Set("input-value", "staging")
+			for _, name := range []string{"csrf", "request-id", "loaded-selection"} {
+				field := regexp.MustCompile(`name="` + regexp.QuoteMeta(name) + `" value="([^"]+)"`).FindStringSubmatch(page)
+				if len(field) != 2 {
+					t.Fatalf("source dispatch page has no %s", name)
+				}
+				form.Set(name, field[1])
+			}
+			page = loadDispatchForm(t, handler, form)
+			if !strings.Contains(page, test.caption) || strings.Contains(page, "Load workflow to see the current default.") {
+				t.Fatalf("loaded workflow does not show the current default caption %q: %s", test.caption, page)
+			}
+			if !strings.Contains(page, `value="dry-run" data-input-field disabled>`) || !strings.Contains(page, `value="notes" data-input-field disabled>`) {
+				t.Fatal("loading defaults included omitted optional inputs")
+			}
+			wantRequest := testWorkflowFileRequest{client.ObjectKey{Namespace: "default", Name: "project"}, "acme", "example", form.Get("workflow-path"), testHeadRevision}
+			if !reflect.DeepEqual(resolver.workflowRequests, []testWorkflowFileRequest{wantRequest}) {
+				t.Fatalf("workflow file requests = %#v, want %#v", resolver.workflowRequests, wantRequest)
+			}
+			assertDispatchNotCreated(t, handler, form)
+		})
+	}
 }
 
 func TestConsoleDispatchRequiresReloadAfterSelectionChanges(t *testing.T) {

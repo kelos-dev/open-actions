@@ -174,6 +174,7 @@ type dispatchPageData struct {
 	WorkflowPath       string
 	Inputs             []dispatchInputPageData
 	InputsFromWorkflow bool
+	InputsFromSnapshot bool
 	CSRFToken          string
 	RequestID          string
 }
@@ -197,6 +198,8 @@ type dispatchInputPageData struct {
 	Type        string
 	Options     []string
 	Value       string
+	Default     string
+	HasDefault  bool
 	Required    bool
 	Included    bool
 }
@@ -797,6 +800,7 @@ func (h *Handler) loadDispatchPageData(ctx context.Context, query url.Values) (d
 			}
 			if trigger, found := definition.On.Events[string(actionsv1alpha1.GitHubEventNameWorkflowDispatch)]; found {
 				data.InputsFromWorkflow = true
+				data.InputsFromSnapshot = true
 				data.Inputs = declaredDispatchInputs(trigger.Inputs, githubSource.Event.Inputs)
 				// The new run uses the latest commit, so inputs the source run omitted must keep that commit's defaults
 				// rather than the snapshot's.
@@ -843,9 +847,10 @@ func declaredDispatchInputs(definitions map[string]workflow.WorkflowInput, suppl
 		if inputType == "" {
 			inputType = "string"
 		}
+		defaultValue, hasDefault := definition.DefaultValue()
 		value, included := supplied[name]
 		if !included {
-			value, included = definition.DefaultValue()
+			value, included = defaultValue, hasDefault
 		}
 		if !included {
 			switch inputType {
@@ -857,6 +862,7 @@ func declaredDispatchInputs(definitions map[string]workflow.WorkflowInput, suppl
 		}
 		inputs = append(inputs, dispatchInputPageData{
 			Name: name, Description: definition.Description, Type: inputType, Options: definition.Options,
+			Default: defaultValue, HasDefault: hasDefault,
 			Value: value, Required: definition.Required, Included: included || definition.Required,
 		})
 	}
