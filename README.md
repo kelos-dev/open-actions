@@ -280,9 +280,17 @@ configuration, supported workflow syntax, and the webhook contract.
 make update     # Format, generate Go code and CRDs, and tidy modules.
 make verify     # Check generated files, formatting, modules, and go vet.
 make test       # Run unit and schema tests.
+make test-artifact-actions # Run the official artifact actions against the artifact service.
 make build      # Build the CLI, controller, artifact service, Console, and runner binaries under bin/.
 make image      # Build the controller, artifact service, Console, and runner images.
 ```
+
+`make test-artifact-actions` requires Git, Bash, Node.js 20 as `node`, Node.js 24
+as `node24`, and network access to GitHub to fetch the action commits pinned in
+the test. It runs the unmodified upload v4–v7 and download v4–v8 actions through
+the runner, verifies artifact contents across jobs, and checks the upstream
+GHES rejection. This suite runs separately from the cluster end-to-end tests,
+whose artifact fixtures exercise the protocol with small test scripts.
 
 Install the control plane before running the end-to-end suite against the
 cluster selected by the current Kubernetes context:

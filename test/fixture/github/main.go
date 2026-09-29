@@ -137,7 +137,7 @@ jobs:
         run: |
           sleep 5
           printf '%s\n' '${{ matrix.shard }}' > 'result-${{ matrix.shard }}.txt'
-      - uses: actions/upload-artifact@v7
+      - uses: actions/artifact-upload-fixture@v1
         with:
           name: result-${{ matrix.shard }}
           path: result-${{ matrix.shard }}.txt
@@ -145,7 +145,7 @@ jobs:
     needs: generate
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v8
+      - uses: actions/artifact-download-fixture@v1
         with:
           pattern: result-*
           merge-multiple: true
@@ -1065,12 +1065,12 @@ func createRepositories(dataDirectory string) (fixtureRevisions, error) {
 	}); err != nil {
 		return fixtureRevisions{}, err
 	}
-	if _, err := createRepository(dataDirectory, "actions", "upload-artifact", "v7", map[string]string{
+	if _, err := createRepository(dataDirectory, "actions", "artifact-upload-fixture", "v1", map[string]string{
 		"action.yml": uploadArtifactMetadata, "dist/index.js": uploadArtifactScript,
 	}); err != nil {
 		return fixtureRevisions{}, err
 	}
-	if _, err := createRepository(dataDirectory, "actions", "download-artifact", "v8", map[string]string{
+	if _, err := createRepository(dataDirectory, "actions", "artifact-download-fixture", "v1", map[string]string{
 		"action.yml": downloadArtifactMetadata, "dist/index.js": downloadArtifactScript,
 	}); err != nil {
 		return fixtureRevisions{}, err
