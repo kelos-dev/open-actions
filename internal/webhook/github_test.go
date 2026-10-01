@@ -272,12 +272,16 @@ func TestNormalizeRemainingWebhookEvents(t *testing.T) {
 	workflowRun := base()
 	workflowRun.Action = "completed"
 	workflowRun.WorkflowRun.Name = "Release"
+	workflowRun.WorkflowRun.Event = "push"
 	workflowRun.WorkflowRun.HeadBranch = "main"
 	workflowRun.WorkflowRun.HeadSHA = strings.Repeat("a", 40)
 	workflowRun.WorkflowRun.Conclusion = "success"
 	normalized, supported, err := normalize("workflow_run", workflowRun)
 	if err != nil || !supported || normalized.WorkflowName != "Release" || normalized.BaseRef != "main" || normalized.ResolveRef != "main" || normalized.WorkflowRun == nil || normalized.WorkflowRun.Conclusion != "success" || normalized.WorkflowRun.HeadSHA != strings.Repeat("a", 40) {
 		t.Fatalf("workflow_run normalized = %#v, supported %v, error %v", normalized, supported, err)
+	}
+	if normalized.WorkflowRun.Event != "push" {
+		t.Fatalf("workflow_run event = %q, want push", normalized.WorkflowRun.Event)
 	}
 
 	release := base()

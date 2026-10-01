@@ -93,6 +93,7 @@ type payload struct {
 	} `json:"merge_group"`
 	WorkflowRun struct {
 		Name       string `json:"name"`
+		Event      string `json:"event"`
 		HeadBranch string `json:"head_branch"`
 		HeadSHA    string `json:"head_sha"`
 		Conclusion string `json:"conclusion"`
@@ -131,6 +132,7 @@ type normalizedPullRequest struct {
 }
 
 type normalizedWorkflowRun struct {
+	Event      string `json:"event,omitempty"`
 	Conclusion string `json:"conclusion,omitempty"`
 	HeadSHA    string `json:"headSHA"`
 }
@@ -161,6 +163,7 @@ type normalizedEvent struct {
 	MergeBaseSHA  string                 `json:"mergeBaseSHA,omitempty"`
 	Fork          bool                   `json:"fork,omitempty"`
 	Dependabot    bool                   `json:"dependabot,omitempty"`
+	JobToken      bool                   `json:"jobToken,omitempty"`
 	MergeRevision bool                   `json:"mergeRevision,omitempty"`
 	WorkflowName  string                 `json:"workflowName,omitempty"`
 	PullRequest   *normalizedPullRequest `json:"pullRequest,omitempty"`
@@ -356,7 +359,7 @@ func normalize(eventName string, event *payload) (normalizedEvent, bool, error) 
 		}
 		result.WorkflowName = event.WorkflowRun.Name
 		result.BaseRef = event.WorkflowRun.HeadBranch
-		result.WorkflowRun = &normalizedWorkflowRun{Conclusion: event.WorkflowRun.Conclusion, HeadSHA: event.WorkflowRun.HeadSHA}
+		result.WorkflowRun = &normalizedWorkflowRun{Event: event.WorkflowRun.Event, Conclusion: event.WorkflowRun.Conclusion, HeadSHA: event.WorkflowRun.HeadSHA}
 		setDefaultBranchRevision(&result, event)
 	case "issues", "issue_comment":
 		if event.Issue.Number < 1 || !validEventBody(event.Issue.Body) {

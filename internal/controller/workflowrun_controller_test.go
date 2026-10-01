@@ -165,12 +165,20 @@ func TestGitHubTokenPermissionsRestrictsForkWrites(t *testing.T) {
 	}
 }
 
-func TestForkPullRequestWaitsForApprovalWithoutCreatingJobs(t *testing.T) {
+func TestPullRequestWaitsForApprovalWithoutCreatingJobs(t *testing.T) {
+	for _, origin := range []string{"fork", "job token", "fork and job token"} {
+		t.Run(origin, func(t *testing.T) {
+			testPullRequestWaitsForApproval(t, origin)
+		})
+	}
+}
+
+func testPullRequestWaitsForApproval(t *testing.T, origin string) {
 	scheme := runtime.NewScheme()
 	if err := actionsv1alpha1.AddToScheme(scheme); err != nil {
 		t.Fatal(err)
 	}
-	run := forkApprovalTestRun(false)
+	run := pullRequestApprovalTestRun(origin, false)
 	clusterClient := fake.NewClientBuilder().WithScheme(scheme).
 		WithStatusSubresource(&actionsv1alpha1.WorkflowRun{}).
 		WithObjects(run).Build()
@@ -196,12 +204,20 @@ func TestForkPullRequestWaitsForApprovalWithoutCreatingJobs(t *testing.T) {
 	}
 }
 
-func TestNewForkPullRequestRevisionSupersedesUnapprovedRun(t *testing.T) {
+func TestNewPullRequestRevisionSupersedesUnapprovedRun(t *testing.T) {
+	for _, origin := range []string{"fork", "job token", "fork and job token"} {
+		t.Run(origin, func(t *testing.T) {
+			testPullRequestRevisionSupersedesUnapprovedRun(t, origin)
+		})
+	}
+}
+
+func testPullRequestRevisionSupersedesUnapprovedRun(t *testing.T, origin string) {
 	scheme := runtime.NewScheme()
 	if err := actionsv1alpha1.AddToScheme(scheme); err != nil {
 		t.Fatal(err)
 	}
-	oldRun := forkApprovalTestRun(false)
+	oldRun := pullRequestApprovalTestRun(origin, false)
 	oldRun.CreationTimestamp = metav1.NewTime(time.Unix(1, 0))
 	clusterClient := fake.NewClientBuilder().WithScheme(scheme).
 		WithStatusSubresource(&actionsv1alpha1.WorkflowRun{}).
@@ -211,7 +227,10 @@ func TestNewForkPullRequestRevisionSupersedesUnapprovedRun(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	newRun := forkApprovalTestRun(false)
+	newRun := pullRequestApprovalTestRun(origin, false)
+	if origin == "job token" {
+		newRun.Spec.Approval = nil
+	}
 	newRun.Name = "ci-new-head"
 	newRun.UID = "new-run-uid"
 	newRun.CreationTimestamp = metav1.NewTime(time.Unix(2, 0))
@@ -220,7 +239,7 @@ func TestNewForkPullRequestRevisionSupersedesUnapprovedRun(t *testing.T) {
 	if err := clusterClient.Create(context.Background(), newRun); err != nil {
 		t.Fatal(err)
 	}
-	requests := reconciler.workflowRunsSupersededByForkPullRequestRevision(context.Background(), newRun)
+	requests := reconciler.workflowRunsSupersededByPullRequestRevision(context.Background(), newRun)
 	if len(requests) != 1 || requests[0].NamespacedName != client.ObjectKeyFromObject(oldRun) {
 		t.Fatalf("superseded requests = %#v", requests)
 	}
@@ -241,16 +260,19 @@ func TestNewForkPullRequestRevisionSupersedesUnapprovedRun(t *testing.T) {
 	}
 }
 
-func TestForkPullRequestApprovalValidatesCurrentHead(t *testing.T) {
+func TestPullRequestApprovalValidatesCurrentHead(t *testing.T) {
 	approvedHead := strings.Repeat("b", 40)
 	for _, test := range []struct {
 		name        string
 		currentHead string
 		wantReason  string
 		wantRequeue bool
+		jobToken    bool
 	}{
 		{name: "current revision", currentHead: approvedHead, wantReason: "ApprovalGranted", wantRequeue: true},
 		{name: "superseded revision", currentHead: strings.Repeat("c", 40), wantReason: "RevisionSuperseded"},
+		{name: "App current revision", currentHead: approvedHead, wantReason: "ApprovalGranted", wantRequeue: true, jobToken: true},
+		{name: "App superseded revision", currentHead: strings.Repeat("c", 40), wantReason: "RevisionSuperseded", jobToken: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
@@ -293,7 +315,11 @@ func TestForkPullRequestApprovalValidatesCurrentHead(t *testing.T) {
 			secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "github", Namespace: "default"}, Data: map[string][]byte{
 				"private-key": pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(privateKey)}),
 			}}
-			run := forkApprovalTestRun(true)
+			origin := "fork"
+			if test.jobToken {
+				origin = "job token"
+			}
+			run := pullRequestApprovalTestRun(origin, true)
 			clusterClient := fake.NewClientBuilder().WithScheme(scheme).
 				WithStatusSubresource(&actionsv1alpha1.WorkflowRun{}).
 				WithObjects(project, secret, run).Build()
@@ -329,6 +355,18 @@ func TestForkPullRequestApprovalValidatesCurrentHead(t *testing.T) {
 			}
 		})
 	}
+}
+
+func pullRequestApprovalTestRun(origin string, approved bool) *actionsv1alpha1.WorkflowRun {
+	run := forkApprovalTestRun(approved)
+	if origin != "fork" {
+		run.Spec.Approval = &actionsv1alpha1.WorkflowRunApproval{Approved: approved}
+	}
+	if origin == "job token" {
+		run.Spec.ForkPullRequest = nil
+		run.Spec.Source.GitHub.Event.PullRequest.HeadRepository = run.Spec.Source.GitHub.Repository
+	}
+	return run
 }
 
 func forkApprovalTestRun(approved bool) *actionsv1alpha1.WorkflowRun {
@@ -457,6 +495,14 @@ func TestPlanWorkflowJobsAppliesPermissionPrecedence(t *testing.T) {
 }
 
 func TestWorkflowRunPlansUnnamedWorkflowFromLocalPullRequestIntegration(t *testing.T) {
+	for _, appTriggered := range []bool{false, true} {
+		t.Run(fmt.Sprintf("App_triggered_%t", appTriggered), func(t *testing.T) {
+			testWorkflowRunPlansPullRequestIntegration(t, appTriggered)
+		})
+	}
+}
+
+func testWorkflowRunPlansPullRequestIntegration(t *testing.T, appTriggered bool) {
 	serverRoot, baseSHA, headSHA, mergeBaseSHA := createControllerTestRepository(t)
 	gitRepository, err := gitrepository.NewClient(serverRoot)
 	if err != nil {
@@ -481,6 +527,10 @@ func TestWorkflowRunPlansUnnamedWorkflowFromLocalPullRequestIntegration(t *testi
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		if request.Method == http.MethodPost && request.URL.Path == "/app/installations/2/access_tokens" {
 			fmt.Fprint(writer, `{"token":"contents-token"}`)
+			return
+		}
+		if request.URL.Path == "/repos/acme/example/commits" && request.URL.Query().Get("sha") == "refs/pull/42/head" {
+			fmt.Fprintf(writer, `[{"sha":%q}]`, headSHA)
 			return
 		}
 		http.NotFound(writer, request)
@@ -528,6 +578,9 @@ func TestWorkflowRunPlansUnnamedWorkflowFromLocalPullRequestIntegration(t *testi
 			}},
 		},
 	}
+	if appTriggered {
+		run.Spec.Approval = &actionsv1alpha1.WorkflowRunApproval{}
+	}
 	setTestWorkflowRunIdentity(run)
 	clusterClient := fake.NewClientBuilder().WithScheme(scheme).
 		WithStatusSubresource(&actionsv1alpha1.WorkflowRun{}, &actionsv1alpha1.WorkflowJob{}).
@@ -536,6 +589,28 @@ func TestWorkflowRunPlansUnnamedWorkflowFromLocalPullRequestIntegration(t *testi
 	reconciler := &WorkflowRunReconciler{
 		Client: clusterClient, APIReader: clusterClient, GitHub: github, GitRepository: gitRepository,
 		GitHubAPIBase: server.URL, GitHubServerURL: "https://github.example", ActionCloneBaseURL: "https://github.example",
+	}
+	if appTriggered {
+		if _, err := reconciler.reconcileWorkflowRun(t.Context(), run); err != nil {
+			t.Fatal(err)
+		}
+		pendingJobs := &actionsv1alpha1.WorkflowJobList{}
+		if err := clusterClient.List(t.Context(), pendingJobs); err != nil || len(pendingJobs.Items) != 0 {
+			t.Fatalf("jobs before approval = %d, error = %v", len(pendingJobs.Items), err)
+		}
+		if err := clusterClient.Get(t.Context(), client.ObjectKeyFromObject(run), run); err != nil {
+			t.Fatal(err)
+		}
+		run.Spec.Approval.Approved = true
+		if err := clusterClient.Update(t.Context(), run); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := reconciler.reconcileWorkflowRun(t.Context(), run); err != nil {
+			t.Fatal(err)
+		}
+		if err := clusterClient.Get(t.Context(), client.ObjectKeyFromObject(run), run); err != nil {
+			t.Fatal(err)
+		}
 	}
 	if _, err := reconciler.reconcileWorkflowRun(context.Background(), run); err != nil {
 		t.Fatal(err)

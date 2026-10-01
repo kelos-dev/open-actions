@@ -19,6 +19,8 @@ import (
 )
 
 const workflowPath = ".open-actions/workflows/ci.yaml"
+const issueCommentWorkflowPath = ".open-actions/workflows/issue-comment.yaml"
+const workflowRunWorkflowPath = ".open-actions/workflows/workflow-run.yaml"
 const preparationWorkflowPath = ".open-actions/workflows/preparation.yaml"
 const dynamicMatrixWorkflowPath = ".open-actions/workflows/dynamic-matrix.yaml"
 const artifactWorkflowPath = ".open-actions/workflows/artifacts.yaml"
@@ -85,6 +87,27 @@ jobs:
     runs-on: [ubuntu-latest, docker]
     steps:
       - run: test "${{ needs.test.result }}" = success && printf 'dependency graph e2e works\n'
+`
+
+const issueCommentWorkflowData = `name: Issue comment
+on: issue_comment
+jobs:
+  comment:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo comment received
+`
+
+const workflowRunWorkflowData = `name: Native workflow notification
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+jobs:
+  respond:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo native workflow completed
 `
 
 const preparationSteps = `      - name: Block action downloads
@@ -859,10 +882,36 @@ func main() {
 		writer.WriteHeader(http.StatusNoContent)
 	})
 	mux.HandleFunc("/repos/acme/example/contents/.open-actions/workflows", func(writer http.ResponseWriter, _ *http.Request) {
-		writeJSON(writer, []map[string]string{{"name": "ci.yaml", "path": workflowPath, "type": "file"}})
+		writeJSON(writer, []map[string]string{
+			{"name": "ci.yaml", "path": workflowPath, "type": "file"},
+			{"name": "issue-comment.yaml", "path": issueCommentWorkflowPath, "type": "file"},
+			{"name": "workflow-run.yaml", "path": workflowRunWorkflowPath, "type": "file"},
+		})
 	})
 	mux.HandleFunc("/repos/acme/example/contents/"+workflowPath, func(writer http.ResponseWriter, _ *http.Request) {
 		writeJSON(writer, map[string]string{"encoding": "base64", "content": base64.StdEncoding.EncodeToString([]byte(workflowData))})
+	})
+	mux.HandleFunc("/repos/acme/example/contents/"+issueCommentWorkflowPath, func(writer http.ResponseWriter, _ *http.Request) {
+		writeJSON(writer, map[string]string{"encoding": "base64", "content": base64.StdEncoding.EncodeToString([]byte(issueCommentWorkflowData))})
+	})
+	mux.HandleFunc("/repos/acme/example/contents/"+workflowRunWorkflowPath, func(writer http.ResponseWriter, _ *http.Request) {
+		writeJSON(writer, map[string]string{"encoding": "base64", "content": base64.StdEncoding.EncodeToString([]byte(workflowRunWorkflowData))})
+	})
+	mux.HandleFunc("/repos/acme/example/commits", func(writer http.ResponseWriter, request *http.Request) {
+		var sha string
+		switch request.URL.Query().Get("sha") {
+		case "main", "refs/heads/main":
+			sha = revisions.PushSHA
+		case "refs/pull/42/head":
+			sha = revisions.HeadSHA
+		default:
+			http.NotFound(writer, request)
+			return
+		}
+		writeJSON(writer, []map[string]string{{"sha": sha}})
+	})
+	mux.HandleFunc("/repos/acme/example/compare/"+revisions.BaseSHA+"..."+revisions.HeadSHA, func(writer http.ResponseWriter, _ *http.Request) {
+		writeJSON(writer, map[string]any{"merge_base_commit": map[string]string{"sha": revisions.MergeBaseSHA}})
 	})
 	mux.HandleFunc("/repos/acme/example/contents/"+preparationWorkflowPath, func(writer http.ResponseWriter, _ *http.Request) {
 		writeJSON(writer, map[string]string{"encoding": "base64", "content": base64.StdEncoding.EncodeToString([]byte(preparationWorkflowData))})
