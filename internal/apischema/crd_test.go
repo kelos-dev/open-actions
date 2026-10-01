@@ -208,6 +208,50 @@ func TestWorkflowRunForkPullRequestApprovalContract(t *testing.T) {
 	}
 }
 
+func TestWorkflowRunApprovalContract(t *testing.T) {
+	crd, _ := loadCRD(t, "actions.kelos.dev_workflowruns.yaml")
+	newObject := func() map[string]any {
+		object := loadSample(t, "actions_v1alpha1_workflowrun.yaml")
+		normalizeWorkflowRunCELIntegers(object)
+		workflowRunGitHub(object)["event"].(map[string]any)["pullRequest"] = pullRequestEventMetadata()
+		object["spec"].(map[string]any)["approval"] = map[string]any{"approved": false}
+		return object
+	}
+	original := newObject()
+	if errs := validateObject(t, crd, original, nil); len(errs) > 0 {
+		t.Fatalf("valid approval requirement was rejected: %v", errs.ToAggregate())
+	}
+	approved := newObject()
+	approved["spec"].(map[string]any)["approval"].(map[string]any)["approved"] = true
+	if errs := validateObject(t, crd, approved, original); len(errs) > 0 {
+		t.Fatalf("approval was rejected: %v", errs.ToAggregate())
+	}
+	if errs := validateObject(t, crd, original, approved); len(errs) == 0 {
+		t.Fatal("approval was revoked")
+	}
+	withoutApproval := newObject()
+	delete(withoutApproval["spec"].(map[string]any), "approval")
+	if errs := validateObject(t, crd, withoutApproval, original); len(errs) == 0 {
+		t.Fatal("approval requirement was removed")
+	}
+	if errs := validateObject(t, crd, original, withoutApproval); len(errs) == 0 {
+		t.Fatal("approval requirement was added after creation")
+	}
+	for _, action := range []string{"opened", "synchronize", "reopened", "labeled"} {
+		object := newObject()
+		workflowRunGitHub(object)["event"].(map[string]any)["action"] = action
+		errs := validateObject(t, crd, object, nil)
+		if (len(errs) == 0) != (action != "labeled") {
+			t.Fatalf("approval for action %q: %v", action, errs.ToAggregate())
+		}
+	}
+	wrongEvent := newObject()
+	setBranchEvent(workflowRunGitHub(wrongEvent), "push", "")
+	if errs := validateObject(t, crd, wrongEvent, nil); len(errs) == 0 {
+		t.Fatal("approval on a push event passed validation")
+	}
+}
+
 func TestWorkflowJobConcurrencyCancellationUnion(t *testing.T) {
 	crd, _ := loadCRD(t, "actions.kelos.dev_workflowjobs.yaml")
 	for _, test := range []struct {

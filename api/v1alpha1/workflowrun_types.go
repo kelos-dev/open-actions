@@ -30,13 +30,17 @@ const (
 type GitHubEventName string
 
 // WorkflowRunSpec describes one workflow execution. ProjectRef, Source,
-// WorkflowPath, the fork pull request policy, and Rerun are immutable.
+// WorkflowPath, approval requirements, the fork pull request policy, and Rerun
+// are immutable.
 // Set CancelRequested to request graceful cancellation. Deleting a WorkflowRun
 // force-cancels and removes its child resources.
 // +kubebuilder:validation:XValidation:rule="self.projectRef == oldSelf.projectRef && self.source == oldSelf.source && self.workflowPath == oldSelf.workflowPath",message="projectRef, source, and workflowPath are immutable"
 // +kubebuilder:validation:XValidation:rule="!has(self.forkPullRequest) || (self.source.type == 'GitHub' && has(self.source.github) && self.source.github.event.name == 'pull_request' && has(self.source.github.event.pullRequest))",message="forkPullRequest may be specified only for GitHub pull_request events with pull request metadata"
 // +kubebuilder:validation:XValidation:rule="has(self.forkPullRequest) == has(oldSelf.forkPullRequest) && (!has(self.forkPullRequest) || (self.forkPullRequest.requireApproval == oldSelf.forkPullRequest.requireApproval && self.forkPullRequest.sendWriteTokens == oldSelf.forkPullRequest.sendWriteTokens && self.forkPullRequest.sendSecrets == oldSelf.forkPullRequest.sendSecrets))",message="forkPullRequest policy is immutable"
 // +kubebuilder:validation:XValidation:rule="!has(oldSelf.forkPullRequest) || !oldSelf.forkPullRequest.approved || self.forkPullRequest.approved",message="forkPullRequest approval cannot be revoked"
+// +kubebuilder:validation:XValidation:rule="!has(self.approval) || (self.source.type == 'GitHub' && has(self.source.github) && self.source.github.event.name == 'pull_request' && has(self.source.github.event.pullRequest) && self.source.github.event.action in ['opened', 'synchronize', 'reopened'])",message="approval may be specified only for opened, synchronize, or reopened pull_request events with pull request metadata"
+// +kubebuilder:validation:XValidation:rule="has(self.approval) == has(oldSelf.approval)",message="approval requirement is immutable"
+// +kubebuilder:validation:XValidation:rule="!has(oldSelf.approval) || !oldSelf.approval.approved || self.approval.approved",message="approval cannot be revoked"
 // +kubebuilder:validation:XValidation:rule="!has(oldSelf.cancelRequested) || !oldSelf.cancelRequested || (has(self.cancelRequested) && self.cancelRequested)",message="cancelRequested cannot be cleared"
 // +kubebuilder:validation:XValidation:rule="has(self.rerun) == has(oldSelf.rerun) && (!has(self.rerun) || self.rerun == oldSelf.rerun)",message="rerun is immutable"
 // +kubebuilder:validation:XValidation:rule="size(self.projectRef.name) > 0",message="`projectRef.name` must be specified"
@@ -66,6 +70,12 @@ type WorkflowRunSpec struct {
 	// +optional
 	ForkPullRequest *WorkflowRunForkPullRequest `json:"forkPullRequest,omitempty"`
 
+	// Approval requires an administrator to approve a pull request revision
+	// triggered by the Project's GitHub App before jobs can be planned. It does
+	// not change the workflow's token permissions or access to secrets.
+	// +optional
+	Approval *WorkflowRunApproval `json:"approval,omitempty"`
+
 	// CancelRequested asks the controller to cancel ordinary jobs while allowing
 	// jobs whose conditions handle cancellation to finish. Once set, it cannot be
 	// cleared.
@@ -88,6 +98,13 @@ type WorkflowRunSpec struct {
 	// +kubebuilder:validation:Maximum=2147483647
 	// +optional
 	TTLSecondsAfterFinished *int32 `json:"ttlSecondsAfterFinished,omitempty"`
+}
+
+// WorkflowRunApproval authorizes execution of one pinned pull request revision.
+type WorkflowRunApproval struct {
+	// Approved authorizes this revision and may only change from false to true.
+	// +required
+	Approved bool `json:"approved"`
 }
 
 // WorkflowRunForkPullRequest snapshots the security decision for one untrusted

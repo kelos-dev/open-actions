@@ -149,6 +149,10 @@ var _ = Describe("Project", func() {
 
 func sendPushWebhook(repository, deliveryID string) (*http.Response, error) {
 	payload := fmt.Sprintf(`{"after":%q,"ref":"refs/heads/main","installation":{"id":%d},"repository":{"id":123456789,"name":%q,"owner":{"login":"acme"}}}`, fixtureRevision, installationID, repository)
+	return sendGitHubWebhook("push", deliveryID, payload)
+}
+
+func sendGitHubWebhook(event, deliveryID, payload string) (*http.Response, error) {
 	mac := hmac.New(sha256.New, []byte(webhookSecret))
 	if _, err := mac.Write([]byte(payload)); err != nil {
 		return nil, err
@@ -158,7 +162,7 @@ func sendPushWebhook(repository, deliveryID string) (*http.Response, error) {
 		return nil, err
 	}
 	request.Header.Set("Content-Type", "application/json")
-	request.Header.Set("X-GitHub-Event", "push")
+	request.Header.Set("X-GitHub-Event", event)
 	request.Header.Set("X-GitHub-Delivery", deliveryID)
 	request.Header.Set("X-Hub-Signature-256", "sha256="+hex.EncodeToString(mac.Sum(nil)))
 	return http.DefaultClient.Do(request)

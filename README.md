@@ -101,6 +101,11 @@ on every repository whose workflows or private actions Open Actions will use.
 Record the numeric App ID and installation ID. The installation ID is the
 number after `/installations/` in the installation settings URL.
 
+Reserve this App for Open Actions. Events from its bot are suppressed to
+prevent recursive workflows, with approval required for eligible pull request
+runs. Use a different App or a personal access token for other automation that
+should trigger workflows. See [Job token workflow triggers](docs/reference.md#job-token-workflow-triggers).
+
 Each workflow job receives a token narrowed to the permissions requested by
 its workflow and to its Project repository. External actions use a separate
 short-lived token for repositories granted to the installation. See [External

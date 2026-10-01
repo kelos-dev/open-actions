@@ -757,9 +757,57 @@ late-scheduled Pod fails instead of waiting for that credential to expire. The
 tokens are not refreshed during execution, so scheduling plus execution can
 still outlive them.
 
-Because this token belongs to the Project's GitHub App, GitHub treats events it
-creates as ordinary App events. It does not receive the special recursive-run
-suppression that GitHub applies to its native Actions `GITHUB_TOKEN`.
+### Job token workflow triggers
+
+Open Actions uses the Project's GitHub App as its built-in job-token identity.
+Reserve that App for Open Actions and use a different App or a personal access
+token for unrelated automation that should trigger workflows. GitHub webhook
+payloads identify the App actor, but not the individual token used. Consequently,
+tokens issued separately for the same App are subject to the same suppression.
+Token-level attribution for shared Apps remains tracked in
+[#114](https://github.com/kelos-dev/open-actions/issues/114).
+
+After authenticating a webhook, Open Actions checks the triggering sender
+against the authenticated Project App identity before discovering workflows.
+Events from that App, including issue comments, pushes, labels, releases, and
+reviews, do not create WorkflowRuns. Events from other Apps and users continue
+to match workflows normally. For edited or deleted comments, the triggering
+sender determines suppression, not the original comment author. If the App
+identity cannot be resolved, delivery processing retries without creating runs.
+
+For the Project App's `pull_request` events, `opened`, `synchronize`, and
+`reopened` can create ordinary pull request runs with
+`WorkflowRun.spec.approval.approved: false`. An authenticated Console
+administrator must approve the pinned head revision before jobs are planned.
+The approval requirement cannot be added or removed after creation, and an
+approval cannot be revoked. A newer pull request revision supersedes a pending
+approval; the current head is also checked before planning an approved run.
+Reruns preserve the approval decision. This approval gate does not change
+permissions or secret access; fork and Dependabot credential policies still
+apply independently. Other App-generated pull request activities, including
+the derived `pull_request_target` trigger, are suppressed.
+
+Manual `workflow_dispatch` runs through the Console or Kubernetes API,
+schedules, and reusable workflow calls remain eligible to run. For
+`workflow_run` notifications sent by the Project App, only native runs whose
+`workflow_run.event` is `workflow_dispatch` or `repository_dispatch` remain
+eligible. Notifications for other or missing originating events are suppressed
+to prevent native GitHub workflows from feeding job-token mutations back into
+Open Actions. This includes native pull request runs and native `workflow_run`
+chains, whose notifications do not establish approval or the original trigger.
+Human and unrelated App notifications remain eligible.
+
+The GitHub webhook/API dispatch paths, including
+`repository_dispatch`, are not supported by Open Actions. See the supported
+trigger declarations below and
+[#114](https://github.com/kelos-dev/open-actions/issues/114) for the remaining
+token compatibility work.
+
+These rules follow GitHub's
+[native token trigger policy](https://docs.github.com/en/actions/concepts/security/github_token#when-github_token-triggers-workflow-runs)
+within Open Actions. GitHub itself treats this token as an ordinary custom App
+token, so this suppression does not prevent native GitHub Actions workflows
+from running in response to it.
 
 ### GitHub Packages registry authentication
 

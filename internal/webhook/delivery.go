@@ -351,6 +351,15 @@ func (r *DeliveryReconciler) Reconcile(ctx context.Context, request ctrl.Request
 	if err != nil {
 		return ctrl.Result{}, err
 	}
+	jobToken, err := r.jobTokenEvent(ctx, project, delivery.Event, privateKey)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if jobToken && !allowJobTokenEvent(delivery.Event) {
+		r.Logger.Info("suppressed GitHub App event", "delivery_id", delivery.DeliveryID, "event", delivery.Event.Name, "actor", delivery.Event.Actor, "reason", "job_token")
+		return ctrl.Result{}, r.finish(ctx, object, deliveryStateCompleted, 0, "Suppressed event from the Project GitHub App to prevent recursive workflow runs")
+	}
+	delivery.Event.JobToken = jobToken
 	installation, err := r.GitHub.CachedInstallation(ctx, githubConfig.AppID, githubConfig.InstallationID, privateKey, delivery.Repository.Name, githubclient.InstallationPermissions{"contents": "read"})
 	if err != nil {
 		return ctrl.Result{}, err
@@ -366,6 +375,9 @@ func (r *DeliveryReconciler) Reconcile(ctx context.Context, request ctrl.Request
 	workflowJobs := 0
 candidateLoop:
 	for _, candidate := range events {
+		if candidate.JobToken && !allowJobTokenEvent(candidate) {
+			continue
+		}
 		if candidate.Name == "pull_request" && candidate.Fork {
 			enabled, _ := forkPullRequestPolicy(project, candidate.Dependabot)
 			if !enabled {
@@ -635,6 +647,10 @@ func (r *DeliveryReconciler) createWorkflowRun(ctx context.Context, project *act
 	if selection.Event.Name == "pull_request" && selection.Event.Fork {
 		_, forkPullRequest = forkPullRequestPolicy(project, selection.Event.Dependabot)
 	}
+	var approval *actionsv1alpha1.WorkflowRunApproval
+	if selection.Event.Name == "pull_request" && selection.Event.JobToken {
+		approval = &actionsv1alpha1.WorkflowRunApproval{}
+	}
 	desired := &actionsv1alpha1.WorkflowRun{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: name, Namespace: project.Namespace,
@@ -644,6 +660,7 @@ func (r *DeliveryReconciler) createWorkflowRun(ctx context.Context, project *act
 			ProjectRef:              corev1.LocalObjectReference{Name: project.Name},
 			TTLSecondsAfterFinished: r.WorkflowRunTTLSecondsAfterFinished,
 			ForkPullRequest:         forkPullRequest,
+			Approval:                approval,
 			Source: actionsv1alpha1.WorkflowRunSource{
 				Type: actionsv1alpha1.SourceTypeGitHub,
 				GitHub: &actionsv1alpha1.GitHubWorkflowRunSource{
@@ -786,6 +803,9 @@ func matchingWorkflowRun(existing, desired *actionsv1alpha1.WorkflowRun) error {
 	desiredSpec.TTLSecondsAfterFinished = nil
 	if existingSpec.ForkPullRequest != nil && desiredSpec.ForkPullRequest != nil {
 		existingSpec.ForkPullRequest.Approved = desiredSpec.ForkPullRequest.Approved
+	}
+	if existingSpec.Approval != nil && desiredSpec.Approval != nil {
+		existingSpec.Approval.Approved = desiredSpec.Approval.Approved
 	}
 	if existingGitHub, desiredGitHub := existingSpec.Source.GitHub, desiredSpec.Source.GitHub; existingGitHub != nil && desiredGitHub != nil && existingGitHub.Revision.HeadSHA == "" {
 		// Missing HeadSHA is compatible because the API defines SHA as its reporting fallback.

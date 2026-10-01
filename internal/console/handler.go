@@ -1322,7 +1322,7 @@ func (h *Handler) runDetails(writer http.ResponseWriter, request *http.Request, 
 		return
 	}
 	authenticated := h.authenticated(request)
-	if policy := run.Spec.ForkPullRequest; policy != nil && policy.RequireApproval && !policy.Approved && !workflowrun.Terminal(run) && !run.Spec.CancelRequested {
+	if workflowrun.AwaitingApproval(run) && !workflowrun.Terminal(run) && !run.Spec.CancelRequested {
 		data.ApproveURL = runPath(run) + "/approve"
 		if authenticated {
 			data.CanApprove = true
@@ -1380,18 +1380,17 @@ func (h *Handler) approveWorkflow(writer http.ResponseWriter, request *http.Requ
 		if err != nil {
 			return err
 		}
-		policy := run.Spec.ForkPullRequest
-		if policy == nil || !policy.RequireApproval {
+		if !workflowrun.RequiresApproval(run) {
 			return &workflowApprovalConflictError{message: fmt.Sprintf("WorkflowRun %q does not require approval", name)}
 		}
 		if workflowrun.Terminal(run) || run.Spec.CancelRequested {
 			return &workflowApprovalConflictError{message: fmt.Sprintf("WorkflowRun %q can no longer be approved", name)}
 		}
-		if policy.Approved {
+		if !workflowrun.AwaitingApproval(run) {
 			alreadyApproved = true
 			return nil
 		}
-		policy.Approved = true
+		workflowrun.Approve(run)
 		return h.client.Update(request.Context(), run)
 	})
 	if err != nil {
@@ -1404,7 +1403,7 @@ func (h *Handler) approveWorkflow(writer http.ResponseWriter, request *http.Requ
 		return
 	}
 	if !alreadyApproved {
-		h.logger.Info("approved fork pull request workflow run", "namespace", namespace, "workflow_run", name)
+		h.logger.Info("approved pull request workflow run", "namespace", namespace, "workflow_run", name)
 	}
 	http.Redirect(writer, request, "/runs/"+url.PathEscape(namespace)+"/"+url.PathEscape(name), http.StatusSeeOther)
 }

@@ -62,10 +62,24 @@ spec:
           spec:
             description: |-
               WorkflowRunSpec describes one workflow execution. ProjectRef, Source,
-              WorkflowPath, the fork pull request policy, and Rerun are immutable.
+              WorkflowPath, approval requirements, the fork pull request policy, and Rerun
+              are immutable.
               Set CancelRequested to request graceful cancellation. Deleting a WorkflowRun
               force-cancels and removes its child resources.
             properties:
+              approval:
+                description: |-
+                  Approval requires an administrator to approve a pull request revision
+                  triggered by the Project's GitHub App before jobs can be planned. It does
+                  not change the workflow's token permissions or access to secrets.
+                properties:
+                  approved:
+                    description: Approved authorizes this revision and may only change
+                      from false to true.
+                    type: boolean
+                required:
+                - approved
+                type: object
               cancelRequested:
                 description: |-
                   CancelRequested asks the controller to cancel ordinary jobs while allowing
@@ -769,6 +783,16 @@ spec:
             - message: forkPullRequest approval cannot be revoked
               rule: '!has(oldSelf.forkPullRequest) || !oldSelf.forkPullRequest.approved
                 || self.forkPullRequest.approved'
+            - message: approval may be specified only for opened, synchronize, or
+                reopened pull_request events with pull request metadata
+              rule: '!has(self.approval) || (self.source.type == ''GitHub'' && has(self.source.github)
+                && self.source.github.event.name == ''pull_request'' && has(self.source.github.event.pullRequest)
+                && self.source.github.event.action in [''opened'', ''synchronize'',
+                ''reopened''])'
+            - message: approval requirement is immutable
+              rule: has(self.approval) == has(oldSelf.approval)
+            - message: approval cannot be revoked
+              rule: '!has(oldSelf.approval) || !oldSelf.approval.approved || self.approval.approved'
             - message: cancelRequested cannot be cleared
               rule: '!has(oldSelf.cancelRequested) || !oldSelf.cancelRequested ||
                 (has(self.cancelRequested) && self.cancelRequested)'

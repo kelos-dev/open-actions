@@ -724,14 +724,28 @@ func TestConsoleShowsWorkflowValidationError(t *testing.T) {
 	}
 }
 
-func TestConsoleApprovesForkPullRequestRevision(t *testing.T) {
+func TestConsoleApprovesPullRequestRevision(t *testing.T) {
+	for _, origin := range []string{"fork", "job token", "fork and job token"} {
+		t.Run(origin, func(t *testing.T) {
+			testConsoleApprovesPullRequestRevision(t, origin)
+		})
+	}
+}
+
+func testConsoleApprovesPullRequestRevision(t *testing.T, origin string) {
 	handler := newTestHandler(t, false)
+	handler.allowAnonymousWorkflowRuns = true
 	run := &actionsv1alpha1.WorkflowRun{}
 	key := client.ObjectKey{Namespace: "default", Name: "ci"}
 	if err := handler.client.Get(context.Background(), key, run); err != nil {
 		t.Fatal(err)
 	}
-	run.Spec.ForkPullRequest = &actionsv1alpha1.WorkflowRunForkPullRequest{RequireApproval: true}
+	if origin != "job token" {
+		run.Spec.ForkPullRequest = &actionsv1alpha1.WorkflowRunForkPullRequest{RequireApproval: true}
+	}
+	if origin != "fork" {
+		run.Spec.Approval = &actionsv1alpha1.WorkflowRunApproval{}
+	}
 	run.Spec.Source.GitHub.Event.Name = actionsv1alpha1.GitHubEventNamePullRequest
 	run.Spec.Source.GitHub.Event.Action = "synchronize"
 	run.Spec.Source.GitHub.Event.PullRequest = &actionsv1alpha1.GitHubPullRequest{
@@ -760,6 +774,19 @@ func TestConsoleApprovesForkPullRequestRevision(t *testing.T) {
 	}
 
 	form := url.Values{"csrf": {handler.csrfToken}}
+	anonymousRequest := httptest.NewRequest(http.MethodPost, approveURL, strings.NewReader(form.Encode()))
+	anonymousRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	anonymousResponse := httptest.NewRecorder()
+	handler.ServeHTTP(anonymousResponse, anonymousRequest)
+	if anonymousResponse.Code != http.StatusFound || !strings.HasPrefix(anonymousResponse.Header().Get("Location"), "/login?") {
+		t.Fatalf("anonymous approval status = %d", anonymousResponse.Code)
+	}
+	if err := handler.client.Get(context.Background(), key, run); err != nil {
+		t.Fatal(err)
+	}
+	if run.Spec.ForkPullRequest != nil && run.Spec.ForkPullRequest.Approved || run.Spec.Approval != nil && run.Spec.Approval.Approved {
+		t.Fatal("anonymous request granted approval")
+	}
 	request := httptest.NewRequest(http.MethodPost, approveURL, strings.NewReader(form.Encode()))
 	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	request.Header.Set("Authorization", "Bearer "+testConsoleToken)
@@ -771,8 +798,8 @@ func TestConsoleApprovesForkPullRequestRevision(t *testing.T) {
 	if err := handler.client.Get(context.Background(), key, run); err != nil {
 		t.Fatal(err)
 	}
-	if run.Spec.ForkPullRequest == nil || !run.Spec.ForkPullRequest.Approved {
-		t.Fatalf("fork pull request policy = %#v", run.Spec.ForkPullRequest)
+	if run.Spec.ForkPullRequest != nil && !run.Spec.ForkPullRequest.Approved || run.Spec.Approval != nil && !run.Spec.Approval.Approved {
+		t.Fatalf("pull request approval = %#v", run.Spec)
 	}
 }
 
