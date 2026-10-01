@@ -121,11 +121,13 @@ type loginRequest struct {
 }
 
 type mainPageData struct {
-	Runs         []WorkflowRunSummary
-	Limit        int
-	Truncated    bool
-	Durations    durationsResponse
-	DurationsURL string
+	WorkflowRunList
+	Filter           WorkflowRunFilter
+	RepositoryFilter string
+	Filtered         bool
+	Limit            int
+	Durations        durationsResponse
+	DurationsURL     string
 }
 
 type projectsPageData struct {
@@ -205,6 +207,7 @@ type dispatchInputPageData struct {
 }
 
 type runPageData struct {
+	runNavigation
 	RunURL          string
 	ApproveURL      string
 	CancelURL       string
@@ -213,9 +216,6 @@ type runPageData struct {
 	CSRFToken       string
 	CanApprove      bool
 	CanCancel       bool
-	Repository      string
-	WorkflowName    string
-	WorkflowPath    string
 	WorkflowFile    string
 	HasWorkflowFile bool
 	ValidationError string
@@ -281,10 +281,10 @@ type effectiveWorkflowJob struct {
 }
 
 type logPageData struct {
+	runNavigation
+	JobID           string
 	Rerun           rerunPageData
 	JobRerun        *jobRerunPageData
-	Repository      string
-	WorkflowName    string
 	ShortRevision   string
 	Status          string
 	JobName         string
@@ -653,16 +653,30 @@ func (h *Handler) main(writer http.ResponseWriter, request *http.Request) {
 		http.Error(writer, "Console run index is not ready", http.StatusServiceUnavailable)
 		return
 	}
-	h.writeHTML(writer, h.mainPage, h.loadMainPageData())
+	filter := WorkflowRunFilter{Project: request.URL.Query().Get("project"), WorkflowPath: request.URL.Query().Get("workflow")}
+	if repository := request.URL.Query().Get("repository"); repository != "" {
+		id, err := strconv.ParseInt(repository, 10, 64)
+		if err != nil || id <= 0 {
+			http.Error(writer, "invalid repository ID", http.StatusBadRequest)
+			return
+		}
+		filter.RepositoryID = id
+	}
+	h.writeHTML(writer, h.mainPage, h.loadMainPageData(filter))
 }
 
-func (h *Handler) loadMainPageData() mainPageData {
-	runs, truncated := h.workflowRuns.Recent(mainPageRunLimit)
+func (h *Handler) loadMainPageData(filter WorkflowRunFilter) mainPageData {
+	list := h.workflowRuns.List(filter, mainPageRunLimit)
+	runs := list.Runs
+	repositoryFilter := ""
+	if filter.RepositoryID != 0 {
+		repositoryFilter = strconv.FormatInt(filter.RepositoryID, 10)
+	}
 	query := url.Values{}
 	for _, run := range runs {
 		query.Add("run", namespacedValue(run.Namespace, run.Name))
 	}
-	return mainPageData{Runs: runs, Limit: mainPageRunLimit, Truncated: truncated, Durations: workflowRunListDurations(runs), DurationsURL: "/durations?" + query.Encode()}
+	return mainPageData{WorkflowRunList: list, Filter: filter, RepositoryFilter: repositoryFilter, Filtered: filter != (WorkflowRunFilter{}), Limit: mainPageRunLimit, Durations: workflowRunListDurations(runs), DurationsURL: "/durations?" + query.Encode()}
 }
 
 func (h *Handler) projects(writer http.ResponseWriter, request *http.Request) {
@@ -1683,9 +1697,7 @@ func (h *Handler) loadRunPageData(ctx context.Context, run *actionsv1alpha1.Work
 	}
 	data := runPageData{
 		RunURL:        runPath(run),
-		Repository:    run.Spec.Source.GitHub.Repository.Owner + "/" + run.Spec.Source.GitHub.Repository.Name,
-		WorkflowName:  run.Status.WorkflowName,
-		WorkflowPath:  run.Spec.WorkflowPath,
+		runNavigation: workflowRunNavigation(run),
 		Revision:      run.Spec.Source.GitHub.Revision.SHA,
 		ShortRevision: shortRevision(run.Spec.Source.GitHub.Revision.SHA),
 		RefName:       shortRef(run.Spec.Source.GitHub.Revision.Ref),
@@ -1697,9 +1709,6 @@ func (h *Handler) loadRunPageData(ctx context.Context, run *actionsv1alpha1.Work
 		data.DispatchURL = "/dispatch?source=" + url.QueryEscape(namespacedValue(run.Namespace, run.Name))
 	}
 	data.StatusClass = statusClass(data.Status)
-	if data.WorkflowName == "" {
-		data.WorkflowName = data.WorkflowPath
-	}
 	if run.Status.StartTime != nil {
 		data.Started = run.Status.StartTime.UTC().Format(time.RFC3339)
 	}
@@ -1830,7 +1839,7 @@ func (h *Handler) jobLogs(writer http.ResponseWriter, request *http.Request, run
 		runnerName = job.Status.RunnerRef.Name
 	}
 	data := logPageData{
-		Repository: runData.Repository, WorkflowName: runData.WorkflowName,
+		runNavigation: runData.runNavigation, JobID: job.Spec.JobID,
 		ShortRevision: runData.ShortRevision, Status: jobStatus,
 		JobName: displayName, JobResourceName: job.Name, Runner: runnerName, Duration: runData.Durations.Values[job.Name], Durations: runData.Durations,
 		RunURL: path, StreamURL: path + "/jobs/" + url.PathEscape(job.Name) + "/stream", Jobs: runData.Jobs,

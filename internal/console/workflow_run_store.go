@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -22,6 +23,9 @@ import (
 type WorkflowRunSummary struct {
 	URL           string
 	Repository    string
+	RepositoryID  int64
+	WorkflowPath  string
+	RunLabel      string
 	WorkflowName  string
 	Namespace     string
 	Name          string
@@ -41,7 +45,7 @@ type WorkflowRunSummary struct {
 
 // RecentWorkflowRuns provides recent and selected WorkflowRuns for the Console.
 type RecentWorkflowRuns interface {
-	Recent(limit int) ([]WorkflowRunSummary, bool)
+	List(filter WorkflowRunFilter, limit int) WorkflowRunList
 	Find(keys []types.NamespacedName) []WorkflowRunSummary
 	Synced() bool
 }
@@ -128,6 +132,10 @@ func WorkflowRunCacheTransform(object any) (any, error) {
 	workflowPath := run.Spec.WorkflowPath
 	cancelRequested := run.Spec.CancelRequested
 	workflowName := run.Status.WorkflowName
+	var identity *actionsv1alpha1.WorkflowRunIdentityStatus
+	if run.Status.Identity != nil {
+		identity = &actionsv1alpha1.WorkflowRunIdentityStatus{Number: run.Status.Identity.Number, Attempt: run.Status.Identity.Attempt}
+	}
 	startTime := run.Status.StartTime
 	completionTime := run.Status.CompletionTime
 	run.ObjectMeta = metadata
@@ -135,26 +143,68 @@ func WorkflowRunCacheTransform(object any) (any, error) {
 		ProjectRef: projectRef, Source: source, WorkflowPath: workflowPath, CancelRequested: cancelRequested,
 	}
 	run.Status = actionsv1alpha1.WorkflowRunStatus{
-		WorkflowName: workflowName, StartTime: startTime, CompletionTime: completionTime, Conditions: conditions,
+		WorkflowName: workflowName, Identity: identity, StartTime: startTime, CompletionTime: completionTime, Conditions: conditions,
 	}
 	return run, nil
 }
 
-// Recent returns at most limit WorkflowRuns, newest first, and reports whether more exist.
-func (s *WorkflowRunStore) Recent(limit int) ([]WorkflowRunSummary, bool) {
+// List filters before limiting results and derives cascading choices from all retained runs.
+func (s *WorkflowRunStore) List(filter WorkflowRunFilter, limit int) WorkflowRunList {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	if limit < 0 {
-		limit = 0
-	}
-	count := min(limit, len(s.ordered))
-	runs := make([]WorkflowRunSummary, count)
+	result := WorkflowRunList{Runs: make([]WorkflowRunSummary, 0, min(max(limit, 0), len(s.ordered)))}
+	projects, repositories, workflows := map[string]string{}, map[string]string{}, map[string]string{}
 	now := time.Now()
-	for index := 0; index < count; index++ {
-		runs[index] = s.ordered[index].summary
-		runs[index].Duration = elapsedDuration(runs[index].start, runs[index].completion, runs[index].Active, now)
+	for _, entry := range s.ordered {
+		run := entry.summary
+		project := namespacedValue(run.Namespace, run.Project)
+		projects[project] = project
+		if filter.Project != "" && filter.Project != project {
+			continue
+		}
+		repository := strconv.FormatInt(run.RepositoryID, 10)
+		if _, exists := repositories[repository]; !exists {
+			repositories[repository] = run.Repository
+		}
+		if filter.RepositoryID != 0 && filter.RepositoryID != run.RepositoryID {
+			continue
+		}
+		if _, exists := workflows[run.WorkflowPath]; !exists {
+			label := run.WorkflowPath
+			if run.WorkflowName != run.WorkflowPath {
+				label = run.WorkflowName + " · " + run.WorkflowPath
+			}
+			workflows[run.WorkflowPath] = label
+		}
+		if filter.WorkflowPath != "" && filter.WorkflowPath != run.WorkflowPath {
+			continue
+		}
+		if len(result.Runs) >= limit {
+			result.Truncated = true
+			continue
+		}
+		run.Duration = elapsedDuration(run.start, run.completion, run.Active, now)
+		result.Runs = append(result.Runs, run)
 	}
-	return runs, len(s.ordered) > limit
+	// Preserve selections when their last retained run disappears.
+	if filter.Project != "" {
+		projects[filter.Project] = filter.Project
+	}
+	if filter.RepositoryID != 0 {
+		value := strconv.FormatInt(filter.RepositoryID, 10)
+		if _, exists := repositories[value]; !exists {
+			repositories[value] = "Repository " + value
+		}
+	}
+	if filter.WorkflowPath != "" {
+		if _, exists := workflows[filter.WorkflowPath]; !exists {
+			workflows[filter.WorkflowPath] = filter.WorkflowPath
+		}
+	}
+	result.Projects = runFilterOptions(projects)
+	result.Repositories = runFilterOptions(repositories)
+	result.Workflows = runFilterOptions(workflows)
+	return result
 }
 
 // Find returns summaries for the requested WorkflowRuns that are still cached.
@@ -271,6 +321,7 @@ func workflowRunSummary(run *actionsv1alpha1.WorkflowRun) (WorkflowRunSummary, b
 	status := workflowstatus.Run(run)
 	summary := WorkflowRunSummary{
 		URL: runPath(run), Repository: github.Repository.Owner + "/" + github.Repository.Name,
+		RepositoryID: github.Repository.ID, WorkflowPath: run.Spec.WorkflowPath, RunLabel: workflowRunLabel(run),
 		WorkflowName: workflowName, Namespace: run.Namespace, Name: run.Name, Project: run.Spec.ProjectRef.Name,
 		Event: strings.ReplaceAll(string(github.Event.Name), "_", " "), RefName: refName,
 		Revision: github.Revision.SHA, ShortRevision: shortRevision(github.Revision.SHA),

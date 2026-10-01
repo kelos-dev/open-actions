@@ -500,8 +500,8 @@ func TestConsoleMainPageListsWorkflowRunsNewestFirst(t *testing.T) {
 	if response.Code != http.StatusOK || !strings.Contains(body, "Workflow runs") || !strings.Contains(body, `href="/runs/default/ci"`) || !strings.Contains(body, "acme/example") || !strings.Contains(body, "default/project") {
 		t.Fatalf("main page = %d, %q", response.Code, body)
 	}
-	newer := strings.Index(body, "<strong>Lint</strong>")
-	older := strings.Index(body, "<strong>CI</strong>")
+	newer := strings.Index(body, `href="/runs/default/lint"`)
+	older := strings.Index(body, `href="/runs/default/ci"`)
 	if newer == -1 || older == -1 || newer >= older {
 		t.Fatalf("main page is not newest first: %s", body)
 	}
