@@ -1916,6 +1916,20 @@ Open Actions supports the Results Service protocol used by pinned
 `github-token` are scoped to the current WorkflowRun attempt. Cross-repository
 and cross-run downloads through GitHub's artifact REST API are not supported.
 
+These official actions do not support GitHub Enterprise Server (GHES). Their
+bundled client checks `GITHUB_SERVER_URL` and rejects GHES hosts with
+`GHESNotSupportedError` before contacting the artifact service, even when
+`ACTIONS_RESULTS_URL` points to Open Actions. Configuring
+`controller.githubServerURL` (or `--github-server-url`) with a GHES URL therefore
+prevents these actions from uploading or downloading artifacts. Workflow `env`
+and `GITHUB_ENV` cannot override the runner-owned `GITHUB_SERVER_URL`.
+GitHub.com and GitHub Enterprise Cloud hosts under `*.ghe.com` pass this check
+in the tested versions. See the upstream
+[GHES limitation](https://github.com/actions/upload-artifact#ghes-support) and
+[GHES support tracking issue](https://github.com/actions/upload-artifact/issues/537).
+Open Actions does not implement the artifact protocol used by v3, so downgrading
+to those actions is not a supported workaround.
+
 Each job receives `ACTIONS_RESULTS_URL` and an `ACTIONS_RUNTIME_TOKEN`. The
 controller mints the token immediately before creating the native Job and sets
 its lifetime to the enforced runner-start deadline, the job's effective capped
