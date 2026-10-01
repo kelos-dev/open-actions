@@ -76,13 +76,27 @@ to retain those runs indefinitely. The Helm chart passes
 `controller.workflowRunTTLSecondsAfterFinished` to both components.
 
 The Console landing page lists up to 100 WorkflowRuns across all namespaces,
-newest first, and links to each run's details and jobs. A run page renders the
-immutable workflow file snapshot retained by the controller with that
-WorkflowRun. Runs created before snapshot support or whose workflow has not
-yet been fetched and validated report that the file is unavailable. The
-Console presents
-runner output as line-oriented GitHub Actions logs. It
-supports `group` and `endgroup`, debug and annotation commands, command lines,
+newest first, and links to each run's details and jobs. Project, repository, and
+workflow filters are saved in the page URL and applied before the 100-run limit.
+Select filters and choose **Apply** to refresh the list and available choices.
+Changing a selection alone does not navigate away from the page.
+The choices come from all retained runs; repository choices follow the selected
+Project, and workflow choices follow the selected Project and repository.
+Repositories are selected by their GitHub ID, so a repository rename retains
+its history. Workflows are selected by their exact repository-relative path,
+so workflows with the same display name remain distinct. With all repositories
+selected, a workflow path matches that path across repositories.
+Run rows include the full repository name, namespace and Project, workflow
+path, run number, and rerun attempt when greater than one. Runs awaiting identity
+allocation show their resource name. Run and job pages link back to the scoped
+run lists and include the same context in their browser titles. Job IDs are
+shown alongside differing job display names, including in the log sidebar.
+
+A run page renders the immutable workflow file snapshot retained by the
+controller with that WorkflowRun. Runs created before snapshot support or whose
+workflow has not yet been fetched and validated report that the file is
+unavailable. The Console presents runner output as line-oriented GitHub Actions
+logs. It supports `group` and `endgroup`, debug and annotation commands, command lines,
 escaped command data and properties, and `stop-commands` markers. It also shows
 action input and output names without persisting their values. Workflow step
 headings, including post actions, show running, succeeded, failed, cancelled,

@@ -23,7 +23,7 @@ func TestWorkflowRunCacheTransformKeepsRunListFields(t *testing.T) {
 	run.Spec.Source.GitHub.Actor = "octocat"
 	run.Spec.Source.GitHub.Event.DeliveryID = "delivery"
 	run.Spec.Rerun = &actionsv1alpha1.WorkflowRunRerun{JobIDs: []string{"build"}}
-	run.Status.Identity = &actionsv1alpha1.WorkflowRunIdentityStatus{ID: 1}
+	run.Status.Identity = &actionsv1alpha1.WorkflowRunIdentityStatus{ID: 1, Number: 42, Attempt: 2, URL: "https://actions.example/run"}
 	run.Status.Conditions = []metav1.Condition{{
 		Type: actionsv1alpha1.WorkflowRunConditionSucceeded, Status: metav1.ConditionTrue, Reason: "JobsSucceeded", Message: strings.Repeat("x", 1000),
 	}}
@@ -44,10 +44,10 @@ func TestWorkflowRunCacheTransformKeepsRunListFields(t *testing.T) {
 	if transformed.Name != wantName || transformed.Namespace != wantNamespace || transformed.UID != wantUID || transformed.ResourceVersion != wantResourceVersion || !transformed.CreationTimestamp.Equal(&wantCreated) {
 		t.Fatalf("transformed metadata = %#v", transformed.ObjectMeta)
 	}
-	if transformed.Spec.Source.GitHub == nil || transformed.Spec.Source.GitHub.Repository != wantRepository || transformed.Spec.Source.GitHub.Revision.SHA != wantRevision || transformed.Status.WorkflowName != wantWorkflowName {
+	if transformed.Spec.Source.GitHub == nil || transformed.Spec.Source.GitHub.Repository != wantRepository || transformed.Spec.Source.GitHub.Revision.SHA != wantRevision || transformed.Status.WorkflowName != wantWorkflowName || transformed.Status.Identity == nil || transformed.Status.Identity.Number != 42 || transformed.Status.Identity.Attempt != 2 {
 		t.Fatalf("transformed run list fields = %#v", transformed)
 	}
-	if transformed.Labels != nil || transformed.Annotations != nil || transformed.ManagedFields != nil || transformed.Spec.Rerun != nil || transformed.Spec.Source.GitHub.Actor != "" || transformed.Spec.Source.GitHub.Event.DeliveryID != "" || transformed.Status.Identity != nil || transformed.Status.Conditions[0].Message != "" {
+	if transformed.Labels != nil || transformed.Annotations != nil || transformed.ManagedFields != nil || transformed.Spec.Rerun != nil || transformed.Spec.Source.GitHub.Actor != "" || transformed.Spec.Source.GitHub.Event.DeliveryID != "" || transformed.Status.Identity.ID != 0 || transformed.Status.Identity.URL != "" || transformed.Status.Conditions[0].Message != "" {
 		t.Fatalf("transformed run retained unused fields = %#v", transformed)
 	}
 }
@@ -62,20 +62,22 @@ func TestWorkflowRunStoreMaintainsRecentRuns(t *testing.T) {
 	store.upsert(tieSecond)
 	store.upsert(tieFirst)
 
-	runs, truncated := store.Recent(2)
+	result := store.List(WorkflowRunFilter{}, 2)
+	runs, truncated := result.Runs, result.Truncated
 	if !truncated || len(runs) != 2 || runs[0].Namespace != "team-a" || runs[1].Namespace != "team-b" {
 		t.Fatalf("recent runs = %#v, truncated = %t", runs, truncated)
 	}
 
 	tieFirst.Status.WorkflowName = "Updated"
 	store.upsert(tieFirst)
-	runs, _ = store.Recent(1)
+	runs = store.List(WorkflowRunFilter{}, 1).Runs
 	if runs[0].WorkflowName != "Updated" {
 		t.Fatalf("updated run = %#v", runs[0])
 	}
 
 	store.deleteObject(toolscache.DeletedFinalStateUnknown{Key: "team-a/run", Obj: tieFirst})
-	runs, truncated = store.Recent(2)
+	result = store.List(WorkflowRunFilter{}, 2)
+	runs, truncated = result.Runs, result.Truncated
 	if truncated || len(runs) != 2 || runs[0].Namespace != "team-b" || runs[1].WorkflowName != "older" {
 		t.Fatalf("recent runs after deletion = %#v, truncated = %t", runs, truncated)
 	}
@@ -83,7 +85,8 @@ func TestWorkflowRunStoreMaintainsRecentRuns(t *testing.T) {
 	tieSecond.Spec.Source.Type = "Unsupported"
 	tieSecond.Spec.Source.GitHub = nil
 	store.upsert(tieSecond)
-	runs, truncated = store.Recent(2)
+	result = store.List(WorkflowRunFilter{}, 2)
+	runs, truncated = result.Runs, result.Truncated
 	if truncated || len(runs) != 1 || runs[0].WorkflowName != "older" {
 		t.Fatalf("recent runs after unsupported update = %#v, truncated = %t", runs, truncated)
 	}
@@ -108,7 +111,7 @@ func TestWorkflowRunStoreProjectsExecutionTiming(t *testing.T) {
 	run.Status.StartTime = &start
 	run.Status.Conditions = []metav1.Condition{{Type: actionsv1alpha1.WorkflowRunConditionSucceeded, Status: metav1.ConditionUnknown}}
 	store.upsert(run)
-	runs, _ := store.Recent(1)
+	runs := store.List(WorkflowRunFilter{}, 1).Runs
 	duration := runs[0].Duration
 	if !runs[0].Active || !duration.Running || duration.Seconds == nil || *duration.Seconds < 125 || *duration.Seconds > int64(time.Since(start.Time)/time.Second) {
 		t.Fatalf("running duration = %#v", duration)
@@ -119,7 +122,7 @@ func TestWorkflowRunStoreProjectsExecutionTiming(t *testing.T) {
 	run.Status.Conditions[0].Status = metav1.ConditionTrue
 	store.upsert(run)
 	completion.Time = completion.Add(time.Hour)
-	runs, _ = store.Recent(1)
+	runs = store.List(WorkflowRunFilter{}, 1).Runs
 	if runs[0].Active || runs[0].Duration.Running || runs[0].Duration.String() != "1m 15s" {
 		t.Fatalf("completed duration = %#v", runs[0].Duration)
 	}
@@ -133,7 +136,7 @@ func TestWorkflowRunStoreConsumesInformerEvents(t *testing.T) {
 	}
 	run := testWorkflowRun("default", "ci", time.Date(2026, 8, 10, 12, 0, 0, 0, time.UTC))
 	informer.Add(run)
-	runs, _ := store.Recent(1)
+	runs := store.List(WorkflowRunFilter{}, 1).Runs
 	if len(runs) != 1 || runs[0].WorkflowName != "ci" {
 		t.Fatalf("runs after informer add = %#v", runs)
 	}
@@ -141,13 +144,13 @@ func TestWorkflowRunStoreConsumesInformerEvents(t *testing.T) {
 	updated := run.DeepCopy()
 	updated.Status.WorkflowName = "CI"
 	informer.Update(run, updated)
-	runs, _ = store.Recent(1)
+	runs = store.List(WorkflowRunFilter{}, 1).Runs
 	if len(runs) != 1 || runs[0].WorkflowName != "CI" {
 		t.Fatalf("runs after informer update = %#v", runs)
 	}
 
 	informer.Delete(updated)
-	runs, _ = store.Recent(1)
+	runs = store.List(WorkflowRunFilter{}, 1).Runs
 	if len(runs) != 0 {
 		t.Fatalf("runs after informer delete = %#v", runs)
 	}
