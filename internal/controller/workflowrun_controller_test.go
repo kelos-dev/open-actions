@@ -221,6 +221,7 @@ func testPullRequestRevisionSupersedesUnapprovedRun(t *testing.T, origin string)
 	oldRun.CreationTimestamp = metav1.NewTime(time.Unix(1, 0))
 	clusterClient := fake.NewClientBuilder().WithScheme(scheme).
 		WithStatusSubresource(&actionsv1alpha1.WorkflowRun{}).
+		WithIndex(&actionsv1alpha1.WorkflowRun{}, workflowRunPendingPullRequestIndex, indexPendingPullRequestWorkflowRun).
 		WithObjects(oldRun).Build()
 	reconciler := &WorkflowRunReconciler{Client: clusterClient, APIReader: clusterClient}
 	if _, err := reconciler.reconcileWorkflowRun(context.Background(), oldRun); err != nil {

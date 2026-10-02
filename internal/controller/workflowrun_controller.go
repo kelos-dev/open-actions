@@ -70,6 +70,8 @@ const (
 	matrixEvaluationResultRunsOn     = "matrix-evaluation"
 )
 
+const workflowRunPendingPullRequestIndex = "actions.kelos.dev/workflow-run-pending-pull-request"
+
 var digestEncoding = base32.StdEncoding.WithPadding(base32.NoPadding)
 
 type planningFailureDisposition uint8
@@ -3734,10 +3736,16 @@ func (r *WorkflowRunReconciler) SetupWithManager(manager ctrl.Manager) error {
 	if r.GitRepository == nil {
 		return errors.New("Git repository client must be specified")
 	}
+	if err := manager.GetFieldIndexer().IndexField(context.Background(), &actionsv1alpha1.WorkflowRun{}, workflowRunPendingPullRequestIndex, indexPendingPullRequestWorkflowRun); err != nil {
+		return err
+	}
 	return ctrl.NewControllerManagedBy(manager).
 		For(&actionsv1alpha1.WorkflowRun{}).
 		Watches(&actionsv1alpha1.WorkflowRun{}, handler.EnqueueRequestsFromMapFunc(r.workflowRunsSupersededByPullRequestRevision), builder.WithPredicates(predicate.Funcs{
-			CreateFunc:  func(event.CreateEvent) bool { return true },
+			CreateFunc: func(e event.CreateEvent) bool {
+				// The primary watch reconciles every retained run and checks pending approvals on startup.
+				return !e.IsInInitialList
+			},
 			UpdateFunc:  func(event.UpdateEvent) bool { return false },
 			DeleteFunc:  func(event.DeleteEvent) bool { return false },
 			GenericFunc: func(event.GenericEvent) bool { return false },
@@ -3746,13 +3754,36 @@ func (r *WorkflowRunReconciler) SetupWithManager(manager ctrl.Manager) error {
 		Complete(r)
 }
 
+func pullRequestKey(run *actionsv1alpha1.WorkflowRun) string {
+	source := run.Spec.Source.GitHub
+	if source == nil || source.Event.Name != actionsv1alpha1.GitHubEventNamePullRequest || source.Event.PullRequest == nil {
+		return ""
+	}
+	return fmt.Sprintf("%s/%d/%d", run.Spec.ProjectRef.Name, source.Repository.ID, source.Event.PullRequest.Number)
+}
+
+func indexPendingPullRequestWorkflowRun(object client.Object) []string {
+	run := object.(*actionsv1alpha1.WorkflowRun)
+	if !workflowrun.AwaitingApproval(run) || terminalRun(run) {
+		return nil
+	}
+	if key := pullRequestKey(run); key != "" {
+		return []string{key}
+	}
+	return nil
+}
+
 func (r *WorkflowRunReconciler) workflowRunsSupersededByPullRequestRevision(ctx context.Context, object client.Object) []reconcile.Request {
 	run, ok := object.(*actionsv1alpha1.WorkflowRun)
-	if !ok || run.Spec.Source.GitHub == nil || run.Spec.Source.GitHub.Event.Name != actionsv1alpha1.GitHubEventNamePullRequest {
+	if !ok {
+		return nil
+	}
+	key := pullRequestKey(run)
+	if key == "" {
 		return nil
 	}
 	runs := &actionsv1alpha1.WorkflowRunList{}
-	if err := r.APIReader.List(ctx, runs, client.InNamespace(run.Namespace)); err != nil {
+	if err := r.List(ctx, runs, client.InNamespace(run.Namespace), client.MatchingFields{workflowRunPendingPullRequestIndex: key}); err != nil {
 		ctrl.LoggerFrom(ctx).Error(err, "List WorkflowRuns for pull request revision", "workflow_run", run.Name)
 		return nil
 	}
