@@ -43,7 +43,7 @@ const mainPageTemplate = `<!doctype html>
   <title>Workflow runs · Open Actions</title>
   <style>
     :root{color-scheme:dark;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#0d1117;color:#f0f6fc}*{box-sizing:border-box}body{margin:0;background:#0d1117;color:#f0f6fc;font-size:14px}a{color:#58a6ff;text-decoration:none}a:hover{text-decoration:underline}.topbar{height:64px;display:flex;align-items:center;gap:24px;padding:0 24px;border-bottom:1px solid #21262d;background:#010409}.brand{display:flex;align-items:center;gap:10px;color:#f0f6fc;font-weight:600}.brand:hover{text-decoration:none}.brand-mark{display:grid;place-items:center;width:30px;height:30px;border:1px solid #30363d;border-radius:7px;color:#58a6ff;font-size:12px;font-weight:800}.page{width:min(1180px,100%);margin:0 auto;padding:32px 32px 56px}.page-heading{display:flex;align-items:flex-end;justify-content:space-between;gap:24px;margin-bottom:20px}.page-heading h1{margin:0 0 6px;font-size:24px;font-weight:600;letter-spacing:-.01em}.page-heading p{margin:0;color:#8b949e}.count{min-width:20px;padding:2px 8px;border-radius:20px;background:#30363d;color:#c9d1d9;font-size:12px;text-align:center}.runs{overflow:hidden;border:1px solid #30363d;border-radius:6px}.run{display:grid;grid-template-columns:minmax(280px,1fr) minmax(150px,.55fr) 130px 170px;align-items:center;gap:20px;min-height:76px;padding:14px 16px;border-bottom:1px solid #21262d}.run:last-child{border-bottom:0}.run:hover{background:#161b2266}.run-link{display:flex;align-items:center;gap:12px;min-width:0;color:#f0f6fc}.run-link:hover{color:#58a6ff;text-decoration:none}.status-mark{display:grid;place-items:center;flex:0 0 auto;width:20px;height:20px;border:2px solid currentColor;border-radius:50%;font-size:11px;font-weight:800}.status-mark.succeeded{color:#3fb950}.status-mark.failed{color:#f85149}.status-mark.running,.status-mark.cancelling{color:#d29922;border-style:dashed}.status-mark.queued{color:#8b949e}.status-mark.succeeded::after{content:"✓"}.status-mark.failed::after{content:"×"}.status-mark.queued::after{content:"·"}.run-name{min-width:0}.run-name strong,.run-name small{display:block;overflow-wrap:anywhere}.run-name small{margin-top:4px;color:#8b949e;font-weight:400}.revision{min-width:0;color:#c9d1d9}.revision span{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.revision code{display:inline-block;margin-top:4px;color:#8b949e;font:12px ui-monospace,SFMono-Regular,Consolas,monospace}.detail{color:#8b949e;font-size:13px}.status{color:#c9d1d9}.status small{display:block;margin-top:4px;color:#8b949e}.time{display:block;margin-top:4px}.empty{padding:52px 24px;text-align:center}.empty strong{display:block;margin-bottom:6px;font-size:16px}.empty span{color:#8b949e}@media(max-width:800px){.topbar{padding:0 16px}.page{padding:24px 16px 40px}.page-heading{align-items:flex-start}.run{grid-template-columns:minmax(0,1fr) auto}.run .revision,.run .event{display:none}.run .status{text-align:right}}
-    .filters{display:grid;grid-template-columns:minmax(140px,.7fr) minmax(180px,.8fr) minmax(240px,1.5fr) auto auto;align-items:end;gap:12px;margin-bottom:20px}.filters .filter{min-width:0}.filters label{display:block;min-width:0;color:#8b949e;font-size:12px;font-weight:600}.filters select{display:block;width:100%;min-width:0;height:34px;margin-top:6px;padding:0 8px;border:1px solid #30363d;border-radius:6px;background:#161b22;color:#f0f6fc;font:13px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}.filters button{height:34px;padding:0 12px;border:1px solid #30363d;border-radius:6px;background:#21262d;color:#f0f6fc;font:inherit;cursor:pointer}.filters a{line-height:34px;white-space:nowrap}.run-number{margin-left:6px;color:#8b949e;font-size:12px;font-weight:400}.run-name .workflow-path{white-space:normal;overflow-wrap:anywhere;font-size:12px}.filters select:focus-visible,.filters button:focus-visible{outline:2px solid #58a6ff;outline-offset:2px}@media(max-width:800px){.filters{grid-template-columns:1fr 1fr}.filters .workflow-filter{grid-column:1/-1}}@media(max-width:480px){.filters{grid-template-columns:1fr}.filters .workflow-filter{grid-column:auto}.run{grid-template-columns:minmax(0,1fr);gap:10px}.run .status{display:flex;flex-wrap:wrap;align-items:center;gap:8px 12px;padding-left:32px;text-align:left}.run .status small,.run .status .time{margin-top:0}}
+    .filters{display:grid;grid-template-columns:minmax(140px,.7fr) minmax(180px,.8fr) minmax(240px,1.5fr) auto auto;align-items:end;gap:12px;margin-bottom:20px}.filters .filter{min-width:0}.filters label{display:block;min-width:0;color:#8b949e;font-size:12px;font-weight:600}.filters select{display:block;width:100%;min-width:0;height:34px;margin-top:6px;padding:0 8px;border:1px solid #30363d;border-radius:6px;background:#161b22;color:#f0f6fc;font:13px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}.filters button{height:34px;padding:0 12px;border:1px solid #30363d;border-radius:6px;background:#21262d;color:#f0f6fc;font:inherit;cursor:pointer}.filters a{line-height:34px;white-space:nowrap}.filter-status{color:#8b949e}.filter-status:empty{margin:0}.run-number{margin-left:6px;color:#8b949e;font-size:12px;font-weight:400}.run-name .workflow-path{white-space:normal;overflow-wrap:anywhere;font-size:12px}.filters select:focus-visible,.filters button:focus-visible{outline:2px solid #58a6ff;outline-offset:2px}@media(max-width:800px){.filters{grid-template-columns:1fr 1fr}.filters .workflow-filter{grid-column:1/-1}}@media(max-width:480px){.filters{grid-template-columns:1fr}.filters .workflow-filter{grid-column:auto}.run{grid-template-columns:minmax(0,1fr);gap:10px}.run .status{display:flex;flex-wrap:wrap;align-items:center;gap:8px 12px;padding-left:32px;text-align:left}.run .status small,.run .status .time{margin-top:0}}
   </style>
 </head>
 <body>
@@ -54,9 +54,11 @@ const mainPageTemplate = `<!doctype html>
       <div class="filter"><label for="run-project">Project</label><select id="run-project" name="project"><option value="">All projects</option>{{range .Projects}}<option value="{{.Value}}"{{if eq .Value $.Filter.Project}} selected{{end}}>{{.Label}}</option>{{end}}</select></div>
       <div class="filter"><label for="run-repository">Repository</label><select id="run-repository" name="repository"><option value="">All repositories</option>{{range .Repositories}}<option value="{{.Value}}"{{if eq .Value $.RepositoryFilter}} selected{{end}}>{{.Label}}</option>{{end}}</select></div>
       <div class="filter workflow-filter"><label for="run-workflow">Workflow</label><select id="run-workflow" name="workflow"><option value="">All workflows</option>{{range .Workflows}}<option value="{{.Value}}"{{if eq .Value $.Filter.WorkflowPath}} selected{{end}}>{{.Label}}</option>{{end}}</select></div>
-      <button type="submit">Apply</button>{{if .Filtered}}<a href="/">Clear filters</a>{{end}}
+      <button type="submit">Apply</button><a id="clear-filters" href="/"{{if not .Filtered}} hidden{{end}}>Clear filters</a>
     </form>
-    <section class="runs" aria-label="Workflow runs">
+    <p class="filter-status" id="filter-status" role="status"></p>
+    <section class="runs" aria-label="Workflow runs" data-duration-url="{{.DurationsURL}}">
+      <script id="run-durations" type="application/json">{{.Durations}}</script>
       {{range .Runs}}<article class="run">
         <a class="run-link" href="{{.URL}}"><span class="status-mark {{.StatusClass}}" aria-hidden="true"></span><span class="run-name"><strong>{{.WorkflowName}} <span class="run-number">{{.RunLabel}}</span></strong><small>{{.Repository}} · {{.Namespace}}/{{.Project}}</small><small class="workflow-path">{{.WorkflowPath}}</small></span></a>
         <div class="revision"><span>{{if .RefName}}{{.RefName}}{{else}}—{{end}}</span><code title="{{.Revision}}">{{.ShortRevision}}</code></div>
@@ -66,12 +68,88 @@ const mainPageTemplate = `<!doctype html>
     </section>
   </main>
   <script>
-    const filters=document.getElementById('run-filters');
-    filters.addEventListener('change',event=>{
-      if(event.target.name==='project'){filters.elements.repository.value='';filters.elements.workflow.value=''}
-      if(event.target.name==='repository')filters.elements.workflow.value='';
+    const filters = document.getElementById('run-filters');
+    const filterStatus = document.getElementById('filter-status');
+    const filterButton = filters.querySelector('button');
+    const clearFilters = document.getElementById('clear-filters');
+    const filterNames = ['project', 'repository', 'workflow'];
+    let filterRequest;
+    let requestedFilterURL;
+    filterButton.hidden = true;
+    function formatRunTimes() {
+      for (const element of document.querySelectorAll('[data-time]')) {
+        const date = new Date(element.dataset.time);
+        if (!Number.isNaN(date.valueOf())) element.textContent = new Intl.DateTimeFormat(undefined, {dateStyle: 'medium', timeStyle: 'short'}).format(date);
+      }
+    }
+    function selectedFiltersURL() {
+      const query = new URLSearchParams();
+      for (const name of filterNames) if (filters.elements[name].value) query.set(name, filters.elements[name].value);
+      const search = query.toString();
+      return '/' + (search ? '?' + search : '');
+    }
+    async function refreshRunFilters(url, pushHistory = true) {
+      requestedFilterURL = url;
+      if (filterRequest) filterRequest.abort();
+      const request = new AbortController();
+      filterRequest = request;
+      document.querySelector('.runs').setAttribute('aria-busy', 'true');
+      filterStatus.textContent = 'Updating workflow runs…';
+      filterButton.hidden = true;
+      try {
+        const response = await fetch(url, {signal: request.signal, cache: 'no-store'});
+        if (!response.ok) throw new Error('Unable to load workflow runs');
+        const page = new DOMParser().parseFromString(await response.text(), 'text/html');
+        if (request.signal.aborted) return;
+        for (const name of filterNames) {
+          const select = filters.elements[name];
+          const next = page.getElementById('run-' + name);
+          const value = next.value;
+          const sameOptions = select.options.length === next.options.length && Array.from(select.options).every((option, index) => option.value === next.options[index].value && option.text === next.options[index].text);
+          if (!sameOptions) select.replaceChildren(...next.options);
+          select.value = value;
+        }
+        stopDurationTracking();
+        const runs = page.querySelector('.runs');
+        document.querySelector('.runs').replaceWith(runs);
+        document.querySelector('.page-heading').replaceWith(page.querySelector('.page-heading'));
+        const hideClearFilters = page.getElementById('clear-filters').hidden;
+        if (hideClearFilters && document.activeElement === clearFilters) filters.elements.project.focus();
+        clearFilters.hidden = hideClearFilters;
+        formatRunTimes();
+        stopDurationTracking = trackDurations(JSON.parse(runs.querySelector('#run-durations').textContent), runs.dataset.durationUrl);
+        if (pushHistory && url !== location.pathname + location.search) history.pushState(null, '', url);
+        const count = runs.querySelectorAll('.run').length;
+        filterStatus.textContent = count + (count === 1 ? ' workflow run shown' : ' workflow runs shown');
+      } catch (_) {
+        if (request.signal.aborted) return;
+        filterStatus.textContent = 'Could not update workflow runs. Try again.';
+        filterButton.textContent = 'Retry';
+        filterButton.hidden = false;
+      } finally {
+        if (!request.signal.aborted) {
+          document.querySelector('.runs').removeAttribute('aria-busy');
+          for (const name of filterNames) filters.elements[name].disabled = false;
+        }
+      }
+    }
+    filters.addEventListener('change', event => {
+      const index = filterNames.indexOf(event.target.name);
+      for (const name of filterNames.slice(index + 1)) {
+        filters.elements[name].value = '';
+        filters.elements[name].disabled = true;
+      }
+      refreshRunFilters(selectedFiltersURL());
     });
-    for(const element of document.querySelectorAll('[data-time]')){const date=new Date(element.dataset.time);if(!Number.isNaN(date.valueOf()))element.textContent=new Intl.DateTimeFormat(undefined,{dateStyle:'medium',timeStyle:'short'}).format(date)}</script>
+    filters.addEventListener('submit', event => { event.preventDefault(); refreshRunFilters(requestedFilterURL || selectedFiltersURL()); });
+    clearFilters.addEventListener('click', event => {
+      if (event.button !== 0 || event.ctrlKey || event.metaKey || event.shiftKey || event.altKey) return;
+      event.preventDefault();
+      refreshRunFilters('/');
+    });
+    window.addEventListener('popstate', () => refreshRunFilters(location.pathname + location.search, false));
+    formatRunTimes();
+  </script>
 ` + durationScript + `
 </body>
 </html>`
@@ -304,11 +382,13 @@ const durationScript = `<script>
       if (seconds >= 60) return Math.floor(seconds / 60) + 'm ' + seconds % 60 + 's';
       return seconds + 's';
     }
-    (() => {
-      let durations = {{.Durations}};
+    function trackDurations(durations, durationURL) {
       let updatedAt = performance.now();
       const elements = document.querySelectorAll('[data-duration]');
-      const durationURL = {{.DurationsURL}};
+      let stopped = false;
+      let timer;
+      let refreshTimer;
+      const stop = () => { stopped = true; clearInterval(timer); clearTimeout(refreshTimer); };
       function renderDurations() {
         const elapsed = Math.floor((performance.now() - updatedAt) / 1000);
         for (const element of elements) {
@@ -318,24 +398,30 @@ const durationScript = `<script>
         }
       }
       renderDurations();
-      if (!durations.active) return;
-      const timer = setInterval(renderDurations, 1000);
+      if (!durations.active) return stop;
+      timer = setInterval(renderDurations, 1000);
       async function refreshDurations() {
         try {
           const response = await fetch(durationURL, {cache: 'no-store'});
           if (response.ok) {
-            durations = await response.json();
+            const data = await response.json();
+            if (stopped) return;
+            durations = data;
             updatedAt = performance.now();
             renderDurations();
           }
         } catch (_) {
           // Keep the elapsed counters moving while the connection recovers.
         }
-        if (durations.active) setTimeout(refreshDurations, 5000);
+        if (stopped) return;
+        if (durations.active) refreshTimer = setTimeout(refreshDurations, 5000);
         else clearInterval(timer);
       }
-      setTimeout(refreshDurations, 5000);
-    })();
+      refreshTimer = setTimeout(refreshDurations, 5000);
+      return stop;
+    }
+    const durationURL = {{.DurationsURL}};
+    let stopDurationTracking = trackDurations({{.Durations}}, durationURL);
   </script>`
 
 const logPageTemplate = `<!doctype html>
