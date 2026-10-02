@@ -143,6 +143,8 @@ func TestConsoleFiltersRunsAndDurationRequests(t *testing.T) {
 		`<option value="team/project" selected>team/project</option>`,
 		`<option value="456" selected>other/example</option>`,
 		`<option value=".open-actions/workflows/test.yaml" selected>`,
+		`data-duration-url="/durations?run=team%2Ftarget"`,
+		`<script id="run-durations" type="application/json">{"values":{"/runs/team/target":`,
 	} {
 		if !strings.Contains(body, expected) {
 			t.Fatalf("filtered page missing %q: %d %s", expected, response.Code, body)

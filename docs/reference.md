@@ -78,8 +78,10 @@ to retain those runs indefinitely. The Helm chart passes
 The Console landing page lists up to 100 WorkflowRuns across all namespaces,
 newest first, and links to each run's details and jobs. Project, repository, and
 workflow filters are saved in the page URL and applied before the 100-run limit.
-Select filters and choose **Apply** to refresh the list and available choices.
-Changing a selection alone does not navigate away from the page.
+Selecting a filter updates the list and dependent choices immediately, without
+reloading the page or moving keyboard focus. The URL follows the applied filters,
+and browser Back and Forward restore previous selections. Without JavaScript,
+choose **Apply** to submit the filters.
 The choices come from all retained runs; repository choices follow the selected
 Project, and workflow choices follow the selected Project and repository.
 Repositories are selected by their GitHub ID, so a repository rename retains
