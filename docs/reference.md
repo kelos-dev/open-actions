@@ -29,6 +29,63 @@ open-actions run logs ci-abc123 --job build --follow --namespace team-ci
 The CLI accesses these resources with the permissions of the selected
 kubeconfig user. It does not use the Console administrator token.
 
+### Creating workflow runs
+
+`open-actions run create WORKFLOW --project PROJECT --repo OWNER/REPO` creates a
+`workflow_dispatch` WorkflowRun in the selected namespace. `WORKFLOW` is the
+repository-relative `.yaml` or `.yml` path of a direct child of the Project's
+`spec.workflowDirectory` (default `.open-actions/workflows`). Nested paths and
+files outside that directory are rejected. The Project must be configured with
+a GitHub source. The kubeconfig user needs permission to read the Project and
+create WorkflowRuns in its namespace; retrying an existing `--name` also requires
+permission to read that WorkflowRun. Execution uses the Project's GitHub App
+installation, which must have access to the repository.
+
+The command requires [GitHub CLI (`gh`)](https://cli.github.com/) on `PATH`,
+authenticated as a user with repository write, maintain, or admin access.
+It records that user's login as the actor and resolves the repository's
+canonical identity through GitHub. `--hostname` defaults to `github.com`; for
+GitHub Enterprise, select the same hostname configured for the control plane
+and authenticate `gh` for that host.
+
+Kubernetes RBAC on WorkflowRun creation is the authorization boundary. The CLI
+checks GitHub write access and records the authenticated actor before creating
+the resource; the controller does not enforce those checks for direct API
+clients, which supply their own actor.
+
+```console
+open-actions run create .open-actions/workflows/deploy.yaml \
+  --project default --repo owner/repo --ref main \
+  -f environment=staging --namespace team-ci
+```
+
+`--ref` accepts a branch or tag and defaults to the repository's default branch.
+Use `refs/heads/NAME` or `refs/tags/NAME` when a branch and tag share a name;
+ambiguous short names are rejected. Commit expressions and pull request refs
+are not accepted. The selected ref is resolved to a full commit SHA, which pins
+the workflow and code for the run, including when the ref is an annotated tag.
+Following GitHub's [manual dispatch rules](https://docs.github.com/en/actions/how-tos/manage-workflow-runs/manually-run-a-workflow),
+the workflow must exist and declare `workflow_dispatch` on both the default
+branch and the selected revision.
+
+Pass inputs with repeatable `-f KEY=VALUE` or `--raw-field KEY=VALUE` flags.
+Values are literal strings, including commas, equals signs, and an explicit
+empty value such as `-f notes=`. The CLI validates required inputs and declared
+types against the selected workflow. Omitted inputs remain omitted in the
+created resource; the controller applies workflow defaults. Unknown inputs,
+duplicate names ignoring case, more than 25 inputs, and input names and values
+exceeding 65,535 characters in total are rejected.
+
+On success, stdout contains only the WorkflowRun resource name followed by a
+newline, suitable for `run view RUN` and `run logs RUN`. Creation returns before
+execution completes. Each invocation generates a fresh name unless `--name`
+is supplied. Use a fixed `--name` when retrying a request: if the existing run's
+spec matches, the CLI prints its name and succeeds without modifying it.
+Cancellation and retention settings are ignored when comparing requests.
+Different parameters, including a ref that has moved to another commit, cause
+an error. CLI-created runs omit `ttlSecondsAfterFinished` and are retained
+indefinitely unless that field is set through the Kubernetes API.
+
 ### Controller and Console
 
 `--github-api-url` defaults to `https://api.github.com/` and may include a
@@ -74,6 +131,8 @@ The controller and Console both accept
 `spec.ttlSecondsAfterFinished` for the WorkflowRuns they create. Omit the flag
 to retain those runs indefinitely. The Helm chart passes
 `controller.workflowRunTTLSecondsAfterFinished` to both components.
+These defaults do not apply to WorkflowRuns created directly through the
+Kubernetes API, including `open-actions run create`.
 
 The Console landing page lists up to 100 WorkflowRuns across all namespaces,
 newest first, and links to each run's details and jobs. Project, repository, and
@@ -1813,8 +1872,9 @@ the `X-GitHub-Delivery` value on webhook-backed events. The controller verifies
 that the workflow declares `workflow_dispatch`, validates the supplied inputs,
 and applies defaults before planning jobs. See
 [`config/samples/actions_v1alpha1_workflowrun-dispatch.yaml`](../config/samples/actions_v1alpha1_workflowrun-dispatch.yaml).
-The authenticated Console **Run workflow** form creates the same resource and
-can be prepopulated from a previous branch- or tag-backed run.
+`open-actions run create` and the authenticated Console **Run workflow** form
+create the same resource. The Console form can be prepopulated from a previous
+branch- or tag-backed run.
 
 Supported input types are `string`, `boolean`, `number`, `choice`, and
 `environment`; `choice` inputs require options. `workflow_call` declarations
