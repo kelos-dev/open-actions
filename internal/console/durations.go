@@ -55,15 +55,27 @@ func elapsedDuration(start, completion *metav1.Time, active bool, now time.Time)
 }
 
 type durationsResponse struct {
-	Values map[string]executionDuration `json:"values"`
-	Active bool                         `json:"active"`
+	Values   map[string]executionDuration `json:"values"`
+	Active   bool                         `json:"active"`
+	Statuses map[string]executionStatus   `json:"statuses"`
+}
+
+type executionStatus struct {
+	Label string `json:"label"`
+	Class string `json:"class"`
+}
+
+func executionStatusFor(label string) executionStatus {
+	return executionStatus{Label: label, Class: statusClass(label)}
 }
 
 func workflowRunDurations(run *actionsv1alpha1.WorkflowRun, jobs []effectiveWorkflowJob, now time.Time) durationsResponse {
 	data := durationsResponse{Values: make(map[string]executionDuration, len(jobs)+1), Active: !workflowrun.Terminal(run)}
+	data.Statuses = map[string]executionStatus{runPath(run): executionStatusFor(workflowstatus.Run(run))}
 	data.Values[runPath(run)] = elapsedDuration(run.Status.StartTime, run.Status.CompletionTime, data.Active, now)
 	for _, item := range jobs {
 		data.Values[item.job.Name] = workflowJobDuration(&item.job, now)
+		data.Statuses[item.job.Name] = executionStatusFor(workflowstatus.Job(&item.job))
 		if !workflowstatus.JobTerminal(&item.job) && item.job.Status.CompletionTime == nil {
 			data.Active = true
 		}
@@ -109,9 +121,10 @@ func (h *Handler) runListDurations(writer http.ResponseWriter, request *http.Req
 }
 
 func workflowRunListDurations(runs []WorkflowRunSummary) durationsResponse {
-	data := durationsResponse{Values: make(map[string]executionDuration, len(runs))}
+	data := durationsResponse{Values: make(map[string]executionDuration, len(runs)), Statuses: make(map[string]executionStatus, len(runs))}
 	for _, run := range runs {
 		data.Values[run.URL] = run.Duration
+		data.Statuses[run.URL] = executionStatusFor(run.Status)
 		data.Active = data.Active || run.Active
 	}
 	return data
