@@ -60,10 +60,10 @@ const mainPageTemplate = `<!doctype html>
     <section class="runs" aria-label="Workflow runs" data-duration-url="{{.DurationsURL}}">
       <script id="run-durations" type="application/json">{{.Durations}}</script>
       {{range .Runs}}<article class="run">
-        <a class="run-link" href="{{.URL}}"><span class="status-mark {{.StatusClass}}" aria-hidden="true"></span><span class="run-name"><strong>{{.WorkflowName}} <span class="run-number">{{.RunLabel}}</span></strong><small>{{.Repository}} · {{.Namespace}}/{{.Project}}</small><small class="workflow-path">{{.WorkflowPath}}</small></span></a>
+        <a class="run-link" href="{{.URL}}"><span class="status-mark {{.StatusClass}}" data-status-class="{{.URL}}" aria-hidden="true"></span><span class="run-name"><strong>{{.WorkflowName}} <span class="run-number">{{.RunLabel}}</span></strong><small>{{.Repository}} · {{.Namespace}}/{{.Project}}</small><small class="workflow-path">{{.WorkflowPath}}</small></span></a>
         <div class="revision"><span>{{if .RefName}}{{.RefName}}{{else}}—{{end}}</span><code title="{{.Revision}}">{{.ShortRevision}}</code></div>
         <div class="detail event">{{.Event}}</div>
-        <div class="detail status"><span>{{.Status}}</span><small data-duration="{{.URL}}" title="Workflow run duration">{{.Duration}}</small>{{if .Created}}<time class="time" data-time="{{.Created}}">{{.Created}}</time>{{end}}</div>
+        <div class="detail status"><span data-status="{{.URL}}">{{.Status}}</span><small data-duration="{{.URL}}" title="Workflow run duration">{{.Duration}}</small>{{if .Created}}<time class="time" data-time="{{.Created}}">{{.Created}}</time>{{end}}</div>
       </article>{{else}}<div class="empty">{{if .Filtered}}<strong>No matching workflow runs</strong><span>Change or clear the filters to see other retained runs.</span>{{else}}<strong>No workflow runs</strong><span>Runs will appear here when a configured project receives a supported event.</span>{{end}}</div>{{end}}
     </section>
   </main>
@@ -344,6 +344,7 @@ const runPageTemplate = `<!doctype html>
 <body>
   <nav class="topbar" aria-label="Global"><a class="brand" href="/"><span class="brand-mark" aria-hidden="true">OA</span><span>Open Actions</span></a><a href="/projects">Projects</a><a href="/dispatch">Run workflow</a></nav>
   <main class="page">
+    <div data-refresh="run">
     {{template "run-navigation" .}}
     <div class="run-heading">
       <div><h1>{{.WorkflowName}}</h1><div class="muted workflow-path">{{.WorkflowPath}}</div></div>
@@ -365,6 +366,7 @@ const runPageTemplate = `<!doctype html>
         <span class="cell status-text">{{.Status}}</span><span class="cell runner">{{if .Runner}}{{.Runner}}{{else}}—{{end}}</span><span class="cell duration" data-duration="{{.Name}}" title="Job duration">{{.Duration}}</span>
       </div>{{else}}<div class="empty">No jobs have been created.</div>{{end}}
     </section>
+    </div>
     <h2 class="section-title">Workflow file</h2>
     <section class="workflow-file" aria-label="Workflow file">
       {{if .HasWorkflowFile}}<div class="workflow-file-header"><code>{{.WorkflowPath}}</code></div><pre class="workflow-source"><code>{{.WorkflowFile}}</code></pre>{{else}}<div class="empty">The workflow file is not available for this run.</div>{{end}}
@@ -384,18 +386,60 @@ const durationScript = `<script>
     }
     function trackDurations(durations, durationURL) {
       let updatedAt = performance.now();
-      const elements = document.querySelectorAll('[data-duration]');
+      let displayedStatuses = JSON.stringify(durations.statuses);
       let stopped = false;
       let timer;
       let refreshTimer;
       const stop = () => { stopped = true; clearInterval(timer); clearTimeout(refreshTimer); };
       function renderDurations() {
         const elapsed = Math.floor((performance.now() - updatedAt) / 1000);
-        for (const element of elements) {
+        for (const element of document.querySelectorAll('[data-duration]')) {
           const duration = durations.values[element.dataset.duration];
           element.textContent = duration && duration.seconds !== null
             ? formatDuration(duration.seconds + (duration.running ? elapsed : 0)) : '—';
         }
+      }
+      function refreshInteractionActive(sections) {
+        const selection = window.getSelection();
+        for (const section of sections) {
+          if (section.contains(document.activeElement)) return true;
+          if (selection && !selection.isCollapsed) {
+            for (let index = 0; index < selection.rangeCount; index++) {
+              if (selection.getRangeAt(index).intersectsNode(section)) return true;
+            }
+          }
+        }
+        return false;
+      }
+      async function refreshStatuses() {
+        const statuses = JSON.stringify(durations.statuses);
+        if (statuses === displayedStatuses) return;
+        const sections = document.querySelectorAll('[data-refresh]');
+        if (sections.length) {
+          if (refreshInteractionActive(sections)) return;
+          const response = await fetch(location.pathname + location.search, {cache: 'no-store'});
+          if (!response.ok) throw new Error('Unable to refresh workflow status');
+          const page = new DOMParser().parseFromString(await response.text(), 'text/html');
+          if (stopped || refreshInteractionActive(sections)) return;
+          const replacements = Array.from(sections, section => page.querySelector('[data-refresh="' + section.dataset.refresh + '"]'));
+          if (replacements.some(section => !section)) throw new Error('Missing workflow status sections');
+          sections.forEach((section, index) => section.replaceWith(replacements[index]));
+          for (const element of document.querySelectorAll('[data-time]')) {
+            const date = new Date(element.dataset.time);
+            if (!Number.isNaN(date.valueOf())) element.textContent = new Intl.DateTimeFormat(undefined, {dateStyle: 'medium', timeStyle: 'short'}).format(date);
+          }
+          renderDurations();
+        } else {
+          for (const element of document.querySelectorAll('[data-status]')) {
+            const status = durations.statuses[element.dataset.status];
+            if (status) element.textContent = status.label;
+          }
+          for (const element of document.querySelectorAll('[data-status-class]')) {
+            const status = durations.statuses[element.dataset.statusClass];
+            if (status) element.className = 'status-mark ' + status.class;
+          }
+        }
+        displayedStatuses = statuses;
       }
       renderDurations();
       if (!durations.active) return stop;
@@ -409,12 +453,13 @@ const durationScript = `<script>
             durations = data;
             updatedAt = performance.now();
             renderDurations();
+            await refreshStatuses();
           }
         } catch (_) {
-          // Keep the elapsed counters moving while the connection recovers.
+          // Retry status updates even when the run completed during a connection failure.
         }
         if (stopped) return;
-        if (durations.active) refreshTimer = setTimeout(refreshDurations, 5000);
+        if (durations.active || JSON.stringify(durations.statuses) !== displayedStatuses) refreshTimer = setTimeout(refreshDurations, 5000);
         else clearInterval(timer);
       }
       refreshTimer = setTimeout(refreshDurations, 5000);
@@ -440,17 +485,17 @@ const logPageTemplate = `<!doctype html>
 <body data-stream-url="{{.StreamURL}}">
   <nav class="topbar" aria-label="Global"><a class="brand" href="/"><span class="brand-mark" aria-hidden="true">OA</span><span>Open Actions</span></a><a href="/projects">Projects</a><a href="/dispatch">Run workflow</a></nav>
   <main class="page">
-    <div class="workflow-heading">{{template "run-navigation" .}}{{template "run-rerun" .Rerun}}</div>
+    <div class="workflow-heading" data-refresh="heading">{{template "run-navigation" .}}{{template "run-rerun" .Rerun}}</div>
     <div class="workflow-path log-workflow-path">{{.WorkflowPath}}</div>
     <div class="layout">
-      <aside class="sidebar" aria-label="Workflow jobs">
+      <aside class="sidebar" aria-label="Workflow jobs" data-refresh="jobs">
         <a class="summary-link" href="{{.RunURL}}">← Run summary</a>
         <h2 class="sidebar-title">Jobs</h2>
         {{range .Jobs}}<div class="side-job-row{{if .Selected}} selected{{end}}"><a class="side-job" href="{{.URL}}"><span class="side-dot {{.StatusClass}}" aria-hidden="true"></span><span class="side-name">{{.DisplayName}}{{if ne .DisplayName .ID}}<small>{{.ID}}</small>{{end}}</span><span class="side-duration" data-duration="{{.Name}}" title="Job duration">{{.Duration}}</span></a>{{template "job-rerun" .Rerun}}</div>{{end}}
       </aside>
       <section>
         <header class="job-header">
-          <div><div class="job-title"><h1>{{.JobName}}</h1><div class="mobile-job-rerun">{{template "job-rerun" .JobRerun}}</div></div><div class="job-meta">{{if ne .JobName .JobID}}<code>{{.JobID}}</code>{{end}}<span>{{.Status}}</span><span>{{.Runner}}</span><span data-duration="{{.JobResourceName}}" title="Job duration">{{.Duration}}</span><code class="optional">{{.ShortRevision}}</code></div></div>
+          <div data-refresh="job"><div class="job-title"><h1>{{.JobName}}</h1><div class="mobile-job-rerun">{{template "job-rerun" .JobRerun}}</div></div><div class="job-meta">{{if ne .JobName .JobID}}<code>{{.JobID}}</code>{{end}}<span>{{.Status}}</span><span>{{.Runner}}</span><span data-duration="{{.JobResourceName}}" title="Job duration">{{.Duration}}</span><code class="optional">{{.ShortRevision}}</code></div></div>
           <div class="state-pill live" id="state-pill"><span class="pulse" aria-hidden="true"></span><span id="state" aria-live="polite">Connecting…</span></div>
         </header>
         <div class="toolbar">

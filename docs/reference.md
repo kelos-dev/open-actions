@@ -116,9 +116,14 @@ The workflow run list, run summary, job list, log header, and log sidebar show
 execution durations in hours, minutes, and seconds. Job durations start when
 the runner container starts; workflow run durations start when the first job's
 runner container starts. Active durations update every second; the Console
-checks for completion every five seconds and fixes durations at the recorded
-completion time. Runs and jobs without execution timestamps show a dash,
-including queued runs and skipped jobs.
+checks for status changes every five seconds and fixes durations at the recorded
+completion time. Status labels and icons for displayed runs update automatically.
+On active run and job pages, status changes also refresh the job list, runner
+assignment, and available actions without interrupting logs or resetting log
+controls and expanded steps. Status updates on run and job pages wait while
+keyboard focus or selected text is inside the area being refreshed, then resume
+on the next poll after the interaction ends. Runs and jobs without execution
+timestamps show a dash, including queued runs and skipped jobs.
 The run list keeps updating durations for its displayed runs even when newer
 runs arrive.
 Step headings, including composite steps and post actions, show elapsed time
