@@ -27,7 +27,7 @@ CHART_CRD_DIR := $(CHART_DIR)/templates/crds
 CHART_REGISTRY ?= oci://ghcr.io/kelos-dev/charts
 RELEASE_PLATFORMS ?= linux/amd64 linux/arm64 darwin/amd64 darwin/arm64
 
-.PHONY: all build fmt generate manifests update verify test image manifest release-binaries release-chart publish-chart test-e2e ginkgo
+.PHONY: all build fmt generate manifests update verify test test-artifact-actions image manifest release-binaries release-chart publish-chart test-e2e ginkgo
 
 all: build
 
@@ -99,6 +99,9 @@ verify:
 
 test:
 	CGO_ENABLED=$(if $(findstring -race,$(TEST_FLAGS)),1,$(shell go env CGO_ENABLED)) go test $(TEST_FLAGS) ./...
+
+test-artifact-actions:
+	go test -tags=artifactintegration -run '^TestArtifactActions$$' -count=1 -timeout=10m $(TEST_FLAGS) ./internal/runner
 
 image:
 	@set -e; for dir in $(or $(WHAT),$(IMAGE_DIRS)); do \
