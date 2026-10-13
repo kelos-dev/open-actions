@@ -2258,7 +2258,7 @@ func TestReadKeyValueFile(t *testing.T) {
 func TestFailedActionDownloadUsesFreshDirectory(t *testing.T) {
 	directory := t.TempDir()
 	downloadDirectories := []string{}
-	resolver := newActionResolver("https://github.example", directory, []string{"PATH=/usr/bin"}, "action-token", func(_ context.Context, command string, arguments []string, _ string, _ []string) error {
+	resolver := newActionResolver(slog.New(slog.NewTextHandler(io.Discard, nil)), "https://github.example", directory, []string{"PATH=/usr/bin"}, "action-token", actionDownloadRetryDelay, func(_ context.Context, command string, arguments []string, _ string, _ []string) error {
 		if command == "git" && len(arguments) >= 3 && arguments[0] == "init" {
 			downloadDirectories = append(downloadDirectories, arguments[2])
 			if err := os.MkdirAll(arguments[2], 0o755); err != nil {
@@ -3052,6 +3052,7 @@ func testExecutorWithEnvironment(t *testing.T, environment []string, stdout, std
 	if err != nil {
 		t.Fatal(err)
 	}
+	executor.retryDelay = func(int) time.Duration { return 0 }
 	return executor
 }
 

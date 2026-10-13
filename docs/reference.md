@@ -881,6 +881,13 @@ An unavailable action therefore fails preparation even when its step would be
 skipped. This keeps action download authentication out of workflow inputs and
 the step environment.
 
+Failed action fetches are attempted up to four times with the same credentials.
+The runner waits 1, 2, and 4 seconds before retries, each with up to one additional
+second of random delay. This allows newly issued GitHub App tokens time to
+propagate and tolerates brief network failures. Retries are logged and stop when
+the job is canceled or its timeout expires. If all attempts fail, the job fails
+before any workflow step runs.
+
 For pull request events, Open Actions applies its merge checkout integration to
 `actions/checkout` and compatible forks whose repository is named `checkout`.
 An action with that repository name must implement the `actions/checkout`

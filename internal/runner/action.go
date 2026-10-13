@@ -5,11 +5,14 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"log/slog"
+	"math/rand/v2"
 	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/kelos-dev/open-actions/internal/actionref"
 	workflowexpression "github.com/kelos-dev/open-actions/internal/expression"
@@ -42,10 +45,12 @@ type actionRuns struct {
 }
 
 type actionResolver struct {
+	logger        *slog.Logger
 	cloneBaseURL  string
 	directory     string
 	environment   []string
 	actionToken   string
+	retryDelay    func(int) time.Duration
 	execute       func(context.Context, string, []string, string, []string) error
 	repositories  map[string]string
 	actions       map[string]preparedAction
@@ -69,12 +74,14 @@ type actionInvocation struct {
 	outputs    map[string]string
 }
 
-func newActionResolver(cloneBaseURL, directory string, environment []string, actionToken string, executeCommand func(context.Context, string, []string, string, []string) error) *actionResolver {
+func newActionResolver(logger *slog.Logger, cloneBaseURL, directory string, environment []string, actionToken string, retryDelay func(int) time.Duration, executeCommand func(context.Context, string, []string, string, []string) error) *actionResolver {
 	return &actionResolver{
+		logger:       logger,
 		cloneBaseURL: strings.TrimSuffix(cloneBaseURL, "/"),
 		directory:    directory,
 		environment:  environment,
 		actionToken:  actionToken,
+		retryDelay:   retryDelay,
 		execute:      executeCommand,
 		repositories: map[string]string{},
 		actions:      map[string]preparedAction{},
@@ -225,18 +232,49 @@ func ActionTokenRequired(plan *Plan) bool {
 func (r *actionResolver) download(ctx context.Context, reference actionref.Reference, directory string) error {
 	remoteURL := r.cloneBaseURL + "/" + url.PathEscape(reference.Owner) + "/" + url.PathEscape(reference.Repository)
 	environment := actionDownloadEnvironment(r.environment, remoteURL, r.actionToken)
-	commands := [][]string{
-		{"git", "init", "--quiet", directory},
-		{"git", "-C", directory, "remote", "add", "origin", remoteURL},
-		{"git", "-C", directory, "fetch", "--quiet", "--depth=1", "origin", reference.Ref},
-		{"git", "-C", directory, "checkout", "--quiet", "--detach", "FETCH_HEAD"},
+	commands := []struct {
+		arguments []string
+		attempts  int
+	}{
+		{[]string{"init", "--quiet", directory}, 1},
+		{[]string{"-C", directory, "remote", "add", "origin", remoteURL}, 1},
+		{[]string{"-C", directory, "fetch", "--quiet", "--depth=1", "origin", reference.Ref}, 4},
+		{[]string{"-C", directory, "checkout", "--quiet", "--detach", "FETCH_HEAD"}, 1},
 	}
 	for _, command := range commands {
-		if err := r.execute(ctx, command[0], command[1:], r.directory, environment); err != nil {
+		var err error
+		for attempt := 1; attempt <= command.attempts; attempt++ {
+			if err = ctx.Err(); err != nil {
+				break
+			}
+			err = r.execute(ctx, "git", command.arguments, r.directory, environment)
+			if ctx.Err() != nil {
+				err = ctx.Err()
+				break
+			}
+			if err == nil || attempt == command.attempts {
+				break
+			}
+			// A newly issued installation token may not have reached every GitHub
+			// replica. Retry the fetch with the same token while it propagates.
+			delay := r.retryDelay(attempt)
+			r.logger.Warn("Retrying action download", "action", reference.Owner+"/"+reference.Repository+"@"+reference.Ref, "attempt", attempt+1, "retry_after", delay)
+			timer := time.NewTimer(delay)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+			case <-timer.C:
+			}
+		}
+		if err != nil {
 			return fmt.Errorf("download action %s/%s@%s: %w", reference.Owner, reference.Repository, reference.Ref, err)
 		}
 	}
 	return nil
+}
+
+func actionDownloadRetryDelay(attempt int) time.Duration {
+	return time.Second<<(attempt-1) + time.Duration(rand.Int64N(int64(time.Second)))
 }
 
 func actionDownloadEnvironment(environment []string, remoteURL, token string) []string {
