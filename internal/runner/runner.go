@@ -170,6 +170,7 @@ type Executor struct {
 	runnerName  string
 	githubToken string
 	actionToken string
+	retryDelay  func(int) time.Duration
 	secrets     map[string]string
 	variables   map[string]string
 	environment []string
@@ -257,6 +258,7 @@ func NewExecutor(config ExecutorConfig) (*Executor, error) {
 		runnerName:  config.RunnerName,
 		githubToken: config.GitHubToken,
 		actionToken: config.ActionToken,
+		retryDelay:  actionDownloadRetryDelay,
 		secrets:     cloneStringMap(config.Secrets),
 		variables:   cloneStringMap(config.Variables),
 		environment: append([]string(nil), config.Environment...),
@@ -512,7 +514,7 @@ func (e *Executor) executePlan(ctx context.Context, plan *Plan, workspace string
 		githubToken:        e.githubToken,
 		secrets:            e.secrets,
 		variables:          e.variables,
-		resolver:           newActionResolver(plan.Repository.ActionCloneBaseURL, filepath.Join(temporaryDirectory, "actions"), environment, actionTokenForClone(plan, e.actionToken), e.executeCommand),
+		resolver:           newActionResolver(e.logger, plan.Repository.ActionCloneBaseURL, filepath.Join(temporaryDirectory, "actions"), environment, actionTokenForClone(plan, e.actionToken), e.retryDelay, e.executeCommand),
 		stepOutputs:        map[string]map[string]any{},
 		jobStatus:          workflowStepStatus(false, false),
 		resolvedContent:    jobContentBytes,
