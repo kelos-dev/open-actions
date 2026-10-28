@@ -44,8 +44,8 @@ jobs:
     env:
       DEV_CLUSTER_API_HOSTNAME: dev-cluster.kelos.dev
       OPEN_ACTIONS_IMAGE_TAG: sha-${{ github.event.workflow_run.head_sha || github.sha }}
-      CLOUDFLARED_VERSION: 2026.7.1
-      CLOUDFLARED_DEB_SHA256: 79f790b45e6a9152c6cf63f60f4901e3d8a029f7f4be1345a24cd2373aba8e7d
+      CLOUDFLARED_VERSION: 2026.10.5
+      CLOUDFLARED_DEB_SHA256: 149d1ec4ac8e58bdbf08a41cc42347da9184d9fb4ef0df6528d75c90a85ac0ed
     steps:
       - uses: actions/checkout@v4
         with:
