@@ -75,6 +75,34 @@ jobs:
           go test -race ./...
           printf 'runner tool baseline works\n'
           printf 'open actions e2e works\n'
+      - name: Verify orphan process reaping
+        run: |
+          directory="$(mktemp -d "$RUNNER_TEMP/reaping.XXXXXX")"
+          node - "$directory" <<'NODE'
+          const fs = require('node:fs');
+          const { spawn } = require('node:child_process');
+          const directory = process.argv[2];
+          const child = spawn(process.execPath, ['-e',
+            'const fs = require("node:fs"); const timer = setInterval(() => { if (fs.existsSync(process.argv[1])) clearInterval(timer); }, 10);',
+            directory + '/exit',
+          ], { detached: true, stdio: 'ignore' });
+          fs.writeFileSync(directory + '/pid', String(child.pid));
+          child.unref();
+          NODE
+          pid="$(cat "$directory/pid")"
+          touch "$directory/exit"
+          for attempt in {1..100}; do
+            if [ ! -e "/proc/$pid" ]; then
+              break
+            fi
+            sleep 0.05
+          done
+          if [ -e "/proc/$pid" ]; then
+            cat "/proc/$pid/status" >&2
+            exit 1
+          fi
+          rm -r "$directory"
+          printf 'orphan process reaping works\n'
       - name: Verify Docker execution
         run: |
           CGO_ENABLED=0 go build -o docker-e2e ./cmd/docker-e2e
