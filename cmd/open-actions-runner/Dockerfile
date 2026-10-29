@@ -18,7 +18,7 @@ ARG GH_VERSION=2.98.0
 ARG KUBECTL_VERSION=1.35.8
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends build-essential ca-certificates curl git jq make netcat-openbsd openssl passwd \
+    && apt-get install -y --no-install-recommends build-essential ca-certificates curl git jq make netcat-openbsd openssl passwd tini \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --gid 65532 open-actions \
     && useradd --uid 65532 --gid 65532 --create-home open-actions
@@ -57,4 +57,4 @@ ENV PATH=/usr/local/go/bin:${PATH}
 
 USER 65532:65532
 WORKDIR /workspace
-ENTRYPOINT ["/open-actions-runner"]
+ENTRYPOINT ["/usr/bin/tini", "--", "/open-actions-runner"]

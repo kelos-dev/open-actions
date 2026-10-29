@@ -951,8 +951,9 @@ cluster according to the Kubernetes
 [version-skew policy](https://kubernetes.io/releases/version-skew-policy/).
 
 The image runs as numeric user and group `65532:65532` under the restricted
-workflow Pod security context. It remains intentionally different from a
-GitHub-hosted Ubuntu virtual machine, where GitHub documents
+workflow Pod security context. Its entrypoint uses Tini to reap orphaned child
+processes and forward termination signals to the runner. It remains intentionally
+different from a GitHub-hosted Ubuntu virtual machine, where GitHub documents
 [passwordless `sudo`](https://docs.github.com/en/actions/reference/runners/github-hosted-runners#administrative-privileges).
 The workflow container has no `sudo` access and cannot install Debian packages
 or modify system paths at runtime. It does not provide the full GitHub-hosted
