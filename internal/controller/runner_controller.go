@@ -17,6 +17,7 @@ import (
 	"github.com/kelos-dev/open-actions/internal/cache"
 	"github.com/kelos-dev/open-actions/internal/eventsnapshot"
 	githubclient "github.com/kelos-dev/open-actions/internal/github"
+	"github.com/kelos-dev/open-actions/internal/joblog"
 	actionmetrics "github.com/kelos-dev/open-actions/internal/metrics"
 	"github.com/kelos-dev/open-actions/internal/runner"
 	batchv1 "k8s.io/api/batch/v1"
@@ -679,6 +680,25 @@ func (r *RunnerReconciler) executeWorkflowJob(ctx context.Context, runnerObject 
 	if actionInstallation != nil {
 		actionToken = actionInstallation.Token()
 	}
+	archive := ""
+	if r.ArtifactResultsURL != "" {
+		archive = "true"
+	}
+	if workflowJob.Annotations[joblog.ArchiveAnnotation] != archive {
+		before := workflowJob.DeepCopy()
+		if workflowJob.Annotations == nil {
+			workflowJob.Annotations = map[string]string{}
+		}
+		if archive == "" {
+			delete(workflowJob.Annotations, joblog.ArchiveAnnotation)
+		} else {
+			workflowJob.Annotations[joblog.ArchiveAnnotation] = archive
+		}
+		if err := r.Patch(ctx, workflowJob, client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{})); err != nil {
+			revokeInstallations()
+			return false, fmt.Errorf("configure log archive for WorkflowJob %q: %w", workflowJob.Name, err)
+		}
+	}
 	if err := r.ensureAuthSecret(ctx, workflowJob, jobInstallation.Token(), actionToken, artifactToken); err != nil {
 		revokeInstallations()
 		return false, err
@@ -1251,6 +1271,7 @@ func (r *RunnerReconciler) buildJob(workflowJob *actionsv1alpha1.WorkflowJob, ru
 				LocalObjectReference: corev1.LocalObjectReference{Name: childName(workflowJob.Name, "auth")}, Key: artifact.TokenSecretKey,
 			}}},
 			corev1.EnvVar{Name: runner.ArtifactResultsURLEnvVar, Value: r.ArtifactResultsURL},
+			corev1.EnvVar{Name: joblog.URLEnvVar, Value: r.ArtifactResultsURL},
 			corev1.EnvVar{Name: "GITHUB_RETENTION_DAYS", Value: strconv.Itoa(r.ArtifactMaxRetentionDays)},
 		)
 	}

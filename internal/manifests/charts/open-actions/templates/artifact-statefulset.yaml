@@ -53,6 +53,9 @@ spec:
           imagePullPolicy: {{ .Values.artifacts.image.pullPolicy }}
           args:
             - {{ printf "--public-url=http://open-actions-artifacts.%s.svc" .Release.Namespace | quote }}
+            - {{ printf "--log-retention-days=%d" (int64 .Values.artifacts.logRetentionDays) | quote }}
+            - {{ printf "--max-log-bytes=%d" (int64 .Values.artifacts.maxLogBytes) | quote }}
+            - {{ printf "--max-log-chunks=%d" (int64 .Values.artifacts.maxLogChunks) | quote }}
             - --storage-directory=/var/lib/open-actions/artifacts
             - {{ printf "--cache-enabled=%t" .Values.artifacts.cache.enabled | quote }}
             - {{ printf "--cache-max-entry-bytes=%d" (int64 .Values.artifacts.cache.maxEntryBytes) | quote }}
@@ -60,6 +63,7 @@ spec:
             - {{ printf "--cache-max-total-bytes=%d" (int64 .Values.artifacts.cache.maxTotalBytes) | quote }}
             - {{ printf "--cache-retention-days=%d" (int64 .Values.artifacts.cache.retentionDays) | quote }}
             - --signing-key-file=/var/run/secrets/open-actions-artifacts/signing-key
+            - --log-read-key-file=/var/run/secrets/open-actions-logs/read-key
             - {{ printf "--max-file-bytes=%d" (int64 .Values.artifacts.maxFileBytes) | quote }}
             - {{ printf "--max-artifact-bytes=%d" (int64 .Values.artifacts.maxArtifactBytes) | quote }}
             - {{ printf "--max-run-bytes=%d" (int64 .Values.artifacts.maxRunBytes) | quote }}
@@ -71,6 +75,9 @@ spec:
           volumeMounts:
             - name: artifact-storage
               mountPath: /var/lib/open-actions/artifacts
+            - name: log-read-auth
+              mountPath: /var/run/secrets/open-actions-logs
+              readOnly: true
             - name: artifact-auth
               mountPath: /var/run/secrets/open-actions-artifacts
               readOnly: true
@@ -102,6 +109,13 @@ spec:
         - name: artifact-storage
           emptyDir: {}
         {{- end }}
+        - name: log-read-auth
+          secret:
+            secretName: {{ default "open-actions-log-read-auth" .Values.artifacts.logReadKeySecretName }}
+            defaultMode: 0440
+            items:
+              - key: {{ .Values.artifacts.logReadKeyKey | quote }}
+                path: read-key
         - name: artifact-auth
           secret:
             secretName: {{ default "open-actions-artifact-auth" .Values.artifacts.signingKeySecretName }}

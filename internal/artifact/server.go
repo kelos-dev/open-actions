@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/kelos-dev/open-actions/internal/cache"
+	"github.com/kelos-dev/open-actions/internal/joblog"
 )
 
 const artifactServicePath = "/twirp/github.actions.results.api.v1.ArtifactService/"
@@ -27,6 +28,8 @@ type ServerConfig struct {
 	PublicURL  string
 	Store      *Store
 	CacheStore *cache.Store
+	Logs       *joblog.Store
+	LogReads   *joblog.ReadTokenCodec
 	Tokens     *TokenCodec
 	Logger     *slog.Logger
 	Now        func() time.Time
@@ -37,6 +40,8 @@ type Server struct {
 	publicURL  string
 	store      *Store
 	cacheStore *cache.Store
+	logs       *joblog.Store
+	logReads   *joblog.ReadTokenCodec
 	tokens     *TokenCodec
 	logger     *slog.Logger
 	now        func() time.Time
@@ -45,6 +50,9 @@ type Server struct {
 }
 
 func NewServer(config ServerConfig) (*Server, error) {
+	if config.Logs != nil && config.LogReads == nil {
+		return nil, errors.New("log read signing key is required with log storage")
+	}
 	if config.Address == "" || config.PublicURL == "" || config.Store == nil || config.Tokens == nil || config.Logger == nil {
 		return nil, errors.New("artifact server configuration is incomplete")
 	}
@@ -56,8 +64,9 @@ func NewServer(config ServerConfig) (*Server, error) {
 	if now == nil {
 		now = time.Now
 	}
-	server := &Server{address: config.Address, publicURL: strings.TrimSuffix(parsed.String(), "/"), store: config.Store, cacheStore: config.CacheStore, tokens: config.Tokens, logger: config.Logger, now: now}
+	server := &Server{address: config.Address, publicURL: strings.TrimSuffix(parsed.String(), "/"), store: config.Store, cacheStore: config.CacheStore, logs: config.Logs, logReads: config.LogReads, tokens: config.Tokens, logger: config.Logger, now: now}
 	mux := http.NewServeMux()
+	mux.HandleFunc(joblog.Path, server.jobLogs)
 	mux.HandleFunc("/healthz", server.health)
 	mux.HandleFunc("/readyz", server.readiness)
 	mux.HandleFunc(artifactServicePath+"CreateArtifact", server.createArtifact)
@@ -88,6 +97,11 @@ func (s *Server) Start(ctx context.Context) error {
 	if s.cacheStore != nil {
 		if err := s.cacheStore.Cleanup(); err != nil {
 			return fmt.Errorf("clean cache storage: %w", err)
+		}
+	}
+	if s.logs != nil {
+		if err := s.logs.Cleanup(); err != nil {
+			return fmt.Errorf("clean job log storage: %w", err)
 		}
 	}
 	listener, err := net.Listen("tcp", s.address)
@@ -125,6 +139,11 @@ func (s *Server) cleanup(ctx context.Context) {
 			if s.cacheStore != nil {
 				if err := s.cacheStore.Cleanup(); err != nil {
 					s.logger.Error("cache cleanup failed", "error", err)
+				}
+			}
+			if s.logs != nil {
+				if err := s.logs.Cleanup(); err != nil {
+					s.logger.Error("job log cleanup failed", "error", err)
 				}
 			}
 			if err := s.store.Cleanup(); err != nil {

@@ -17,8 +17,13 @@ the selected run and its WorkflowJobs. `open-actions run logs RUN` prints the
 runner logs for the job selected by `--job`; the selector accepts either a
 workflow-local job ID or a WorkflowJob resource name, with an exact resource
 name taking precedence. The selector is optional for single-job runs. Pass
-`--follow` to wait for the runner Pod when necessary and continue streaming its
-logs.
+`--follow` to continue streaming output while the job runs. For archived jobs,
+the CLI reads logs through the run's Console URL. Use `--console-url` to select
+another reachable Console origin, including a local port-forward. The Console
+must be available to read archived logs. If no Console URL is configured, the
+CLI reads retained Pod logs and warns that rotation may have truncated their
+history. Jobs without log archiving also use the Kubernetes Pod logs API.
+CLI output omits timestamps for both archived and Pod logs.
 
 ```console
 open-actions run list --namespace team-ci
@@ -26,8 +31,10 @@ open-actions run view ci-abc123 --namespace team-ci
 open-actions run logs ci-abc123 --job build --follow --namespace team-ci
 ```
 
-The CLI accesses these resources with the permissions of the selected
-kubeconfig user. It does not use the Console administrator token.
+The CLI discovers resources with the permissions of the selected kubeconfig
+user. Log downloads through the Console follow its public read-access policy;
+they do not forward Kubernetes credentials or use the Console administrator
+token.
 
 ### Controller and Console
 
@@ -111,6 +118,13 @@ sequences are discarded. Log lines larger than 256 KiB are truncated so a
 workflow cannot retain unbounded Console memory. Lines longer than 4,096
 characters initially render as previews; users can expand and collapse the
 complete retained line in place.
+
+With the artifact service enabled, runners archive masked output during job
+execution. The Console reads both live and completed output from that service,
+so kubelet log rotation and runner Pod deletion do not remove archived output.
+Reconnects replay the same ordered output and preserve log event IDs. An
+incomplete or expired archive reports an error instead of substituting Pod logs.
+See [Runner log retention](#runner-log-retention) for limits and configuration.
 
 The workflow run list, run summary, job list, log header, and log sidebar show
 execution durations in hours, minutes, and seconds. Job durations start when
@@ -323,11 +337,14 @@ open-actions-controller \
 open-actions-artifact-server \
   --public-url=http://open-actions-artifacts.open-actions-system.svc \
   --storage-directory=/var/lib/open-actions/artifacts \
-  --signing-key-file=/var/run/secrets/open-actions-artifacts/signing-key
+  --signing-key-file=/var/run/secrets/open-actions-artifacts/signing-key \
+  --log-read-key-file=/var/run/secrets/open-actions-logs/read-key
 
 open-actions-console \
   --github-api-url=https://github.example/api/v3 \
   --token-file=/var/run/secrets/open-actions-console/token \
+  --log-service-url=http://open-actions-artifacts.open-actions-system.svc \
+  --log-read-key-file=/var/run/secrets/open-actions-logs/read-key \
   --secure-cookie
 ```
 
@@ -1275,6 +1292,9 @@ their Pods carry the
 runner result format required to complete that job. Native Jobs also carry
 `actions.kelos.dev/job-deadline`: `startup` means deadline expiry is reported
 as `JobStartFailed`, while `execution` means it is reported as `JobTimedOut`.
+WorkflowJobs configured for archived logs carry the controller-owned
+`actions.kelos.dev/log-archive` annotation with value `"true"`. The Console and
+CLI use it to select the archived log source. Users must not set or modify it.
 
 Webhook-created WorkflowRuns use the workflow filename followed by a stable
 20-character digest of the project, delivery replay, and workflow path.
@@ -2021,14 +2041,14 @@ its headless Service governs Pod identity, while workflow jobs use the separate
 uploads or cleanup. The artifact service does not use the Kubernetes API and
 its service account token is not mounted.
 
-The controller and artifact service share a credential signing key. By default,
-the chart generates that key in the
+The controller and artifact service share an artifact credential signing key.
+By default, the chart generates that key in the
 `open-actions-artifact-auth` Secret. Set `artifacts.signingKeySecretName` and
 `artifacts.signingKeyKey` to use an externally managed key of at least 32 bytes.
 Anyone who can read the key can mint artifact credentials. After rotating an
-external key, restart the `open-actions-controller` Deployment and
-`open-actions-artifacts` StatefulSet; tokens and signed URLs issued with the
-previous key stop working.
+external key, restart the `open-actions-controller` Deployment and the
+`open-actions-artifacts` StatefulSet; tokens and signed URLs
+issued with the previous key stop working.
 
 Set
 `artifacts.persistence.existingClaim` to use a provisioned claim, or configure
@@ -2117,6 +2137,126 @@ see [issue #41](https://github.com/kelos-dev/open-actions/issues/41).
 The `cache-mode` inheritance rules for job calls to reusable workflows do not
 apply because reusable-workflow job calls are not supported.
 
+### Runner log retention
+
+When the controller has `--artifact-service-url` configured, it enables log
+archiving for jobs it starts. The runner uploads masked stdout, stderr, and
+runner lifecycle records to that service in ordered chunks while also writing
+to its container streams. Job-scoped artifact credentials authorize uploads;
+the Console signs short-lived credentials that can read one job's archive.
+Each WorkflowJob UID identifies its own archive, including rerun attempts.
+Archiving uses the same secret masking and `::add-mask::` processing as container
+output, following GitHub's
+[log masking rules](https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-commands#masking-a-value-in-a-log).
+
+The service acknowledges chunks after syncing them to disk. Retrying an
+identical chunk does not duplicate output. The runner uses a temporary spool
+bounded to 4 MiB. While running, it sends at most one partial chunk per
+one-second timer tick; full 256 KiB chunks can upload immediately. Smaller
+remainders wait for the next tick or final flushing. A full spool pauses output
+writes while uploads catch up,
+with a 30-second limit on a wait without upload progress. Job timeout,
+cancellation, or execution completion releases blocked output immediately.
+If execution stops with a full spool, its buffered output continues uploading
+within the retry and flush deadlines. Further output goes only to the container
+streams, and the archive is marked incomplete because output was omitted.
+The runner sends masked execution errors through the archive stream before
+final flushing.
+Setup failures, including incompatible job plans and missing input files, are
+also archived. Failures before the uploader starts use one timestamped upload
+bounded to 30 seconds and one chunk; oversized diagnostics are explicitly
+truncated. Credential and loaded Project Secret values are masked.
+Transient upload failures retry with backoff capped at five seconds, allowing
+jobs to continue through artifact-service restarts. Each request has a
+five-second timeout. Retries during execution are bounded by the job's execution
+and cleanup deadline. Final flushing waits up to 30 seconds within that
+deadline. Invalid or expired credentials, quota errors, spool
+errors, or an exhausted deadline stop archiving
+and are reported when the runner closes the archive. Container output and
+subsequent steps, including cleanup, continue; an archive failure fails an
+otherwise successful job after execution. Cancellation and timeout conclusions
+remain intact. Abrupt runner or node loss can lose unacknowledged output.
+
+Timed-out jobs remain readable in the Console even when their runner Pod has
+been deleted. On graceful timeout, the runner attempts to flush the remaining
+output and finalize the archive. If the Pod is forcibly terminated before
+finalization, readers show all acknowledged output, including a final line without a newline, then report
+that the archive is incomplete. If termination occurs before the first upload,
+there is no archived output to recover.
+
+Cancellation publishes a job's result before its runner finishes cleanup.
+Followers continue waiting for cleanup output until the runner container stops,
+or the five-minute cleanup allowance plus 30 seconds for flushing has elapsed
+after cancellation. Snapshots return the output available while cleanup is
+still running. If uploads stop without a final chunk, readers report that the
+archive is incomplete.
+
+`open-actions-artifact-server --log-retention-days` defaults to 7 and accepts
+1 through 3650 days. Retention starts at the most recent upload and applies to
+complete and incomplete archives. Expired output is unavailable immediately
+and is removed on service startup and by hourly cleanup. `--max-log-bytes`
+defaults to 1073741824 (1 GiB) of timestamped output per job.
+`--max-log-chunks` defaults to 32768 chunk files per job and must be positive;
+the completion record counts toward this limit. New chunks beyond either quota
+are rejected with HTTP 413, while identical retries of stored chunks remain
+valid. These limits are independent of artifact quotas and `retention-days`
+inputs. The Helm values are `artifacts.logRetentionDays`,
+`artifacts.maxLogBytes`, and `artifacts.maxLogChunks`.
+
+Archives share the artifact service's volume and survive service restarts when
+persistent storage is enabled. Size that volume for all retained artifacts,
+caches, and logs, including encoded storage overhead. Each chunk uses a separate
+file, so filesystem blocks and metadata consume capacity beyond `maxLogBytes`.
+Steady low-volume output can create one chunk file per second, or about 21,600
+files over six hours. Provision and monitor free filesystem inodes as well as
+bytes (`df -i` and `df -h` on the mounted volume). Budget one inode per retained
+chunk, plus job directories and artifact/cache files. For example, 300
+ten-minute jobs per day retained for seven days can produce about 1.26 million
+chunk files even when their output uses few bytes. The default `20Gi` PVC's
+inode capacity depends on its filesystem and formatting; a byte-sized volume
+alone does not ensure enough inodes. Exhausted inodes block log, artifact, and
+cache writes and can cause job failures. Size inode capacity for the retained
+job count and duration, or reduce retention; the per-job chunk cap does not
+bound aggregate inode use across jobs. Increase `maxLogChunks` when supporting
+longer jobs that need more per-second chunks.
+
+Deleting a WorkflowRun removes its
+Console log routes but leaves archive bytes until log retention expires.
+`artifacts.enabled=false` disables archiving for jobs started afterward;
+`artifacts.persistence.enabled=false` loses archives when the service Pod is
+replaced. Existing jobs keep the log source selected when they were started.
+
+For a manual installation, configure the Console with `--log-service-url` and
+`--log-read-key-file` together. The Console and artifact server require the same
+dedicated log-read key of at least 32 bytes; pass its path to the artifact server
+with `--log-read-key-file` as well. The artifact server rejects a read key that
+matches its artifact credential signing key. The Helm chart generates the
+log-read key in `open-actions-log-read-auth`, mounts it in those two components,
+and keeps the artifact signing key out of the Console's volumes. Configure an
+external read-key Secret with `artifacts.logReadKeySecretName` and
+`artifacts.logReadKeyKey`. Restart the Console Deployment and artifact
+StatefulSet after rotating the read key. This rotation invalidates log-read
+tokens without changing artifact credentials.
+
+Archived logs have the same public read access as other Console logs; protect
+the Console's ingress when workflow output is private. The CLI rejects login
+redirects and unexpected response formats; use `--console-url` with a local
+port-forward to access a Console behind browser-based authentication. Its HTTP
+transport honors the standard proxy environment settings. Downloads carry
+heartbeat records every 15 seconds while following queued or quiet jobs, and
+completion and error records in the response body. The CLI emits only log
+bytes, and reports an error if the completion record is missing. Gateways must
+allow streaming responses with buffering disabled; `X-Accel-Buffering: no`
+is sent by the Console.
+
+When upgrading an installation, upgrade the artifact service and Console, then
+update every Runner image to an archiving-capable runner binary before
+upgrading the controller. A runner without archiving support cannot provide an
+archive for a job that the controller starts with archiving enabled. Jobs
+started without archiving continue reading retained Pod logs, whose history is
+limited to the current kubelet log file, as documented by
+[Kubernetes](https://kubernetes.io/docs/concepts/cluster-administration/logging/#log-rotation).
+
 ### Execution constraints
 
 External actions must use the `node20`, `node24`, or composite runtime and be
@@ -2161,12 +2301,13 @@ never interpreted as literal values.
 `WorkflowJob` resources are not retried or reassigned when a Runner is removed.
 Completed native Jobs and runner Pods are retained with their WorkflowRun.
 WorkflowRuns are retained indefinitely unless `spec.ttlSecondsAfterFinished` is
-set. When that TTL expires, the WorkflowRun, its Jobs and Pods, and their logs
-are deleted. Console reruns require the original and latest WorkflowRuns to
-remain available. Selective reruns also require the WorkflowJobs that provide
-the selected jobs' latest prerequisite results and outputs. Open Actions does
-not archive logs outside Kubernetes, so cluster-level log rotation and node
-retention policies still apply.
+set. When that TTL expires, the WorkflowRun and its Jobs and Pods are deleted,
+and their Console log routes become unavailable. Console reruns require the
+original and latest WorkflowRuns to remain available. Selective reruns also
+require the WorkflowJobs that provide the selected jobs' latest prerequisite
+results and outputs. Archived logs follow the separate log retention policy.
+For jobs started without archiving, kubelet log rotation and node retention
+policies still limit available output.
 
 ## Webhook API
 

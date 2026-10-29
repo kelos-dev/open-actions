@@ -129,7 +129,7 @@ func (s *testLogSource) ListPods(context.Context, string, string) (*corev1.PodLi
 	return &corev1.PodList{Items: []corev1.Pod{*s.pod.DeepCopy()}}, nil
 }
 
-func (s *testLogSource) Stream(context.Context, string, string) (io.ReadCloser, error) {
+func (s *testLogSource) Stream(context.Context, string, string, bool) (io.ReadCloser, error) {
 	return io.NopCloser(strings.NewReader(s.logs)), nil
 }
 

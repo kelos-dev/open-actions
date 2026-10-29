@@ -29,6 +29,10 @@ spec:
           image: "{{ .Values.console.image.repository }}:{{ .Values.console.image.tag }}"
           imagePullPolicy: {{ .Values.console.image.pullPolicy }}
           args:
+            {{- if .Values.artifacts.enabled }}
+            - {{ printf "--log-service-url=http://open-actions-artifacts.%s.svc" .Release.Namespace | quote }}
+            - --log-read-key-file=/var/run/secrets/open-actions-logs/read-key
+            {{- end }}
             - {{ printf "--github-api-url=%s" .Values.controller.githubAPIURL | quote }}
             - "--token-file=/var/run/secrets/open-actions-console/token"
             {{- if index .Values.console "allowAnonymousWorkflowRuns" }}
@@ -63,10 +67,23 @@ spec:
               drop: [ALL]
             readOnlyRootFilesystem: true
           volumeMounts:
+            {{- if .Values.artifacts.enabled }}
+            - name: log-read-auth
+              mountPath: /var/run/secrets/open-actions-logs
+              readOnly: true
+            {{- end }}
             - name: authentication
               mountPath: /var/run/secrets/open-actions-console
               readOnly: true
       volumes:
+        {{- if .Values.artifacts.enabled }}
+        - name: log-read-auth
+          secret:
+            secretName: {{ default "open-actions-log-read-auth" .Values.artifacts.logReadKeySecretName }}
+            items:
+              - key: {{ .Values.artifacts.logReadKeyKey | quote }}
+                path: read-key
+        {{- end }}
         - name: authentication
           secret:
             secretName: {{ default "open-actions-console-auth" .Values.console.secretName }}
