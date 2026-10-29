@@ -6,13 +6,19 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/kelos-dev/open-actions/internal/artifact"
 	"github.com/kelos-dev/open-actions/internal/endpointurl"
+	"github.com/kelos-dev/open-actions/internal/joblog"
+	"k8s.io/client-go/kubernetes"
+	ctrl "sigs.k8s.io/controller-runtime"
 )
 
 func main() {
@@ -35,11 +41,17 @@ func runArtifactServer(ctx context.Context, arguments []string) error {
 	maxRunBytes := flags.Int64("max-run-bytes", 10<<30, "Maximum stored artifact bytes in one workflow run attempt")
 	defaultRetentionDays := flags.Int("default-retention-days", 7, "Default artifact retention in days")
 	maxRetentionDays := flags.Int("max-retention-days", 30, "Maximum artifact retention in days")
+	logTokenFile := flags.String("log-read-token-file", "", "File containing the job log archive read token; omit to disable collection")
+	logMaxBytes := flags.Int64("log-max-bytes", 100<<20, "Maximum archived log bytes per runner Pod")
+	logRetentionDays := flags.Int("log-retention-days", 7, "Archived job log retention in days after the last update")
 	if err := flags.Parse(arguments); err != nil {
 		return err
 	}
 	if *publicURL == "" || *storageDirectory == "" || *signingKeyFile == "" {
 		return errors.New("public-url, storage-directory, and signing-key-file are required")
+	}
+	if *logMaxBytes <= 0 || *logRetentionDays < 1 || *logRetentionDays > 3650 {
+		return errors.New("job log byte limit must be positive and retention must be between 1 and 3650 days")
 	}
 	normalizedPublicURL, err := endpointurl.NormalizeOrigin(*publicURL, "Artifact service URL")
 	if err != nil {
@@ -70,11 +82,58 @@ func runArtifactServer(ctx context.Context, arguments []string) error {
 		return err
 	}
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	var logHandler http.Handler
+	var collector *joblog.Collector
+	if *logTokenFile != "" {
+		token, err := os.ReadFile(*logTokenFile)
+		if err != nil {
+			return fmt.Errorf("read job log archive token: %w", err)
+		}
+		logs, err := joblog.NewStore(filepath.Join(*storageDirectory, "job-logs"), *logMaxBytes, time.Duration(*logRetentionDays)*24*time.Hour)
+		if err != nil {
+			return err
+		}
+		if err := logs.Cleanup(); err != nil {
+			return fmt.Errorf("clean job log archive: %w", err)
+		}
+		logHandler, err = joblog.NewHandler(logs, strings.TrimSpace(string(token)))
+		if err != nil {
+			return err
+		}
+		configuration, err := ctrl.GetConfig()
+		if err != nil {
+			return fmt.Errorf("load log collector Kubernetes configuration: %w", err)
+		}
+		clientset, err := kubernetes.NewForConfig(configuration)
+		if err != nil {
+			return err
+		}
+		collector, err = joblog.NewCollector(joblog.KubernetesPods{Client: clientset}, logs, logger)
+		if err != nil {
+			return err
+		}
+	}
 	server, err := artifact.NewServer(artifact.ServerConfig{
-		Address: *bindAddress, PublicURL: normalizedPublicURL, Store: store, Tokens: tokens, Logger: logger,
+		Address: *bindAddress, PublicURL: normalizedPublicURL, Store: store, Tokens: tokens, Logger: logger, LogHandler: logHandler,
 	})
 	if err != nil {
 		return err
 	}
-	return server.Start(ctx)
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	if collector == nil {
+		return server.Start(ctx)
+	}
+	collectorErrors := make(chan error, 1)
+	serverErrors := make(chan error, 1)
+	go func() { collectorErrors <- collector.Run(ctx) }()
+	go func() { serverErrors <- server.Start(ctx) }()
+	select {
+	case err := <-collectorErrors:
+		cancel()
+		return errors.Join(err, <-serverErrors)
+	case err := <-serverErrors:
+		cancel()
+		return errors.Join(err, <-collectorErrors)
+	}
 }

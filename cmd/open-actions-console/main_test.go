@@ -93,3 +93,16 @@ func TestReadinessWaitsForWorkflowRunCache(t *testing.T) {
 		})
 	}
 }
+
+func TestRunConsoleRequiresBothArchiveOptions(t *testing.T) {
+	tokenFile := filepath.Join(t.TempDir(), "token")
+	if err := os.WriteFile(tokenFile, []byte("console-token"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, flag := range []string{"--log-archive-url=http://archive", "--log-archive-token-file=token"} {
+		err := runConsole(context.Background(), []string{"--token-file=" + tokenFile, flag})
+		if err == nil || !strings.Contains(err.Error(), "must be specified together") {
+			t.Fatalf("configuration error = %v", err)
+		}
+	}
+}

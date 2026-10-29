@@ -55,12 +55,13 @@ storage for content and metadata and retains the claim when the StatefulSet is
 deleted or scaled down. The StatefulSet replaces its only Pod sequentially;
 its headless Service governs Pod identity, while workflow jobs use the separate
 `open-actions-artifacts` ClusterIP Service. Controller rollouts do not interrupt
-artifact traffic. The artifact service has no Kubernetes API access and does
-not mount a service account token. Set
+artifact traffic. With `artifacts.logs.enabled=true`, the service also collects
+runner logs and mounts a service account token with read access to Pods and
+their logs. Set
 `artifacts.persistence.existingClaim` to mount a claim managed outside the
 StatefulSet; that claim must be writable by the artifact Pod's supplemental
-group `65532`. Size the volume for all artifacts retained across Projects and
-attempts; `artifacts.maxRunBytes` is a per-attempt quota, not a volume-wide
+group `65532`. Size the volume for all artifacts and logs retained across
+Projects and attempts; `artifacts.maxRunBytes` is a per-attempt quota, not a volume-wide
 quota. Storage administrators and principals that can mount or snapshot the
 claim can read artifact content. Use storage-class encryption and access
 controls appropriate for workflow output.
@@ -77,8 +78,22 @@ credentials signed with the previous key stop working.
 
 `artifacts.persistence.enabled=false` replaces the claim with an `emptyDir`.
 That setting is suitable for disposable test clusters only because an artifact
-Pod replacement loses every artifact. `artifacts.enabled=false` omits the
+Pod replacement loses every artifact and log archive. `artifacts.enabled=false` omits the
 artifact Service and does not issue artifact runtime credentials to jobs.
+
+Runner log archives are enabled by default. The Console falls back to archived
+output when Pod logs are unavailable, including after native Job deadlines
+and cancellation. The chart creates a separate `open-actions-log-auth` Secret
+and reuses its read token across upgrades. `artifacts.logs.secretName` and
+`artifacts.logs.tokenKey` select an externally managed read token. This token
+can read logs across all namespaces and must be limited to trusted
+administrators; workflow Pods do not receive it. Restart the artifact service
+and Console after rotating the token. Set `artifacts.logs.enabled=false` to
+disable collection, the read endpoint, and the collector's Kubernetes API
+access. Log archives default to 100 MiB per Pod and seven days of retention
+after the last update, independently of WorkflowRun TTL and artifact quotas.
+See [archived runner logs](../../../../../docs/reference.md#archived-runner-logs)
+for CLI access, incomplete-log warnings, and collection limits.
 
 Set each component's `resources.requests` and `resources.limits` in the values
 file passed to `open-actions install`. Resource lists accept Kubernetes resource
@@ -115,6 +130,11 @@ controller:
 | `artifacts.image.pullPolicy` | `IfNotPresent` | Artifact service image pull policy |
 | `artifacts.signingKeySecretName` | `""` | Existing credential signing Secret; the chart creates `open-actions-artifact-auth` when empty |
 | `artifacts.signingKeyKey` | `signing-key` | Secret key containing at least 32 bytes of signing material |
+| `artifacts.logs.enabled` | `true` | Collect runner logs on the artifact volume and enable Console archive fallback |
+| `artifacts.logs.secretName` | `""` | Existing archive read-token Secret; creates `open-actions-log-auth` when empty |
+| `artifacts.logs.tokenKey` | `token` | Secret key containing the archive read token |
+| `artifacts.logs.maxBytes` | `104857600` | Maximum archived log bytes per runner Pod |
+| `artifacts.logs.retentionDays` | `7` | Days to retain logs after their last update |
 | `artifacts.defaultRetentionDays` | `7` | Retention used when an upload omits `retention-days` |
 | `artifacts.maxRetentionDays` | `30` | Maximum accepted artifact retention and value exposed to upload actions |
 | `artifacts.maxFileBytes` | `1073741824` | Maximum uncompressed size of one file |

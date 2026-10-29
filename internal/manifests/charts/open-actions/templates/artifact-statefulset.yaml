@@ -37,7 +37,7 @@ spec:
         app.kubernetes.io/component: artifacts
     spec:
       serviceAccountName: open-actions-artifacts
-      automountServiceAccountToken: false
+      automountServiceAccountToken: {{ .Values.artifacts.logs.enabled }}
       securityContext:
         runAsNonRoot: true
         fsGroup: 65532
@@ -57,6 +57,11 @@ spec:
             - {{ printf "--max-run-bytes=%d" (int64 .Values.artifacts.maxRunBytes) | quote }}
             - {{ printf "--default-retention-days=%d" (int64 .Values.artifacts.defaultRetentionDays) | quote }}
             - {{ printf "--max-retention-days=%d" (int64 .Values.artifacts.maxRetentionDays) | quote }}
+            {{- if .Values.artifacts.logs.enabled }}
+            - --log-read-token-file=/var/run/secrets/open-actions-logs/token
+            - {{ printf "--log-max-bytes=%d" (int64 .Values.artifacts.logs.maxBytes) | quote }}
+            - {{ printf "--log-retention-days=%d" (int64 .Values.artifacts.logs.retentionDays) | quote }}
+            {{- end }}
           ports:
             - name: http
               containerPort: 8080
@@ -66,6 +71,11 @@ spec:
             - name: artifact-auth
               mountPath: /var/run/secrets/open-actions-artifacts
               readOnly: true
+            {{- if .Values.artifacts.logs.enabled }}
+            - name: log-auth
+              mountPath: /var/run/secrets/open-actions-logs
+              readOnly: true
+            {{- end }}
           readinessProbe:
             httpGet:
               path: /readyz
@@ -101,6 +111,15 @@ spec:
             items:
               - key: {{ .Values.artifacts.signingKeyKey }}
                 path: signing-key
+        {{- if .Values.artifacts.logs.enabled }}
+        - name: log-auth
+          secret:
+            secretName: {{ default "open-actions-log-auth" .Values.artifacts.logs.secretName }}
+            defaultMode: 0440
+            items:
+              - key: {{ .Values.artifacts.logs.tokenKey | quote }}
+                path: token
+        {{- end }}
       terminationGracePeriodSeconds: 10
   {{- if and .Values.artifacts.persistence.enabled (not .Values.artifacts.persistence.existingClaim) }}
   volumeClaimTemplates:

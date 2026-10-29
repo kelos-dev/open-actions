@@ -35,8 +35,9 @@ import (
 const testConsoleToken = "test-console-token"
 
 type testLogSource struct {
-	pod  *corev1.Pod
-	logs string
+	pod       *corev1.Pod
+	logs      string
+	streamErr error
 }
 
 var testHeadRevision = strings.Repeat("d", 40)
@@ -126,10 +127,16 @@ func TestConsoleTopbarsUseConsistentSpacing(t *testing.T) {
 }
 
 func (s *testLogSource) ListPods(context.Context, string, string) (*corev1.PodList, error) {
+	if s.pod == nil {
+		return &corev1.PodList{}, nil
+	}
 	return &corev1.PodList{Items: []corev1.Pod{*s.pod.DeepCopy()}}, nil
 }
 
 func (s *testLogSource) Stream(context.Context, string, string) (io.ReadCloser, error) {
+	if s.streamErr != nil {
+		return nil, s.streamErr
+	}
 	return io.NopCloser(strings.NewReader(s.logs)), nil
 }
 
@@ -1910,5 +1917,51 @@ func TestConsoleSelectiveRerunReplacesDeferredPlaceholder(t *testing.T) {
 	}
 	if len(jobs) != 0 {
 		t.Fatalf("pending matrix retry inherited superseded jobs: %#v", jobs)
+	}
+}
+
+type testLogArchive struct {
+	namespace, uid string
+	timestamps     bool
+	err            error
+}
+
+func (a *testLogArchive) Open(_ context.Context, namespace, uid string, timestamps bool) (io.ReadCloser, error) {
+	a.namespace, a.uid, a.timestamps = namespace, uid, timestamps
+	if a.err != nil {
+		return nil, a.err
+	}
+	return io.NopCloser(strings.NewReader("2026-10-29T01:00:00Z archived output\n")), nil
+}
+
+func TestConsoleReadsArchivedLogsAfterTimeout(t *testing.T) {
+	for _, missingPod := range []bool{true, false} {
+		t.Run(fmt.Sprintf("missing Pod %t", missingPod), func(t *testing.T) {
+			archive := &testLogArchive{}
+			handler := newTestHandler(t, false, func(config *Config) { config.LogArchive = archive })
+			source := handler.logs.(*testLogSource)
+			if missingPod {
+				source.pod = nil
+			} else {
+				source.streamErr = errors.New("Pod logs are gone")
+			}
+			job := &actionsv1alpha1.WorkflowJob{}
+			if err := handler.client.Get(context.Background(), client.ObjectKey{Namespace: "default", Name: "build"}, job); err != nil {
+				t.Fatal(err)
+			}
+			job.Status.Result = actionsv1alpha1.WorkflowJobResultFailure
+			job.Status.Conditions = []metav1.Condition{{Type: actionsv1alpha1.WorkflowJobConditionSucceeded, Status: metav1.ConditionFalse, Reason: "JobTimedOut"}}
+			if err := handler.client.Update(context.Background(), job); err != nil {
+				t.Fatal(err)
+			}
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/runs/default/ci/jobs/build/stream", nil))
+			if !strings.Contains(response.Body.String(), `"text":"archived output","time":"2026-10-29T01:00:00Z"`) || !strings.Contains(response.Body.String(), "event: end") {
+				t.Fatalf("archive response = %s", response.Body.String())
+			}
+			if archive.namespace != "default" || archive.uid != "job-uid" || !archive.timestamps {
+				t.Fatalf("archive request = %+v", archive)
+			}
+		})
 	}
 }

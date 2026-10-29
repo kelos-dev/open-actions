@@ -26,6 +26,7 @@ import (
 	actionsv1alpha1 "github.com/kelos-dev/open-actions/api/v1alpha1"
 	"github.com/kelos-dev/open-actions/internal/eventsnapshot"
 	githubclient "github.com/kelos-dev/open-actions/internal/github"
+	"github.com/kelos-dev/open-actions/internal/joblog"
 	"github.com/kelos-dev/open-actions/internal/projectvalue"
 	"github.com/kelos-dev/open-actions/internal/workflow"
 	"github.com/kelos-dev/open-actions/internal/workflowrun"
@@ -86,6 +87,7 @@ type Config struct {
 	Client                             client.Client
 	WorkflowRuns                       RecentWorkflowRuns
 	Logs                               LogSource
+	LogArchive                         joblog.Archive
 	Repositories                       RepositoryResolver
 	Token                              string
 	AllowAnonymousWorkflowRuns         bool
@@ -99,6 +101,7 @@ type Handler struct {
 	client                             client.Client
 	workflowRuns                       RecentWorkflowRuns
 	logs                               LogSource
+	logArchive                         joblog.Archive
 	repositories                       RepositoryResolver
 	tokenDigest                        [sha256.Size]byte
 	sessionValue                       string
@@ -352,7 +355,7 @@ func New(config Config) (*Handler, error) {
 		workflowRunTTLSecondsAfterFinished = &value
 	}
 	return &Handler{
-		client: config.Client, workflowRuns: config.WorkflowRuns, logs: config.Logs, repositories: config.Repositories, tokenDigest: tokenDigest,
+		client: config.Client, workflowRuns: config.WorkflowRuns, logs: config.Logs, logArchive: config.LogArchive, repositories: config.Repositories, tokenDigest: tokenDigest,
 		sessionValue: sessionValue(config.Token), csrfToken: csrfValue(config.Token),
 		allowAnonymousWorkflowRuns:         config.AllowAnonymousWorkflowRuns,
 		workflowRunTTLSecondsAfterFinished: workflowRunTTLSecondsAfterFinished,
@@ -1889,14 +1892,9 @@ func (h *Handler) streamJobLogs(writer http.ResponseWriter, request *http.Reques
 	writer.Header().Set("Cache-Control", "no-store")
 	writer.Header().Set("X-Accel-Buffering", "no")
 	writeEvent(writer, flusher, "status", "Waiting for runner logs...")
-	pod, err := h.waitForPod(request.Context(), job, func() { writeSSEComment(writer, flusher, "keepalive") })
+	stream, err := h.openJobLogs(request.Context(), job, func() { writeSSEComment(writer, flusher, "keepalive") })
 	if err != nil {
 		writeEvent(writer, flusher, "error", err.Error())
-		return
-	}
-	stream, err := h.logs.Stream(request.Context(), pod.Namespace, pod.Name)
-	if err != nil {
-		writeEvent(writer, flusher, "error", "Unable to open runner logs.")
 		return
 	}
 	defer stream.Close()
@@ -1966,6 +1964,32 @@ func (h *Handler) streamJobLogs(writer http.ResponseWriter, request *http.Reques
 			return
 		}
 	}
+}
+
+func (h *Handler) openJobLogs(ctx context.Context, job *actionsv1alpha1.WorkflowJob, heartbeat func()) (io.ReadCloser, error) {
+	pod, err := h.waitForPod(ctx, job, heartbeat)
+	if err == nil {
+		stream, streamErr := h.logs.Stream(ctx, pod.Namespace, pod.Name)
+		if streamErr == nil {
+			return stream, nil
+		}
+		err = streamErr
+	} else if !errors.Is(err, errLogsUnavailable) {
+		return nil, err
+	}
+	if h.logArchive != nil {
+		stream, archiveErr := h.logArchive.Open(ctx, job.Namespace, string(job.UID), true)
+		if archiveErr == nil {
+			return stream, nil
+		}
+		if !errors.Is(archiveErr, joblog.ErrNotFound) {
+			h.logger.Error("unable to read archived runner logs", "namespace", job.Namespace, "workflow_job", job.Name, "error", archiveErr)
+		}
+	}
+	if errors.Is(err, errLogsUnavailable) {
+		return nil, err
+	}
+	return nil, errors.New("Unable to open runner logs.")
 }
 
 func parseLastEventID(value string) (uint64, error) {

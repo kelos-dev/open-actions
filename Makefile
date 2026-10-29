@@ -86,6 +86,12 @@ verify:
 	$(HELM) template open-actions $(CHART_DIR) --namespace open-actions-system --set artifacts.persistence.existingClaim=open-actions-artifacts >/dev/null
 	$(HELM) template open-actions $(CHART_DIR) --namespace open-actions-system --set artifacts.persistence.enabled=false >/dev/null
 	$(HELM) template open-actions $(CHART_DIR) --namespace open-actions-system --set artifacts.enabled=false >/dev/null
+	$(HELM) template open-actions $(CHART_DIR) --namespace open-actions-system --set artifacts.logs.enabled=false >/dev/null
+	$(HELM) template open-actions $(CHART_DIR) --namespace open-actions-system --set artifacts.logs.secretName=open-actions-log-auth >/dev/null
+	@if $(HELM) template open-actions $(CHART_DIR) --namespace open-actions-system --set artifacts.logs.retentionDays=0 >/dev/null 2>&1; then \
+		echo "Helm accepted a non-positive job log retention" >&2; \
+		exit 1; \
+	fi
 	@if $(HELM) template open-actions $(CHART_DIR) --namespace open-actions-system --set console.publicURL= >/dev/null 2>&1; then \
 		echo "Helm accepted an enabled Console without a public URL" >&2; \
 		exit 1; \

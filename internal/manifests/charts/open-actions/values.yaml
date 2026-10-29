@@ -24,6 +24,12 @@ artifacts:
     pullPolicy: IfNotPresent
   signingKeySecretName: ""
   signingKeyKey: signing-key
+  logs:
+    enabled: true
+    secretName: ""
+    tokenKey: token
+    maxBytes: 104857600
+    retentionDays: 7
   defaultRetentionDays: 7
   maxRetentionDays: 30
   maxFileBytes: 1073741824

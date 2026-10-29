@@ -3,7 +3,12 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
+	"github.com/kelos-dev/open-actions/internal/joblog"
 	"io"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -233,4 +238,53 @@ func testWorkflowJob(t *testing.T, run *actionsv1alpha1.WorkflowRun, name, jobID
 
 func typesUID(value string) types.UID {
 	return types.UID("uid-" + value)
+}
+
+func TestRunLogsReadsArchiveAfterTimeout(t *testing.T) {
+	run := testWorkflowRun("ci", "team-ci", "CI", metav1.ConditionFalse)
+	job := testWorkflowJob(t, run, "ci-build", "build", "Build")
+	job.Status.Result = actionsv1alpha1.WorkflowJobResultFailure
+	job.Status.Conditions = []metav1.Condition{{Type: actionsv1alpha1.WorkflowJobConditionSucceeded, Status: metav1.ConditionFalse, Reason: "JobTimedOut"}}
+	store, err := joblog.NewStore(t.TempDir(), 1<<20, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	record, err := store.Begin(joblog.Record{Namespace: job.Namespace, JobUID: string(job.UID), PodUID: "pod-uid", CreatedAt: time.Now()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Append(record, []byte("2026-10-29T01:00:00Z output before timeout\n")); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Finish(record, false); err != nil {
+		t.Fatal(err)
+	}
+	handler, err := joblog.NewHandler(store, "read-token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(handler)
+	defer server.Close()
+	tokenFile := filepath.Join(t.TempDir(), "token")
+	if err := os.WriteFile(tokenFile, []byte("read-token\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	dependencies := testRunDependencies(t, &testRunLogSource{}, run, job)
+	var output bytes.Buffer
+	if err := runWithDependencies(context.Background(), []string{"run", "logs", "ci", "-n", "team-ci", "--log-archive-url", server.URL, "--log-archive-token-file", tokenFile}, &output, &bytes.Buffer{}, dependencies); err != nil {
+		t.Fatal(err)
+	}
+	if output.String() != "output before timeout\n"+joblog.IncompleteWarning {
+		t.Fatalf("archive output = %q", output.String())
+	}
+}
+
+func TestRunLogsRequiresBothArchiveOptions(t *testing.T) {
+	dependencies := commandDependencies{newRunClients: func(runKubeOptions) (*runClients, error) { return nil, errors.New("unexpected Kubernetes access") }}
+	for _, flag := range []string{"--log-archive-url=http://localhost", "--log-archive-token-file=token"} {
+		err := runWithDependencies(context.Background(), []string{"run", "logs", "ci", flag}, &bytes.Buffer{}, &bytes.Buffer{}, dependencies)
+		if err == nil || !strings.Contains(err.Error(), "must be specified together") {
+			t.Fatalf("configuration error = %v", err)
+		}
+	}
 }

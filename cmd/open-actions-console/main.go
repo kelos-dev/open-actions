@@ -16,6 +16,7 @@ import (
 	actionsv1alpha1 "github.com/kelos-dev/open-actions/api/v1alpha1"
 	"github.com/kelos-dev/open-actions/internal/console"
 	githubclient "github.com/kelos-dev/open-actions/internal/github"
+	"github.com/kelos-dev/open-actions/internal/joblog"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
@@ -47,6 +48,8 @@ func runConsole(ctx context.Context, arguments []string) error {
 		workflowRunTTLSecondsAfterFinished = &parsed
 		return nil
 	})
+	logArchiveURL := flags.String("log-archive-url", "", "Job log archive origin used when Pod logs are unavailable")
+	logArchiveTokenFile := flags.String("log-archive-token-file", "", "File containing the job log archive read token")
 	secureCookie := flags.Bool("secure-cookie", false, "Restrict the Console session cookie to HTTPS")
 	if err := flags.Parse(arguments); err != nil {
 		return err
@@ -60,6 +63,20 @@ func runConsole(ctx context.Context, arguments []string) error {
 		return err
 	}
 
+	var logArchive joblog.Archive
+	if (*logArchiveURL == "") != (*logArchiveTokenFile == "") {
+		return errors.New("log-archive-url and log-archive-token-file must be specified together")
+	}
+	if *logArchiveURL != "" {
+		token, err := os.ReadFile(*logArchiveTokenFile)
+		if err != nil {
+			return fmt.Errorf("read job log archive token: %w", err)
+		}
+		logArchive, err = joblog.NewClient(*logArchiveURL, strings.TrimSpace(string(token)), &http.Client{Timeout: 30 * time.Second})
+		if err != nil {
+			return err
+		}
+	}
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 	scheme := runtime.NewScheme()
 	if err := clientgoscheme.AddToScheme(scheme); err != nil {
@@ -108,7 +125,7 @@ func runConsole(ctx context.Context, arguments []string) error {
 		return fmt.Errorf("configure GitHub repository resolver: %w", err)
 	}
 	handler, err := console.New(console.Config{
-		Client: kubernetesClient, WorkflowRuns: workflowRuns, Logs: console.NewKubernetesLogSource(clientset), Repositories: repositories,
+		Client: kubernetesClient, WorkflowRuns: workflowRuns, Logs: console.NewKubernetesLogSource(clientset), LogArchive: logArchive, Repositories: repositories,
 		Token: token, WorkflowRunTTLSecondsAfterFinished: workflowRunTTLSecondsAfterFinished,
 		AllowAnonymousWorkflowRuns: *allowAnonymousWorkflowRuns,
 		SecureCookie:               *secureCookie, Logger: logger,

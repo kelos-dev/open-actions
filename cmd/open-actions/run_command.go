@@ -2,8 +2,11 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
+	"net/http"
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -11,6 +14,7 @@ import (
 	"time"
 
 	actionsv1alpha1 "github.com/kelos-dev/open-actions/api/v1alpha1"
+	"github.com/kelos-dev/open-actions/internal/joblog"
 	"github.com/kelos-dev/open-actions/internal/runner"
 	"github.com/kelos-dev/open-actions/internal/workflowstatus"
 	"github.com/spf13/cobra"
@@ -142,11 +146,27 @@ func newRunLogsCommand(dependencies commandDependencies) *cobra.Command {
 	options := runCommandOptions{}
 	jobName := ""
 	follow := false
+	archiveURL, archiveTokenFile := "", ""
 	command := &cobra.Command{
 		Use:   "logs RUN",
 		Short: "Print logs for a workflow job",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(command *cobra.Command, arguments []string) error {
+			var archive joblog.Archive
+			var err error
+			if (archiveURL == "") != (archiveTokenFile == "") {
+				return errors.New("--log-archive-url and --log-archive-token-file must be specified together")
+			}
+			if archiveURL != "" {
+				token, err := os.ReadFile(archiveTokenFile)
+				if err != nil {
+					return fmt.Errorf("read job log archive token: %w", err)
+				}
+				archive, err = joblog.NewClient(archiveURL, strings.TrimSpace(string(token)), &http.Client{Timeout: 30 * time.Second})
+				if err != nil {
+					return err
+				}
+			}
 			clients, namespace, err := loadRunClients(dependencies, options)
 			if err != nil {
 				return err
@@ -159,13 +179,9 @@ func newRunLogsCommand(dependencies commandDependencies) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			pod, err := workflowJobPod(command.Context(), clients, job, follow, command.ErrOrStderr())
+			stream, err := openWorkflowJobLogs(command.Context(), clients, job, follow, command.ErrOrStderr(), archive)
 			if err != nil {
 				return err
-			}
-			stream, err := clients.logs.Stream(command.Context(), pod.Namespace, pod.Name, follow)
-			if err != nil {
-				return fmt.Errorf("open logs for WorkflowJob %q: %w", job.Spec.JobID, err)
 			}
 			defer stream.Close()
 			if _, err := io.Copy(command.OutOrStdout(), stream); err != nil && command.Context().Err() == nil {
@@ -177,7 +193,30 @@ func newRunLogsCommand(dependencies commandDependencies) *cobra.Command {
 	addRunKubeFlags(command, &options, dependencies.defaultKubeconfig)
 	command.Flags().StringVar(&jobName, "job", "", "Workflow job ID or resource name (resource name takes precedence); optional when the run has one job")
 	command.Flags().BoolVarP(&follow, "follow", "f", false, "Follow the runner log stream")
+	command.Flags().StringVar(&archiveURL, "log-archive-url", "", "Job log archive origin used when Pod logs are unavailable")
+	command.Flags().StringVar(&archiveTokenFile, "log-archive-token-file", "", "File containing the job log archive read token")
 	return command
+}
+
+func openWorkflowJobLogs(ctx context.Context, clients *runClients, job *actionsv1alpha1.WorkflowJob, follow bool, stderr io.Writer, archive joblog.Archive) (io.ReadCloser, error) {
+	pod, err := workflowJobPod(ctx, clients, job, follow, stderr)
+	if err == nil {
+		stream, streamErr := clients.logs.Stream(ctx, pod.Namespace, pod.Name, follow)
+		if streamErr == nil {
+			return stream, nil
+		}
+		err = fmt.Errorf("open logs for WorkflowJob %q: %w", job.Name, streamErr)
+	}
+	if archive != nil && ctx.Err() == nil {
+		stream, archiveErr := archive.Open(ctx, job.Namespace, string(job.UID), false)
+		if archiveErr == nil {
+			return stream, nil
+		}
+		if !errors.Is(archiveErr, joblog.ErrNotFound) {
+			return nil, fmt.Errorf("open archived logs for WorkflowJob %q: %w", job.Name, archiveErr)
+		}
+	}
+	return nil, err
 }
 
 func addRunKubeFlags(command *cobra.Command, options *runCommandOptions, defaultKubeconfig string) {

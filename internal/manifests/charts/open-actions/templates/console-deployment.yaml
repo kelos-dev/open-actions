@@ -22,6 +22,7 @@ spec:
       serviceAccountName: open-actions-console
       securityContext:
         runAsNonRoot: true
+        fsGroup: 65532
         seccompProfile:
           type: RuntimeDefault
       containers:
@@ -31,6 +32,10 @@ spec:
           args:
             - {{ printf "--github-api-url=%s" .Values.controller.githubAPIURL | quote }}
             - "--token-file=/var/run/secrets/open-actions-console/token"
+            {{- if and .Values.artifacts.enabled .Values.artifacts.logs.enabled }}
+            - {{ printf "--log-archive-url=http://open-actions-artifacts.%s.svc" .Release.Namespace | quote }}
+            - --log-archive-token-file=/var/run/secrets/open-actions-logs/token
+            {{- end }}
             {{- if index .Values.console "allowAnonymousWorkflowRuns" }}
             - "--allow-anonymous-workflow-runs=true"
             {{- end }}
@@ -66,6 +71,11 @@ spec:
             - name: authentication
               mountPath: /var/run/secrets/open-actions-console
               readOnly: true
+            {{- if and .Values.artifacts.enabled .Values.artifacts.logs.enabled }}
+            - name: log-auth
+              mountPath: /var/run/secrets/open-actions-logs
+              readOnly: true
+            {{- end }}
       volumes:
         - name: authentication
           secret:
@@ -73,5 +83,14 @@ spec:
             items:
               - key: {{ .Values.console.tokenKey | quote }}
                 path: token
+        {{- if and .Values.artifacts.enabled .Values.artifacts.logs.enabled }}
+        - name: log-auth
+          secret:
+            secretName: {{ default "open-actions-log-auth" .Values.artifacts.logs.secretName }}
+            defaultMode: 0440
+            items:
+              - key: {{ .Values.artifacts.logs.tokenKey | quote }}
+                path: token
+        {{- end }}
       terminationGracePeriodSeconds: 10
 {{- end }}

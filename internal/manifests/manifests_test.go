@@ -381,3 +381,48 @@ func assertQuantityEqual(t *testing.T, got resource.Quantity, want string) {
 		t.Errorf("resource quantity = %s, want %s", got.String(), want)
 	}
 }
+
+func TestJobLogArchiveDeploymentConfiguration(t *testing.T) {
+	chart := Chart()
+	data, err := fs.ReadFile(chart, "values.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, enabled := range []bool{true, false} {
+		t.Run(fmt.Sprintf("enabled %t", enabled), func(t *testing.T) {
+			var values map[string]any
+			if err := yaml.Unmarshal(data, &values); err != nil {
+				t.Fatal(err)
+			}
+			values["artifacts"].(map[string]any)["logs"].(map[string]any)["enabled"] = enabled
+			artifacts := renderWorkloadPodSpec(t, chart, "templates/artifact-statefulset.yaml", values)
+			console := renderWorkloadPodSpec(t, chart, "templates/console-deployment.yaml", values)
+			if artifacts.AutomountServiceAccountToken == nil || *artifacts.AutomountServiceAccountToken != enabled {
+				t.Fatalf("collector service account token = %v", artifacts.AutomountServiceAccountToken)
+			}
+			for _, test := range []struct {
+				spec corev1.PodSpec
+				arg  string
+			}{
+				{artifacts, "--log-read-token-file=/var/run/secrets/open-actions-logs/token"},
+				{console, "--log-archive-token-file=/var/run/secrets/open-actions-logs/token"},
+			} {
+				if slices.Contains(test.spec.Containers[0].Args, test.arg) != enabled {
+					t.Fatalf("arguments = %v", test.spec.Containers[0].Args)
+				}
+				found := false
+				for _, volume := range test.spec.Volumes {
+					if volume.Name == "log-auth" {
+						found = true
+						if volume.Secret.SecretName != "open-actions-log-auth" {
+							t.Fatalf("log secret = %v", volume.Secret)
+						}
+					}
+				}
+				if found != enabled {
+					t.Fatalf("log token volume enabled = %t", found)
+				}
+			}
+		})
+	}
+}

@@ -1922,6 +1922,71 @@ Names, branch patterns, action references, paths, map keys, and values are also
 bounded during workflow validation. Field and aggregate content limits are
 reapplied after expression evaluation before a step executes.
 
+### Archived runner logs
+
+The Helm chart enables continuous runner log collection through
+`artifacts.logs.enabled`. The artifact service reads runner container logs
+through the Kubernetes API and stores them on its volume independently of
+runner Pods. This preserves collected output when a native Job hard deadline
+or cancellation deletes a Pod. The runner's execution timeout and cleanup
+allowance still apply.
+
+The Console first tries Pod logs and falls back to the archive when the Pod
+is gone or its logs cannot be opened. The archive contains a snapshot of the
+collected output. The CLI can use the same fallback with
+`--log-archive-url` and `--log-archive-token-file`. For example, an administrator
+can port-forward the internal service and provide a local file containing the
+read token:
+
+```sh
+kubectl port-forward --namespace open-actions-system service/open-actions-artifacts 8081:80
+```
+
+```sh
+open-actions run logs ci-abc123 --job build --namespace team-ci \
+  --log-archive-url=http://localhost:8081 \
+  --log-archive-token-file=/secure/path/log-read-token
+```
+
+The chart generates the read token in `open-actions-log-auth` and mounts it in
+the artifact service and Console. To supply an existing Secret, set
+`artifacts.logs.secretName` and `artifacts.logs.tokenKey`. The read token grants
+access to archived logs across all namespaces; distribute it only to trusted
+administrators. It is separate from artifact signing keys and job credentials,
+and is never passed to workflow Pods. Restart the artifact service and Console
+after rotating it. The archive HTTP endpoint requires this token even when Pod
+logs are publicly readable through the Console.
+
+By default, each Pod archive is limited to 100 MiB and expires seven days after
+its last update. Configure these values with `artifacts.logs.maxBytes` and
+`artifacts.logs.retentionDays`. Cleanup runs at startup and hourly, and expired
+logs are unavailable immediately. Logs are scoped by namespace, WorkflowJob
+UID, and Pod UID, so reruns do not overwrite earlier attempts. If a job has
+multiple Pods, readers select the earliest archived Pod, matching Pod log
+selection. Deleting a WorkflowRun does not remove archives before their log
+retention expires, although the Console and CLI still require the run and job
+resources to resolve them.
+
+Collection preserves the runner's already-masked output and resumes after
+service restarts while Pod logs remain available. It cannot recover output
+that rotated away before collection, logs from a Pod deleted before discovery,
+or output lost with a node before collection. A stream interrupted by Pod
+deletion, an archive that has not observed the runner's final log stream, or a
+size limit produces an incomplete-log warning. Records of 1 MiB or more also
+stop collection with that warning. `--follow` follows live Pod logs; an archive
+fallback returns a snapshot and ends. Persistent storage is required to retain
+archives across artifact Pod replacement; `artifacts.persistence.enabled=false`
+uses an ephemeral volume. Set `artifacts.logs.enabled=false` to disable
+collection and remove the collector's Kubernetes API access.
+
+For deployments outside Helm, enable collection with the artifact server's
+`--log-read-token-file`, `--log-max-bytes`, and `--log-retention-days` flags.
+The collector needs cluster-wide `get`/`list` access to Pods and `get` access to
+`pods/log`. Configure the Console with `--log-archive-url` and
+`--log-archive-token-file`; both flags must be specified together. Log bytes are
+stored under `job-logs` in the artifact storage directory. Archive limits are
+separate from artifact quotas, so size the shared volume for both.
+
 ### Workflow artifacts
 
 Open Actions supports the Results Service protocol used by pinned
@@ -1989,8 +2054,9 @@ PersistentVolumeClaim by default and retains that claim when the StatefulSet is
 deleted or scaled down. The StatefulSet replaces its only Pod sequentially;
 its headless Service governs Pod identity, while workflow jobs use the separate
 `open-actions-artifacts` ClusterIP Service. Controller rollouts do not interrupt
-uploads or cleanup. The artifact service does not use the Kubernetes API and
-its service account token is not mounted.
+uploads or cleanup. When archived runner logs are enabled, the artifact service
+mounts a service account token to read Pods and their logs. Disabling
+`artifacts.logs.enabled` removes that access.
 
 The controller and artifact service share a credential signing key. By default,
 the chart generates that key in the
@@ -2055,11 +2121,12 @@ never interpreted as literal values.
 Completed native Jobs and runner Pods are retained with their WorkflowRun.
 WorkflowRuns are retained indefinitely unless `spec.ttlSecondsAfterFinished` is
 set. When that TTL expires, the WorkflowRun, its Jobs and Pods, and their logs
-are deleted. Console reruns require the original and latest WorkflowRuns to
-remain available. Selective reruns also require the WorkflowJobs that provide
-the selected jobs' latest prerequisite results and outputs. Open Actions does
-not archive logs outside Kubernetes, so cluster-level log rotation and node
-retention policies still apply.
+are deleted from Kubernetes. Collected log archives have their own retention
+period described above. Console reruns require the original and latest
+WorkflowRuns to remain available. Selective reruns also require the WorkflowJobs that provide
+the selected jobs' latest prerequisite results and outputs. Open Actions archives
+collected logs on the artifact volume when log collection is enabled. Without
+collection, cluster-level log rotation and node retention policies apply.
 
 ## Webhook API
 

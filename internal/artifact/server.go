@@ -21,12 +21,13 @@ import (
 const artifactServicePath = "/twirp/github.actions.results.api.v1.ArtifactService/"
 
 type ServerConfig struct {
-	Address   string
-	PublicURL string
-	Store     *Store
-	Tokens    *TokenCodec
-	Logger    *slog.Logger
-	Now       func() time.Time
+	Address    string
+	PublicURL  string
+	Store      *Store
+	Tokens     *TokenCodec
+	Logger     *slog.Logger
+	Now        func() time.Time
+	LogHandler http.Handler
 }
 
 type Server struct {
@@ -62,6 +63,9 @@ func NewServer(config ServerConfig) (*Server, error) {
 	mux.HandleFunc(artifactServicePath+"GetSignedArtifactURL", server.getSignedArtifactURL)
 	mux.HandleFunc(artifactServicePath+"DeleteArtifact", server.deleteArtifact)
 	mux.HandleFunc("/artifacts/blobs/", server.blob)
+	if config.LogHandler != nil {
+		mux.Handle("/job-logs/", config.LogHandler)
+	}
 	server.handler = mux
 	return server, nil
 }

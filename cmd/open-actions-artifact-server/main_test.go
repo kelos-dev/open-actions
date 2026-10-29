@@ -17,6 +17,8 @@ func TestRunArtifactServerRejectsInvalidConfiguration(t *testing.T) {
 		{name: "required values", want: "are required"},
 		{name: "public URL", arguments: []string{"--public-url=git://artifacts.example", "--storage-directory=/tmp/artifacts", "--signing-key-file=/tmp/key"}, want: "must use http or https"},
 		{name: "byte limits", arguments: []string{"--public-url=https://artifacts.example", "--storage-directory=/tmp/artifacts", "--signing-key-file=/tmp/key", "--max-file-bytes=2", "--max-artifact-bytes=1"}, want: "byte limits"},
+		{name: "log byte limit", arguments: []string{"--public-url=https://artifacts.example", "--storage-directory=/tmp/artifacts", "--signing-key-file=/tmp/key", "--log-max-bytes=0"}, want: "job log byte limit"},
+		{name: "log retention", arguments: []string{"--public-url=https://artifacts.example", "--storage-directory=/tmp/artifacts", "--signing-key-file=/tmp/key", "--log-retention-days=3651"}, want: "job log byte limit"},
 		{name: "retention", arguments: []string{"--public-url=https://artifacts.example", "--storage-directory=/tmp/artifacts", "--signing-key-file=/tmp/key", "--default-retention-days=31", "--max-retention-days=30"}, want: "artifact retention"},
 		{name: "key file", arguments: []string{"--public-url=https://artifacts.example", "--storage-directory=/tmp/artifacts", "--signing-key-file=/path/that/does/not/exist"}, want: "read artifact signing key"},
 	} {

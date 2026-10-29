@@ -272,7 +272,10 @@ open-actions run logs RUN --job JOB --follow --namespace open-actions
 resource name. An exact resource-name match takes precedence over a job ID.
 `--job` may be omitted when the run contains exactly one job.
 Completed native Jobs and runner Pods are retained with their WorkflowRun, so
-runner logs remain available until that run is deleted.
+runner Pod logs remain subject to Kubernetes retention. The default Helm
+installation also archives collected logs for seven days, preserving output
+from deleted Pods. See [archived runner logs](docs/reference.md#archived-runner-logs)
+for retention settings and CLI archive access.
 
 ## API reference
 

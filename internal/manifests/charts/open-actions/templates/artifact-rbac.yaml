@@ -1,0 +1,26 @@
+{{- if and .Values.artifacts.enabled .Values.artifacts.logs.enabled }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: open-actions-log-collector
+rules:
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [get, list]
+  - apiGroups: [""]
+    resources: [pods/log]
+    verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: open-actions-log-collector
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: open-actions-log-collector
+subjects:
+  - kind: ServiceAccount
+    name: open-actions-artifacts
+    namespace: {{ .Release.Namespace }}
+{{- end }}
