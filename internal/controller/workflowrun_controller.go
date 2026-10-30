@@ -1073,6 +1073,9 @@ func (r *WorkflowRunReconciler) planWorkflowJobs(run *actionsv1alpha1.WorkflowRu
 	}
 	for _, id := range jobIDs {
 		definitionJob := definition.Jobs[id]
+		if definitionJob.CacheMode == "" {
+			definitionJob.CacheMode = definition.CacheMode
+		}
 		definitionJob.Permissions = workflow.EffectivePermissions(definition.Permissions, definitionJob.Permissions)
 		if workflow.JobPlanningUsesNeeds(definitionJob) {
 			if !variablesSnapshotted {
@@ -1959,8 +1962,9 @@ func (r *WorkflowRunReconciler) jobPlan(run *actionsv1alpha1.WorkflowRun, workfl
 		})
 	}
 	return &runner.Plan{
-		Version: runner.PlanVersion,
-		Inputs:  inputValues,
+		Version:   runner.PlanVersion,
+		CacheMode: string(job.CacheMode),
+		Inputs:    inputValues,
 		Run: runner.Run{
 			ID: identity.ID, Number: identity.Number, Attempt: identity.Attempt,
 			Actor: githubSourceActor(githubSource), TriggeringActor: githubSourceActor(githubSource), URL: identity.URL,

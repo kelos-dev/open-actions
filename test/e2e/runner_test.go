@@ -18,6 +18,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
@@ -323,6 +324,56 @@ var _ = Describe("Runner", func() {
 				Repositories: []string{"example"},
 				Permissions:  permissions,
 			}))
+		}
+	})
+
+	It("restores a post-job cache in a separate workflow run and runner Pod", func() {
+		ctx := context.Background()
+		podUIDs := []types.UID{}
+		for attempt := range 2 {
+			run := &actionsv1alpha1.WorkflowRun{
+				ObjectMeta: metav1.ObjectMeta{Name: fmt.Sprintf("runner-cache-%d", attempt), Namespace: e2eNamespace},
+				Spec: actionsv1alpha1.WorkflowRunSpec{
+					ProjectRef: corev1.LocalObjectReference{Name: "default"},
+					Source: actionsv1alpha1.WorkflowRunSource{Type: actionsv1alpha1.SourceTypeGitHub, GitHub: &actionsv1alpha1.GitHubWorkflowRunSource{
+						Repository: actionsv1alpha1.GitHubRepository{ID: 123456789, Owner: "acme", Name: "example"},
+						Event:      actionsv1alpha1.GitHubEvent{Name: "push", DeliveryID: fmt.Sprintf("cache-delivery-%d", attempt)},
+						Revision:   actionsv1alpha1.GitRevision{SHA: fixtureRevision, Ref: "refs/heads/main"},
+					}},
+					WorkflowPath: ".open-actions/workflows/cache.yaml",
+				},
+			}
+			Expect(clusterClient.Create(ctx, run)).To(Succeed())
+			Eventually(func(g Gomega) {
+				stored := &actionsv1alpha1.WorkflowRun{}
+				g.Expect(clusterClient.Get(ctx, client.ObjectKeyFromObject(run), stored)).To(Succeed())
+				condition := meta.FindStatusCondition(stored.Status.Conditions, actionsv1alpha1.WorkflowRunConditionSucceeded)
+				g.Expect(condition).NotTo(BeNil())
+				if condition != nil {
+					g.Expect(condition.Status).To(Equal(metav1.ConditionTrue), condition.Message)
+				}
+			}, 180*time.Second, time.Second).Should(Succeed())
+			jobs := &actionsv1alpha1.WorkflowJobList{}
+			Expect(clusterClient.List(ctx, jobs, client.InNamespace(e2eNamespace), client.MatchingLabels{actionsv1alpha1.LabelWorkflowRunUID: string(run.UID)})).To(Succeed())
+			Expect(jobs.Items).To(HaveLen(1))
+			if len(jobs.Items) != 1 {
+				return
+			}
+			want := ""
+			if attempt == 1 {
+				want = "true"
+			}
+			Expect(jobs.Items[0].Status.Outputs).To(HaveKeyWithValue("hit", want))
+			pods, err := clientset.CoreV1().Pods(e2eNamespace).List(ctx, metav1.ListOptions{LabelSelector: labels.Set{batchv1.JobNameLabel: jobs.Items[0].Name}.String()})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(pods.Items).To(HaveLen(1))
+			if len(pods.Items) == 1 {
+				podUIDs = append(podUIDs, pods.Items[0].UID)
+			}
+		}
+		Expect(podUIDs).To(HaveLen(2))
+		if len(podUIDs) == 2 {
+			Expect(podUIDs[0]).NotTo(Equal(podUIDs[1]))
 		}
 	})
 

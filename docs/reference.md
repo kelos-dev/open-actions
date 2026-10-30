@@ -2010,6 +2010,85 @@ artifact persistence uses an `emptyDir` and is intended only for disposable
 test clusters because Pod replacement loses stored artifacts. Set
 `artifacts.enabled=false` to omit the service and runtime credentials.
 
+### Workflow caches
+
+The artifact service also hosts the v2 Results Cache Service used by
+`actions/cache@v4`, `actions/setup-go@v5`, and `actions/setup-node@v4`.
+Actions create and extract their own archives and run their own post-job save
+hooks. The default runner image includes GNU tar and zstd; custom images must
+provide the archive tools required by their actions. Cache entries are opaque
+blobs, independent of artifact names, ZIP validation, and retention.
+
+Each job receives `ACTIONS_CACHE_SERVICE_V2=true`, `ACTIONS_CACHE_URL`, `ACTIONS_RESULTS_URL`,
+`ACTIONS_RUNTIME_TOKEN`, and its effective `ACTIONS_CACHE_MODE`. The runtime
+credential authorizes cache operations for the job's Project UID, repository
+ID, and Git refs. GitHub repository token `permissions` do not grant cache
+access. The service enforces the signed cache permissions even if a workflow
+changes those environment variables. Cache credentials and signed blob URLs
+expire with the job credential described above; deleting its Secret does not
+revoke an issued credential.
+
+Workflow-level and job-level `cache-mode` accept `read`, `write` (read and
+write), `write-only`, and `none`. A job-level declaration overrides the
+workflow-level declaration. Without a declaration, `push`, `workflow_dispatch`,
+and `schedule` runs have read/write access. Other supported events resolving to
+the default branch have read-only access. An explicit write-capable mode can
+allow those events to write caches; only use it when their inputs and code can
+be trusted. Ordinary `pull_request` runs write to their merge ref
+(`refs/pull/<number>/merge`), including runs from forks.
+
+Entries are immutable within their Project, repository, ref, key, and cache
+version. A job searches its current ref first, then its pull-request base branch
+when applicable, then the default branch. In each scope it searches the primary
+key exactly, then by prefix, followed by each restore key in order, with exact
+matches before prefix matches. Prefix matches select the most recently created
+entry. Versions must match. Sibling branches and other pull requests cannot
+read a pull request's merge-ref cache. Caches are shared across workflow files,
+runs, and attempts within their authorized scopes and survive WorkflowRun
+deletion. Never put secrets in a cache: pull-request jobs can read caches from
+their base and default branches. These rules follow GitHub's
+[dependency caching reference](https://docs.github.com/en/actions/reference/workflows-and-actions/dependency-caching).
+
+Concurrent saves of the same ref, key, and version reserve one entry; competing
+saves do not replace it. Uploaded entries become visible only after successful
+finalization. Pending uploads expire after one hour. Finalized entries expire
+after seven days without access by default. Capacity pressure evicts finalized
+entries in least-recently-used order, within the repository quota or across
+Projects for the service-wide quota. Pending uploads consume capacity and are
+not evicted while being uploaded. Cleanup runs on lookup or reservation, at
+startup, and hourly. Metadata and blobs persist under the volume's `cache/`
+subdirectory; cache eviction never deletes artifacts.
+
+The chart enables caching with `artifacts.cache.enabled=true`. Configure
+`artifacts.cache.maxEntryBytes`, `maxRepositoryBytes`, and `maxTotalBytes` to set
+per-entry, per-Project/repository, and service-wide byte limits. Each defaults to
+10 GiB, and they must be ordered from smallest to largest. Set
+`artifacts.cache.retentionDays` to change inactivity expiration. The standalone
+server accepts corresponding `--cache-max-entry-bytes`,
+`--cache-max-repository-bytes`, `--cache-max-total-bytes`, and
+`--cache-retention-days` flags. Set `--cache-enabled=false` on both the
+controller and service to disable caching outside Helm. Disabling
+`artifacts.enabled` disables both services. Size the shared PVC for retained
+artifacts, caches, and temporary upload/assembly space; cache quotas do not
+reserve space for artifacts or replace volume capacity planning. Use one
+service replica; its metadata coordination is local to that process.
+
+BuildKit can use `--cache-from type=gha,version=2` and
+`--cache-to type=gha,version=2,mode=max` with a Docker-capable Runner and a
+Buildx driver supporting the `gha` backend. Use different `scope` values for
+different images. The runner exports the runtime variables to shell steps.
+Do not configure BuildKit's optional `ghtoken`/`repository` GitHub REST lookup
+optimization: GitHub's REST API does not list Open Actions cache entries.
+Cache export failures retain BuildKit's normal behavior; use `ignore-error=true`
+if exports should be optional. Actions retain their own handling of misses,
+service failures, `fail-on-cache-miss`, `lookup-only`, and `cache-hit` outputs.
+
+The v1 cache REST protocol, GitHub REST cache management, and toolkit caching
+on GitHub Enterprise Server (whose toolkit selects v1) are not supported;
+see [issue #41](https://github.com/kelos-dev/open-actions/issues/41).
+The `cache-mode` inheritance rules for job calls to reusable workflows do not
+apply because reusable-workflow job calls are not supported.
+
 ### Execution constraints
 
 External actions must use the `node20`, `node24`, or composite runtime and be
@@ -2036,20 +2115,19 @@ same immutable snapshot. Synthetic `workflow_dispatch`, `schedule`, and
 `workflow_call` runs use a bounded generated document containing their inputs,
 schedule, repository identity, and supported event metadata.
 
-The controller emits job-plan version 9, and the runner accepts versions 1
-through 9. When a release changes the job-plan version, update every Runner
+The controller emits job-plan version 10, and the runner accepts versions 1
+through 10. When a release changes the job-plan version, update every Runner
 `spec.execution.runner.image` to an image that accepts both the installed and
 target controller versions before upgrading the controller. The received job-plan
 version also determines the runner result version: plan versions 1 through 5
-use result version 1, and plan versions 6 through 9 use result version 2. A
+use result version 1, and plan versions 6 through 10 use result version 2. A
 runner that accepts more than one plan version must emit the result version
 assigned to that plan, not always the latest result version supported by the
 runner binary. Integration
 commit construction is part of this versioned contract; changing its merge
 behavior or commit metadata requires a job-plan version transition.
 
-Docker actions, local actions, service containers, and caches are not
-supported. Expressions outside the documented
+Docker actions, local actions, and service containers are not supported. Expressions outside the documented
 fields and runtime contexts are rejected during planning or execution and are
 never interpreted as literal values.
 `WorkflowJob` resources are not retried or reassigned when a Runner is removed.

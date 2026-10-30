@@ -24,7 +24,7 @@ runs. Each job status links directly to the corresponding job in the Console.
 Invalid workflows receive separate validation failures linking to the run page,
 while valid sibling workflows continue independently.
 Runners execute steps in Kubernetes Jobs and use the standalone artifact service
-for workflow artifact uploads and downloads. The Console shows runs, jobs, and
+for workflow artifact uploads, downloads, and dependency caches. The Console shows runs, jobs, and
 live logs. Each `Project` defines an execution domain and its GitHub App
 integration.
 
@@ -288,6 +288,14 @@ make test       # Run unit and schema tests.
 make build      # Build the CLI, controller, artifact service, Console, and runner binaries under bin/.
 make image      # Build the controller, artifact service, Console, and runner images.
 ```
+
+Run `make test-cache-conformance` to exercise pinned official action bundles
+against the service with a miss, post-job save, and restore into a cleared
+workspace. This requires `gh`, Node.js, npm, Go, and GNU tar, and downloads the
+bundles from GitHub. Its BuildKit test additionally requires Docker with
+Buildx, creates an isolated builder, clears its local build cache, and checks
+that a second build reuses exported layers. It is skipped when Docker is not
+installed.
 
 Install the control plane before running the end-to-end suite against the
 cluster selected by the current Kubernetes context:

@@ -12,6 +12,7 @@ IMAGE_PLATFORMS ?= linux/$(LOCAL_ARCH)
 IMAGE_ARCHES = $(shell echo "$(IMAGE_PLATFORMS)" | tr ',' '\n' | cut -d'/' -f2 | tr '\n' ' ')
 PUSH ?= false
 SOURCE_VERSION ?= $(VERSION)
+TEST_PACKAGES ?= ./...
 TEST_FLAGS ?=
 E2E_PROCS ?= 1
 
@@ -27,7 +28,7 @@ CHART_CRD_DIR := $(CHART_DIR)/templates/crds
 CHART_REGISTRY ?= oci://ghcr.io/kelos-dev/charts
 RELEASE_PLATFORMS ?= linux/amd64 linux/arm64 darwin/amd64 darwin/arm64
 
-.PHONY: all build fmt generate manifests update verify test image manifest release-binaries release-chart publish-chart test-e2e ginkgo
+.PHONY: test-cache-conformance all build fmt generate manifests update verify test image manifest release-binaries release-chart publish-chart test-e2e ginkgo
 
 all: build
 
@@ -85,6 +86,11 @@ verify:
 	$(HELM) template open-actions $(CHART_DIR) --namespace open-actions-system --set artifacts.signingKeySecretName=open-actions-artifact-auth >/dev/null
 	$(HELM) template open-actions $(CHART_DIR) --namespace open-actions-system --set artifacts.persistence.existingClaim=open-actions-artifacts >/dev/null
 	$(HELM) template open-actions $(CHART_DIR) --namespace open-actions-system --set artifacts.persistence.enabled=false >/dev/null
+	$(HELM) template open-actions $(CHART_DIR) --namespace open-actions-system --set artifacts.cache.enabled=false >/dev/null
+	@if $(HELM) template open-actions $(CHART_DIR) --namespace open-actions-system --set artifacts.cache.maxRepositoryBytes=1 >/dev/null 2>&1; then \
+		echo "Helm accepted unordered cache limits" >&2; \
+		exit 1; \
+	fi
 	$(HELM) template open-actions $(CHART_DIR) --namespace open-actions-system --set artifacts.enabled=false >/dev/null
 	@if $(HELM) template open-actions $(CHART_DIR) --namespace open-actions-system --set console.publicURL= >/dev/null 2>&1; then \
 		echo "Helm accepted an enabled Console without a public URL" >&2; \
@@ -98,7 +104,11 @@ verify:
 	go vet ./...
 
 test:
-	CGO_ENABLED=$(if $(findstring -race,$(TEST_FLAGS)),1,$(shell go env CGO_ENABLED)) go test $(TEST_FLAGS) ./...
+	CGO_ENABLED=$(if $(findstring -race,$(TEST_FLAGS)),1,$(shell go env CGO_ENABLED)) go test $(TEST_FLAGS) $(TEST_PACKAGES)
+
+# Requires gh, Node.js, npm, Go, GNU tar, and a Docker daemon with Buildx for layer caching.
+test-cache-conformance:
+	$(MAKE) test TEST_PACKAGES=./internal/artifact TEST_FLAGS='-tags=cacheconformance -run TestCacheConformance -count=1 -timeout=15m -v'
 
 image:
 	@set -e; for dir in $(or $(WHAT),$(IMAGE_DIRS)); do \

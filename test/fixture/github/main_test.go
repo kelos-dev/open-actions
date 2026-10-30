@@ -1,7 +1,11 @@
 package main
 
 import (
+	"encoding/json"
+	githubclient "github.com/kelos-dev/open-actions/internal/github"
 	"maps"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
@@ -86,5 +90,36 @@ func TestSelectiveRerunWorkflowIsValid(t *testing.T) {
 		if len(definition.Jobs) != 2 || len(definition.Jobs["verify"].Needs) != 1 || definition.Jobs["verify"].Needs[0] != "prepare" {
 			t.Fatalf("jobs = %#v", definition.Jobs)
 		}
+	}
+}
+
+func TestCacheFixtureWorkflow(t *testing.T) {
+	definition, err := workflow.Parse([]byte(cacheWorkflowData))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if definition.Jobs["cached"].Steps[0].Uses != "actions/cache@v4" || definition.Jobs["cached"].Outputs["hit"] != "${{ steps.cache.outputs.cache-hit }}" {
+		t.Fatal(definition)
+	}
+}
+
+func TestRepositoryMetadataRoutes(t *testing.T) {
+	mux := http.NewServeMux()
+	registerRepositoryMetadata(mux)
+	for _, name := range []string{"example", "invalid-trigger", "invalid-field"} {
+		t.Run(name, func(t *testing.T) {
+			response := httptest.NewRecorder()
+			mux.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/repos/acme/"+name, nil))
+			if response.Code != http.StatusOK {
+				t.Fatalf("repository metadata status = %d", response.Code)
+			}
+			var repository githubclient.Repository
+			if err := json.Unmarshal(response.Body.Bytes(), &repository); err != nil {
+				t.Fatal(err)
+			}
+			if repository.ID != 123456789 || repository.Name != name || repository.DefaultBranch != "main" || repository.Owner.Login != "acme" {
+				t.Fatalf("repository = %#v", repository)
+			}
+		})
 	}
 }

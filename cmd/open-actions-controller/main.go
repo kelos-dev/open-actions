@@ -85,6 +85,7 @@ func runManager(arguments []string) error {
 	metricsAddress := flags.String("metrics-bind-address", ":8082", "Address used by the metrics endpoint")
 	healthAddress := flags.String("health-probe-bind-address", ":8081", "Address used by health probes")
 	webhookAddress := flags.String("webhook-bind-address", ":8080", "Address used by the GitHub webhook endpoint")
+	cacheEnabled := flags.Bool("cache-enabled", true, "Enable workflow cache credentials when the artifact service is configured")
 	artifactServiceURL := flags.String("artifact-service-url", "", "Artifact service origin exposed to workflow jobs; omit to disable artifacts")
 	artifactSigningKeyFile := flags.String("artifact-signing-key-file", "", "File containing the artifact credential signing key; required with artifact-service-url")
 	artifactMaxRetentionDays := flags.Int("artifact-max-retention-days", 30, "Maximum artifact retention in days")
@@ -235,6 +236,7 @@ func runManager(arguments []string) error {
 		Recorder:                 controllerManager.GetEventRecorder("runner-controller"),
 		ArtifactResultsURL:       normalizedArtifactServiceURL,
 		ArtifactMaxRetentionDays: *artifactMaxRetentionDays,
+		CacheEnabled:             *cacheEnabled,
 		ArtifactTokens:           artifactTokens,
 		Metrics:                  durationMetrics,
 	}).SetupWithManager(controllerManager); err != nil {

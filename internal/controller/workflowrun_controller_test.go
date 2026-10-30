@@ -461,7 +461,7 @@ func TestPlanWorkflowJobsInheritsWorkflowEnvironment(t *testing.T) {
 }
 
 func TestPlanWorkflowJobsAppliesPermissionPrecedence(t *testing.T) {
-	definition, err := workflow.Parse([]byte("name: CI\non: push\npermissions:\n  contents: write\n  issues: read\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: true\n  publish:\n    permissions:\n      packages: write\n    runs-on: ubuntu-latest\n    steps:\n      - run: true\n"))
+	definition, err := workflow.Parse([]byte("name: CI\non: push\ncache-mode: read\npermissions:\n  contents: write\n  issues: read\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: true\n  publish:\n    cache-mode: write-only\n    permissions:\n      packages: write\n    runs-on: ubuntu-latest\n    steps:\n      - run: true\n"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -488,6 +488,10 @@ func TestPlanWorkflowJobsAppliesPermissionPrecedence(t *testing.T) {
 		plan, err := runner.DecodePlan([]byte(planned[index].plan))
 		if err != nil {
 			t.Fatal(err)
+		}
+		wantModes := []string{"read", "write-only"}
+		if plan.CacheMode != wantModes[index] {
+			t.Errorf("job %q cache mode=%q", planned[index].id, plan.CacheMode)
 		}
 		if !maps.Equal(plan.GitHubTokenPermissions, want[index]) {
 			t.Errorf("job %q permissions = %#v, want %#v", planned[index].id, plan.GitHubTokenPermissions, want[index])

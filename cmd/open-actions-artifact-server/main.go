@@ -8,10 +8,12 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
 	"github.com/kelos-dev/open-actions/internal/artifact"
+	"github.com/kelos-dev/open-actions/internal/cache"
 	"github.com/kelos-dev/open-actions/internal/endpointurl"
 )
 
@@ -35,6 +37,11 @@ func runArtifactServer(ctx context.Context, arguments []string) error {
 	maxRunBytes := flags.Int64("max-run-bytes", 10<<30, "Maximum stored artifact bytes in one workflow run attempt")
 	defaultRetentionDays := flags.Int("default-retention-days", 7, "Default artifact retention in days")
 	maxRetentionDays := flags.Int("max-retention-days", 30, "Maximum artifact retention in days")
+	cacheEnabled := flags.Bool("cache-enabled", true, "Enable the workflow cache service")
+	cacheMaxEntryBytes := flags.Int64("cache-max-entry-bytes", 10<<30, "Maximum bytes in one cache entry")
+	cacheMaxRepositoryBytes := flags.Int64("cache-max-repository-bytes", 10<<30, "Maximum cache bytes per Project and repository")
+	cacheMaxTotalBytes := flags.Int64("cache-max-total-bytes", 10<<30, "Maximum cache bytes across all Projects")
+	cacheRetentionDays := flags.Int("cache-retention-days", 7, "Expire caches after this many days without access")
 	if err := flags.Parse(arguments); err != nil {
 		return err
 	}
@@ -50,6 +57,17 @@ func runArtifactServer(ctx context.Context, arguments []string) error {
 	}
 	if *defaultRetentionDays < 1 || *maxRetentionDays < *defaultRetentionDays || *maxRetentionDays > 3650 {
 		return errors.New("artifact retention must be between 1 and 3650 days and the default must not exceed the maximum")
+	}
+	cacheLimits := cache.DefaultLimits()
+	cacheLimits.MaxEntryBytes = *cacheMaxEntryBytes
+	cacheLimits.MaxRepositoryBytes = *cacheMaxRepositoryBytes
+	cacheLimits.MaxTotalBytes = *cacheMaxTotalBytes
+	if *cacheRetentionDays < 1 || *cacheRetentionDays > 3650 {
+		return errors.New("cache retention must be between 1 and 3650 days")
+	}
+	cacheLimits.Retention = time.Duration(*cacheRetentionDays) * 24 * time.Hour
+	if err := cacheLimits.Validate(); err != nil {
+		return err
 	}
 	signingKey, err := os.ReadFile(*signingKeyFile)
 	if err != nil {
@@ -69,9 +87,16 @@ func runArtifactServer(ctx context.Context, arguments []string) error {
 	if err != nil {
 		return err
 	}
+	var cacheStore *cache.Store
+	if *cacheEnabled {
+		cacheStore, err = cache.NewStore(filepath.Join(*storageDirectory, "cache"), cacheLimits)
+		if err != nil {
+			return fmt.Errorf("open cache storage: %w", err)
+		}
+	}
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 	server, err := artifact.NewServer(artifact.ServerConfig{
-		Address: *bindAddress, PublicURL: normalizedPublicURL, Store: store, Tokens: tokens, Logger: logger,
+		Address: *bindAddress, PublicURL: normalizedPublicURL, Store: store, CacheStore: cacheStore, Tokens: tokens, Logger: logger,
 	})
 	if err != nil {
 		return err

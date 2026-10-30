@@ -14,6 +14,7 @@ import (
 
 	actionsv1alpha1 "github.com/kelos-dev/open-actions/api/v1alpha1"
 	"github.com/kelos-dev/open-actions/internal/artifact"
+	"github.com/kelos-dev/open-actions/internal/cache"
 	"github.com/kelos-dev/open-actions/internal/eventsnapshot"
 	githubclient "github.com/kelos-dev/open-actions/internal/github"
 	actionmetrics "github.com/kelos-dev/open-actions/internal/metrics"
@@ -103,6 +104,7 @@ type RunnerReconciler struct {
 	GitHub                   *githubclient.Client
 	MaxJobTimeout            time.Duration
 	Recorder                 events.EventRecorder
+	CacheEnabled             bool
 	ArtifactResultsURL       string
 	ArtifactMaxRetentionDays int
 	ArtifactTokens           *artifact.TokenCodec
@@ -632,10 +634,25 @@ func (r *RunnerReconciler) executeWorkflowJob(ctx context.Context, runnerObject 
 		return true, r.cancelWorkflowJob(ctx, workflowJob, cancellation)
 	}
 	artifactToken := ""
+	var cacheAccess *cache.Access
 	if r.ArtifactResultsURL != "" {
 		if r.ArtifactTokens == nil {
 			revokeInstallations()
 			return false, errors.New("artifact token codec is not configured")
+		}
+		if r.CacheEnabled {
+			repository, err := jobInstallation.GetRepository(ctx, githubSource.Repository.Owner, githubSource.Repository.Name)
+			if err != nil {
+				revokeInstallations()
+				return false, fmt.Errorf("resolve cache scopes for WorkflowJob %q: %w", workflowJob.Name, err)
+			}
+			if repository.ID != githubSource.Repository.ID || repository.DefaultBranch == "" {
+				revokeInstallations()
+				return false, fmt.Errorf("resolve cache scopes for WorkflowJob %q: repository identity or default branch is invalid", workflowJob.Name)
+			}
+			_, baseRef := githubSourcePullRequestRefs(githubSource)
+			access := cache.ResolveAccess(string(githubSource.Event.Name), githubSource.Revision.Ref, baseRef, repository.DefaultBranch, decodedPlan.CacheMode)
+			cacheAccess = &access
 		}
 		attempt := int32(1)
 		if run.Spec.Rerun != nil {
@@ -651,6 +668,7 @@ func (r *RunnerReconciler) executeWorkflowJob(ctx context.Context, runnerObject 
 				RootRunUID: rootRunUID, RunUID: string(run.UID), Attempt: attempt,
 			},
 			WorkflowRunBackendID: string(run.UID), WorkflowJobBackendID: string(workflowJob.UID),
+			Cache: cacheAccess,
 		})
 		if err != nil {
 			revokeInstallations()
@@ -668,6 +686,10 @@ func (r *RunnerReconciler) executeWorkflowJob(ctx context.Context, runnerObject 
 	nativeJob, err := r.buildJob(workflowJob, run, project, runnerObject, startupDeadline)
 	if err != nil {
 		return false, errors.Join(err, r.cleanupAuthSecret(ctx, workflowJob))
+	}
+	if cacheAccess != nil {
+		container := &nativeJob.Spec.Template.Spec.Containers[0]
+		container.Env = setEnvironmentVariables(container.Env, corev1.EnvVar{Name: "ACTIONS_CACHE_MODE", Value: cacheAccess.Mode})
 	}
 	if cancellation, err := r.workflowJobCancellationRequested(ctx, workflowJob, run); err != nil {
 		return false, errors.Join(err, r.cleanupAuthSecret(ctx, workflowJob))
@@ -1231,6 +1253,10 @@ func (r *RunnerReconciler) buildJob(workflowJob *actionsv1alpha1.WorkflowJob, ru
 			corev1.EnvVar{Name: runner.ArtifactResultsURLEnvVar, Value: r.ArtifactResultsURL},
 			corev1.EnvVar{Name: "GITHUB_RETENTION_DAYS", Value: strconv.Itoa(r.ArtifactMaxRetentionDays)},
 		)
+	}
+	if r.CacheEnabled && r.ArtifactResultsURL != "" {
+		container := &podTemplate.Spec.Containers[0]
+		container.Env = setEnvironmentVariables(container.Env, corev1.EnvVar{Name: "ACTIONS_CACHE_SERVICE_V2", Value: "true"}, corev1.EnvVar{Name: "ACTIONS_CACHE_URL", Value: strings.TrimSuffix(r.ArtifactResultsURL, "/") + "/"})
 	}
 	jobAnnotations := copyStringMap(annotations)
 	if jobAnnotations == nil {

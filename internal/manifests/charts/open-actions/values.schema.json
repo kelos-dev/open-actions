@@ -52,7 +52,7 @@
     "artifacts": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["enabled", "image", "signingKeySecretName", "signingKeyKey", "defaultRetentionDays", "maxRetentionDays", "maxFileBytes", "maxArtifactBytes", "maxRunBytes", "resources", "persistence"],
+      "required": ["enabled", "image", "signingKeySecretName", "signingKeyKey", "defaultRetentionDays", "maxRetentionDays", "maxFileBytes", "maxArtifactBytes", "maxRunBytes", "cache", "resources", "persistence"],
       "properties": {
         "enabled": {"type": "boolean"},
         "image": {
@@ -84,6 +84,18 @@
         "maxFileBytes": {"type": "integer", "minimum": 1},
         "maxArtifactBytes": {"type": "integer", "minimum": 1},
         "maxRunBytes": {"type": "integer", "minimum": 1},
+        "cache": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["enabled", "maxEntryBytes", "maxRepositoryBytes", "maxTotalBytes", "retentionDays"],
+          "properties": {
+            "enabled": {"type": "boolean"},
+            "maxEntryBytes": {"type": "integer", "minimum": 1},
+            "maxRepositoryBytes": {"type": "integer", "minimum": 1},
+            "maxTotalBytes": {"type": "integer", "minimum": 1},
+            "retentionDays": {"type": "integer", "minimum": 1, "maximum": 3650}
+          }
+        },
         "resources": {"$ref": "#/definitions/containerResources"},
         "persistence": {
           "type": "object",

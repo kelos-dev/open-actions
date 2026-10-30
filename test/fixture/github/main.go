@@ -796,6 +796,7 @@ func main() {
 		log.Fatal(err)
 	}
 	mux := http.NewServeMux()
+	registerRepositoryMetadata(mux)
 	gitBackend := &cgi.Handler{
 		Path: gitPath,
 		Args: []string{"http-backend"},
@@ -947,6 +948,9 @@ func main() {
 	mux.HandleFunc("/repos/acme/example/contents/"+dynamicMatrixWorkflowPath, func(writer http.ResponseWriter, _ *http.Request) {
 		writeJSON(writer, map[string]string{"encoding": "base64", "content": base64.StdEncoding.EncodeToString([]byte(dynamicMatrixWorkflowData))})
 	})
+	mux.HandleFunc("/repos/acme/example/contents/"+cacheWorkflowPath, func(writer http.ResponseWriter, _ *http.Request) {
+		writeJSON(writer, map[string]string{"encoding": "base64", "content": base64.StdEncoding.EncodeToString([]byte(cacheWorkflowData))})
+	})
 	mux.HandleFunc("/repos/acme/example/contents/"+artifactWorkflowPath, func(writer http.ResponseWriter, _ *http.Request) {
 		writeJSON(writer, map[string]string{"encoding": "base64", "content": base64.StdEncoding.EncodeToString([]byte(artifactWorkflowData))})
 	})
@@ -1090,6 +1094,20 @@ func main() {
 	log.Fatal(server.ListenAndServe())
 }
 
+func registerRepositoryMetadata(mux *http.ServeMux) {
+	for _, repository := range []string{"example", "invalid-trigger", "invalid-field"} {
+		mux.HandleFunc("/repos/acme/"+repository, func(writer http.ResponseWriter, request *http.Request) {
+			if request.Method != http.MethodGet {
+				http.Error(writer, "method not allowed", http.StatusMethodNotAllowed)
+				return
+			}
+			writeJSON(writer, map[string]any{
+				"id": 123456789, "name": repository, "default_branch": "main", "owner": map[string]string{"login": "acme"},
+			})
+		})
+	}
+}
+
 func createRepositories(dataDirectory string) (fixtureRevisions, error) {
 	if err := os.RemoveAll(filepath.Join(dataDirectory, "git")); err != nil {
 		return fixtureRevisions{}, err
@@ -1140,6 +1158,9 @@ func createRepositories(dataDirectory string) (fixtureRevisions, error) {
 	if _, err := createRepository(dataDirectory, "actions", "composite", "v1", map[string]string{
 		"action.yml": compositeMetadata,
 	}); err != nil {
+		return fixtureRevisions{}, err
+	}
+	if _, err := createRepository(dataDirectory, "actions", "cache", "v4", map[string]string{"action.yml": cacheMetadata, "dist/index.js": cacheScript}); err != nil {
 		return fixtureRevisions{}, err
 	}
 	if _, err := createRepository(dataDirectory, "actions", "upload-artifact", "v7", map[string]string{

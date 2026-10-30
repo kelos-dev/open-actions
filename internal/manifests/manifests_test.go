@@ -381,3 +381,37 @@ func assertQuantityEqual(t *testing.T, got resource.Quantity, want string) {
 		t.Errorf("resource quantity = %s, want %s", got.String(), want)
 	}
 }
+
+func TestCacheWorkloadConfiguration(t *testing.T) {
+	chart := Chart()
+	data, err := fs.ReadFile(chart, "values.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, enabled := range []bool{true, false} {
+		var values map[string]any
+		if err := yaml.Unmarshal(data, &values); err != nil {
+			t.Fatal(err)
+		}
+		cacheValues := values["artifacts"].(map[string]any)["cache"].(map[string]any)
+		cacheValues["enabled"] = enabled
+		cacheValues["maxEntryBytes"] = 1024
+		cacheValues["maxRepositoryBytes"] = 2048
+		cacheValues["maxTotalBytes"] = 4096
+		cacheValues["retentionDays"] = 3
+		for _, path := range []string{"templates/deployment.yaml", "templates/artifact-statefulset.yaml"} {
+			pod := renderWorkloadPodSpec(t, chart, path, values)
+			args := pod.Containers[0].Args
+			if !slices.Contains(args, fmt.Sprintf("--cache-enabled=%t", enabled)) {
+				t.Fatalf("%s cache flag missing: %#v", path, args)
+			}
+			if path == "templates/artifact-statefulset.yaml" {
+				for _, want := range []string{"--cache-max-entry-bytes=1024", "--cache-max-repository-bytes=2048", "--cache-max-total-bytes=4096", "--cache-retention-days=3"} {
+					if !slices.Contains(args, want) {
+						t.Fatalf("%s missing from %#v", want, args)
+					}
+				}
+			}
+		}
+	}
+}

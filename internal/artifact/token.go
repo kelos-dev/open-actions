@@ -12,6 +12,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/kelos-dev/open-actions/internal/cache"
 )
 
 const (
@@ -29,12 +31,15 @@ type Scope struct {
 
 type TokenClaims struct {
 	Scope
-	ScopeClaim           string `json:"scp"`
-	WorkflowRunBackendID string `json:"workflow_run_backend_id"`
-	WorkflowJobBackendID string `json:"workflow_job_run_backend_id"`
-	IssuedAt             int64  `json:"iat"`
-	ExpiresAt            int64  `json:"exp"`
-	TokenID              string `json:"jti"`
+	Cache                *cache.Access `json:"cache,omitempty"`
+	AccessControls       string        `json:"ac,omitempty"`
+	NotBefore            int64         `json:"nbf"`
+	ScopeClaim           string        `json:"scp"`
+	WorkflowRunBackendID string        `json:"workflow_run_backend_id"`
+	WorkflowJobBackendID string        `json:"workflow_job_run_backend_id"`
+	IssuedAt             int64         `json:"iat"`
+	ExpiresAt            int64         `json:"exp"`
+	TokenID              string        `json:"jti"`
 }
 
 type TokenCodec struct {
@@ -58,6 +63,36 @@ func (c *TokenCodec) NewRuntimeToken(now time.Time, lifetime time.Duration, clai
 	if err := validateIdentity(claims.WorkflowRunBackendID, claims.WorkflowJobBackendID); err != nil {
 		return "", err
 	}
+	if claims.Cache != nil {
+		if err := claims.Cache.Validate(); err != nil {
+			return "", err
+		}
+		controls := []struct {
+			Scope      string
+			Permission int
+		}{}
+		for _, ref := range claims.Cache.ReadRefs {
+			permission := 0
+			if claims.Cache.Readable() {
+				permission |= 1
+			}
+			if claims.Cache.Writable() && ref == claims.Cache.WriteRef {
+				permission |= 2
+			}
+			if permission != 0 {
+				controls = append(controls, struct {
+					Scope      string
+					Permission int
+				}{ref, permission})
+			}
+		}
+		data, err := json.Marshal(controls)
+		if err != nil {
+			return "", err
+		}
+		claims.AccessControls = string(data)
+	}
+	claims.NotBefore = now.Unix()
 	claims.IssuedAt = now.Unix()
 	claims.ExpiresAt = now.Add(lifetime).Unix()
 	claims.ScopeClaim = "Actions.Results:" + claims.WorkflowRunBackendID + ":" + claims.WorkflowJobBackendID
@@ -117,7 +152,12 @@ func (c *TokenCodec) ParseRuntimeToken(token string, now time.Time) (TokenClaims
 	if claims.ScopeClaim != "Actions.Results:"+claims.WorkflowRunBackendID+":"+claims.WorkflowJobBackendID {
 		return TokenClaims{}, errors.New("artifact token scope is invalid")
 	}
-	if claims.TokenID == "" || claims.IssuedAt <= 0 || claims.ExpiresAt <= claims.IssuedAt || now.Unix() >= claims.ExpiresAt {
+	if claims.Cache != nil {
+		if err := claims.Cache.Validate(); err != nil {
+			return TokenClaims{}, err
+		}
+	}
+	if claims.NotBefore > now.Unix() || claims.TokenID == "" || claims.IssuedAt <= 0 || claims.ExpiresAt <= claims.IssuedAt || now.Unix() >= claims.ExpiresAt {
 		return TokenClaims{}, errors.New("artifact token is expired")
 	}
 	return claims, nil

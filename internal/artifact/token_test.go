@@ -1,6 +1,8 @@
 package artifact
 
 import (
+	"encoding/json"
+	"github.com/kelos-dev/open-actions/internal/cache"
 	"strings"
 	"testing"
 	"time"
@@ -90,5 +92,43 @@ func testClaims(jobID string) TokenClaims {
 	return TokenClaims{
 		Scope:                Scope{ProjectUID: "project-uid", RepositoryID: 123, RootRunUID: "root-uid", RunUID: "run-uid", Attempt: 1},
 		WorkflowRunBackendID: "run-uid", WorkflowJobBackendID: jobID,
+	}
+}
+
+func TestCacheRuntimeTokenAccessControls(t *testing.T) {
+	for _, mode := range []string{"read", "write", "write-only", "none"} {
+		claims := testClaims("job")
+		access := cache.ResolveAccess("push", "refs/heads/feature", "", "main", mode)
+		claims.Cache = &access
+		codec := testTokenCodec(t)
+		token := testRuntimeToken(t, codec, time.Now(), claims)
+		parsed, err := codec.ParseRuntimeToken(token, time.Now())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if parsed.Cache.Mode != mode || parsed.NotBefore == 0 {
+			t.Fatal(parsed)
+		}
+		var controls []struct {
+			Scope      string
+			Permission int
+		}
+		if err := json.Unmarshal([]byte(parsed.AccessControls), &controls); err != nil {
+			t.Fatal(err)
+		}
+		permissions := map[string]int{}
+		for _, c := range controls {
+			permissions[c.Scope] = c.Permission
+		}
+		wantRead, wantWrite := 0, 0
+		if mode == "read" || mode == "write" {
+			wantRead = 1
+		}
+		if mode == "write" || mode == "write-only" {
+			wantWrite = 2
+		}
+		if permissions["refs/heads/feature"] != wantRead|wantWrite || permissions["refs/heads/main"] != wantRead {
+			t.Fatal(permissions)
+		}
 	}
 }

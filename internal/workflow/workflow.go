@@ -63,9 +63,21 @@ type Definition struct {
 	Name        string         `yaml:"name"`
 	On          Trigger        `yaml:"on"`
 	Permissions Permissions    `yaml:"permissions"`
+	CacheMode   CacheMode      `yaml:"cache-mode"`
 	Env         map[string]any `yaml:"env"`
 	Concurrency Concurrency    `yaml:"concurrency"`
 	Jobs        map[string]Job `yaml:"jobs"`
+}
+
+// CacheMode controls access to the workflow cache independently of repository permissions.
+type CacheMode string
+
+func (m *CacheMode) UnmarshalYAML(node *yaml.Node) error {
+	if node.Kind != yaml.ScalarNode || node.Tag != "!!str" || !slices.Contains([]string{"read", "write", "write-only", "none"}, node.Value) {
+		return fmt.Errorf("cache-mode must be read, write, write-only, or none")
+	}
+	*m = CacheMode(node.Value)
+	return nil
 }
 
 // Permissions contains the repository access requested for a workflow job.
@@ -216,6 +228,7 @@ type Job struct {
 	RunsOn          StringList        `yaml:"runs-on"`
 	Needs           StringList        `yaml:"needs"`
 	Permissions     Permissions       `yaml:"permissions"`
+	CacheMode       CacheMode         `yaml:"cache-mode"`
 	Outputs         map[string]any    `yaml:"outputs"`
 	Steps           []Step            `yaml:"steps"`
 	Strategy        Strategy          `yaml:"strategy"`

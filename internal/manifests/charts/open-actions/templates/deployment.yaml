@@ -45,6 +45,7 @@ spec:
             {{- end }}
             {{- if .Values.artifacts.enabled }}
             - {{ printf "--artifact-service-url=http://open-actions-artifacts.%s.svc" .Release.Namespace | quote }}
+            - {{ printf "--cache-enabled=%t" .Values.artifacts.cache.enabled | quote }}
             - --artifact-signing-key-file=/var/run/secrets/open-actions-artifacts/signing-key
             - {{ printf "--artifact-max-retention-days=%d" (int64 .Values.artifacts.maxRetentionDays) | quote }}
             {{- end }}
