@@ -35,7 +35,7 @@ runs:
   using: node20
   main: dist/index.js
   post: dist/index.js
-  post-if: success()
+  post-if: "success() || env.CACHE_ON_FAILURE == 'true'"
 `
 
 const cacheScript = `const fs = require('fs');
