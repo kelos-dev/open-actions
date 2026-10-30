@@ -46,6 +46,28 @@ jobs:
       - name: Test
         run: make test TEST_FLAGS=-race
 
+  test-artifact-actions:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.19.0
+      - name: Expose Node.js 24 runtime
+        run: |
+          mkdir -p "$RUNNER_TEMP/artifact-runtimes"
+          ln -s "$(command -v node)" "$RUNNER_TEMP/artifact-runtimes/node24"
+          echo "$RUNNER_TEMP/artifact-runtimes" >> "$GITHUB_PATH"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20.20.2
+      - name: Test official artifact actions
+        run: make test-artifact-actions
+
   test-e2e:
     runs-on: ubuntu-latest
     timeout-minutes: 15
