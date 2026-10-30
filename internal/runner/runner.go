@@ -801,13 +801,19 @@ func (e *Executor) runPostActions(ctx context.Context, state *executionState, st
 	step := len(state.plan.Steps) + 1
 	for index := len(state.posts) - 1; index >= 0; index-- {
 		invocation := state.posts[index]
-		if !matchesPostCondition(invocation.definition.Runs.PostIf, status) {
+		run, conditionError := actionLifecycleCondition(invocation.definition.Runs.PostIf, invocation, state, status, actionPostConditionAvailability)
+		if conditionError == nil && !run {
 			e.logger.Info("skipping post action", "job", state.plan.JobID, "step", step, "action", invocation.step.Uses)
 			step++
 			continue
 		}
 		e.logger.Info("starting post action", "job", state.plan.JobID, "step", step, "action", invocation.step.Uses)
-		err := e.runJavaScriptHook(ctx, invocation, "post", invocation.definition.Runs.Post, state)
+		var err error
+		if conditionError != nil {
+			err = fmt.Errorf("evaluate post-if: %w", conditionError)
+		} else {
+			err = e.runJavaScriptHook(ctx, invocation, "post", invocation.definition.Runs.Post, state)
+		}
 		if err != nil {
 			result = errors.Join(result, fmt.Errorf("post action %s: %w", invocation.step.Uses, err))
 			status.Success = false
@@ -1000,18 +1006,5 @@ func runnerArchitecture() string {
 		return "ARM"
 	default:
 		return runtime.GOARCH
-	}
-}
-
-func matchesPostCondition(condition string, status expression.Status) bool {
-	switch strings.TrimSpace(condition) {
-	case "", "always()":
-		return true
-	case "success()":
-		return status.Success
-	case "failure()":
-		return status.Failure
-	default:
-		return false
 	}
 }

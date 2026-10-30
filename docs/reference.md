@@ -1394,9 +1394,25 @@ is rejected when the workflow or action metadata is loaded.
 | Workflow step name, run script, working directory, environment, inputs, and `continue-on-error` | `github`, `open_actions`, `needs`, `strategy`, `matrix`, `job`, `runner`, `env`, `vars`, `secrets`, `steps`, `inputs`; `hashFiles` |
 | Workflow step condition | Step contexts except `secrets`; status functions and `hashFiles` |
 | Action input default | `github`, `open_actions`, `strategy`, `matrix`, `job`, `runner`; `hashFiles` |
+| Action `runs.pre-if` | Step contexts except `secrets` and `steps`; status functions and `hashFiles` |
+| Action `runs.post-if` | Step contexts except `secrets`; status functions and `hashFiles` |
 | Composite step name, run script, working directory, environment, inputs, and `continue-on-error` | `github`, `open_actions`, `inputs`, `strategy`, `matrix`, `steps`, `job`, `runner`, `env`; `hashFiles` |
 | Composite step condition | Composite step contexts; status functions and `hashFiles` |
 | Composite output | Composite step contexts without `hashFiles` |
+
+JavaScript action `runs.pre-if` and `runs.post-if` conditions are evaluated
+when their hooks are considered. Pre-hook status functions and `job.status`
+use the job-start status, before any workflow steps have run. Post-hook status
+functions and `job.status` use the current job status at cleanup time.
+The resolved action step environment overrides job environment values;
+variables exported through `GITHUB_ENV` are available to later hooks. Omitted
+conditions default to `always()`. Explicit lifecycle conditions are evaluated
+directly, without an implicit `success()` check. Status functions describe the
+job status for the hook's phase rather than the individual action's result.
+Invalid syntax or unavailable contexts fail action preparation before workflow steps run.
+Evaluation errors fail the hook; remaining post hooks still run according to
+their conditions and the updated job status. These rules follow GitHub's
+[action metadata reference](https://docs.github.com/en/actions/reference/workflows-and-actions/metadata-syntax#runspost-if).
 
 `open_actions` is an Open Actions extension. It supplies `run_url` and
 `run_query_url` at every site where the table lists it.

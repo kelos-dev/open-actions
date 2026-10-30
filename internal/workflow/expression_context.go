@@ -20,6 +20,8 @@ const (
 	ExpressionCompositeStep
 	ExpressionCompositeCondition
 	ExpressionCompositeOutput
+	ExpressionActionPreCondition
+	ExpressionActionPostCondition
 )
 
 // ExpressionAvailability returns the contexts and special functions available
@@ -50,6 +52,10 @@ func ExpressionAvailability(site ExpressionSite) expression.Availability {
 		return expression.NewAvailability("github", "open_actions", "strategy", "matrix", "job", "runner", "env", "inputs", "steps").WithHashFiles()
 	case ExpressionCompositeCondition:
 		return expression.NewAvailability("github", "open_actions", "strategy", "matrix", "job", "runner", "env", "inputs", "steps").WithStatusFunctions().WithHashFiles()
+	case ExpressionActionPreCondition:
+		return expression.NewAvailability("github", "open_actions", "needs", "strategy", "matrix", "job", "runner", "env", "vars", "inputs").WithStatusFunctions().WithHashFiles()
+	case ExpressionActionPostCondition:
+		return expression.NewAvailability("github", "open_actions", "needs", "strategy", "matrix", "job", "runner", "env", "vars", "steps", "inputs").WithStatusFunctions().WithHashFiles()
 	case ExpressionCompositeOutput:
 		return expression.NewAvailability("github", "open_actions", "strategy", "matrix", "job", "runner", "env", "inputs", "steps")
 	default:

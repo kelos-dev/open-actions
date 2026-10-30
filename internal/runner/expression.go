@@ -12,14 +12,16 @@ import (
 )
 
 var (
-	runnerJobAvailability          = workflow.ExpressionAvailability(workflow.ExpressionJobEnvironment)
-	runnerJobOutputAvailability    = workflow.ExpressionAvailability(workflow.ExpressionJobOutput)
-	actionDefaultAvailability      = workflow.ExpressionAvailability(workflow.ExpressionActionInputDefault)
-	runnerStepAvailability         = workflow.ExpressionAvailability(workflow.ExpressionStep)
-	runnerConditionAvailability    = workflow.ExpressionAvailability(workflow.ExpressionStepCondition)
-	compositeAvailability          = workflow.ExpressionAvailability(workflow.ExpressionCompositeStep)
-	compositeConditionAvailability = workflow.ExpressionAvailability(workflow.ExpressionCompositeCondition)
-	compositeOutputAvailability    = workflow.ExpressionAvailability(workflow.ExpressionCompositeOutput)
+	runnerJobAvailability           = workflow.ExpressionAvailability(workflow.ExpressionJobEnvironment)
+	runnerJobOutputAvailability     = workflow.ExpressionAvailability(workflow.ExpressionJobOutput)
+	actionPreConditionAvailability  = workflow.ExpressionAvailability(workflow.ExpressionActionPreCondition)
+	actionPostConditionAvailability = workflow.ExpressionAvailability(workflow.ExpressionActionPostCondition)
+	actionDefaultAvailability       = workflow.ExpressionAvailability(workflow.ExpressionActionInputDefault)
+	runnerStepAvailability          = workflow.ExpressionAvailability(workflow.ExpressionStep)
+	runnerConditionAvailability     = workflow.ExpressionAvailability(workflow.ExpressionStepCondition)
+	compositeAvailability           = workflow.ExpressionAvailability(workflow.ExpressionCompositeStep)
+	compositeConditionAvailability  = workflow.ExpressionAvailability(workflow.ExpressionCompositeCondition)
+	compositeOutputAvailability     = workflow.ExpressionAvailability(workflow.ExpressionCompositeOutput)
 )
 
 func resolveJobEnvironment(values map[string]string, plan *Plan, environment []string, token string, secrets, variables map[string]string) (map[string]string, error) {
@@ -137,6 +139,28 @@ func workflowStepCondition(input string, environment map[string]string, status w
 	}
 	context.Values["env"] = workflowexpression.DeferredObjectMap{Resolve: resolveEnvironment, Values: allEnvironment}
 	return evaluateCondition(input, context, status.Success)
+}
+
+func actionLifecycleCondition(input string, invocation *actionInvocation, state *executionState, status workflowexpression.Status, availability workflowexpression.Availability) (bool, error) {
+	if strings.TrimSpace(input) == "" {
+		return true, nil
+	}
+	program, err := workflowexpression.ParseCondition(input)
+	if err != nil {
+		return false, err
+	}
+	environment := mergeEnvironment(state.contextEnvironment, invocation.step.Env)
+	values := map[string]any{"steps": state.stepOutputs}
+	context := expressionContext(state.plan, state.environment, environment, invocation.directory, values, availability, &status, state.githubToken, state.secrets, state.variables)
+	github := context.Values["github"].(map[string]any)
+	github["action_ref"] = invocation.reference.Ref
+	github["action_repository"] = invocation.reference.Owner + "/" + invocation.reference.Repository
+	// GitHub evaluates lifecycle conditions directly without adding a success() check.
+	result, err := program.Evaluate(context)
+	if err != nil {
+		return false, err
+	}
+	return result.Bool(), nil
 }
 
 func workflowExpressionContext(state *executionState, environment map[string]string, availability workflowexpression.Availability, status *workflowexpression.Status) workflowexpression.Context {

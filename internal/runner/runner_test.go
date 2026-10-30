@@ -2989,19 +2989,6 @@ func TestCompositeStepsCountTowardEvaluatedContentLimit(t *testing.T) {
 	}
 }
 
-func TestMatchesPostConditionDistinguishesCancellationFromFailure(t *testing.T) {
-	status := workflowexpression.Status{Cancelled: true}
-	if matchesPostCondition("success()", status) {
-		t.Fatal("success post condition matched cancellation")
-	}
-	if matchesPostCondition("failure()", status) {
-		t.Fatal("failure post condition matched cancellation")
-	}
-	if !matchesPostCondition("always()", status) {
-		t.Fatal("always post condition did not match cancellation")
-	}
-}
-
 func waitForFile(t *testing.T, path, timeoutMessage string) {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)

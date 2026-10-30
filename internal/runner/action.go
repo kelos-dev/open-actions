@@ -173,8 +173,23 @@ func (r *actionResolver) resolve(ctx context.Context, uses string) (preparedActi
 		if definition.Runs.Main == "" {
 			return preparedAction{}, fmt.Errorf("action %s does not define runs.main", uses)
 		}
-		if !supportedActionCondition(definition.Runs.PreIf) || !supportedActionCondition(definition.Runs.PostIf) {
-			return preparedAction{}, fmt.Errorf("action %s uses an unsupported lifecycle condition", uses)
+		for _, condition := range []struct {
+			field, input string
+			availability workflowexpression.Availability
+		}{
+			{"pre-if", definition.Runs.PreIf, actionPreConditionAvailability},
+			{"post-if", definition.Runs.PostIf, actionPostConditionAvailability},
+		} {
+			if strings.TrimSpace(condition.input) == "" {
+				continue
+			}
+			program, err := workflowexpression.ParseCondition(condition.input)
+			if err == nil {
+				err = program.Validate(condition.availability)
+			}
+			if err != nil {
+				return preparedAction{}, fmt.Errorf("action %s runs.%s: %w", uses, condition.field, err)
+			}
 		}
 	case "composite":
 	default:
@@ -423,8 +438,16 @@ func (e *Executor) runJavaScriptHook(ctx context.Context, invocation *actionInvo
 	if entrypoint == "" {
 		return nil
 	}
-	if hook == "pre" && !matchesPreCondition(invocation.definition.Runs.PreIf) {
-		return nil
+	if hook == "pre" {
+		// Pre-hook status checks describe the job before workflow steps execute.
+		status := workflowStepStatus(false, false)
+		run, err := actionLifecycleCondition(invocation.definition.Runs.PreIf, invocation, state, status, actionPreConditionAvailability)
+		if err != nil {
+			return fmt.Errorf("evaluate pre-if: %w", err)
+		}
+		if !run {
+			return nil
+		}
 	}
 	entrypointPath, err := withinDirectory(invocation.directory, entrypoint)
 	if err != nil {
@@ -556,22 +579,4 @@ func actionRuntimeExecutable(runtime string, environment []string) (string, erro
 		return path, nil
 	}
 	return "", fmt.Errorf("%s action runtime is unavailable: executable %q was not found in PATH", runtime, executable)
-}
-
-func matchesPreCondition(condition string) bool {
-	switch strings.TrimSpace(condition) {
-	case "", "always()", "success()":
-		return true
-	default:
-		return false
-	}
-}
-
-func supportedActionCondition(condition string) bool {
-	switch strings.TrimSpace(condition) {
-	case "", "always()", "success()", "failure()":
-		return true
-	default:
-		return false
-	}
 }

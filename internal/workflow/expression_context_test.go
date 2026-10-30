@@ -24,6 +24,8 @@ func TestExpressionAvailabilityMatchesGitHubContextTable(t *testing.T) {
 		{name: "job output", site: ExpressionJobOutput, contexts: "github open_actions needs strategy matrix job runner env vars secrets steps inputs"},
 		{name: "step", site: ExpressionStep, contexts: "github open_actions needs strategy matrix job runner env vars secrets steps inputs", hashFiles: true},
 		{name: "step condition", site: ExpressionStepCondition, contexts: "github open_actions needs strategy matrix job runner env vars steps inputs", status: true, hashFiles: true},
+		{name: "action pre condition", site: ExpressionActionPreCondition, contexts: "github open_actions needs strategy matrix job runner env vars inputs", status: true, hashFiles: true},
+		{name: "action post condition", site: ExpressionActionPostCondition, contexts: "github open_actions needs strategy matrix job runner env vars steps inputs", status: true, hashFiles: true},
 		{name: "action input default", site: ExpressionActionInputDefault, contexts: "github open_actions strategy matrix job runner", hashFiles: true},
 		{name: "composite step", site: ExpressionCompositeStep, contexts: "github open_actions strategy matrix job runner env inputs steps", hashFiles: true},
 		{name: "composite condition", site: ExpressionCompositeCondition, contexts: "github open_actions strategy matrix job runner env inputs steps", status: true, hashFiles: true},
