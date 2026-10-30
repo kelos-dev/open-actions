@@ -18,7 +18,7 @@ ARG GH_VERSION=2.98.0
 ARG KUBECTL_VERSION=1.35.8
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends build-essential ca-certificates curl git jq make netcat-openbsd openssl passwd tini \
+    && apt-get install -y --no-install-recommends build-essential ca-certificates curl git jq make netcat-openbsd openssl passwd tar tini zstd \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --gid 65532 open-actions \
     && useradd --uid 65532 --gid 65532 --create-home open-actions

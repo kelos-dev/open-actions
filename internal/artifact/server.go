@@ -16,28 +16,32 @@ import (
 	"strings"
 	"sync/atomic"
 	"time"
+
+	"github.com/kelos-dev/open-actions/internal/cache"
 )
 
 const artifactServicePath = "/twirp/github.actions.results.api.v1.ArtifactService/"
 
 type ServerConfig struct {
-	Address   string
-	PublicURL string
-	Store     *Store
-	Tokens    *TokenCodec
-	Logger    *slog.Logger
-	Now       func() time.Time
+	Address    string
+	PublicURL  string
+	Store      *Store
+	CacheStore *cache.Store
+	Tokens     *TokenCodec
+	Logger     *slog.Logger
+	Now        func() time.Time
 }
 
 type Server struct {
-	address   string
-	publicURL string
-	store     *Store
-	tokens    *TokenCodec
-	logger    *slog.Logger
-	now       func() time.Time
-	ready     atomic.Bool
-	handler   http.Handler
+	address    string
+	publicURL  string
+	store      *Store
+	cacheStore *cache.Store
+	tokens     *TokenCodec
+	logger     *slog.Logger
+	now        func() time.Time
+	ready      atomic.Bool
+	handler    http.Handler
 }
 
 func NewServer(config ServerConfig) (*Server, error) {
@@ -52,7 +56,7 @@ func NewServer(config ServerConfig) (*Server, error) {
 	if now == nil {
 		now = time.Now
 	}
-	server := &Server{address: config.Address, publicURL: strings.TrimSuffix(parsed.String(), "/"), store: config.Store, tokens: config.Tokens, logger: config.Logger, now: now}
+	server := &Server{address: config.Address, publicURL: strings.TrimSuffix(parsed.String(), "/"), store: config.Store, cacheStore: config.CacheStore, tokens: config.Tokens, logger: config.Logger, now: now}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", server.health)
 	mux.HandleFunc("/readyz", server.readiness)
@@ -62,6 +66,13 @@ func NewServer(config ServerConfig) (*Server, error) {
 	mux.HandleFunc(artifactServicePath+"GetSignedArtifactURL", server.getSignedArtifactURL)
 	mux.HandleFunc(artifactServicePath+"DeleteArtifact", server.deleteArtifact)
 	mux.HandleFunc("/artifacts/blobs/", server.blob)
+	if config.CacheStore != nil {
+		mux.HandleFunc(cacheServicePath, server.cacheRPC)
+		mux.HandleFunc("/_apis/artifactcache/", func(w http.ResponseWriter, r *http.Request) {
+			writeTwirpError(w, http.StatusNotImplemented, "unimplemented", "cache protocol v1 is not supported; use a v2-compatible client (https://github.com/kelos-dev/open-actions/issues/41)")
+		})
+		mux.HandleFunc("/cache/blobs/", server.cacheBlob)
+	}
 	server.handler = mux
 	return server, nil
 }
@@ -73,6 +84,11 @@ func (s *Server) Handler() http.Handler {
 func (s *Server) Start(ctx context.Context) error {
 	if err := s.store.Cleanup(); err != nil {
 		return fmt.Errorf("clean artifact storage: %w", err)
+	}
+	if s.cacheStore != nil {
+		if err := s.cacheStore.Cleanup(); err != nil {
+			return fmt.Errorf("clean cache storage: %w", err)
+		}
 	}
 	listener, err := net.Listen("tcp", s.address)
 	if err != nil {
@@ -106,6 +122,11 @@ func (s *Server) cleanup(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			if s.cacheStore != nil {
+				if err := s.cacheStore.Cleanup(); err != nil {
+					s.logger.Error("cache cleanup failed", "error", err)
+				}
+			}
 			if err := s.store.Cleanup(); err != nil {
 				s.logger.Error("artifact cleanup failed", "error", err)
 			}

@@ -1,3 +1,6 @@
+{{- if and .Values.artifacts.enabled (or (gt (int64 .Values.artifacts.cache.maxEntryBytes) (int64 .Values.artifacts.cache.maxRepositoryBytes)) (gt (int64 .Values.artifacts.cache.maxRepositoryBytes) (int64 .Values.artifacts.cache.maxTotalBytes))) }}
+{{- fail "cache byte limits must be ordered by entry, repository, and total" }}
+{{- end }}
 {{- if and .Values.artifacts.enabled (gt (int64 .Values.artifacts.defaultRetentionDays) (int64 .Values.artifacts.maxRetentionDays)) }}
 {{- fail "artifacts.defaultRetentionDays must not exceed artifacts.maxRetentionDays" }}
 {{- end }}
@@ -51,6 +54,11 @@ spec:
           args:
             - {{ printf "--public-url=http://open-actions-artifacts.%s.svc" .Release.Namespace | quote }}
             - --storage-directory=/var/lib/open-actions/artifacts
+            - {{ printf "--cache-enabled=%t" .Values.artifacts.cache.enabled | quote }}
+            - {{ printf "--cache-max-entry-bytes=%d" (int64 .Values.artifacts.cache.maxEntryBytes) | quote }}
+            - {{ printf "--cache-max-repository-bytes=%d" (int64 .Values.artifacts.cache.maxRepositoryBytes) | quote }}
+            - {{ printf "--cache-max-total-bytes=%d" (int64 .Values.artifacts.cache.maxTotalBytes) | quote }}
+            - {{ printf "--cache-retention-days=%d" (int64 .Values.artifacts.cache.retentionDays) | quote }}
             - --signing-key-file=/var/run/secrets/open-actions-artifacts/signing-key
             - {{ printf "--max-file-bytes=%d" (int64 .Values.artifacts.maxFileBytes) | quote }}
             - {{ printf "--max-artifact-bytes=%d" (int64 .Values.artifacts.maxArtifactBytes) | quote }}

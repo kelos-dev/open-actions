@@ -49,6 +49,17 @@ Completed native Jobs and runner Pods are retained with their WorkflowRun so
 their logs remain available. Deleting an expired WorkflowRun also deletes its
 owned WorkflowJobs and execution resources.
 
+The artifact service also provides workflow caching. `artifacts.cache.enabled`
+defaults to `true`; set it to `false` to disable cache credentials and endpoints.
+`artifacts.cache.maxEntryBytes`, `maxRepositoryBytes`, and `maxTotalBytes` each
+default to 10 GiB and must be ordered by entry, repository, and total. Entries
+expire after `artifacts.cache.retentionDays` days without access (default 7),
+and finalized entries are evicted in least-recently-used order under capacity
+pressure. These limits are separate from artifact quotas. Size the shared PVC
+for both services and temporary upload space. See the
+[cache reference](../../../../docs/reference.md#workflow-caches) for supported
+clients, scope rules, and configuration.
+
 The chart enables the internal artifact service as a standalone, one-replica
 StatefulSet. By default, its volume claim template provisions persistent
 storage for content and metadata and retains the claim when the StatefulSet is
@@ -120,6 +131,11 @@ controller:
 | `artifacts.maxFileBytes` | `1073741824` | Maximum uncompressed size of one file |
 | `artifacts.maxArtifactBytes` | `2147483648` | Maximum stored and total uncompressed size of one artifact |
 | `artifacts.maxRunBytes` | `10737418240` | Maximum stored artifact bytes in one WorkflowRun attempt |
+| `artifacts.cache.enabled` | `true` | Enable the v2 workflow cache service and job-scoped cache credentials |
+| `artifacts.cache.maxEntryBytes` | `10737418240` | Maximum stored bytes in one cache entry |
+| `artifacts.cache.maxRepositoryBytes` | `10737418240` | Maximum cache bytes per Project and repository; must be at least `artifacts.cache.maxEntryBytes` |
+| `artifacts.cache.maxTotalBytes` | `10737418240` | Maximum cache bytes across all Projects; must be at least `artifacts.cache.maxRepositoryBytes` |
+| `artifacts.cache.retentionDays` | `7` | Expire finalized cache entries after this many days without access |
 | `artifacts.resources` | CPU `50m`/`1`, memory `64Mi`/`256Mi` | Kubernetes resource requests and limits for the artifact server container |
 | `artifacts.persistence.enabled` | `true` | Use StatefulSet-managed persistent storage instead of an ephemeral `emptyDir` |
 | `artifacts.persistence.existingClaim` | `""` | Existing claim to mount instead of creating one from the StatefulSet volume claim template |

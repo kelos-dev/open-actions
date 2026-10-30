@@ -46,6 +46,19 @@ jobs:
       - name: Test
         run: make test TEST_FLAGS=-race
 
+  test-cache-conformance:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Cache client conformance
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: make test-cache-conformance
+
   test-e2e:
     runs-on: ubuntu-latest
     timeout-minutes: 15

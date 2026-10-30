@@ -2026,7 +2026,15 @@ func TestExecuteWorkflowJobMintsPlannedTokenPermissions(t *testing.T) {
 	})
 }
 
-func testExecuteWorkflowJobMintsPlannedTokenPermissions(t *testing.T, steps []runner.Step, wantActionToken bool, tokenLifetime time.Duration) {
+func TestCacheControllerCredentials(t *testing.T) {
+	for _, mode := range []string{"", "read", "write-only", "none"} {
+		t.Run("mode="+mode, func(t *testing.T) {
+			testExecuteWorkflowJobMintsPlannedTokenPermissions(t, []runner.Step{{Run: "true"}}, false, time.Hour, mode)
+		})
+	}
+}
+
+func testExecuteWorkflowJobMintsPlannedTokenPermissions(t *testing.T, steps []runner.Step, wantActionToken bool, tokenLifetime time.Duration, cacheModes ...string) {
 	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
 		t.Fatal(err)
@@ -2039,6 +2047,10 @@ func testExecuteWorkflowJobMintsPlannedTokenPermissions(t *testing.T, steps []ru
 	revoked := []string{}
 	tokenExpiresAt := time.Now().Add(tokenLifetime)
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.Method == http.MethodGet && request.URL.Path == "/repos/acme/example" {
+			_ = json.NewEncoder(writer).Encode(map[string]any{"id": 1, "default_branch": "main"})
+			return
+		}
 		if request.Method == http.MethodDelete && request.URL.Path == "/installation/token" {
 			revoked = append(revoked, strings.TrimPrefix(request.Header.Get("Authorization"), "Bearer "))
 			writer.WriteHeader(http.StatusNoContent)
@@ -2118,6 +2130,18 @@ func testExecuteWorkflowJobMintsPlannedTokenPermissions(t *testing.T, steps []ru
 	if err := controllerutil.SetControllerReference(workflowJob, plan, scheme); err != nil {
 		t.Fatal(err)
 	}
+	if len(cacheModes) > 0 {
+		decoded, err := runner.DecodePlan([]byte(plan.Data[jobPlanKey]))
+		if err != nil {
+			t.Fatal(err)
+		}
+		decoded.CacheMode = cacheModes[0]
+		encoded, err := json.Marshal(decoded)
+		if err != nil {
+			t.Fatal(err)
+		}
+		plan.Data[jobPlanKey] = string(encoded)
+	}
 	credentials := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "github", Namespace: "default"}, Data: map[string][]byte{"private-key": privateKeyData}}
 	runnerObject := &actionsv1alpha1.Runner{
 		ObjectMeta: metav1.ObjectMeta{Name: "runner", Namespace: "default", UID: types.UID("runner-uid")},
@@ -2127,6 +2151,15 @@ func testExecuteWorkflowJobMintsPlannedTokenPermissions(t *testing.T, steps []ru
 		WithStatusSubresource(&actionsv1alpha1.WorkflowJob{}, &batchv1.Job{}).
 		WithObjects(project, run, workflowJob, plan, credentials, runnerObject).Build()
 	reconciler := &RunnerReconciler{Client: clusterClient, APIReader: clusterClient, GitHub: github}
+	if len(cacheModes) > 0 {
+		codec, err := artifact.NewTokenCodec([]byte(strings.Repeat("a", 32)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		reconciler.CacheEnabled = true
+		reconciler.ArtifactResultsURL = "http://results.example"
+		reconciler.ArtifactTokens = codec
+	}
 	terminal, err := reconciler.executeWorkflowJob(context.Background(), runnerObject, workflowJob, project)
 	wantRequests := 1
 	if wantActionToken {
@@ -2182,6 +2215,26 @@ func testExecuteWorkflowJobMintsPlannedTokenPermissions(t *testing.T, steps []ru
 	nativeJob := &batchv1.Job{}
 	if err := clusterClient.Get(context.Background(), client.ObjectKey{Namespace: "default", Name: workflowJob.Name}, nativeJob); err != nil {
 		t.Fatal(err)
+	}
+	if len(cacheModes) > 0 {
+		claims, err := reconciler.ArtifactTokens.ParseRuntimeToken(string(auth.Data[artifact.TokenSecretKey]), time.Now())
+		if err != nil {
+			t.Fatal(err)
+		}
+		wantMode := cacheModes[0]
+		if wantMode == "" {
+			wantMode = "write"
+		}
+		if claims.Cache == nil || claims.Cache.Mode != wantMode || claims.Cache.WriteRef != "refs/pull/7/merge" || !slices.Equal(claims.Cache.ReadRefs, []string{"refs/pull/7/merge", "refs/heads/main"}) {
+			t.Fatalf("cache claims=%#v", claims.Cache)
+		}
+		environment := map[string]string{}
+		for _, e := range nativeJob.Spec.Template.Spec.Containers[0].Env {
+			environment[e.Name] = e.Value
+		}
+		if environment["ACTIONS_CACHE_SERVICE_V2"] != "true" || environment["ACTIONS_CACHE_MODE"] != wantMode || environment["ACTIONS_RESULTS_URL"] != "http://results.example" {
+			t.Fatal(environment)
+		}
 	}
 	maximumStartSeconds := int64((time.Hour - installationTokenStartMargin) / time.Second)
 	if nativeJob.Spec.ActiveDeadlineSeconds == nil || *nativeJob.Spec.ActiveDeadlineSeconds > maximumStartSeconds || *nativeJob.Spec.ActiveDeadlineSeconds < maximumStartSeconds-60 {

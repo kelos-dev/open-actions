@@ -29,6 +29,12 @@ artifacts:
   maxFileBytes: 1073741824
   maxArtifactBytes: 2147483648
   maxRunBytes: 10737418240
+  cache:
+    enabled: true
+    maxEntryBytes: 10737418240
+    maxRepositoryBytes: 10737418240
+    maxTotalBytes: 10737418240
+    retentionDays: 7
   resources:
     requests:
       cpu: 50m

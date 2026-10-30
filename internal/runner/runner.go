@@ -18,6 +18,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/kelos-dev/open-actions/internal/cache"
 	"github.com/kelos-dev/open-actions/internal/eventsnapshot"
 	"github.com/kelos-dev/open-actions/internal/expression"
 	"github.com/kelos-dev/open-actions/internal/workflow"
@@ -27,7 +28,7 @@ import (
 
 const (
 	minimumPlanVersion       = 1
-	PlanVersion              = 9
+	PlanVersion              = 10
 	ContainerName            = "runner"
 	RunnerNameEnvVar         = "RUNNER_NAME"
 	GitHubTokenEnvVar        = "OPEN_ACTIONS_GITHUB_TOKEN"
@@ -43,6 +44,7 @@ const runnerLogMarker = "open_actions_runner"
 
 type Plan struct {
 	Version                int               `json:"version"`
+	CacheMode              string            `json:"cacheMode,omitempty"`
 	Run                    Run               `json:"run"`
 	Repository             Repository        `json:"repository"`
 	Event                  Event             `json:"event"`
@@ -324,6 +326,9 @@ func DecodePlan(data []byte) (*Plan, error) {
 	}
 	if plan.Version >= 7 && (plan.Run.ID < 1 || plan.Run.Number < 1 || plan.Run.Attempt < 1 || plan.Run.Actor == "") {
 		return nil, errors.New("job plan run identity is incomplete")
+	}
+	if plan.CacheMode != "" && !cache.ValidMode(plan.CacheMode) {
+		return nil, errors.New("job plan cache mode is invalid")
 	}
 	if plan.Version >= 8 && !validGitHubTokenPermissions(plan.GitHubTokenPermissions) {
 		return nil, errors.New("job plan GitHub token permissions are incomplete")
