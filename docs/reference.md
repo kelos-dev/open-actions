@@ -1213,9 +1213,11 @@ The resources expose these condition contracts:
 | `WorkflowJob` | `ConcurrencyAcquired` | `Unknown` | `WaitingForConcurrency` |
 | `WorkflowJob` | `ConcurrencyAcquired` | `True` | `ConcurrencyAcquired` |
 | `WorkflowJob` | `ConcurrencyAcquired` | `False` | `ConcurrencySuperseded` |
-| `WorkflowJob` | `Scheduled` | `True` | `RunnerAssigned` |
-| `WorkflowJob` | `Scheduled` | `False` | `ConditionFalse`, `ConditionEvaluationFailed`, `JobPlanningFailed`, `ConcurrencyEvaluationFailed`, `ConcurrencySuperseded`, `ConcurrencyCancelled`, `CancellationRequested`, `MatrixFailFast`, `ProjectRecreated` |
-| `WorkflowJob` | `Succeeded` | `Unknown` | `JobRunning` |
+| `WorkflowJob` | `Assigned` | `True` | `RunnerAssigned` |
+| `WorkflowJob` | `Scheduled` | `True` | `PodScheduled` |
+| `WorkflowJob` | `Scheduled` | `Unknown` | `PodPending` |
+| `WorkflowJob` | `Scheduled` | `False` | `PodPending`, `ConditionFalse`, `ConditionEvaluationFailed`, `JobPlanningFailed`, `ConcurrencyEvaluationFailed`, `ConcurrencySuperseded`, `ConcurrencyCancelled`, `CancellationRequested`, `MatrixFailFast`, `ProjectRecreated` |
+| `WorkflowJob` | `Succeeded` | `Unknown` | `JobPending`, `JobRunning` |
 | `WorkflowJob` | `Succeeded` | `True` | `JobSucceeded` |
 | `WorkflowJob` | `Succeeded` | `False` | `JobFailed`, `JobTimedOut`, `JobCancelled`, `JobResultInvalid`, `ConditionEvaluationFailed`, `JobPlanningFailed`, `ConcurrencyEvaluationFailed`, `PlanUnavailable`, `JobStartFailed`, `GitHubTokenPermissionsRejected`, `ExecutionStateLost`, `CancellationRequested`, `MatrixFailFast`, `ProjectRecreated`, `PodLevelResourcesInvalid`, `PodLevelResourcesUnsupported` |
 | `WorkflowJob` | `CancellationRequested` | `True` | `CancellationRequested`, `ConditionEvaluationFailed`, `ConcurrencyCancelled`, `MatrixFailFast` |
@@ -1226,6 +1228,16 @@ private-key parsing, Project value constraints, and installation uniqueness. It
 does not assert remote GitHub App or installation availability. `Runner/Ready`
 reports operational health independently of capacity; clients use
 `Runner/Busy` to determine whether a Runner already has an assignment.
+
+`WorkflowJob/Assigned` reports Runner assignment. `WorkflowJob/Scheduled` is true
+only after the owned Pod reports `PodScheduled=True`, meaning Kubernetes has
+scheduled it to a node. An assigned job initially reports `Scheduled=False`
+with reason `PodPending`. Once the Pod exists, the condition reflects its
+`PodScheduled` status and includes any scheduling failure details.
+Assignment and node placement do not mean execution has started. The Console and
+CLI show the job as queued until the runner container starts and
+`status.startTime` is recorded. Queue and startup metrics use the assignment time
+independently of Pod scheduling.
 
 When the controller reports a Project, Runner, WorkflowRun, or WorkflowJob
 failure, it emits a Kubernetes Warning Event with the condition's reason and

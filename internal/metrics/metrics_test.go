@@ -34,7 +34,7 @@ func TestRecorderPublishesLifecycleDurations(t *testing.T) {
 	recorder.WorkflowRunCompleted(run.Status.DeepCopy(), run)
 
 	readyAt := base.Add(10 * time.Second)
-	scheduledAt := metav1.NewTime(base.Add(20 * time.Second))
+	assignedAt := metav1.NewTime(base.Add(20 * time.Second))
 	jobStart := metav1.NewTime(base.Add(35 * time.Second))
 	jobCompletion := metav1.NewTime(base.Add(95 * time.Second))
 	job := &actionsv1alpha1.WorkflowJob{
@@ -44,12 +44,13 @@ func TestRecorderPublishesLifecycleDurations(t *testing.T) {
 		Status: actionsv1alpha1.WorkflowJobStatus{
 			StartTime: &jobStart, CompletionTime: &jobCompletion, Result: actionsv1alpha1.WorkflowJobResultFailure,
 			Conditions: []metav1.Condition{
-				{Type: actionsv1alpha1.WorkflowJobConditionScheduled, Status: metav1.ConditionTrue, LastTransitionTime: scheduledAt},
+				{Type: actionsv1alpha1.WorkflowJobConditionAssigned, Status: metav1.ConditionTrue, LastTransitionTime: assignedAt},
+				{Type: actionsv1alpha1.WorkflowJobConditionScheduled, Status: metav1.ConditionTrue, LastTransitionTime: metav1.NewTime(base.Add(25 * time.Second))},
 				{Type: actionsv1alpha1.WorkflowJobConditionSucceeded, Status: metav1.ConditionFalse, Reason: "JobTimedOut"},
 			},
 		},
 	}
-	recorder.WorkflowJobScheduled(job, readyAt)
+	recorder.WorkflowJobAssigned(job, readyAt)
 	recorder.WorkflowJobUpdated(&actionsv1alpha1.WorkflowJobStatus{}, job)
 	recorder.WebhookRequest("push", "accepted", 2*time.Second)
 	recorder.WebhookDelivery("ci", "project", "push", "completed", 12*time.Second)

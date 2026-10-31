@@ -141,7 +141,7 @@ type recordingWebhookMetrics struct {
 func (m *recordingWebhookMetrics) WorkflowRunCompleted(_ *actionsv1alpha1.WorkflowRunStatus, _ *actionsv1alpha1.WorkflowRun) {
 }
 
-func (m *recordingWebhookMetrics) WorkflowJobScheduled(_ *actionsv1alpha1.WorkflowJob, _ time.Time) {
+func (m *recordingWebhookMetrics) WorkflowJobAssigned(_ *actionsv1alpha1.WorkflowJob, _ time.Time) {
 }
 
 func (m *recordingWebhookMetrics) WorkflowJobUpdated(_ *actionsv1alpha1.WorkflowJobStatus, _ *actionsv1alpha1.WorkflowJob) {

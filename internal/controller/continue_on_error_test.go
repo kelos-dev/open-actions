@@ -421,7 +421,7 @@ func TestJobContinueOnErrorDependencies(t *testing.T) {
 				finished := metav1.Now()
 				nativeJob := &batchv1.Job{Status: batchv1.JobStatus{CompletionTime: &finished}}
 				runnerReconciler := &RunnerReconciler{Client: clusterClient, APIReader: clusterClient}
-				if err := runnerReconciler.updateWorkflowJobStatus(ctx, failed, nativeJob, &finished, &runner.Result{
+				if err := runnerReconciler.updateWorkflowJobStatus(ctx, failed, nativeJob, nil, &finished, &runner.Result{
 					Conclusion: runner.ResultConclusionFailure, Outputs: map[string]string{"artifact": "ready"},
 				}, false); err != nil {
 					t.Fatal(err)

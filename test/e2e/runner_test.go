@@ -73,7 +73,7 @@ var _ = Describe("Runner", func() {
 					if workflowJob.Status.RunnerRef != nil {
 						g.Expect(workflowJob.Status.RunnerRef.Name).To(Equal("runner-1"))
 					}
-					g.Expect(meta.IsStatusConditionTrue(workflowJob.Status.Conditions, actionsv1alpha1.WorkflowJobConditionScheduled)).To(BeTrue())
+					g.Expect(meta.IsStatusConditionTrue(workflowJob.Status.Conditions, actionsv1alpha1.WorkflowJobConditionAssigned)).To(BeTrue())
 				case "report":
 					reportWorkflowJobName = workflowJob.Name
 					g.Expect(workflowJob.Spec.Needs).To(Equal([]string{"test"}))
