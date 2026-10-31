@@ -19,7 +19,7 @@ var (
 // DurationRecorder records completed Open Actions lifecycle intervals.
 type DurationRecorder interface {
 	WorkflowRunCompleted(previous *actionsv1alpha1.WorkflowRunStatus, run *actionsv1alpha1.WorkflowRun)
-	WorkflowJobScheduled(job *actionsv1alpha1.WorkflowJob, queuedAt time.Time)
+	WorkflowJobAssigned(job *actionsv1alpha1.WorkflowJob, queuedAt time.Time)
 	WorkflowJobUpdated(previous *actionsv1alpha1.WorkflowJobStatus, job *actionsv1alpha1.WorkflowJob)
 	WebhookRequest(event, result string, duration time.Duration)
 	WebhookDelivery(namespace, project, event, result string, duration time.Duration)
@@ -114,13 +114,13 @@ func (r *Recorder) WorkflowRunCompleted(previous *actionsv1alpha1.WorkflowRunSta
 	).Observe(duration.Seconds())
 }
 
-// WorkflowJobScheduled records how long a job waited for Runner assignment.
-func (r *Recorder) WorkflowJobScheduled(job *actionsv1alpha1.WorkflowJob, queuedAt time.Time) {
-	scheduled := meta.FindStatusCondition(job.Status.Conditions, actionsv1alpha1.WorkflowJobConditionScheduled)
-	if scheduled == nil || scheduled.Status != metav1.ConditionTrue {
+// WorkflowJobAssigned records how long a job waited for Runner assignment.
+func (r *Recorder) WorkflowJobAssigned(job *actionsv1alpha1.WorkflowJob, queuedAt time.Time) {
+	assigned := meta.FindStatusCondition(job.Status.Conditions, actionsv1alpha1.WorkflowJobConditionAssigned)
+	if assigned == nil || assigned.Status != metav1.ConditionTrue {
 		return
 	}
-	duration, valid := elapsed(queuedAt, scheduled.LastTransitionTime.Time)
+	duration, valid := elapsed(queuedAt, assigned.LastTransitionTime.Time)
 	if !valid {
 		return
 	}
@@ -130,9 +130,9 @@ func (r *Recorder) WorkflowJobScheduled(job *actionsv1alpha1.WorkflowJob, queued
 // WorkflowJobUpdated records startup and execution intervals on their first completed transition.
 func (r *Recorder) WorkflowJobUpdated(previous *actionsv1alpha1.WorkflowJobStatus, job *actionsv1alpha1.WorkflowJob) {
 	if previous.StartTime == nil && job.Status.StartTime != nil {
-		scheduled := meta.FindStatusCondition(job.Status.Conditions, actionsv1alpha1.WorkflowJobConditionScheduled)
-		if scheduled != nil && scheduled.Status == metav1.ConditionTrue {
-			if duration, valid := elapsed(scheduled.LastTransitionTime.Time, job.Status.StartTime.Time); valid {
+		assigned := meta.FindStatusCondition(job.Status.Conditions, actionsv1alpha1.WorkflowJobConditionAssigned)
+		if assigned != nil && assigned.Status == metav1.ConditionTrue {
+			if duration, valid := elapsed(assigned.LastTransitionTime.Time, job.Status.StartTime.Time); valid {
 				r.workflowJobStartDuration.WithLabelValues(jobLabels(job)...).Observe(duration.Seconds())
 			}
 		}

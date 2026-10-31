@@ -60,15 +60,15 @@ func TestWorkflowJobAssignmentRecordsMetricsAfterPatch(t *testing.T) {
 	if err := reconciler.assignWorkflowJob(context.Background(), second, "runner-2", created); err == nil {
 		t.Fatal("conflicting assignment succeeded")
 	}
-	if metrics.jobSchedules != 1 {
-		t.Fatalf("workflow job metric schedules = %d, want 1", metrics.jobSchedules)
+	if metrics.jobAssignments != 1 {
+		t.Fatalf("workflow job metric assignments = %d, want 1", metrics.jobAssignments)
 	}
 }
 
 func TestWorkflowJobStatusRecordsMetricsOnce(t *testing.T) {
 	scheme := runnerTestScheme(t)
 	base := time.Date(2026, 8, 28, 10, 0, 0, 0, time.UTC)
-	scheduledAt := metav1.NewTime(base)
+	assignedAt := metav1.NewTime(base)
 	start := metav1.NewTime(base.Add(10 * time.Second))
 	completion := metav1.NewTime(base.Add(time.Minute))
 	workflowJob := &actionsv1alpha1.WorkflowJob{
@@ -77,7 +77,7 @@ func TestWorkflowJobStatusRecordsMetricsOnce(t *testing.T) {
 		Status: actionsv1alpha1.WorkflowJobStatus{
 			RunnerRef: &corev1.LocalObjectReference{Name: "runner"},
 			Conditions: []metav1.Condition{{
-				Type: actionsv1alpha1.WorkflowJobConditionScheduled, Status: metav1.ConditionTrue, LastTransitionTime: scheduledAt,
+				Type: actionsv1alpha1.WorkflowJobConditionAssigned, Status: metav1.ConditionTrue, LastTransitionTime: assignedAt,
 			}},
 		},
 	}
@@ -88,14 +88,14 @@ func TestWorkflowJobStatusRecordsMetricsOnce(t *testing.T) {
 	clusterClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&actionsv1alpha1.WorkflowJob{}).WithObjects(workflowJob).Build()
 	metrics := &recordingDurationMetrics{}
 	reconciler := &RunnerReconciler{Client: clusterClient, Metrics: metrics}
-	if err := reconciler.updateWorkflowJobStatus(context.Background(), workflowJob, nativeJob, &start, nil, false); err != nil {
+	if err := reconciler.updateWorkflowJobStatus(context.Background(), workflowJob, nativeJob, nil, &start, nil, false); err != nil {
 		t.Fatal(err)
 	}
 	stored := &actionsv1alpha1.WorkflowJob{}
 	if err := clusterClient.Get(context.Background(), client.ObjectKeyFromObject(workflowJob), stored); err != nil {
 		t.Fatal(err)
 	}
-	if err := reconciler.updateWorkflowJobStatus(context.Background(), stored, nativeJob, &start, nil, false); err != nil {
+	if err := reconciler.updateWorkflowJobStatus(context.Background(), stored, nativeJob, nil, &start, nil, false); err != nil {
 		t.Fatal(err)
 	}
 	if metrics.jobUpdates != 1 {
@@ -142,7 +142,7 @@ func TestWorkflowRunCompletionRecordsMetricsOnce(t *testing.T) {
 
 type recordingDurationMetrics struct {
 	runCompletions int
-	jobSchedules   int
+	jobAssignments int
 	jobUpdates     int
 }
 
@@ -152,8 +152,8 @@ func (m *recordingDurationMetrics) WorkflowRunCompleted(previous *actionsv1alpha
 	}
 }
 
-func (m *recordingDurationMetrics) WorkflowJobScheduled(_ *actionsv1alpha1.WorkflowJob, _ time.Time) {
-	m.jobSchedules++
+func (m *recordingDurationMetrics) WorkflowJobAssigned(_ *actionsv1alpha1.WorkflowJob, _ time.Time) {
+	m.jobAssignments++
 }
 
 func (m *recordingDurationMetrics) WorkflowJobUpdated(_ *actionsv1alpha1.WorkflowJobStatus, _ *actionsv1alpha1.WorkflowJob) {

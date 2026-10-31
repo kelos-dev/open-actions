@@ -282,9 +282,10 @@ spec:
                   Conditions describe dependency readiness, concurrency acquisition, Runner
                   assignment, cancellation, and the terminal result. When present, Ready is
                   true when a Runner may claim the job. Dependency-free unconditional jobs
-                  without concurrency are also claimable when Ready is absent. Scheduled is
-                  true after the scheduler assigns status.runnerRef. Known condition types are
-                  Ready, ConcurrencyAcquired, Scheduled, Succeeded, and CancellationRequested.
+                  without concurrency are also claimable when Ready is absent. Assigned is
+                  true after status.runnerRef is set. Scheduled is true after the Pod is
+                  scheduled to a node. Known condition types are Ready, ConcurrencyAcquired,
+                  Assigned, Scheduled, Succeeded, and CancellationRequested.
                 items:
                   description: Condition contains details for one aspect of the current
                     state of this API Resource.
@@ -375,8 +376,8 @@ spec:
                 type: string
               runnerRef:
                 description: |-
-                  RunnerRef identifies the Runner assigned by the scheduler in the same
-                  namespace. It is set once when the job is scheduled.
+                  RunnerRef identifies the Runner assigned in the same namespace.
+                  It is set once when the job is claimed.
                 properties:
                   name:
                     default: ""

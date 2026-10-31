@@ -51,7 +51,7 @@ func Run(run *actionsv1alpha1.WorkflowRun) string {
 	}
 }
 
-// Job returns the user-facing status derived from a WorkflowJob's conditions and runner assignment.
+// Job returns the user-facing status derived from a WorkflowJob's conditions and execution start time.
 func Job(job *actionsv1alpha1.WorkflowJob) string {
 	condition := meta.FindStatusCondition(job.Status.Conditions, actionsv1alpha1.WorkflowJobConditionSucceeded)
 	if condition != nil && condition.Status == metav1.ConditionFalse && condition.Reason == "JobTimedOut" {
@@ -79,7 +79,7 @@ func Job(job *actionsv1alpha1.WorkflowJob) string {
 	if cancellation != nil && cancellation.Status == metav1.ConditionTrue {
 		return cancelling
 	}
-	if job.Status.RunnerRef != nil {
+	if job.Status.StartTime != nil {
 		return running
 	}
 	ready := meta.FindStatusCondition(job.Status.Conditions, actionsv1alpha1.WorkflowJobConditionReady)

@@ -36,6 +36,7 @@ func TestRun(t *testing.T) {
 }
 
 func TestJob(t *testing.T) {
+	started := metav1.Now()
 	for _, test := range []struct {
 		name string
 		job  *actionsv1alpha1.WorkflowJob
@@ -43,7 +44,9 @@ func TestJob(t *testing.T) {
 	}{
 		{name: "waiting", job: &actionsv1alpha1.WorkflowJob{}, want: "Queued"},
 		{name: "dependency waiting", job: &actionsv1alpha1.WorkflowJob{Spec: actionsv1alpha1.WorkflowJobSpec{Needs: []string{"build"}}, Status: actionsv1alpha1.WorkflowJobStatus{Conditions: []metav1.Condition{{Type: actionsv1alpha1.WorkflowJobConditionReady, Status: metav1.ConditionUnknown}}}}, want: "Waiting"},
-		{name: "running", job: &actionsv1alpha1.WorkflowJob{Status: actionsv1alpha1.WorkflowJobStatus{RunnerRef: &corev1.LocalObjectReference{Name: "runner"}}}, want: "Running"},
+		{name: "assigned but not started", job: &actionsv1alpha1.WorkflowJob{Status: actionsv1alpha1.WorkflowJobStatus{RunnerRef: &corev1.LocalObjectReference{Name: "runner"}}}, want: "Queued"},
+		{name: "scheduled but not started", job: &actionsv1alpha1.WorkflowJob{Status: actionsv1alpha1.WorkflowJobStatus{RunnerRef: &corev1.LocalObjectReference{Name: "runner"}, Conditions: []metav1.Condition{{Type: actionsv1alpha1.WorkflowJobConditionScheduled, Status: metav1.ConditionTrue}}}}, want: "Queued"},
+		{name: "running", job: &actionsv1alpha1.WorkflowJob{Status: actionsv1alpha1.WorkflowJobStatus{StartTime: &started, RunnerRef: &corev1.LocalObjectReference{Name: "runner"}}}, want: "Running"},
 		{name: "cancelling", job: &actionsv1alpha1.WorkflowJob{Status: actionsv1alpha1.WorkflowJobStatus{RunnerRef: &corev1.LocalObjectReference{Name: "runner"}, Conditions: []metav1.Condition{{Type: actionsv1alpha1.WorkflowJobConditionCancellationRequested, Status: metav1.ConditionTrue}}}}, want: "Cancelling"},
 		{name: "succeeded", job: workflowJobWithCondition(metav1.ConditionTrue), want: "Succeeded"},
 		{name: "failed", job: workflowJobWithCondition(metav1.ConditionFalse), want: "Failed"},

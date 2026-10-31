@@ -8,6 +8,7 @@ import (
 const (
 	WorkflowJobConditionReady                 = "Ready"
 	WorkflowJobConditionConcurrencyAcquired   = "ConcurrencyAcquired"
+	WorkflowJobConditionAssigned              = "Assigned"
 	WorkflowJobConditionScheduled             = "Scheduled"
 	WorkflowJobConditionSucceeded             = "Succeeded"
 	WorkflowJobConditionCancellationRequested = "CancellationRequested"
@@ -232,8 +233,8 @@ type WorkflowJobStatus struct {
 	// +optional
 	Result WorkflowJobResult `json:"result,omitempty"`
 
-	// RunnerRef identifies the Runner assigned by the scheduler in the same
-	// namespace. It is set once when the job is scheduled.
+	// RunnerRef identifies the Runner assigned in the same namespace.
+	// It is set once when the job is claimed.
 	// +optional
 	RunnerRef *corev1.LocalObjectReference `json:"runnerRef,omitempty"`
 
@@ -266,9 +267,10 @@ type WorkflowJobStatus struct {
 	// Conditions describe dependency readiness, concurrency acquisition, Runner
 	// assignment, cancellation, and the terminal result. When present, Ready is
 	// true when a Runner may claim the job. Dependency-free unconditional jobs
-	// without concurrency are also claimable when Ready is absent. Scheduled is
-	// true after the scheduler assigns status.runnerRef. Known condition types are
-	// Ready, ConcurrencyAcquired, Scheduled, Succeeded, and CancellationRequested.
+	// without concurrency are also claimable when Ready is absent. Assigned is
+	// true after status.runnerRef is set. Scheduled is true after the Pod is
+	// scheduled to a node. Known condition types are Ready, ConcurrencyAcquired,
+	// Assigned, Scheduled, Succeeded, and CancellationRequested.
 	// +listType=map
 	// +listMapKey=type
 	// +kubebuilder:validation:MaxItems=16

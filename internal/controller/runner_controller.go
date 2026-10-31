@@ -140,7 +140,7 @@ func (r *RunnerReconciler) Reconcile(ctx context.Context, request ctrl.Request) 
 		return ctrl.Result{}, r.Update(ctx, runnerObject)
 	}
 	if workflowJob != nil {
-		if err := r.updateWorkflowJobScheduled(ctx, workflowJob); err != nil {
+		if err := r.updateWorkflowJobAssigned(ctx, workflowJob); err != nil {
 			return ctrl.Result{}, err
 		}
 		found, terminal, err := r.observeNativeJob(ctx, workflowJob)
@@ -529,7 +529,7 @@ func (r *RunnerReconciler) executeWorkflowJob(ctx context.Context, runnerObject 
 	if workflowJob.Labels[actionsv1alpha1.LabelProjectUID] != string(project.UID) {
 		return true, r.failAssignedWorkflowJob(ctx, workflowJob, "ProjectRecreated", fmt.Sprintf("Project %q was recreated before execution started", project.Name))
 	}
-	if workflowJobStarted(workflowJob) {
+	if workflowJobLaunched(workflowJob) {
 		active, err := r.activeWorkflowJobPods(ctx, workflowJob)
 		if err != nil {
 			return false, err
@@ -537,7 +537,7 @@ func (r *RunnerReconciler) executeWorkflowJob(ctx context.Context, runnerObject 
 		if active {
 			return false, nil
 		}
-		return true, r.failAssignedWorkflowJob(ctx, workflowJob, "ExecutionStateLost", "The native Job disappeared after execution started")
+		return true, r.failAssignedWorkflowJob(ctx, workflowJob, "ExecutionStateLost", "The native Job disappeared after creation")
 	}
 	plan := &corev1.ConfigMap{}
 	planKey := client.ObjectKey{Namespace: workflowJob.Namespace, Name: childName(workflowJob.Name, "plan")}
@@ -703,7 +703,7 @@ func (r *RunnerReconciler) executeWorkflowJob(ctx context.Context, runnerObject 
 		}
 		return false, errors.Join(err, r.cleanupAuthSecret(ctx, workflowJob))
 	}
-	return false, r.updateWorkflowJobStatus(ctx, workflowJob, nativeJob, nil, nil, false)
+	return false, r.updateWorkflowJobStatus(ctx, workflowJob, nativeJob, nil, nil, nil, false)
 }
 
 func (r *RunnerReconciler) createNativeJob(ctx context.Context, nativeJob *batchv1.Job, workflowJob *actionsv1alpha1.WorkflowJob) error {
@@ -855,21 +855,25 @@ func (r *RunnerReconciler) observeNativeJob(ctx context.Context, workflowJob *ac
 		return false, false, fmt.Errorf("native Job %q is not controlled by WorkflowJob %q", nativeJob.Name, workflowJob.Name)
 	}
 	terminal := jobTerminal(nativeJob)
+	var pod *corev1.Pod
 	var runnerContainerStatus *corev1.ContainerStatus
-	deadlinePhase := nativeJob.Annotations[nativeJobDeadlineAnnotation]
-	runnerMayHaveStarted := nativeJob.Status.Ready != nil && *nativeJob.Status.Ready > 0
-	needsRunnerStatus := terminal ||
-		(deadlinePhase == nativeJobDeadlineExecution && workflowJob.Status.StartTime == nil) ||
-		(deadlinePhase != nativeJobDeadlineExecution && runnerMayHaveStarted)
-	if needsRunnerStatus {
+	if terminal || workflowJob.Status.StartTime == nil || !meta.IsStatusConditionTrue(workflowJob.Status.Conditions, actionsv1alpha1.WorkflowJobConditionScheduled) {
 		var err error
-		runnerContainerStatus, err = workflowJobRunnerContainerStatus(ctx, r.APIReader, workflowJob, nativeJob)
+		pod, err = workflowJobPod(ctx, r.APIReader, workflowJob, nativeJob)
 		if err != nil {
 			return true, terminal, err
 		}
+		if pod != nil {
+			for _, container := range pod.Status.ContainerStatuses {
+				if container.Name == runner.ContainerName {
+					runnerContainerStatus = container.DeepCopy()
+					break
+				}
+			}
+		}
 	}
 	runnerStartTime := runnerContainerStartTime(runnerContainerStatus)
-	if runnerStartTime == nil && deadlinePhase == nativeJobDeadlineExecution && workflowJob.Status.StartTime != nil {
+	if runnerStartTime == nil && workflowJob.Status.StartTime != nil {
 		runnerStartTime = workflowJob.Status.StartTime.DeepCopy()
 	}
 	if !terminal {
@@ -886,7 +890,7 @@ func (r *RunnerReconciler) observeNativeJob(ctx context.Context, workflowJob *ac
 			executionResult = &runner.Result{Version: runner.ResultVersion}
 		}
 	}
-	if err := r.updateWorkflowJobStatus(ctx, workflowJob, nativeJob, runnerStartTime, executionResult, resultInvalid); err != nil {
+	if err := r.updateWorkflowJobStatus(ctx, workflowJob, nativeJob, pod, runnerStartTime, executionResult, resultInvalid); err != nil {
 		return true, terminal, err
 	}
 	if terminal {
@@ -913,7 +917,7 @@ func runnerResultExpected(version string) bool {
 	return err == nil && parsed >= 1 && parsed <= runner.ResultVersion
 }
 
-func workflowJobRunnerContainerStatus(ctx context.Context, reader client.Reader, workflowJob *actionsv1alpha1.WorkflowJob, nativeJob *batchv1.Job) (*corev1.ContainerStatus, error) {
+func workflowJobPod(ctx context.Context, reader client.Reader, workflowJob *actionsv1alpha1.WorkflowJob, nativeJob *batchv1.Job) (*corev1.Pod, error) {
 	pods := &corev1.PodList{}
 	if err := reader.List(ctx, pods, client.InNamespace(workflowJob.Namespace), client.MatchingLabels{
 		actionsv1alpha1.LabelWorkflowJobUID: string(workflowJob.UID),
@@ -926,11 +930,7 @@ func workflowJobRunnerContainerStatus(ctx context.Context, reader client.Reader,
 		if owner == nil || owner.UID != nativeJob.UID {
 			continue
 		}
-		for _, container := range pod.Status.ContainerStatuses {
-			if container.Name == runner.ContainerName {
-				return container.DeepCopy(), nil
-			}
-		}
+		return pod, nil
 	}
 	return nil, nil
 }
@@ -999,12 +999,12 @@ func (r *RunnerReconciler) reconcileNativeJobDeadline(ctx context.Context, workf
 	return nil
 }
 
-func workflowJobStarted(workflowJob *actionsv1alpha1.WorkflowJob) bool {
+func workflowJobLaunched(workflowJob *actionsv1alpha1.WorkflowJob) bool {
 	if workflowJob.Status.StartTime != nil {
 		return true
 	}
 	condition := meta.FindStatusCondition(workflowJob.Status.Conditions, actionsv1alpha1.WorkflowJobConditionSucceeded)
-	return condition != nil && condition.Status == metav1.ConditionUnknown && condition.Reason == "JobRunning"
+	return condition != nil && condition.Status == metav1.ConditionUnknown && (condition.Reason == "JobPending" || condition.Reason == "JobRunning")
 }
 
 func (r *RunnerReconciler) activeWorkflowJobPods(ctx context.Context, workflowJob *actionsv1alpha1.WorkflowJob) (bool, error) {
@@ -1439,14 +1439,15 @@ func resourceListPreserved(expected, actual corev1.ResourceList) bool {
 	return true
 }
 
-func (r *RunnerReconciler) updateWorkflowJobStatus(ctx context.Context, workflowJob *actionsv1alpha1.WorkflowJob, nativeJob *batchv1.Job, runnerStartTime *metav1.Time, executionResult *runner.Result, resultInvalid bool) error {
+func (r *RunnerReconciler) updateWorkflowJobStatus(ctx context.Context, workflowJob *actionsv1alpha1.WorkflowJob, nativeJob *batchv1.Job, pod *corev1.Pod, runnerStartTime *metav1.Time, executionResult *runner.Result, resultInvalid bool) error {
 	before := workflowJob.Status.DeepCopy()
-	if err := setWorkflowJobScheduled(workflowJob); err != nil {
+	if err := setWorkflowJobAssigned(workflowJob); err != nil {
 		return err
 	}
 	if runnerStartTime != nil {
 		workflowJob.Status.StartTime = runnerStartTime.DeepCopy()
 	}
+	setWorkflowJobPodScheduled(workflowJob, pod)
 	validRunnerResult := !resultInvalid && executionResult != nil && executionResult.Conclusion != ""
 	switch {
 	case validRunnerResult && executionResult.Conclusion == runner.ResultConclusionTimedOut:
@@ -1496,8 +1497,10 @@ func (r *RunnerReconciler) updateWorkflowJobStatus(ctx context.Context, workflow
 			workflowJob.Status.Outputs = copyStringMap(executionResult.Outputs)
 		}
 		meta.SetStatusCondition(&workflowJob.Status.Conditions, metav1.Condition{Type: actionsv1alpha1.WorkflowJobConditionSucceeded, Status: metav1.ConditionFalse, ObservedGeneration: workflowJob.Generation, Reason: "JobFailed", Message: "The workflow job failed"})
-	default:
+	case workflowJob.Status.StartTime != nil:
 		meta.SetStatusCondition(&workflowJob.Status.Conditions, metav1.Condition{Type: actionsv1alpha1.WorkflowJobConditionSucceeded, Status: metav1.ConditionUnknown, ObservedGeneration: workflowJob.Generation, Reason: "JobRunning", Message: "The workflow job is running"})
+	default:
+		meta.SetStatusCondition(&workflowJob.Status.Conditions, metav1.Condition{Type: actionsv1alpha1.WorkflowJobConditionSucceeded, Status: metav1.ConditionUnknown, ObservedGeneration: workflowJob.Generation, Reason: "JobPending", Message: "The workflow job is waiting for the runner container to start"})
 	}
 	if apiEquality.Semantic.DeepEqual(before, &workflowJob.Status) {
 		return nil
@@ -1540,7 +1543,7 @@ func (r *RunnerReconciler) failAssignedWorkflowJob(ctx context.Context, workflow
 
 func (r *RunnerReconciler) completeAssignedWorkflowJob(ctx context.Context, workflowJob *actionsv1alpha1.WorkflowJob, result actionsv1alpha1.WorkflowJobResult, reason, message string) error {
 	before := workflowJob.Status.DeepCopy()
-	if err := setWorkflowJobScheduled(workflowJob); err != nil {
+	if err := setWorkflowJobAssigned(workflowJob); err != nil {
 		return err
 	}
 	now := metav1.Now()
@@ -1598,8 +1601,8 @@ func (r *RunnerReconciler) failQueuedWorkflowJob(ctx context.Context, workflowJo
 }
 
 func (r *RunnerReconciler) failExpiredPreStart(ctx context.Context, workflowJob *actionsv1alpha1.WorkflowJob, message string) (bool, error) {
-	scheduled := meta.FindStatusCondition(workflowJob.Status.Conditions, actionsv1alpha1.WorkflowJobConditionScheduled)
-	if scheduled == nil || time.Since(scheduled.LastTransitionTime.Time) < jobStartTimeout {
+	assigned := meta.FindStatusCondition(workflowJob.Status.Conditions, actionsv1alpha1.WorkflowJobConditionAssigned)
+	if assigned == nil || time.Since(assigned.LastTransitionTime.Time) < jobStartTimeout {
 		return false, nil
 	}
 	if err := r.failAssignedWorkflowJob(ctx, workflowJob, "JobStartFailed", fmt.Sprintf("WorkflowJob did not start within %s: %s", jobStartTimeout, message)); err != nil {
@@ -1608,9 +1611,9 @@ func (r *RunnerReconciler) failExpiredPreStart(ctx context.Context, workflowJob 
 	return true, nil
 }
 
-func (r *RunnerReconciler) updateWorkflowJobScheduled(ctx context.Context, workflowJob *actionsv1alpha1.WorkflowJob) error {
+func (r *RunnerReconciler) updateWorkflowJobAssigned(ctx context.Context, workflowJob *actionsv1alpha1.WorkflowJob) error {
 	before := workflowJob.DeepCopy()
-	if err := setWorkflowJobScheduled(workflowJob); err != nil {
+	if err := setWorkflowJobAssigned(workflowJob); err != nil {
 		return err
 	}
 	if apiEquality.Semantic.DeepEqual(&before.Status, &workflowJob.Status) {
@@ -1622,14 +1625,14 @@ func (r *RunnerReconciler) updateWorkflowJobScheduled(ctx context.Context, workf
 func (r *RunnerReconciler) assignWorkflowJob(ctx context.Context, workflowJob *actionsv1alpha1.WorkflowJob, runnerName string, queuedAt time.Time) error {
 	before := workflowJob.DeepCopy()
 	workflowJob.Status.RunnerRef = &corev1.LocalObjectReference{Name: runnerName}
-	if err := setWorkflowJobScheduled(workflowJob); err != nil {
+	if err := setWorkflowJobAssigned(workflowJob); err != nil {
 		return err
 	}
 	if err := r.Status().Patch(ctx, workflowJob, client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{})); err != nil {
 		return err
 	}
 	if r.Metrics != nil {
-		r.Metrics.WorkflowJobScheduled(workflowJob, queuedAt)
+		r.Metrics.WorkflowJobAssigned(workflowJob, queuedAt)
 	}
 	return nil
 }
@@ -1645,19 +1648,57 @@ func workflowJobQueueStartedAt(workflowJob *actionsv1alpha1.WorkflowJob, planned
 	return queuedAt
 }
 
-func setWorkflowJobScheduled(workflowJob *actionsv1alpha1.WorkflowJob) error {
+func setWorkflowJobAssigned(workflowJob *actionsv1alpha1.WorkflowJob) error {
 	if workflowJob.Status.RunnerRef == nil {
 		return fmt.Errorf("WorkflowJob %q has no assigned Runner", workflowJob.Name)
 	}
 	workflowJob.Status.ObservedGeneration = workflowJob.Generation
+	var assignedAt metav1.Time
+	scheduled := meta.FindStatusCondition(workflowJob.Status.Conditions, actionsv1alpha1.WorkflowJobConditionScheduled)
+	if scheduled != nil && scheduled.Reason == "RunnerAssigned" {
+		assignedAt = scheduled.LastTransitionTime
+	}
 	meta.SetStatusCondition(&workflowJob.Status.Conditions, metav1.Condition{
-		Type:               actionsv1alpha1.WorkflowJobConditionScheduled,
+		Type:               actionsv1alpha1.WorkflowJobConditionAssigned,
+		LastTransitionTime: assignedAt,
 		Status:             metav1.ConditionTrue,
 		ObservedGeneration: workflowJob.Generation,
 		Reason:             "RunnerAssigned",
 		Message:            fmt.Sprintf("WorkflowJob is assigned to Runner %q", workflowJob.Status.RunnerRef.Name),
 	})
+	if scheduled == nil || scheduled.Reason == "RunnerAssigned" {
+		meta.SetStatusCondition(&workflowJob.Status.Conditions, metav1.Condition{
+			Type: actionsv1alpha1.WorkflowJobConditionScheduled, Status: metav1.ConditionFalse,
+			ObservedGeneration: workflowJob.Generation, Reason: "PodPending",
+			Message: "Waiting for the workflow Pod to be scheduled to a node",
+		})
+	}
 	return nil
+}
+
+func setWorkflowJobPodScheduled(workflowJob *actionsv1alpha1.WorkflowJob, pod *corev1.Pod) {
+	if pod == nil {
+		return
+	}
+	for _, condition := range pod.Status.Conditions {
+		if condition.Type != corev1.PodScheduled {
+			continue
+		}
+		reason := "PodPending"
+		message := condition.Message
+		if condition.Status == corev1.ConditionTrue {
+			reason = "PodScheduled"
+			message = "The workflow Pod is scheduled to a node"
+		} else if message == "" {
+			message = "Waiting for the workflow Pod to be scheduled to a node"
+		}
+		meta.SetStatusCondition(&workflowJob.Status.Conditions, metav1.Condition{
+			Type: actionsv1alpha1.WorkflowJobConditionScheduled, Status: metav1.ConditionStatus(condition.Status),
+			ObservedGeneration: workflowJob.Generation, Reason: reason,
+			Message: message, LastTransitionTime: condition.LastTransitionTime,
+		})
+		return
+	}
 }
 
 func (r *RunnerReconciler) updateRunnerStatus(ctx context.Context, runnerObject *actionsv1alpha1.Runner, ready metav1.ConditionStatus, readyReason, readyMessage string, workflowJobRef *corev1.LocalObjectReference) error {
