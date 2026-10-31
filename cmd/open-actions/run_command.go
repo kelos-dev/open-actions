@@ -2,8 +2,12 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
+	"mime"
+	"net/http"
+	"net/url"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -11,6 +15,8 @@ import (
 	"time"
 
 	actionsv1alpha1 "github.com/kelos-dev/open-actions/api/v1alpha1"
+	"github.com/kelos-dev/open-actions/internal/endpointurl"
+	"github.com/kelos-dev/open-actions/internal/joblog"
 	"github.com/kelos-dev/open-actions/internal/runner"
 	"github.com/kelos-dev/open-actions/internal/workflowstatus"
 	"github.com/spf13/cobra"
@@ -139,6 +145,7 @@ func newRunViewCommand(dependencies commandDependencies) *cobra.Command {
 }
 
 func newRunLogsCommand(dependencies commandDependencies) *cobra.Command {
+	consoleURL := ""
 	options := runCommandOptions{}
 	jobName := ""
 	follow := false
@@ -151,7 +158,7 @@ func newRunLogsCommand(dependencies commandDependencies) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			_, jobs, err := getWorkflowRun(command.Context(), clients.reader, namespace, arguments[0])
+			run, jobs, err := getWorkflowRun(command.Context(), clients.reader, namespace, arguments[0])
 			if err != nil {
 				return err
 			}
@@ -159,9 +166,33 @@ func newRunLogsCommand(dependencies commandDependencies) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			pod, err := workflowJobPod(command.Context(), clients, job, follow, command.ErrOrStderr())
-			if err != nil {
+			runURL := ""
+			if run.Status.Identity != nil {
+				runURL = run.Status.Identity.URL
+			}
+			if consoleURL != "" {
+				origin, err := endpointurl.NormalizeOrigin(consoleURL, "Console URL")
+				if err != nil {
+					return err
+				}
+				runURL = origin + "/runs/" + url.PathEscape(namespace) + "/" + url.PathEscape(run.Name)
+			}
+			if runURL != "" && (consoleURL != "" || job.Annotations[joblog.ArchiveAnnotation] == "true") {
+				return printConsoleLogs(command.Context(), command.OutOrStdout(), runURL, job.Name, follow)
+			}
+			pod, podErr := workflowJobPod(command.Context(), clients, job, follow, command.ErrOrStderr())
+			current := &actionsv1alpha1.WorkflowJob{}
+			if err := clients.reader.Get(command.Context(), client.ObjectKeyFromObject(job), current); err != nil {
 				return err
+			}
+			if current.Annotations[joblog.ArchiveAnnotation] == "true" && runURL != "" {
+				return printConsoleLogs(command.Context(), command.OutOrStdout(), runURL, job.Name, follow)
+			}
+			if podErr != nil {
+				return podErr
+			}
+			if current.Annotations[joblog.ArchiveAnnotation] == "true" {
+				fmt.Fprintln(command.ErrOrStderr(), "No Console URL is configured; showing retained Pod logs, which may be truncated by kubelet rotation")
 			}
 			stream, err := clients.logs.Stream(command.Context(), pod.Namespace, pod.Name, follow)
 			if err != nil {
@@ -177,7 +208,60 @@ func newRunLogsCommand(dependencies commandDependencies) *cobra.Command {
 	addRunKubeFlags(command, &options, dependencies.defaultKubeconfig)
 	command.Flags().StringVar(&jobName, "job", "", "Workflow job ID or resource name (resource name takes precedence); optional when the run has one job")
 	command.Flags().BoolVarP(&follow, "follow", "f", false, "Follow the runner log stream")
+	command.Flags().StringVar(&consoleURL, "console-url", "", "Console origin serving job logs; defaults to the run Console URL")
 	return command
+}
+
+func printConsoleLogs(ctx context.Context, output io.Writer, runURL, job string, follow bool) error {
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(runURL, "/")+"/jobs/"+url.PathEscape(job)+"/logs?follow="+fmt.Sprint(follow), nil)
+	if err != nil {
+		return err
+	}
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.ResponseHeaderTimeout = 30 * time.Second
+	client := &http.Client{Transport: transport, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	defer client.CloseIdleConnections()
+	response, err := client.Do(request)
+	if err != nil {
+		return fmt.Errorf("open logs for WorkflowJob %q: %w", job, err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode >= 300 && response.StatusCode < 400 || response.StatusCode == http.StatusUnauthorized || response.StatusCode == http.StatusForbidden {
+		return fmt.Errorf("open logs for WorkflowJob %q: Console authentication or redirect requires --console-url with a local port-forward", job)
+	}
+	if response.StatusCode != http.StatusOK {
+		message, _ := io.ReadAll(io.LimitReader(response.Body, 4<<10))
+		if detail := strings.TrimSpace(string(message)); detail != "" {
+			return fmt.Errorf("open logs for WorkflowJob %q: HTTP %d: %s", job, response.StatusCode, detail)
+		}
+		return fmt.Errorf("open logs for WorkflowJob %q: HTTP %d", job, response.StatusCode)
+	}
+	contentType, _, err := mime.ParseMediaType(response.Header.Get("Content-Type"))
+	if err != nil || contentType != joblog.DownloadContentType {
+		return fmt.Errorf("open logs for WorkflowJob %q: unexpected Console response type; use --console-url with a local port-forward", job)
+	}
+	decoder := json.NewDecoder(response.Body)
+	for {
+		var record joblog.DownloadRecord
+		if err := decoder.Decode(&record); err != nil {
+			if ctx.Err() != nil {
+				return nil
+			}
+			return fmt.Errorf("read logs for WorkflowJob %q: download ended without a completion record: %w", job, err)
+		}
+		if len(record.Data) > 0 {
+			if _, err := output.Write(record.Data); err != nil {
+				return fmt.Errorf("write logs for WorkflowJob %q: %w", job, err)
+			}
+		}
+		if record.Error != "" {
+			return fmt.Errorf("read logs for WorkflowJob %q: %s", job, record.Error)
+		}
+		if record.End {
+			return nil
+		}
+	}
+
 }
 
 func addRunKubeFlags(command *cobra.Command, options *runCommandOptions, defaultKubeconfig string) {

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"flag"
@@ -15,6 +16,7 @@ import (
 	"github.com/kelos-dev/open-actions/internal/artifact"
 	"github.com/kelos-dev/open-actions/internal/cache"
 	"github.com/kelos-dev/open-actions/internal/endpointurl"
+	"github.com/kelos-dev/open-actions/internal/joblog"
 )
 
 func main() {
@@ -32,6 +34,7 @@ func runArtifactServer(ctx context.Context, arguments []string) error {
 	publicURL := flags.String("public-url", "", "Artifact service origin exposed to workflow jobs")
 	storageDirectory := flags.String("storage-directory", "", "Directory used for artifact storage")
 	signingKeyFile := flags.String("signing-key-file", "", "File containing the artifact credential signing key")
+	logReadKeyFile := flags.String("log-read-key-file", "", "File containing the dedicated log read signing key")
 	maxFileBytes := flags.Int64("max-file-bytes", 1<<30, "Maximum uncompressed bytes in one artifact file")
 	maxArtifactBytes := flags.Int64("max-artifact-bytes", 2<<30, "Maximum stored and uncompressed bytes in one artifact")
 	maxRunBytes := flags.Int64("max-run-bytes", 10<<30, "Maximum stored artifact bytes in one workflow run attempt")
@@ -42,11 +45,14 @@ func runArtifactServer(ctx context.Context, arguments []string) error {
 	cacheMaxRepositoryBytes := flags.Int64("cache-max-repository-bytes", 10<<30, "Maximum cache bytes per Project and repository")
 	cacheMaxTotalBytes := flags.Int64("cache-max-total-bytes", 10<<30, "Maximum cache bytes across all Projects")
 	cacheRetentionDays := flags.Int("cache-retention-days", 7, "Expire caches after this many days without access")
+	logRetentionDays := flags.Int("log-retention-days", 7, "Job log retention in days after the last upload")
+	maxLogBytes := flags.Int64("max-log-bytes", 1<<30, "Maximum archived bytes per job")
+	maxLogChunks := flags.Int64("max-log-chunks", joblog.DefaultMaxChunks, "Maximum archived chunk files per job")
 	if err := flags.Parse(arguments); err != nil {
 		return err
 	}
-	if *publicURL == "" || *storageDirectory == "" || *signingKeyFile == "" {
-		return errors.New("public-url, storage-directory, and signing-key-file are required")
+	if *publicURL == "" || *storageDirectory == "" || *signingKeyFile == "" || *logReadKeyFile == "" {
+		return errors.New("public-url, storage-directory, signing-key-file, and log-read-key-file are required")
 	}
 	normalizedPublicURL, err := endpointurl.NormalizeOrigin(*publicURL, "Artifact service URL")
 	if err != nil {
@@ -69,11 +75,28 @@ func runArtifactServer(ctx context.Context, arguments []string) error {
 	if err := cacheLimits.Validate(); err != nil {
 		return err
 	}
+	if *logRetentionDays < 1 || *logRetentionDays > 3650 || *maxLogBytes < 1 {
+		return errors.New("log retention must be between 1 and 3650 days and the byte limit must be positive")
+	}
+	if *maxLogChunks < 1 {
+		return errors.New("log chunk limit must be positive")
+	}
 	signingKey, err := os.ReadFile(*signingKeyFile)
 	if err != nil {
 		return fmt.Errorf("read artifact signing key: %w", err)
 	}
 	tokens, err := artifact.NewTokenCodec(signingKey)
+	if err != nil {
+		return err
+	}
+	readKey, err := os.ReadFile(*logReadKeyFile)
+	if err != nil {
+		return fmt.Errorf("read log signing key: %w", err)
+	}
+	if bytes.Equal(readKey, signingKey) {
+		return errors.New("log read signing key must differ from artifact signing key")
+	}
+	logReads, err := joblog.NewReadTokenCodec(readKey)
 	if err != nil {
 		return err
 	}
@@ -94,9 +117,13 @@ func runArtifactServer(ctx context.Context, arguments []string) error {
 			return fmt.Errorf("open cache storage: %w", err)
 		}
 	}
+	logs, err := joblog.NewStore(filepath.Join(*storageDirectory, "logs"), time.Duration(*logRetentionDays)*24*time.Hour, *maxLogBytes, *maxLogChunks)
+	if err != nil {
+		return err
+	}
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 	server, err := artifact.NewServer(artifact.ServerConfig{
-		Address: *bindAddress, PublicURL: normalizedPublicURL, Store: store, CacheStore: cacheStore, Tokens: tokens, Logger: logger,
+		Address: *bindAddress, PublicURL: normalizedPublicURL, Store: store, CacheStore: cacheStore, Logs: logs, LogReads: logReads, Tokens: tokens, Logger: logger,
 	})
 	if err != nil {
 		return err

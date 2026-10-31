@@ -1,17 +1,22 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 
+	"github.com/kelos-dev/open-actions/internal/joblog"
 	"github.com/kelos-dev/open-actions/internal/runner"
 )
 
@@ -24,7 +29,7 @@ func main() {
 	}
 }
 
-func run(ctx context.Context, arguments []string) error {
+func run(ctx context.Context, arguments []string) (runError error) {
 	flags := flag.NewFlagSet("open-actions-runner", flag.ContinueOnError)
 	jobFile := flags.String("job-file", "/var/run/open-actions/job.json", "Path to the workflow job plan")
 	needsFile := flags.String("needs-file", "", "Path to the immutable needs context")
@@ -33,6 +38,26 @@ func run(ctx context.Context, arguments []string) error {
 	secretsDirectory := flags.String("secrets-directory", "", "Directory containing Project secret values")
 	variablesDirectory := flags.String("variables-directory", "", "Directory containing Project variable values")
 	workspace := flags.String("workspace", "/workspace", "Path to the job workspace")
+	githubToken := os.Getenv(runner.GitHubTokenEnvVar)
+	actionToken := os.Getenv(runner.ActionTokenEnvVar)
+	artifactToken := os.Getenv(runner.ArtifactTokenEnvVar)
+	logURL := os.Getenv(joblog.URLEnvVar)
+	var secrets map[string]string
+	var archive io.Writer
+	defer func() {
+		if runError == nil || archive != nil || logURL == "" {
+			return
+		}
+		values := []string{githubToken, actionToken, artifactToken}
+		for _, value := range secrets {
+			values = append(values, value)
+		}
+		message := runner.MaskMessage(runError.Error(), values...)
+		runError = errors.New(message)
+		if err := archiveSetupError(ctx, logURL, artifactToken, message); err != nil {
+			runError = errors.Join(runError, fmt.Errorf("archive runner setup error: %w", err))
+		}
+	}()
 	if err := flags.Parse(arguments); err != nil {
 		return err
 	}
@@ -50,7 +75,7 @@ func run(ctx context.Context, arguments []string) error {
 			return err
 		}
 	}
-	secrets, err := loadValues(*secretsDirectory)
+	secrets, err = loadValues(*secretsDirectory)
 	if err != nil {
 		return fmt.Errorf("load Project secrets: %w", err)
 	}
@@ -58,13 +83,45 @@ func run(ctx context.Context, arguments []string) error {
 	if err != nil {
 		return fmt.Errorf("load Project variables: %w", err)
 	}
-	githubToken := os.Getenv(runner.GitHubTokenEnvVar)
-	actionToken := os.Getenv(runner.ActionTokenEnvVar)
-	artifactToken := os.Getenv(runner.ArtifactTokenEnvVar)
 	runnerName := os.Getenv(runner.RunnerNameEnvVar)
 	environment := withoutEnvironmentVariables(os.Environ(), runner.GitHubTokenEnvVar, runner.ActionTokenEnvVar, runner.RunnerNameEnvVar)
+	var stdout io.Writer = os.Stdout
+	var stderr io.Writer = os.Stderr
+	var uploader *joblog.Uploader
+	stopOutput := func() {}
+	if logURL != "" {
+		logClient, err := joblog.NewClient(logURL, &http.Client{})
+		if err != nil {
+			return err
+		}
+		retryContext := context.WithoutCancel(ctx)
+		stopRetry := func() {}
+		if plan.TimeoutSeconds > 0 {
+			cleanup := runner.CleanupTimeout
+			if plan.CleanupTimeoutSeconds > 0 {
+				cleanup = time.Duration(plan.CleanupTimeoutSeconds) * time.Second
+			}
+			retryContext, stopRetry = context.WithDeadline(retryContext, time.Now().Add(time.Duration(plan.TimeoutSeconds)*time.Second).Add(cleanup))
+		}
+		defer stopRetry()
+		var outputContext context.Context
+		if plan.TimeoutSeconds > 0 {
+			outputContext, stopOutput = context.WithTimeout(ctx, time.Duration(plan.TimeoutSeconds)*time.Second)
+		} else {
+			outputContext, stopOutput = context.WithCancel(ctx)
+		}
+		defer stopOutput()
+		uploader, err = joblog.NewUploader(retryContext, outputContext, logClient, artifactToken, os.TempDir())
+		if err != nil {
+			return err
+		}
+		defer uploader.Close()
+		archive = joblog.NewTimestampWriter(uploader)
+		stdout = io.MultiWriter(os.Stdout, archive)
+		stderr = io.MultiWriter(os.Stderr, archive)
+	}
 	executor, err := runner.NewExecutor(runner.ExecutorConfig{
-		Logger:        slog.New(slog.NewJSONHandler(os.Stdout, nil)),
+		Logger:        slog.New(slog.NewJSONHandler(stdout, nil)),
 		RunnerName:    runnerName,
 		GitHubToken:   githubToken,
 		ActionToken:   actionToken,
@@ -72,13 +129,28 @@ func run(ctx context.Context, arguments []string) error {
 		Secrets:       secrets,
 		Variables:     variables,
 		Environment:   environment,
-		Stdout:        os.Stdout,
-		Stderr:        os.Stderr,
+		Stdout:        stdout,
+		Stderr:        stderr,
 	})
 	if err != nil {
+		if archive != nil {
+			fmt.Fprintln(archive, err)
+		}
 		return err
 	}
 	result, executionError := executor.ExecuteResult(ctx, plan, *workspace)
+	stopOutput()
+	if executionError != nil && archive != nil {
+		fmt.Fprintln(archive, executionError)
+	}
+	if uploader != nil {
+		if err := uploader.Close(); err != nil {
+			if result.Conclusion == runner.ResultConclusionSuccess {
+				result.Conclusion = runner.ResultConclusionFailure
+			}
+			executionError = errors.Join(executionError, err)
+		}
+	}
 	resultData, resultError := runner.EncodeResult(result)
 	if resultError == nil {
 		if err := os.WriteFile(*resultFile, resultData, 0o600); err != nil {
@@ -86,6 +158,28 @@ func run(ctx context.Context, arguments []string) error {
 		}
 	}
 	return errors.Join(executionError, resultError)
+}
+
+func archiveSetupError(ctx context.Context, origin, credential, message string) error {
+	if credential == "" {
+		return errors.New("log upload credential is required")
+	}
+	client, err := joblog.NewClient(origin, &http.Client{})
+	if err != nil {
+		return err
+	}
+	var output bytes.Buffer
+	if _, err := fmt.Fprintln(joblog.NewTimestampWriter(&output), message); err != nil {
+		return err
+	}
+	data := output.Bytes()
+	if len(data) > joblog.MaxChunkBytes {
+		const truncated = " [diagnostic truncated]\n"
+		data = append(data[:joblog.MaxChunkBytes-len(truncated)], truncated...)
+	}
+	uploadContext, cancel := context.WithTimeout(context.WithoutCancel(ctx), joblog.FlushTimeout)
+	defer cancel()
+	return client.Append(uploadContext, credential, joblog.Chunk{Data: data, Complete: true})
 }
 
 func loadValues(directory string) (map[string]string, error) {

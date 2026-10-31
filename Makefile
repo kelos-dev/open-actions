@@ -83,7 +83,7 @@ verify:
 	fi
 	$(HELM) template open-actions $(CHART_DIR) --namespace open-actions-system --set console.secretName=open-actions-console-auth >/dev/null
 	$(HELM) template open-actions $(CHART_DIR) --namespace open-actions-system --set console.enabled=false >/dev/null
-	$(HELM) template open-actions $(CHART_DIR) --namespace open-actions-system --set artifacts.signingKeySecretName=open-actions-artifact-auth >/dev/null
+	$(HELM) template open-actions $(CHART_DIR) --namespace open-actions-system --set artifacts.signingKeySecretName=open-actions-artifact-auth --set artifacts.logReadKeySecretName=open-actions-log-read-auth >/dev/null
 	$(HELM) template open-actions $(CHART_DIR) --namespace open-actions-system --set artifacts.persistence.existingClaim=open-actions-artifacts >/dev/null
 	$(HELM) template open-actions $(CHART_DIR) --namespace open-actions-system --set artifacts.persistence.enabled=false >/dev/null
 	$(HELM) template open-actions $(CHART_DIR) --namespace open-actions-system --set artifacts.cache.enabled=false >/dev/null

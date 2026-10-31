@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
@@ -21,6 +22,7 @@ import (
 	"github.com/kelos-dev/open-actions/internal/artifact"
 	"github.com/kelos-dev/open-actions/internal/eventsnapshot"
 	githubclient "github.com/kelos-dev/open-actions/internal/github"
+	"github.com/kelos-dev/open-actions/internal/joblog"
 	"github.com/kelos-dev/open-actions/internal/runner"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -517,7 +519,7 @@ func TestRunnerBuildsJobWithArtifactCredential(t *testing.T) {
 	for _, variable := range job.Spec.Template.Spec.Containers[0].Env {
 		environment[variable.Name] = variable
 	}
-	if environment[runner.ArtifactResultsURLEnvVar].Value != reconciler.ArtifactResultsURL || environment["GITHUB_RETENTION_DAYS"].Value != "30" {
+	if environment[joblog.URLEnvVar].Value != reconciler.ArtifactResultsURL || environment[runner.ArtifactResultsURLEnvVar].Value != reconciler.ArtifactResultsURL || environment["GITHUB_RETENTION_DAYS"].Value != "30" {
 		t.Fatalf("artifact environment = %#v", environment)
 	}
 	for _, name := range []string{"GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT"} {
@@ -2145,15 +2147,14 @@ func testExecuteWorkflowJobMintsPlannedTokenPermissions(t *testing.T, steps []ru
 	clusterClient := fake.NewClientBuilder().WithScheme(scheme).
 		WithStatusSubresource(&actionsv1alpha1.WorkflowJob{}, &batchv1.Job{}).
 		WithObjects(project, run, workflowJob, plan, credentials, runnerObject).Build()
-	reconciler := &RunnerReconciler{Client: clusterClient, APIReader: clusterClient, GitHub: github}
+	tokens, err := artifact.NewTokenCodec(bytes.Repeat([]byte("k"), 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	reconciler := &RunnerReconciler{Client: clusterClient, APIReader: clusterClient, GitHub: github, ArtifactResultsURL: "http://artifacts.example", ArtifactTokens: tokens}
 	if len(cacheModes) > 0 {
-		codec, err := artifact.NewTokenCodec([]byte(strings.Repeat("a", 32)))
-		if err != nil {
-			t.Fatal(err)
-		}
 		reconciler.CacheEnabled = true
 		reconciler.ArtifactResultsURL = "http://results.example"
-		reconciler.ArtifactTokens = codec
 	}
 	terminal, err := reconciler.executeWorkflowJob(context.Background(), runnerObject, workflowJob, project)
 	wantRequests := 1
@@ -2199,6 +2200,17 @@ func testExecuteWorkflowJobMintsPlannedTokenPermissions(t *testing.T, steps []ru
 	auth := &corev1.Secret{}
 	if err := clusterClient.Get(context.Background(), client.ObjectKey{Namespace: "default", Name: childName(workflowJob.Name, "auth")}, auth); err != nil {
 		t.Fatal(err)
+	}
+	stored := &actionsv1alpha1.WorkflowJob{}
+	if err := clusterClient.Get(context.Background(), client.ObjectKeyFromObject(workflowJob), stored); err != nil {
+		t.Fatal(err)
+	}
+	if stored.Annotations[joblog.ArchiveAnnotation] != "true" {
+		t.Fatalf("archive annotation = %v", stored.Annotations)
+	}
+	claims, err := tokens.ParseRuntimeToken(string(auth.Data[artifact.TokenSecretKey]), time.Now())
+	if err != nil || claims.WorkflowJobBackendID != string(workflowJob.UID) {
+		t.Fatalf("log upload claims = %#v, %v", claims, err)
 	}
 	wantActionTokenValue := ""
 	if wantActionToken {
