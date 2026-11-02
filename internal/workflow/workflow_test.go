@@ -1181,8 +1181,8 @@ func TestMatchesGitHubBranchPatterns(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := matchesBranch(tt.patterns, tt.branch); got != tt.want {
-				t.Errorf("matchesBranch(%v, %q) = %v, want %v", tt.patterns, tt.branch, got, tt.want)
+			if got := matchesPatterns(tt.patterns, tt.branch); got != tt.want {
+				t.Errorf("matchesPatterns(%v, %q) = %v, want %v", tt.patterns, tt.branch, got, tt.want)
 			}
 		})
 	}

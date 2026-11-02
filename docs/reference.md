@@ -1709,6 +1709,48 @@ Pull request and merge group target branches are available as
 
 ### Trigger matching
 
+`push`, `pull_request`, and `pull_request_target` accept `paths` or `paths-
+ignore` as a repository-root-relative glob pattern string or a list of
+patterns. Numeric and Boolean scalars are converted to string patterns. The two
+fields cannot be combined for the same event. `paths` runs the workflow when at
+least one changed file matches; ordered `!` patterns exclude files, and later
+positive patterns can include them again. At least one positive pattern is
+required. `paths-ignore` skips the workflow only when every changed file is
+ignored. Branch and path filters must both match. Tag pushes bypass path
+filters.
+
+```yaml
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - '!src/docs/**'
+  pull_request:
+    paths-ignore:
+      - 'docs/**'
+```
+
+Changed files come from a two-dot comparison of the signed before/after
+revisions for existing branches, including force pushes. New branches compare
+against the first parent of the earliest pushed commit, or the empty tree for
+an initial root commit. Pull request events compare the pinned head against its
+merge base with the pinned base revision; changes made only on the base branch
+do not match. Added, modified, deleted, and both sides of renamed paths are
+considered. An empty diff, including a branch deletion or a new branch without
+pushed commits, does not match either path filter.
+
+Path filtering examines the first 3,000 changed paths in Git diff order. Pushes
+with more than 1,000 commits and diffs that exceed 30 seconds bypass path
+filtering; branch and activity filters still apply. Other diff errors defer
+discovery for retry rather than treating unknown changed files as an empty diff.
+Filtered workflows create no `WorkflowRun` or success commit status. A required
+status therefore remains pending unless it has already been reported.
+These rules follow
+[GitHub's path filtering and diff comparisons](https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax#onpushpull_requestpull_request_targetpathspaths-ignore).
+`branches-ignore` remains unsupported and is tracked in
+[issue #116](https://github.com/kelos-dev/open-actions/issues/116).
+
 Push branch filters apply only to branch refs, and push tag filters apply only
 to tag refs. Defining only one filter kind excludes the other ref kind. An
 omitted `pull_request.types` filter matches GitHub's default `opened`,
@@ -1921,6 +1963,9 @@ Workflow definitions must satisfy these limits:
 - A workflow may contain at most 1,000 jobs.
 - A branch or tag filter may contain at most 256 patterns of at most 256
   characters each.
+- A path filter may contain at most 256 patterns of at most 1,024 characters
+  each. Empty strings, explicit empty lists, nulls, and non-scalar patterns are
+  invalid.
 - A `workflow_run` trigger may contain at most 100 workflow names of at most
   256 characters each.
 - A workflow trigger may define at most 25 inputs. Input names contain at most
