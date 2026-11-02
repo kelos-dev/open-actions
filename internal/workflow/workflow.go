@@ -166,17 +166,21 @@ type Trigger struct {
 }
 
 type EventFilter struct {
-	Branches     []string                 `yaml:"branches"`
-	Tags         []string                 `yaml:"tags"`
-	Types        []string                 `yaml:"types"`
-	Workflows    []string                 `yaml:"workflows"`
-	Inputs       map[string]WorkflowInput `yaml:"inputs"`
-	Schedules    []Schedule               `yaml:"-"`
-	branchesSet  bool
-	tagsSet      bool
-	typesSet     bool
-	workflowsSet bool
-	inputsSet    bool
+	Branches       []string                 `yaml:"branches"`
+	Paths          []string                 `yaml:"paths"`
+	PathsIgnore    []string                 `yaml:"paths-ignore"`
+	Tags           []string                 `yaml:"tags"`
+	Types          []string                 `yaml:"types"`
+	Workflows      []string                 `yaml:"workflows"`
+	Inputs         map[string]WorkflowInput `yaml:"inputs"`
+	Schedules      []Schedule               `yaml:"-"`
+	pathsSet       bool
+	pathsIgnoreSet bool
+	branchesSet    bool
+	tagsSet        bool
+	typesSet       bool
+	workflowsSet   bool
+	inputsSet      bool
 }
 
 type WorkflowInput struct {
@@ -337,6 +341,7 @@ type Event struct {
 	Issue        *IssueEvent
 	Comment      *CommentEvent
 	Review       *ReviewEvent
+	ChangedFiles *ChangedFiles
 	Payload      map[string]any
 }
 
@@ -1770,6 +1775,9 @@ func validateTrigger(trigger Trigger) error {
 		if err := validateRefPatterns(eventName, "tag", filter.Tags, filter.tagsSet, eventName == "push"); err != nil {
 			return err
 		}
+		if err := validatePathFilters(eventName, filter); err != nil {
+			return err
+		}
 		if len(filter.Workflows) > maxWorkflowFilters {
 			return fmt.Errorf("trigger %q defines %d workflow filters; maximum is %d", eventName, len(filter.Workflows), maxWorkflowFilters)
 		}
@@ -2216,6 +2224,10 @@ func (f *EventFilter) UnmarshalYAML(node *yaml.Node) error {
 		name := node.Content[index].Value
 		value := node.Content[index+1]
 		switch name {
+		case "paths", "paths-ignore":
+			if err := f.decodePaths(name, value); err != nil {
+				return err
+			}
 		case "branches":
 			f.branchesSet = true
 			if err := value.Decode(&f.Branches); err != nil {
@@ -2345,11 +2357,11 @@ func Match(trigger Trigger, event Event) (Event, bool, error) {
 	if event.Name == "push" {
 		switch {
 		case strings.HasPrefix(event.Ref, "refs/heads/"):
-			if (filter.tagsSet && !filter.branchesSet) || (filter.branchesSet && !matchesBranch(filter.Branches, event.RefName)) {
+			if (filter.tagsSet && !filter.branchesSet) || (filter.branchesSet && !matchesPatterns(filter.Branches, event.RefName)) {
 				return event, false, nil
 			}
 		case strings.HasPrefix(event.Ref, "refs/tags/"):
-			if (filter.branchesSet && !filter.tagsSet) || (filter.tagsSet && !matchesBranch(filter.Tags, event.RefName)) {
+			if (filter.branchesSet && !filter.tagsSet) || (filter.tagsSet && !matchesPatterns(filter.Tags, event.RefName)) {
 				return event, false, nil
 			}
 		default:
@@ -2360,8 +2372,16 @@ func Match(trigger Trigger, event Event) (Event, bool, error) {
 	if event.Name == "pull_request" || event.Name == "pull_request_target" || event.Name == "merge_group" || event.Name == "workflow_run" {
 		branch = event.BaseRef
 	}
-	if event.Name != "push" && len(filter.Branches) > 0 && !matchesBranch(filter.Branches, branch) {
+	if event.Name != "push" && len(filter.Branches) > 0 && !matchesPatterns(filter.Branches, branch) {
 		return event, false, nil
+	}
+	if filter.NeedsChangedFiles(event) {
+		if event.ChangedFiles == nil {
+			return event, false, fmt.Errorf("%s event requires changed files for path filtering", event.Name)
+		}
+		if !filter.matchesPaths(*event.ChangedFiles) {
+			return event, false, nil
+		}
 	}
 	if event.Name == "workflow_dispatch" || event.Name == "workflow_call" {
 		inputs, inputValues, err := resolveInputs(event.Name, filter.Inputs, event.Inputs)
@@ -2539,20 +2559,36 @@ func contains(values []string, candidate string) bool {
 	return false
 }
 
-func matchesBranch(patterns []string, branch string) bool {
-	matched := false
+type patternMatcher struct {
+	matcher *regexp.Regexp
+	negated bool
+}
+
+type patternMatchers []patternMatcher
+
+func compilePatterns(patterns []string) patternMatchers {
+	matchers := make(patternMatchers, 0, len(patterns))
 	for _, pattern := range patterns {
-		negated := strings.HasPrefix(pattern, "!")
-		pattern = strings.TrimPrefix(pattern, "!")
-		matcher, err := compileGitHubPattern(pattern)
-		if err != nil {
-			continue
+		matcher, err := compileGitHubPattern(strings.TrimPrefix(pattern, "!"))
+		if err == nil {
+			matchers = append(matchers, patternMatcher{matcher: matcher, negated: strings.HasPrefix(pattern, "!")})
 		}
-		if matcher.MatchString(branch) {
-			matched = !negated
+	}
+	return matchers
+}
+
+func (matchers patternMatchers) matches(value string) bool {
+	matched := false
+	for _, pattern := range matchers {
+		if pattern.matcher.MatchString(value) {
+			matched = !pattern.negated
 		}
 	}
 	return matched
+}
+
+func matchesPatterns(patterns []string, value string) bool {
+	return compilePatterns(patterns).matches(value)
 }
 
 type globAtom struct {
@@ -2610,7 +2646,7 @@ func compileGitHubPattern(pattern string) (*regexp.Regexp, error) {
 		}
 	}
 	var expression strings.Builder
-	expression.WriteByte('^')
+	expression.WriteString("(?s)^")
 	for _, atom := range atoms {
 		expression.WriteString(atom.expression)
 	}

@@ -370,6 +370,7 @@ func (r *DeliveryReconciler) Reconcile(ctx context.Context, request ctrl.Request
 			events[index].SHA = targetRevision
 		}
 	}
+	var changedFiles *workflow.ChangedFiles
 	selections := make([]workflowSelection, 0)
 	seenFiles := map[string]struct{}{}
 	workflowJobs := 0
@@ -466,11 +467,23 @@ candidateLoop:
 				continue
 			}
 			definition := cachedWorkflow.Definition
-			_, matched, err := workflow.Match(definition.On, workflow.Event{
+			matchEvent := workflow.Event{
 				Name: candidate.Name, Action: candidate.Action, Ref: candidate.Ref,
 				RefName: githubclient.RefName(candidate.Ref), HeadRef: candidate.HeadRef,
 				BaseRef: candidate.BaseRef, WorkflowName: candidate.WorkflowName,
-			})
+				ChangedFiles: &workflow.ChangedFiles{AlwaysRun: true},
+			}
+			_, matched, err := workflow.Match(definition.On, matchEvent)
+			if err == nil && matched && definition.On.Events[candidate.Name].NeedsChangedFiles(matchEvent) {
+				if changedFiles == nil {
+					changedFiles, err = r.changedFiles(ctx, installation, mergedRepository, object, &delivery, candidate)
+					if err != nil {
+						return ctrl.Result{}, fmt.Errorf("resolve changed files for delivery %q: %w", object.Name, err)
+					}
+				}
+				matchEvent.ChangedFiles = changedFiles
+				_, matched, err = workflow.Match(definition.On, matchEvent)
+			}
 			if err != nil {
 				message := fmt.Sprintf("workflow %q does not accept the event: %v", workflowPath, err)
 				if r.skipForkPullRequestDiscovery(candidate, &delivery, message) {
