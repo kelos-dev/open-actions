@@ -68,9 +68,7 @@ func NewServer(config ServerConfig) (*Server, error) {
 	mux.HandleFunc("/artifacts/blobs/", server.blob)
 	if config.CacheStore != nil {
 		mux.HandleFunc(cacheServicePath, server.cacheRPC)
-		mux.HandleFunc("/_apis/artifactcache/", func(w http.ResponseWriter, r *http.Request) {
-			writeTwirpError(w, http.StatusNotImplemented, "unimplemented", "cache protocol v1 is not supported; use a v2-compatible client (https://github.com/kelos-dev/open-actions/issues/41)")
-		})
+		mux.HandleFunc(cacheRESTPath, server.cacheREST)
 		mux.HandleFunc("/cache/blobs/", server.cacheBlob)
 	}
 	server.handler = mux

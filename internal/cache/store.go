@@ -12,6 +12,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -74,6 +75,8 @@ type Store struct {
 	copyBlock       func(io.Writer, io.Reader) (int64, error)
 	removeDirectory func(string) error
 }
+
+func (s *Store) MaxEntryBytes() int64 { return s.limits.MaxEntryBytes }
 
 func NewStore(root string, limits Limits) (*Store, error) {
 	if root == "" {
@@ -325,22 +328,90 @@ func (s *Store) Stage(tenant Tenant, id int64, block string, size int64, body io
 }
 
 func (s *Store) Commit(tenant Tenant, id int64, blocks []string) error {
-	e, err := s.beginCommit(tenant, id, blocks)
+	s.mu.Lock()
+	e, err := s.beginCommitLocked(tenant, id, blocks)
+	s.mu.Unlock()
 	if err != nil {
 		return err
 	}
+	return s.commit(e, blocks)
+}
+
+func (s *Store) StageRange(tenant Tenant, id, offset, size int64, body io.Reader) error {
+	if offset < 0 || size <= 0 || offset > s.limits.MaxEntryBytes-size {
+		return ErrInvalid
+	}
+	return s.Stage(tenant, id, "range:"+strconv.FormatInt(offset, 10), size, body)
+}
+
+func (s *Store) CommitRanges(tenant Tenant, id, size int64) error {
+	s.mu.Lock()
+	e, blocks, err := s.beginRangeCommitLocked(tenant, id, size)
+	s.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	return s.commit(e, blocks)
+}
+
+func (s *Store) beginRangeCommitLocked(tenant Tenant, id, size int64) (Entry, []string, error) {
+	e, err := s.getLocked(tenant, id)
+	if err != nil {
+		return Entry{}, nil, err
+	}
+	if size < 0 || size > s.limits.MaxEntryBytes || e.Uploaded && e.Size != size {
+		return Entry{}, nil, ErrInvalid
+	}
+	if e.Uploaded {
+		return e, nil, nil
+	}
+	offsets := make([]int64, 0, len(e.Blocks))
+	for block := range e.Blocks {
+		text, ok := strings.CutPrefix(block, "range:")
+		offset, err := strconv.ParseInt(text, 10, 64)
+		if !ok || err != nil || offset < 0 {
+			return Entry{}, nil, ErrInvalid
+		}
+		offsets = append(offsets, offset)
+	}
+	slices.Sort(offsets)
+	blocks := make([]string, 0, len(offsets))
+	var end int64
+	for _, offset := range offsets {
+		if offset != end {
+			return Entry{}, nil, ErrInvalid
+		}
+		block := "range:" + strconv.FormatInt(offset, 10)
+		end += e.Blocks[block]
+		blocks = append(blocks, block)
+	}
+	if end != size {
+		return Entry{}, nil, ErrInvalid
+	}
+	if size == 0 {
+		if s.active[id] > 0 || s.committing[id] {
+			return Entry{}, nil, ErrInvalid
+		}
+		s.committing[id] = true
+		return e, blocks, nil
+	}
+	e, err = s.beginCommitLocked(tenant, id, blocks)
+	return e, blocks, err
+}
+
+func (s *Store) commit(e Entry, blocks []string) error {
 	if e.Uploaded {
 		return nil
 	}
-	defer s.finishCommit(id)
-	temporary, err := os.CreateTemp(s.directory(id), ".incoming-")
+	defer s.finishCommit(e.ID)
+	temporary, err := os.CreateTemp(s.directory(e.ID), ".incoming-")
 	if err != nil {
 		return err
 	}
 	defer os.Remove(temporary.Name())
 	defer temporary.Close()
 	for _, block := range blocks {
-		f, err := os.Open(s.blockPath(id, block))
+		f, err := os.Open(s.blockPath(e.ID, block))
 		if err != nil {
 			return err
 		}
@@ -359,16 +430,14 @@ func (s *Store) Commit(tenant Tenant, id int64, blocks []string) error {
 		return err
 	}
 	for block := range e.Blocks {
-		if err := os.Remove(s.blockPath(id, block)); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		if err := os.Remove(s.blockPath(e.ID, block)); err != nil && !errors.Is(err, fs.ErrNotExist) {
 			return err
 		}
 	}
 	return nil
 }
 
-func (s *Store) beginCommit(tenant Tenant, id int64, blocks []string) (Entry, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+func (s *Store) beginCommitLocked(tenant Tenant, id int64, blocks []string) (Entry, error) {
 	e, err := s.getLocked(tenant, id)
 	if err != nil {
 		return Entry{}, err
@@ -499,6 +568,22 @@ func (s *Store) Lookup(tenant Tenant, refs []string, key, version string, restor
 		}
 	}
 	return Entry{}, ErrNotFound
+}
+
+func (s *Store) List(tenant Tenant, refs []string, prefix string) ([]Entry, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.cleanupLocked(); err != nil {
+		return nil, err
+	}
+	entries := []Entry{}
+	for _, e := range s.entries {
+		if e.Tenant == tenant && e.Finalized && slices.Contains(refs, e.Ref) && strings.HasPrefix(e.Key, prefix) {
+			entries = append(entries, e)
+		}
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].CreatedAt.After(entries[j].CreatedAt) })
+	return entries, nil
 }
 
 func (s *Store) Open(tenant Tenant, id int64) (*os.File, Entry, error) {
