@@ -131,7 +131,7 @@ controller:
 | `artifacts.maxFileBytes` | `1073741824` | Maximum uncompressed size of one file |
 | `artifacts.maxArtifactBytes` | `2147483648` | Maximum stored and total uncompressed size of one artifact |
 | `artifacts.maxRunBytes` | `10737418240` | Maximum stored artifact bytes in one WorkflowRun attempt |
-| `artifacts.cache.enabled` | `true` | Enable the v2 workflow cache service and job-scoped cache credentials |
+| `artifacts.cache.enabled` | `true` | Enable the v1 and v2 workflow cache service and job-scoped cache credentials |
 | `artifacts.cache.maxEntryBytes` | `10737418240` | Maximum stored bytes in one cache entry |
 | `artifacts.cache.maxRepositoryBytes` | `10737418240` | Maximum cache bytes per Project and repository; must be at least `artifacts.cache.maxEntryBytes` |
 | `artifacts.cache.maxTotalBytes` | `10737418240` | Maximum cache bytes across all Projects; must be at least `artifacts.cache.maxRepositoryBytes` |

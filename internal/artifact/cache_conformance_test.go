@@ -20,7 +20,6 @@ import (
 
 // Pinned action bundles exercise their shipped toolkit and Azure SDK implementations.
 func TestCacheConformanceActions(t *testing.T) {
-	server, codec, _ := cacheTestServer(t)
 	for _, tc := range []struct{ name, sha string }{
 		{"cache", "0057852bfaa89a56745cba8c7296529d2fc39830"},
 		{"setup-go", "40f1582b2485089dde7abd97c1529aa768e1baff"},
@@ -28,167 +27,176 @@ func TestCacheConformanceActions(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			action := downloadCacheAction(t, tc.name, tc.sha)
-			toolcache := t.TempDir()
-			nodePath, err := exec.LookPath("node")
-			if err != nil {
-				t.Fatal(err)
-			}
-			nodeOutput, err := exec.Command(nodePath, "--version").Output()
-			if err != nil {
-				t.Fatal(err)
-			}
-			nodeVersion := strings.TrimPrefix(strings.TrimSpace(string(nodeOutput)), "v")
-			goOutput, err := exec.Command("go", "env", "GOVERSION").Output()
-			if err != nil {
-				t.Fatal(err)
-			}
-			goVersion := strings.TrimPrefix(strings.TrimSpace(string(goOutput)), "go")
-			arch := runtime.GOARCH
-			if arch == "amd64" {
-				arch = "x64"
-			}
-			for _, tool := range []struct{ name, version, source string }{{"go", goVersion, runtime.GOROOT()}, {"node", nodeVersion, ""}} {
-				directory := filepath.Join(toolcache, tool.name, tool.version)
-				if err := os.MkdirAll(directory, 0700); err != nil {
-					t.Fatal(err)
-				}
-				if tool.name == "go" {
-					if err := os.Symlink(tool.source, filepath.Join(directory, arch)); err != nil {
+			for _, protocol := range []struct{ name, serverURL, v2 string }{
+				{"v2", "https://github.com", "true"},
+				{"v1", "https://github.com", ""},
+				{"ghes", "https://github.example", "true"},
+			} {
+				t.Run(protocol.name, func(t *testing.T) {
+					server, codec, _ := cacheTestServer(t)
+					toolcache := t.TempDir()
+					nodePath, err := exec.LookPath("node")
+					if err != nil {
 						t.Fatal(err)
 					}
-				} else {
-					bin := filepath.Join(directory, arch, "bin")
-					if err := os.MkdirAll(bin, 0700); err != nil {
+					nodeOutput, err := exec.Command(nodePath, "--version").Output()
+					if err != nil {
 						t.Fatal(err)
 					}
-					for _, program := range []string{"node", "npm"} {
-						source, err := exec.LookPath(program)
+					nodeVersion := strings.TrimPrefix(strings.TrimSpace(string(nodeOutput)), "v")
+					goOutput, err := exec.Command("go", "env", "GOVERSION").Output()
+					if err != nil {
+						t.Fatal(err)
+					}
+					goVersion := strings.TrimPrefix(strings.TrimSpace(string(goOutput)), "go")
+					arch := runtime.GOARCH
+					if arch == "amd64" {
+						arch = "x64"
+					}
+					for _, tool := range []struct{ name, version, source string }{{"go", goVersion, runtime.GOROOT()}, {"node", nodeVersion, ""}} {
+						directory := filepath.Join(toolcache, tool.name, tool.version)
+						if err := os.MkdirAll(directory, 0700); err != nil {
+							t.Fatal(err)
+						}
+						if tool.name == "go" {
+							if err := os.Symlink(tool.source, filepath.Join(directory, arch)); err != nil {
+								t.Fatal(err)
+							}
+						} else {
+							bin := filepath.Join(directory, arch, "bin")
+							if err := os.MkdirAll(bin, 0700); err != nil {
+								t.Fatal(err)
+							}
+							for _, program := range []string{"node", "npm"} {
+								source, err := exec.LookPath(program)
+								if err != nil {
+									t.Fatal(err)
+								}
+								source, err = filepath.EvalSymlinks(source)
+								if err != nil {
+									t.Fatal(err)
+								}
+								if err := os.Symlink(source, filepath.Join(bin, program)); err != nil {
+									t.Fatal(err)
+								}
+							}
+						}
+						if err := os.WriteFile(filepath.Join(directory, arch+".complete"), nil, 0600); err != nil {
+							t.Fatal(err)
+						}
+					}
+					workspace := filepath.Join(t.TempDir(), "workspace")
+					home := filepath.Join(t.TempDir(), "home")
+					for attempt := range 2 {
+						for _, directory := range []string{workspace, home} {
+							if err := os.RemoveAll(directory); err != nil {
+								t.Fatal(err)
+							}
+							if err := os.MkdirAll(directory, 0700); err != nil {
+								t.Fatal(err)
+							}
+						}
+						temp := t.TempDir()
+						state, output, envPath := filepath.Join(temp, "state"), filepath.Join(temp, "output"), filepath.Join(temp, "path")
+						for _, p := range []string{state, output, envPath, filepath.Join(temp, "env")} {
+							if err := os.WriteFile(p, nil, 0600); err != nil {
+								t.Fatal(err)
+							}
+						}
+						token := cacheToken(t, codec, "project", fmt.Sprintf("%s-job-%d", tc.name, attempt), "refs/heads/main", "write")
+						env := map[string]string{
+							"HOME": home, "GITHUB_WORKSPACE": workspace, "GITHUB_OUTPUT": output, "GITHUB_STATE": state, "GITHUB_PATH": envPath, "GITHUB_ENV": filepath.Join(temp, "env"),
+							"GITHUB_SERVER_URL": protocol.serverURL, "GITHUB_API_URL": "https://api.github.com", "GITHUB_REPOSITORY": "acme/example", "GITHUB_JOB": "test",
+							"GITHUB_REF": "refs/heads/main", "GITHUB_SHA": strings.Repeat("a", 40), "GITHUB_ACTIONS": "true", "RUNNER_OS": "Linux", "RUNNER_ARCH": strings.ToUpper(arch), "RUNNER_DEBUG": "1",
+							"RUNNER_TEMP": temp, "RUNNER_TOOL_CACHE": toolcache, "ACTIONS_RESULTS_URL": server.URL, "ACTIONS_RUNTIME_TOKEN": token, "ACTIONS_CACHE_SERVICE_V2": protocol.v2,
+							"ACTIONS_CACHE_MODE": "write", "ACTIONS_CACHE_URL": server.URL + "/", "GITHUB_RUN_ID": fmt.Sprint(attempt + 1), "GITHUB_RUN_ATTEMPT": "1",
+							"GOCACHE": filepath.Join(workspace, "go-build"), "GOPATH": filepath.Join(workspace, "gopath"), "NPM_CONFIG_CACHE": filepath.Join(workspace, "npm-cache"),
+						}
+						marker := ""
+						switch tc.name {
+						case "cache":
+							env["INPUT_PATH"] = filepath.Join(workspace, "cached")
+							env["INPUT_KEY"] = "conformance-cache"
+							marker = filepath.Join(workspace, "cached", "marker")
+						case "setup-go":
+							env["INPUT_GO-VERSION"] = goVersion
+							env["INPUT_CACHE"] = "true"
+							env["INPUT_CACHE-DEPENDENCY-PATH"] = "go.sum"
+							if err := os.WriteFile(filepath.Join(workspace, "go.mod"), []byte("module example.com/conformance\n\ngo 1.25\n"), 0600); err != nil {
+								t.Fatal(err)
+							}
+							if err := os.WriteFile(filepath.Join(workspace, "go.sum"), []byte(""), 0600); err != nil {
+								t.Fatal(err)
+							}
+							marker = filepath.Join(workspace, "gopath", "pkg", "mod", "marker")
+						case "setup-node":
+							env["INPUT_NODE-VERSION"] = nodeVersion
+							env["INPUT_CACHE"] = "npm"
+							env["INPUT_CACHE-DEPENDENCY-PATH"] = "package-lock.json"
+							if err := os.WriteFile(filepath.Join(workspace, "package-lock.json"), []byte(`{"name":"conformance","lockfileVersion":3,"packages":{}}`), 0600); err != nil {
+								t.Fatal(err)
+							}
+							marker = filepath.Join(workspace, "npm-cache", "marker")
+						}
+						var metadata struct {
+							Inputs map[string]struct{ Default any }
+							Runs   struct{ Main, Post string }
+						}
+						data, err := os.ReadFile(filepath.Join(action, "action.yml"))
 						if err != nil {
 							t.Fatal(err)
 						}
-						source, err = filepath.EvalSymlinks(source)
-						if err != nil {
+						if err := yaml.Unmarshal(data, &metadata); err != nil {
 							t.Fatal(err)
 						}
-						if err := os.Symlink(source, filepath.Join(bin, program)); err != nil {
-							t.Fatal(err)
+						for name, input := range metadata.Inputs {
+							key := "INPUT_" + strings.ToUpper(strings.ReplaceAll(name, " ", "_"))
+							if _, set := env[key]; !set && input.Default != nil {
+								env[key] = fmt.Sprint(input.Default)
+							}
 						}
-					}
-				}
-				if err := os.WriteFile(filepath.Join(directory, arch+".complete"), nil, 0600); err != nil {
-					t.Fatal(err)
-				}
-			}
-			workspace := filepath.Join(t.TempDir(), "workspace")
-			home := filepath.Join(t.TempDir(), "home")
-			for attempt := range 2 {
-				for _, directory := range []string{workspace, home} {
-					if err := os.RemoveAll(directory); err != nil {
-						t.Fatal(err)
-					}
-					if err := os.MkdirAll(directory, 0700); err != nil {
-						t.Fatal(err)
-					}
-				}
-				temp := t.TempDir()
-				state, output, envPath := filepath.Join(temp, "state"), filepath.Join(temp, "output"), filepath.Join(temp, "path")
-				for _, p := range []string{state, output, envPath, filepath.Join(temp, "env")} {
-					if err := os.WriteFile(p, nil, 0600); err != nil {
-						t.Fatal(err)
-					}
-				}
-				token := cacheToken(t, codec, "project", fmt.Sprintf("%s-job-%d", tc.name, attempt), "refs/heads/main", "write")
-				env := map[string]string{
-					"HOME": home, "GITHUB_WORKSPACE": workspace, "GITHUB_OUTPUT": output, "GITHUB_STATE": state, "GITHUB_PATH": envPath, "GITHUB_ENV": filepath.Join(temp, "env"),
-					"GITHUB_SERVER_URL": "https://github.com", "GITHUB_API_URL": "https://api.github.com", "GITHUB_REPOSITORY": "acme/example", "GITHUB_JOB": "test",
-					"GITHUB_REF": "refs/heads/main", "GITHUB_SHA": strings.Repeat("a", 40), "GITHUB_ACTIONS": "true", "RUNNER_OS": "Linux", "RUNNER_ARCH": strings.ToUpper(arch),
-					"RUNNER_TEMP": temp, "RUNNER_TOOL_CACHE": toolcache, "ACTIONS_RESULTS_URL": server.URL, "ACTIONS_RUNTIME_TOKEN": token, "ACTIONS_CACHE_SERVICE_V2": "true",
-					"ACTIONS_CACHE_MODE": "write", "ACTIONS_CACHE_URL": server.URL + "/", "GITHUB_RUN_ID": fmt.Sprint(attempt + 1), "GITHUB_RUN_ATTEMPT": "1",
-					"GOCACHE": filepath.Join(workspace, "go-build"), "GOPATH": filepath.Join(workspace, "gopath"), "NPM_CONFIG_CACHE": filepath.Join(workspace, "npm-cache"),
-				}
-				marker := ""
-				switch tc.name {
-				case "cache":
-					env["INPUT_PATH"] = filepath.Join(workspace, "cached")
-					env["INPUT_KEY"] = "conformance-cache"
-					marker = filepath.Join(workspace, "cached", "marker")
-				case "setup-go":
-					env["INPUT_GO-VERSION"] = goVersion
-					env["INPUT_CACHE"] = "true"
-					env["INPUT_CACHE-DEPENDENCY-PATH"] = "go.sum"
-					if err := os.WriteFile(filepath.Join(workspace, "go.mod"), []byte("module example.com/conformance\n\ngo 1.25\n"), 0600); err != nil {
-						t.Fatal(err)
-					}
-					if err := os.WriteFile(filepath.Join(workspace, "go.sum"), []byte(""), 0600); err != nil {
-						t.Fatal(err)
-					}
-					marker = filepath.Join(workspace, "gopath", "pkg", "mod", "marker")
-				case "setup-node":
-					env["INPUT_NODE-VERSION"] = nodeVersion
-					env["INPUT_CACHE"] = "npm"
-					env["INPUT_CACHE-DEPENDENCY-PATH"] = "package-lock.json"
-					if err := os.WriteFile(filepath.Join(workspace, "package-lock.json"), []byte(`{"name":"conformance","lockfileVersion":3,"packages":{}}`), 0600); err != nil {
-						t.Fatal(err)
-					}
-					marker = filepath.Join(workspace, "npm-cache", "marker")
-				}
-				var metadata struct {
-					Inputs map[string]struct{ Default any }
-					Runs   struct{ Main, Post string }
-				}
-				data, err := os.ReadFile(filepath.Join(action, "action.yml"))
-				if err != nil {
-					t.Fatal(err)
-				}
-				if err := yaml.Unmarshal(data, &metadata); err != nil {
-					t.Fatal(err)
-				}
-				for name, input := range metadata.Inputs {
-					key := "INPUT_" + strings.ToUpper(strings.ReplaceAll(name, " ", "_"))
-					if _, set := env[key]; !set && input.Default != nil {
-						env[key] = fmt.Sprint(input.Default)
-					}
-				}
-				mainOutput := runCacheAction(t, nodePath, filepath.Join(action, metadata.Runs.Main), workspace, env)
-				if attempt == 0 {
-					if !strings.Contains(strings.ToLower(mainOutput), "cache not found") {
-						t.Fatalf("expected cache miss:\n%s", mainOutput)
-					}
-					if err := os.MkdirAll(filepath.Dir(marker), 0700); err != nil {
-						t.Fatal(err)
-					}
-					if err := os.WriteFile(marker, []byte("preserved across runs"), 0600); err != nil {
-						t.Fatal(err)
-					}
-					if tc.name == "setup-go" {
-						if err := os.MkdirAll(env["GOCACHE"], 0700); err != nil {
-							t.Fatal(err)
+						mainOutput := runCacheAction(t, nodePath, filepath.Join(action, metadata.Runs.Main), workspace, env)
+						if attempt == 0 {
+							if !regexp.MustCompile(`(?i)cache (is )?not found`).MatchString(mainOutput) {
+								t.Fatalf("expected cache miss:\n%s", mainOutput)
+							}
+							if err := os.MkdirAll(filepath.Dir(marker), 0700); err != nil {
+								t.Fatal(err)
+							}
+							if err := os.WriteFile(marker, []byte("preserved across runs"), 0600); err != nil {
+								t.Fatal(err)
+							}
+							if tc.name == "setup-go" {
+								if err := os.MkdirAll(env["GOCACHE"], 0700); err != nil {
+									t.Fatal(err)
+								}
+								if err := os.WriteFile(filepath.Join(env["GOCACHE"], "marker"), []byte("build cache"), 0600); err != nil {
+									t.Fatal(err)
+								}
+							}
+						} else {
+							data, err := os.ReadFile(marker)
+							if err != nil || string(data) != "preserved across runs" {
+								t.Fatalf("cache did not restore: data=%q err=%v\n%s", data, err, mainOutput)
+							}
 						}
-						if err := os.WriteFile(filepath.Join(env["GOCACHE"], "marker"), []byte("build cache"), 0600); err != nil {
-							t.Fatal(err)
+						if attempt == 1 {
+							values := readCacheActionValues(t, output)
+							if values["cache-hit"] != "true" {
+								t.Fatalf("expected exact cache hit: %#v\n%s", values, mainOutput)
+							}
 						}
+						for key, value := range readCacheActionValues(t, state) {
+							env["STATE_"+key] = value
+						}
+						env["STATE_isPost"] = "true"
+						postOutput := runCacheAction(t, nodePath, filepath.Join(action, metadata.Runs.Post), workspace, env)
+						if attempt == 0 && !strings.Contains(strings.ToLower(postOutput), "cache saved") {
+							t.Fatalf("expected post-job save:\n%s", postOutput)
+						}
+						t.Logf("run %d completed with restore and post-job save hooks", attempt+1)
 					}
-				} else {
-					data, err := os.ReadFile(marker)
-					if err != nil || string(data) != "preserved across runs" {
-						t.Fatalf("cache did not restore: data=%q err=%v\n%s", data, err, mainOutput)
-					}
-				}
-				if attempt == 1 {
-					values := readCacheActionValues(t, output)
-					if values["cache-hit"] != "true" {
-						t.Fatalf("expected exact cache hit: %#v\n%s", values, mainOutput)
-					}
-				}
-				for key, value := range readCacheActionValues(t, state) {
-					env["STATE_"+key] = value
-				}
-				env["STATE_isPost"] = "true"
-				postOutput := runCacheAction(t, nodePath, filepath.Join(action, metadata.Runs.Post), workspace, env)
-				if attempt == 0 && !strings.Contains(strings.ToLower(postOutput), "cache saved") {
-					t.Fatalf("expected post-job save:\n%s", postOutput)
-				}
-				t.Logf("run %d completed with restore and post-job save hooks", attempt+1)
+				})
 			}
 		})
 	}

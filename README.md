@@ -290,10 +290,11 @@ make image      # Build the controller, artifact service, Console, and runner im
 ```
 
 Run `make test-cache-conformance` to exercise pinned official action bundles
-against the service with a miss, post-job save, and restore into a cleared
-workspace. This requires `gh`, Node.js, npm, Go, and GNU tar, and downloads the
-bundles from GitHub. Its BuildKit test additionally requires Docker with
-Buildx, creates an isolated builder, clears its local build cache, and checks
+against the service using v1, v2, and GitHub Enterprise Server protocol selection,
+with a miss, post-job save, and restore into a cleared workspace. This requires
+`gh`, Node.js, npm, Go, and GNU tar, and downloads the bundles from GitHub.
+Its BuildKit test additionally requires Docker with Buildx, creates an isolated
+builder, clears its local build cache, and checks
 that a second build reuses exported layers. It is skipped when Docker is not
 installed.
 

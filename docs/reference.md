@@ -2040,8 +2040,14 @@ test clusters because Pod replacement loses stored artifacts. Set
 
 ### Workflow caches
 
-The artifact service also hosts the v2 Results Cache Service used by
-`actions/cache@v4`, `actions/setup-go@v5`, and `actions/setup-node@v4`.
+The artifact service also hosts the v2 Results Cache Service and v1 cache REST
+protocol used by `actions/cache@v4`, `actions/setup-go@v5`, and
+`actions/setup-node@v4`. Both protocols share cache entries, access rules, and
+quotas. Clients using the
+[Actions toolkit](https://github.com/actions/toolkit/blob/main/packages/cache/src/internal/config.ts)
+select v1 on GitHub Enterprise Server even when `ACTIONS_CACHE_SERVICE_V2=true`;
+no additional configuration is needed.
+Other clients use v2 by default when they honor that environment variable.
 Actions create and extract their own archives and run their own post-job save
 hooks. The default runner image includes GNU tar and zstd; custom images must
 provide the archive tools required by their actions. Cache entries are opaque
@@ -2111,8 +2117,7 @@ Cache export failures retain BuildKit's normal behavior; use `ignore-error=true`
 if exports should be optional. Actions retain their own handling of misses,
 service failures, `fail-on-cache-miss`, `lookup-only`, and `cache-hit` outputs.
 
-The v1 cache REST protocol, GitHub REST cache management, and toolkit caching
-on GitHub Enterprise Server (whose toolkit selects v1) are not supported;
+GitHub REST cache management is not supported;
 see [issue #41](https://github.com/kelos-dev/open-actions/issues/41).
 The `cache-mode` inheritance rules for job calls to reusable workflows do not
 apply because reusable-workflow job calls are not supported.
