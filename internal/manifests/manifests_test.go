@@ -415,3 +415,64 @@ func TestCacheWorkloadConfiguration(t *testing.T) {
 		}
 	}
 }
+
+func TestArchivedLogConfiguration(t *testing.T) {
+	chart := Chart()
+	data, err := fs.ReadFile(chart, "values.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var values map[string]any
+	if err := yaml.Unmarshal(data, &values); err != nil {
+		t.Fatal(err)
+	}
+	artifacts := values["artifacts"].(map[string]any)
+	artifacts["logRetentionDays"] = 14
+	artifacts["maxLogBytes"] = 4096
+	artifacts["maxLogChunks"] = 100
+	artifacts["signingKeySecretName"] = "artifact-key"
+	artifacts["logReadKeySecretName"] = "read-key"
+	artifacts["signingKeyKey"] = "artifact-signing-key"
+	artifacts["logReadKeyKey"] = "key"
+	server := renderWorkloadPodSpec(t, chart, "templates/artifact-statefulset.yaml", values)
+	for _, want := range []string{"--log-retention-days=14", "--max-log-bytes=4096", "--max-log-chunks=100"} {
+		if !slices.Contains(server.Containers[0].Args, want) {
+			t.Fatalf("artifact arguments = %#v", server.Containers[0].Args)
+		}
+	}
+	console := renderWorkloadPodSpec(t, chart, "templates/console-deployment.yaml", values)
+	for _, want := range []string{"--log-service-url=http://open-actions-artifacts.open-actions-system.svc", "--log-read-key-file=/var/run/secrets/open-actions-logs/read-key"} {
+		if !slices.Contains(console.Containers[0].Args, want) {
+			t.Fatalf("Console arguments = %#v", console.Containers[0].Args)
+		}
+	}
+	for _, volume := range console.Volumes {
+		if volume.Name == "artifact-auth" || volume.Secret != nil && volume.Secret.SecretName == "artifact-key" {
+			t.Fatal("Console mounted artifact credentials")
+		}
+	}
+	found := false
+	for _, volume := range console.Volumes {
+		if volume.Name == "log-read-auth" {
+			found = true
+			if volume.Secret == nil || volume.Secret.SecretName != "read-key" || len(volume.Secret.Items) != 1 || volume.Secret.Items[0].Key != "key" {
+				t.Fatalf("Console signing key = %#v", volume.Secret)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("Console signing key was not mounted")
+	}
+	artifacts["enabled"] = false
+	console = renderWorkloadPodSpec(t, chart, "templates/console-deployment.yaml", values)
+	for _, argument := range console.Containers[0].Args {
+		if strings.HasPrefix(argument, "--log-") {
+			t.Fatalf("disabled archive argument = %q", argument)
+		}
+	}
+	for _, volume := range console.Volumes {
+		if volume.Name == "log-read-auth" {
+			t.Fatal("disabled archive key is mounted")
+		}
+	}
+}

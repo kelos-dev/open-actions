@@ -256,10 +256,10 @@ storage, resources, image pull policies, or an externally exposed Console.
 
 ## Inspecting workflow runs
 
-The CLI reads workflow runs and runner logs through the Kubernetes API using the
-active kubeconfig context. It defaults to that context's namespace; use
-`--namespace` to select another namespace or `--all-namespaces` when listing
-runs.
+The CLI discovers workflow runs through the Kubernetes API using the active
+kubeconfig context and reads archived job logs through the Console. It defaults
+to that context's namespace; use `--namespace` to select another namespace or
+`--all-namespaces` when listing runs.
 
 ```console
 open-actions run list --namespace open-actions
@@ -271,8 +271,16 @@ open-actions run logs RUN --job JOB --follow --namespace open-actions
 `JOB` may be the workflow-local job ID shown by `run view` or the WorkflowJob
 resource name. An exact resource-name match takes precedence over a job ID.
 `--job` may be omitted when the run contains exactly one job.
-Completed native Jobs and runner Pods are retained with their WorkflowRun, so
-runner logs remain available until that run is deleted.
+
+For archived jobs, the CLI uses the run's Console URL; override it with
+`--console-url` when using a different address or a local port-forward. If no
+Console URL is configured, the CLI warns and reads retained Pod logs. Logs are
+archived on the artifact service volume independently of kubelet rotation.
+See [runner log retention](docs/reference.md#runner-log-retention) for limits,
+failure behavior, and upgrade instructions.
+Completed native Jobs and runner Pods are retained with their WorkflowRun.
+Jobs started without archiving read Pod logs and remain subject to kubelet
+rotation.
 
 ## API reference
 

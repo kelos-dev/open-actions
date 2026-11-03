@@ -24,8 +24,13 @@ artifacts:
     pullPolicy: IfNotPresent
   signingKeySecretName: ""
   signingKeyKey: signing-key
+  logReadKeySecretName: ""
+  logReadKeyKey: read-key
   defaultRetentionDays: 7
   maxRetentionDays: 30
+  logRetentionDays: 7
+  maxLogBytes: 1073741824
+  maxLogChunks: 32768
   maxFileBytes: 1073741824
   maxArtifactBytes: 2147483648
   maxRunBytes: 10737418240

@@ -52,7 +52,7 @@
     "artifacts": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["enabled", "image", "signingKeySecretName", "signingKeyKey", "defaultRetentionDays", "maxRetentionDays", "maxFileBytes", "maxArtifactBytes", "maxRunBytes", "cache", "resources", "persistence"],
+      "required": ["enabled", "image", "signingKeySecretName", "signingKeyKey", "logReadKeySecretName", "logReadKeyKey", "defaultRetentionDays", "maxRetentionDays", "maxFileBytes", "maxArtifactBytes", "maxRunBytes", "cache", "resources", "persistence"],
       "properties": {
         "enabled": {"type": "boolean"},
         "image": {
@@ -79,8 +79,22 @@
           "maxLength": 253,
           "pattern": "^[-._A-Za-z0-9]+$"
         },
+        "logReadKeySecretName": {
+          "type": "string",
+          "maxLength": 253,
+          "pattern": "^$|^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?)*$"
+        },
+        "logReadKeyKey": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 253,
+          "pattern": "^[-._A-Za-z0-9]+$"
+        },
         "defaultRetentionDays": {"type": "integer", "minimum": 1, "maximum": 3650},
         "maxRetentionDays": {"type": "integer", "minimum": 1, "maximum": 3650},
+        "logRetentionDays": {"type": "integer", "minimum": 1, "maximum": 3650},
+        "maxLogBytes": {"type": "integer", "minimum": 1},
+        "maxLogChunks": {"type": "integer", "minimum": 1, "maximum": 2147483647},
         "maxFileBytes": {"type": "integer", "minimum": 1},
         "maxArtifactBytes": {"type": "integer", "minimum": 1},
         "maxRunBytes": {"type": "integer", "minimum": 1},

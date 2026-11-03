@@ -26,6 +26,7 @@ import (
 	actionsv1alpha1 "github.com/kelos-dev/open-actions/api/v1alpha1"
 	"github.com/kelos-dev/open-actions/internal/eventsnapshot"
 	githubclient "github.com/kelos-dev/open-actions/internal/github"
+	"github.com/kelos-dev/open-actions/internal/joblog"
 	"github.com/kelos-dev/open-actions/internal/projectvalue"
 	"github.com/kelos-dev/open-actions/internal/workflow"
 	"github.com/kelos-dev/open-actions/internal/workflowrun"
@@ -65,6 +66,7 @@ const (
 )
 
 var errLogsUnavailable = errors.New("logs are no longer available")
+var errLogsNotReady = errors.New("runner logs are not available yet; use --follow")
 
 var (
 	dispatchInputNamePattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_-]{0,99}$`)
@@ -477,6 +479,8 @@ func (h *Handler) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 		h.runDurations(writer, request, run)
 	case len(parts) == 5 && parts[3] == "jobs":
 		h.jobLogs(writer, request, run, parts[4])
+	case len(parts) == 6 && parts[3] == "jobs" && parts[5] == "logs":
+		h.downloadJobLogs(writer, request, run, parts[4])
 	case len(parts) == 6 && parts[3] == "jobs" && parts[5] == "stream":
 		h.streamJobLogs(writer, request, run, parts[4])
 	default:
@@ -1869,6 +1873,117 @@ func (h *Handler) jobLogs(writer http.ResponseWriter, request *http.Request, run
 	h.writeHTML(writer, h.logPage, data)
 }
 
+func (h *Handler) downloadJobLogs(writer http.ResponseWriter, request *http.Request, run *actionsv1alpha1.WorkflowRun, jobName string) {
+	job, err := h.workflowJob(request.Context(), run, jobName)
+	if err != nil {
+		h.writeResolutionError(writer, request, err)
+		return
+	}
+	follow := request.URL.Query().Get("follow") == "true"
+	writer.Header().Set("Content-Type", joblog.DownloadContentType)
+	writer.Header().Set("X-Accel-Buffering", "no")
+	encoder := json.NewEncoder(writer)
+	send := func(record joblog.DownloadRecord) error {
+		if err := encoder.Encode(record); err != nil {
+			return err
+		}
+		if flusher, ok := writer.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		return nil
+	}
+	heartbeat := func() { _ = send(joblog.DownloadRecord{}) }
+	if follow {
+		heartbeat()
+	}
+	stream, err := h.openJobLogs(request.Context(), job, follow, heartbeat)
+	if err != nil {
+		if request.Context().Err() != nil {
+			return
+		}
+		message := h.logStreamError(job, err)
+		if follow {
+			_ = send(joblog.DownloadRecord{Error: message})
+		} else {
+			status := http.StatusBadGateway
+			if errors.Is(err, errLogsNotReady) {
+				status = http.StatusConflict
+			}
+			writer.Header().Set("Content-Type", "text/plain; charset=utf-8")
+			http.Error(writer, message, status)
+		}
+		return
+	}
+	defer stream.Close()
+	ctx, cancel := context.WithCancel(request.Context())
+	defer cancel()
+	reads := readDownload(ctx, joblog.WithoutTimestamps(stream))
+	ticker := time.NewTicker(streamHeartbeat)
+	defer ticker.Stop()
+	for {
+		select {
+		case read := <-reads:
+			if len(read.data) > 0 {
+				if err := send(joblog.DownloadRecord{Data: read.data}); err != nil {
+					return
+				}
+			}
+			if read.err != nil {
+				if read.err == io.EOF {
+					_ = send(joblog.DownloadRecord{End: true})
+				} else if ctx.Err() == nil {
+					_ = send(joblog.DownloadRecord{Error: h.logStreamError(job, read.err)})
+				}
+				return
+			}
+		case <-ticker.C:
+			if err := send(joblog.DownloadRecord{}); err != nil {
+				return
+			}
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+type downloadRead struct {
+	data []byte
+	err  error
+}
+
+func readDownload(ctx context.Context, source io.Reader) <-chan downloadRead {
+	reads := make(chan downloadRead)
+	go func() {
+		for {
+			data := make([]byte, 32<<10)
+			n, err := source.Read(data)
+			select {
+			case reads <- downloadRead{data: data[:n], err: err}:
+			case <-ctx.Done():
+				return
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
+	return reads
+}
+
+func (h *Handler) logStreamError(job *actionsv1alpha1.WorkflowJob, err error) string {
+	h.logger.Warn("Runner log stream failed", "namespace", job.Namespace, "workflow_job", job.Name, "error", err)
+	switch {
+	case errors.Is(err, errArchiveIncomplete):
+		return "Runner log archive is incomplete or expired."
+	case errors.Is(err, errLogsNotReady):
+		return fmt.Sprintf("Runner logs for WorkflowJob %q are not available yet; use --follow", job.Name)
+	case errors.Is(err, errLogsUnavailable):
+		return "Runner logs are no longer available."
+	default:
+		return "Runner logs are unavailable. Try again later."
+	}
+}
+
 func (h *Handler) streamJobLogs(writer http.ResponseWriter, request *http.Request, run *actionsv1alpha1.WorkflowRun, jobName string) {
 	job, err := h.workflowJob(request.Context(), run, jobName)
 	if err != nil {
@@ -1889,14 +2004,9 @@ func (h *Handler) streamJobLogs(writer http.ResponseWriter, request *http.Reques
 	writer.Header().Set("Cache-Control", "no-store")
 	writer.Header().Set("X-Accel-Buffering", "no")
 	writeEvent(writer, flusher, "status", "Waiting for runner logs...")
-	pod, err := h.waitForPod(request.Context(), job, func() { writeSSEComment(writer, flusher, "keepalive") })
+	stream, err := h.openJobLogs(request.Context(), job, true, func() { writeSSEComment(writer, flusher, "keepalive") })
 	if err != nil {
-		writeEvent(writer, flusher, "error", err.Error())
-		return
-	}
-	stream, err := h.logs.Stream(request.Context(), pod.Namespace, pod.Name)
-	if err != nil {
-		writeEvent(writer, flusher, "error", "Unable to open runner logs.")
+		writeEvent(writer, flusher, "error", h.logStreamError(job, err))
 		return
 	}
 	defer stream.Close()
@@ -1905,7 +2015,8 @@ func (h *Handler) streamJobLogs(writer http.ResponseWriter, request *http.Reques
 	defer heartbeat.Stop()
 	batchTicker := time.NewTicker(logBatchInterval)
 	defer batchTicker.Stop()
-	// Log IDs are positions in the currently retained Pod log, not durable offsets across log rotation.
+	// Archived output preserves event IDs across replay. Pod-log IDs are
+	// positions in the retained file and can shift when kubelet rotates it.
 	var logID uint64
 	batch := make([]byte, 0, logBatchByteLimit+1)
 	batchEntries := 0
@@ -1954,7 +2065,7 @@ func (h *Handler) streamJobLogs(writer http.ResponseWriter, request *http.Reques
 			if result.err == io.EOF {
 				writeEvent(writer, flusher, "end", "Log stream ended.")
 			} else if request.Context().Err() == nil {
-				writeEvent(writer, flusher, "error", "Runner log stream failed.")
+				writeEvent(writer, flusher, "error", h.logStreamError(job, result.err))
 			}
 			return
 		case <-batchTicker.C:
@@ -2063,7 +2174,65 @@ func (h *Handler) workflowJob(ctx context.Context, run *actionsv1alpha1.Workflow
 	return nil, fmt.Errorf("WorkflowJob %q does not belong to WorkflowRun %q", job.Name, run.Name)
 }
 
-func (h *Handler) waitForPod(ctx context.Context, job *actionsv1alpha1.WorkflowJob, heartbeat func()) (*corev1.Pod, error) {
+func (h *Handler) openJobLogs(ctx context.Context, job *actionsv1alpha1.WorkflowJob, follow bool, heartbeat func()) (io.ReadCloser, error) {
+	if job.Annotations[joblog.ArchiveAnnotation] == "true" {
+		source, ok := h.logs.(interface {
+			StreamArchive(context.Context, string, bool, func(context.Context) (bool, error)) (io.ReadCloser, error)
+		})
+		if !ok {
+			return nil, fmt.Errorf("archived logs for WorkflowJob %q are not configured", job.Name)
+		}
+		var cancellationDeadline time.Time
+		return source.StreamArchive(ctx, string(job.UID), follow, func(ctx context.Context) (bool, error) {
+			current := &actionsv1alpha1.WorkflowJob{}
+			if err := h.client.Get(ctx, client.ObjectKeyFromObject(job), current); err != nil {
+				return false, err
+			}
+			if !workflowstatus.JobTerminal(current) {
+				return false, nil
+			}
+			if current.Status.Result != actionsv1alpha1.WorkflowJobResultCancelled {
+				return true, nil
+			}
+			// Cancellation publishes the result before the runner finishes cleanup.
+			if cancellationDeadline.IsZero() {
+				cancelledAt := time.Now()
+				if current.Status.CompletionTime != nil {
+					cancelledAt = current.Status.CompletionTime.Time
+				}
+				cancellationDeadline = cancelledAt.Add(cancelledArchiveWait)
+			}
+			if time.Now().After(cancellationDeadline) {
+				return true, nil
+			}
+			selector := labels.Set{actionsv1alpha1.LabelWorkflowJobUID: string(current.UID)}.String()
+			pods, err := h.logs.ListPods(ctx, current.Namespace, selector)
+			if err != nil {
+				return false, err
+			}
+			for index := range pods.Items {
+				if runnerPodActive(&pods.Items[index]) {
+					return false, nil
+				}
+			}
+			return true, nil
+		})
+	}
+	pod, err := h.waitForPod(ctx, job, follow, heartbeat)
+	current := &actionsv1alpha1.WorkflowJob{}
+	if getErr := h.client.Get(ctx, client.ObjectKeyFromObject(job), current); getErr != nil {
+		return nil, getErr
+	}
+	if current.Annotations[joblog.ArchiveAnnotation] == "true" {
+		return h.openJobLogs(ctx, current, follow, heartbeat)
+	}
+	if err != nil {
+		return nil, err
+	}
+	return h.logs.Stream(ctx, pod.Namespace, pod.Name, follow)
+}
+
+func (h *Handler) waitForPod(ctx context.Context, job *actionsv1alpha1.WorkflowJob, follow bool, heartbeat func()) (*corev1.Pod, error) {
 	poll := time.NewTicker(time.Second)
 	defer poll.Stop()
 	heartbeatTicker := time.NewTicker(streamHeartbeat)
@@ -2086,6 +2255,9 @@ func (h *Handler) waitForPod(ctx context.Context, job *actionsv1alpha1.WorkflowJ
 		}
 		if workflowstatus.JobTerminal(current) {
 			return nil, errLogsUnavailable
+		}
+		if !follow {
+			return nil, fmt.Errorf("%w for WorkflowJob %q", errLogsNotReady, job.Name)
 		}
 		select {
 		case <-ctx.Done():

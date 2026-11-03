@@ -3,12 +3,19 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
+	"fmt"
 	"io"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	actionsv1alpha1 "github.com/kelos-dev/open-actions/api/v1alpha1"
+	"github.com/kelos-dev/open-actions/internal/joblog"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -233,4 +240,141 @@ func testWorkflowJob(t *testing.T, run *actionsv1alpha1.WorkflowRun, name, jobID
 
 func typesUID(value string) types.UID {
 	return types.UID("uid-" + value)
+}
+
+func TestRunLogsUsesConsoleArchiveAndReportsReadErrors(t *testing.T) {
+	for _, failure := range []string{"", "archive is incomplete"} {
+		t.Run(failure, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != "/runs/team-ci/ci/jobs/ci-build/logs" || r.URL.Query().Get("follow") != "true" {
+					t.Errorf("request = %s", r.URL)
+				}
+				w.Header().Set("Content-Type", joblog.DownloadContentType)
+				encoder := json.NewEncoder(w)
+				_ = encoder.Encode(joblog.DownloadRecord{Data: []byte("first\nlast\n")})
+				if failure != "" {
+					_ = encoder.Encode(joblog.DownloadRecord{Error: failure})
+				} else {
+					_ = encoder.Encode(joblog.DownloadRecord{End: true})
+				}
+			}))
+			defer server.Close()
+			run := testWorkflowRun("ci", "team-ci", "CI", metav1.ConditionUnknown)
+			run.Status.Identity = &actionsv1alpha1.WorkflowRunIdentityStatus{URL: server.URL + "/runs/team-ci/ci"}
+			job := testWorkflowJob(t, run, "ci-build", "build", "Build")
+			job.Annotations = map[string]string{joblog.ArchiveAnnotation: "true"}
+			logs := &testRunLogSource{}
+			dependencies := testRunDependencies(t, logs, run, job)
+			var stdout bytes.Buffer
+			err := runWithDependencies(context.Background(), []string{"run", "logs", "ci", "-n", "team-ci", "--follow"}, &stdout, &bytes.Buffer{}, dependencies)
+			if (failure == "") != (err == nil) {
+				t.Fatalf("error = %v", err)
+			}
+			if err != nil && !strings.Contains(err.Error(), failure) {
+				t.Fatal(err)
+			}
+			if stdout.String() != "first\nlast\n" || logs.streamedPod != "" {
+				t.Fatalf("logs = %q, Pod = %q", stdout.String(), logs.streamedPod)
+			}
+		})
+	}
+}
+
+func TestRunLogsWithoutConsoleUsesRetainedPodLogs(t *testing.T) {
+	run := testWorkflowRun("ci", "team-ci", "CI", metav1.ConditionUnknown)
+	job := testWorkflowJob(t, run, "ci-build", "build", "Build")
+	job.Annotations = map[string]string{joblog.ArchiveAnnotation: "true"}
+	logs := &testRunLogSource{pods: []corev1.Pod{{ObjectMeta: metav1.ObjectMeta{Name: "runner", Namespace: "team-ci"}}}, data: "bare output\n"}
+	dependencies := testRunDependencies(t, logs, run, job)
+	var stdout, stderr bytes.Buffer
+	if err := runWithDependencies(context.Background(), []string{"run", "logs", "ci", "-n", "team-ci"}, &stdout, &stderr, dependencies); err != nil {
+		t.Fatal(err)
+	}
+	if stdout.String() != "bare output\n" || logs.streamedPod != "runner" {
+		t.Fatalf("output = %q, Pod = %q", stdout.String(), logs.streamedPod)
+	}
+	if !strings.Contains(stderr.String(), "showing retained Pod logs") {
+		t.Fatalf("missing fallback notice: %q", stderr.String())
+	}
+}
+
+func TestRunLogsConsoleSnapshotExplainsQueuedJob(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "Runner logs are not available yet; use --follow", http.StatusConflict)
+	}))
+	defer server.Close()
+	run := testWorkflowRun("ci", "team-ci", "CI", metav1.ConditionUnknown)
+	job := testWorkflowJob(t, run, "ci-build", "build", "Build")
+	dependencies := testRunDependencies(t, &testRunLogSource{}, run, job)
+	err := runWithDependencies(context.Background(), []string{"run", "logs", "ci", "-n", "team-ci", "--console-url", server.URL}, &bytes.Buffer{}, &bytes.Buffer{}, dependencies)
+	if err == nil || !strings.Contains(err.Error(), "use --follow") {
+		t.Fatalf("queued snapshot error = %v", err)
+	}
+}
+
+func TestRunLogsRejectsUnconfirmedDownload(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", joblog.DownloadContentType)
+		_ = json.NewEncoder(w).Encode(joblog.DownloadRecord{Data: []byte("partial output\n")})
+	}))
+	defer server.Close()
+	var output bytes.Buffer
+	err := printConsoleLogs(context.Background(), &output, server.URL, "job", true)
+	if err == nil || !strings.Contains(err.Error(), "without a completion record") || output.String() != "partial output\n" {
+		t.Fatalf("download = %q, %v", output.String(), err)
+	}
+}
+
+func TestRunLogsRejectsAuthRedirectAndHTML(t *testing.T) {
+	for _, redirect := range []bool{false, true} {
+		t.Run(fmt.Sprint(redirect), func(t *testing.T) {
+			var loginRequests atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/login" {
+					loginRequests.Add(1)
+				}
+				if redirect && r.URL.Path != "/login" {
+					http.Redirect(w, r, "/login", http.StatusFound)
+					return
+				}
+				w.Header().Set("Content-Type", "text/html")
+				io.WriteString(w, "<html>Sign in</html>")
+			}))
+			defer server.Close()
+			var output bytes.Buffer
+			err := printConsoleLogs(context.Background(), &output, server.URL, "job", false)
+			if err == nil || !strings.Contains(err.Error(), "--console-url") || output.Len() != 0 || loginRequests.Load() != 0 {
+				t.Fatalf("auth response output = %q, error %v, redirects %d", output.String(), err, loginRequests.Load())
+			}
+		})
+	}
+}
+
+func TestRunLogsHonorsDefaultTransportProxy(t *testing.T) {
+	var proxyRequests atomic.Int32
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Host != "console.invalid" {
+			t.Errorf("proxy target = %s", r.URL)
+		}
+		proxyRequests.Add(1)
+		w.Header().Set("Content-Type", joblog.DownloadContentType)
+		_ = json.NewEncoder(w).Encode(joblog.DownloadRecord{Data: []byte("proxy output\n"), End: true})
+	}))
+	defer proxy.Close()
+	original := http.DefaultTransport
+	transport := original.(*http.Transport).Clone()
+	proxyURL, err := url.Parse(proxy.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	transport.Proxy = http.ProxyURL(proxyURL)
+	http.DefaultTransport = transport
+	defer func() { http.DefaultTransport = original; transport.CloseIdleConnections() }()
+	var output bytes.Buffer
+	if err := printConsoleLogs(context.Background(), &output, "http://console.invalid/runs/ci", "job", false); err != nil {
+		t.Fatal(err)
+	}
+	if proxyRequests.Load() != 1 || output.String() != "proxy output\n" {
+		t.Fatalf("proxy calls = %d, output = %q", proxyRequests.Load(), output.String())
+	}
 }

@@ -70,8 +70,8 @@ artifact traffic. The artifact service has no Kubernetes API access and does
 not mount a service account token. Set
 `artifacts.persistence.existingClaim` to mount a claim managed outside the
 StatefulSet; that claim must be writable by the artifact Pod's supplemental
-group `65532`. Size the volume for all artifacts retained across Projects and
-attempts; `artifacts.maxRunBytes` is a per-attempt quota, not a volume-wide
+group `65532`. Size the volume for all artifacts and job logs retained across
+Projects and attempts; `artifacts.maxRunBytes` is a per-attempt quota, not a volume-wide
 quota. Storage administrators and principals that can mount or snapshot the
 claim can read artifact content. Use storage-class encryption and access
 controls appropriate for workflow output.
@@ -83,13 +83,33 @@ with a shared key. The chart generates the key in
 `artifacts.signingKeySecretName` to mount an externally managed Secret and
 `artifacts.signingKeyKey` to select its key, which must contain at least 32
 bytes. Readers of that key can mint artifact credentials. Restart the
-controller Deployment and artifact StatefulSet after rotating an external key;
-credentials signed with the previous key stop working.
+controller Deployment and artifact StatefulSet after rotating an
+external key; credentials signed with the previous key stop working.
+
+Runner logs are uploaded continuously after secret masking and stored on the
+same volume, independently of kubelet rotation. The Console reads archives
+using a dedicated log-read key shared with the artifact server; the CLI
+downloads them through the Console. The chart generates this key in
+`open-actions-log-read-auth`. Configure `artifacts.logReadKeySecretName` and
+`artifacts.logReadKeyKey` to supply an external key of at least 32 bytes. This
+key must differ from the artifact signing key. The Console mounts only the
+log-read key for log access. Restart the Console and artifact service when
+rotating this key.
+`artifacts.logRetentionDays` defaults to 7 days after the last upload, including
+incomplete jobs, and `artifacts.maxLogBytes` defaults to 1 GiB per job.
+`artifacts.maxLogChunks` caps each job at 32,768 chunk files, including its
+completion record. Account for encoded storage overhead and filesystem inode
+capacity across all retained jobs when sizing the volume. Steady output can
+create one file per second; inode exhaustion blocks logs, artifacts, and caches
+even when free bytes remain. Monitor both `df -i` and `df -h`. See
+[runner log retention](../../../../docs/reference.md#runner-log-retention) for
+failure behavior, manual configuration, and upgrade order.
 
 `artifacts.persistence.enabled=false` replaces the claim with an `emptyDir`.
 That setting is suitable for disposable test clusters only because an artifact
-Pod replacement loses every artifact. `artifacts.enabled=false` omits the
-artifact Service and does not issue artifact runtime credentials to jobs.
+Pod replacement loses artifacts and archived logs. `artifacts.enabled=false`
+omits the artifact Service and disables artifact runtime credentials and log
+archiving for jobs.
 
 Set each component's `resources.requests` and `resources.limits` in the values
 file passed to `open-actions install`. Resource lists accept Kubernetes resource
@@ -126,8 +146,13 @@ controller:
 | `artifacts.image.pullPolicy` | `IfNotPresent` | Artifact service image pull policy |
 | `artifacts.signingKeySecretName` | `""` | Existing credential signing Secret; the chart creates `open-actions-artifact-auth` when empty |
 | `artifacts.signingKeyKey` | `signing-key` | Secret key containing at least 32 bytes of signing material |
+| `artifacts.logReadKeySecretName` | `""` | Existing log-read signing Secret; the chart creates `open-actions-log-read-auth` when empty |
+| `artifacts.logReadKeyKey` | `read-key` | Secret key containing at least 32 bytes of independent log-read signing material |
 | `artifacts.defaultRetentionDays` | `7` | Retention used when an upload omits `retention-days` |
 | `artifacts.maxRetentionDays` | `30` | Maximum accepted artifact retention and value exposed to upload actions |
+| `artifacts.logRetentionDays` | `7` | Log retention in days after the last upload; applies to complete and incomplete jobs |
+| `artifacts.maxLogBytes` | `1073741824` | Maximum timestamped log output bytes per job |
+| `artifacts.maxLogChunks` | `32768` | Maximum archived chunk files per job, including the completion record |
 | `artifacts.maxFileBytes` | `1073741824` | Maximum uncompressed size of one file |
 | `artifacts.maxArtifactBytes` | `2147483648` | Maximum stored and total uncompressed size of one artifact |
 | `artifacts.maxRunBytes` | `10737418240` | Maximum stored artifact bytes in one WorkflowRun attempt |

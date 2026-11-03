@@ -16,6 +16,7 @@ import (
 	actionsv1alpha1 "github.com/kelos-dev/open-actions/api/v1alpha1"
 	"github.com/kelos-dev/open-actions/internal/console"
 	githubclient "github.com/kelos-dev/open-actions/internal/github"
+	"github.com/kelos-dev/open-actions/internal/joblog"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
@@ -47,6 +48,8 @@ func runConsole(ctx context.Context, arguments []string) error {
 		workflowRunTTLSecondsAfterFinished = &parsed
 		return nil
 	})
+	logServiceURL := flags.String("log-service-url", "", "Origin serving archived runner logs")
+	logReadKeyFile := flags.String("log-read-key-file", "", "File containing the dedicated log read signing key")
 	secureCookie := flags.Bool("secure-cookie", false, "Restrict the Console session cookie to HTTPS")
 	if err := flags.Parse(arguments); err != nil {
 		return err
@@ -60,6 +63,25 @@ func runConsole(ctx context.Context, arguments []string) error {
 		return err
 	}
 
+	if (*logServiceURL == "") != (*logReadKeyFile == "") {
+		return errors.New("log-service-url and log-read-key-file must be specified together")
+	}
+	var archive *joblog.Client
+	var logTokens *joblog.ReadTokenCodec
+	if *logServiceURL != "" {
+		archive, err = joblog.NewClient(*logServiceURL, &http.Client{Timeout: 10 * time.Second})
+		if err != nil {
+			return err
+		}
+		key, err := os.ReadFile(*logReadKeyFile)
+		if err != nil {
+			return fmt.Errorf("read log signing key: %w", err)
+		}
+		logTokens, err = joblog.NewReadTokenCodec(key)
+		if err != nil {
+			return err
+		}
+	}
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 	scheme := runtime.NewScheme()
 	if err := clientgoscheme.AddToScheme(scheme); err != nil {
@@ -107,8 +129,15 @@ func runConsole(ctx context.Context, arguments []string) error {
 	if err != nil {
 		return fmt.Errorf("configure GitHub repository resolver: %w", err)
 	}
+	logs := console.NewKubernetesLogSource(clientset)
+	if archive != nil {
+		logs, err = console.NewArchivedLogSource(clientset, archive, logTokens)
+		if err != nil {
+			return err
+		}
+	}
 	handler, err := console.New(console.Config{
-		Client: kubernetesClient, WorkflowRuns: workflowRuns, Logs: console.NewKubernetesLogSource(clientset), Repositories: repositories,
+		Client: kubernetesClient, WorkflowRuns: workflowRuns, Logs: logs, Repositories: repositories,
 		Token: token, WorkflowRunTTLSecondsAfterFinished: workflowRunTTLSecondsAfterFinished,
 		AllowAnonymousWorkflowRuns: *allowAnonymousWorkflowRuns,
 		SecureCookie:               *secureCookie, Logger: logger,

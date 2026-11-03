@@ -93,3 +93,16 @@ func TestReadinessWaitsForWorkflowRunCache(t *testing.T) {
 		})
 	}
 }
+
+func TestRunConsoleRejectsIncompleteLogConfiguration(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "token")
+	if err := os.WriteFile(path, []byte("admin"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, argument := range []string{"--log-service-url=http://logs.example", "--log-read-key-file=/tmp/key"} {
+		err := runConsole(context.Background(), []string{"--token-file=" + path, argument})
+		if err == nil || !strings.Contains(err.Error(), "must be specified together") {
+			t.Fatalf("error = %v", err)
+		}
+	}
+}

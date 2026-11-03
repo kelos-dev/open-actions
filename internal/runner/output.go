@@ -31,6 +31,17 @@ type maskingWriter struct {
 	buffer []byte
 }
 
+// MaskMessage masks secrets and their encoded forms in a diagnostic.
+func MaskMessage(message string, values ...string) string {
+	masker := newOutputMasker()
+	for _, value := range values {
+		if value != "" {
+			addCredentialMasks(masker, value)
+		}
+	}
+	return masker.mask(message)
+}
+
 func newOutputMasker(values ...string) *outputMasker {
 	masker := &outputMasker{}
 	for _, value := range values {
