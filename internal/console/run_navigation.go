@@ -5,15 +5,19 @@ import (
 	"net/url"
 	"sort"
 	"strconv"
+	"strings"
 
 	actionsv1alpha1 "github.com/kelos-dev/open-actions/api/v1alpha1"
 )
 
-// WorkflowRunFilter selects runs by Project, repository identity, and workflow path.
+// WorkflowRunFilter selects runs by scope, status, Git ref, and event.
 type WorkflowRunFilter struct {
 	Project      string
 	RepositoryID int64
 	WorkflowPath string
+	Status       string
+	Ref          string
+	Event        string
 }
 
 // WorkflowRunOption identifies a choice in a run list filter.
@@ -29,6 +33,9 @@ type WorkflowRunList struct {
 	Projects     []WorkflowRunOption
 	Repositories []WorkflowRunOption
 	Workflows    []WorkflowRunOption
+	Statuses     []WorkflowRunOption
+	Refs         []WorkflowRunOption
+	Events       []WorkflowRunOption
 }
 
 func runFilterOptions(values map[string]string) []WorkflowRunOption {
@@ -43,6 +50,17 @@ func runFilterOptions(values map[string]string) []WorkflowRunOption {
 		return options[i].Value < options[j].Value
 	})
 	return options
+}
+
+func runRefLabel(ref string) string {
+	switch {
+	case strings.HasPrefix(ref, "refs/heads/"):
+		return "Branch: " + strings.TrimPrefix(ref, "refs/heads/")
+	case strings.HasPrefix(ref, "refs/tags/"):
+		return "Tag: " + strings.TrimPrefix(ref, "refs/tags/")
+	default:
+		return ref
+	}
 }
 
 func workflowRunLabel(run *actionsv1alpha1.WorkflowRun) string {

@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os/exec"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -119,9 +120,9 @@ func TestWorkflowRunListUsesIdentityAndExactWorkflowPath(t *testing.T) {
 
 func TestWorkflowRunListRetainsEmptySelection(t *testing.T) {
 	store := readyWorkflowRunStore(slog.New(slog.NewTextHandler(io.Discard, nil)))
-	filter := WorkflowRunFilter{Project: "team/project", RepositoryID: 123, WorkflowPath: ".open-actions/workflows/ci.yaml"}
+	filter := WorkflowRunFilter{Project: "team/project", RepositoryID: 123, WorkflowPath: ".open-actions/workflows/ci.yaml", Status: "failed", Ref: "refs/tags/v1", Event: "workflow_dispatch"}
 	result := store.List(filter, 100)
-	if len(result.Runs) != 0 || result.Truncated || len(result.Projects) != 1 || len(result.Repositories) != 1 || len(result.Workflows) != 1 || result.Workflows[0].Value != filter.WorkflowPath {
+	if len(result.Runs) != 0 || result.Truncated || len(result.Projects) != 1 || len(result.Repositories) != 1 || len(result.Workflows) != 1 || result.Workflows[0].Value != filter.WorkflowPath || len(result.Statuses) != 1 || result.Statuses[0].Value != filter.Status || len(result.Refs) != 1 || result.Refs[0].Value != filter.Ref || len(result.Events) != 1 || result.Events[0].Value != filter.Event {
 		t.Fatalf("empty filtered list = %#v", result)
 	}
 }
@@ -134,7 +135,7 @@ func TestConsoleFiltersRunsAndDurationRequests(t *testing.T) {
 	target.Spec.Source.GitHub.Repository.Owner = "other"
 	target.Spec.WorkflowPath = ".open-actions/workflows/test.yaml"
 	store.upsert(target)
-	query := url.Values{"project": {"team/project"}, "repository": {"456"}, "workflow": {target.Spec.WorkflowPath}}
+	query := url.Values{"project": {"team/project"}, "repository": {"456"}, "workflow": {target.Spec.WorkflowPath}, "status": {"queued"}, "ref": {"refs/heads/main"}, "event": {"push"}}
 	response := httptest.NewRecorder()
 	h.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/?"+query.Encode(), nil))
 	body := response.Body.String()
@@ -143,6 +144,10 @@ func TestConsoleFiltersRunsAndDurationRequests(t *testing.T) {
 		`<option value="team/project" selected>team/project</option>`,
 		`<option value="456" selected>other/example</option>`,
 		`<option value=".open-actions/workflows/test.yaml" selected>`,
+		`<option value="queued" selected>Queued</option>`,
+		`value="refs/heads/main" placeholder="All branches and tags"`,
+		`<option value="refs/heads/main">Branch: main</option>`,
+		`<option value="push" selected>push</option>`,
 		`data-duration-url="/durations?run=team%2Ftarget"`,
 		`<script id="run-durations" type="application/json">{"values":{"/runs/team/target":`,
 	} {
@@ -235,5 +240,132 @@ func TestConsoleNavigationEscapesWorkflowMetadata(t *testing.T) {
 	h.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/", nil))
 	if body := response.Body.String(); strings.Contains(body, run.Status.WorkflowName) || !strings.Contains(body, html.EscapeString(run.Status.WorkflowName)) || !strings.Contains(body, `class="run-number">pending</span>`) {
 		t.Fatalf("escaped pending run = %s", body)
+	}
+}
+
+func TestWorkflowRunListActivityFiltersBeforeLimit(t *testing.T) {
+	store := readyWorkflowRunStore(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	now := time.Now()
+	for index := 0; index <= mainPageRunLimit; index++ {
+		store.upsert(testWorkflowRun("default", fmt.Sprintf("busy-%d", index), now.Add(time.Duration(index)*time.Minute)))
+	}
+	target := testWorkflowRun("team", "target", now.Add(-time.Hour))
+	target.Spec.Source.GitHub.Revision.Ref = "refs/pull/42/merge"
+	target.Spec.Source.GitHub.Revision.HeadRef = "feature"
+	target.Spec.Source.GitHub.Event.Name = actionsv1alpha1.GitHubEventNamePullRequest
+	target.Status.Conditions = []metav1.Condition{{Type: actionsv1alpha1.WorkflowRunConditionSucceeded, Status: metav1.ConditionFalse, Reason: "JobFailed"}}
+	store.upsert(target)
+	for _, filter := range []WorkflowRunFilter{
+		{Status: "failed"}, {Ref: "refs/heads/feature"}, {Event: "pull_request"},
+		{Project: "team/project", RepositoryID: 123, WorkflowPath: target.Spec.WorkflowPath, Status: "failed", Ref: "refs/heads/feature", Event: "pull_request"},
+	} {
+		result := store.List(filter, mainPageRunLimit)
+		if len(result.Runs) != 1 || result.Runs[0].Name != "target" || result.Truncated {
+			t.Fatalf("filter %#v: %#v", filter, result)
+		}
+	}
+	for _, filter := range []WorkflowRunFilter{
+		{Status: "failed", Ref: "refs/heads/main"},
+		{Status: "failed", Event: "push"},
+		{Ref: "refs/pull/42/merge"},
+	} {
+		result := store.List(filter, mainPageRunLimit)
+		if len(result.Runs) != 0 || result.Truncated {
+			t.Fatalf("nonmatching filter %#v: %#v", filter, result)
+		}
+	}
+}
+
+func TestWorkflowRunListActivityChoicesFollowScope(t *testing.T) {
+	store := readyWorkflowRunStore(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	target := testWorkflowRun("team", "target", time.Now())
+	store.upsert(target)
+	tag := target.DeepCopy()
+	tag.Name = "tag"
+	tag.Spec.Source.GitHub.Revision.Ref = "refs/tags/main"
+	tag.Spec.Source.GitHub.Event.Name = actionsv1alpha1.GitHubEventNameWorkflowDispatch
+	tag.Status.Conditions = []metav1.Condition{{Type: actionsv1alpha1.WorkflowRunConditionSucceeded, Status: metav1.ConditionFalse, Reason: "JobFailed"}}
+	store.upsert(tag)
+	for index, mutate := range []func(*actionsv1alpha1.WorkflowRun){
+		func(run *actionsv1alpha1.WorkflowRun) { run.Namespace = "other" },
+		func(run *actionsv1alpha1.WorkflowRun) { run.Spec.ProjectRef.Name = "other" },
+		func(run *actionsv1alpha1.WorkflowRun) { run.Spec.Source.GitHub.Repository.ID = 456 },
+		func(run *actionsv1alpha1.WorkflowRun) { run.Spec.WorkflowPath = ".open-actions/workflows/other.yaml" },
+	} {
+		sibling := target.DeepCopy()
+		sibling.Name = fmt.Sprintf("sibling-%d", index)
+		sibling.Spec.Source.GitHub.Revision.Ref = "refs/heads/other"
+		sibling.Spec.Source.GitHub.Event.Name = actionsv1alpha1.GitHubEventNameRelease
+		sibling.Status.Conditions = []metav1.Condition{{Type: actionsv1alpha1.WorkflowRunConditionSucceeded, Status: metav1.ConditionTrue}}
+		mutate(sibling)
+		store.upsert(sibling)
+	}
+	filter := WorkflowRunFilter{Project: "team/project", RepositoryID: 123, WorkflowPath: target.Spec.WorkflowPath, Status: "queued", Ref: "refs/heads/main", Event: "push"}
+	result := store.List(filter, 100)
+	if len(result.Runs) != 1 || result.Runs[0].Name != "target" {
+		t.Fatalf("combined filter = %#v", result)
+	}
+	wantStatuses := []WorkflowRunOption{{Value: "failed", Label: "Failed"}, {Value: "queued", Label: "Queued"}}
+	wantRefs := []WorkflowRunOption{{Value: "refs/heads/main", Label: "Branch: main"}, {Value: "refs/tags/main", Label: "Tag: main"}}
+	wantEvents := []WorkflowRunOption{{Value: "push", Label: "push"}, {Value: "workflow_dispatch", Label: "workflow dispatch"}}
+	if !reflect.DeepEqual(result.Statuses, wantStatuses) || !reflect.DeepEqual(result.Refs, wantRefs) || !reflect.DeepEqual(result.Events, wantEvents) {
+		t.Fatalf("scoped choices = %#v", result)
+	}
+	filter.Status, filter.Ref, filter.Event = "failed", "refs/tags/main", "workflow_dispatch"
+	result = store.List(filter, 100)
+	if len(result.Runs) != 1 || result.Runs[0].Name != "tag" {
+		t.Fatalf("tag filter = %#v", result)
+	}
+	store.deleteObject(tag)
+	result = store.List(filter, 100)
+	if len(result.Runs) != 0 || result.Truncated || !reflect.DeepEqual(result.Statuses, wantStatuses) || !reflect.DeepEqual(result.Refs, wantRefs) || !reflect.DeepEqual(result.Events, wantEvents) {
+		t.Fatalf("selected values after deletion = %#v", result)
+	}
+}
+
+func TestWorkflowRunListStatusFilters(t *testing.T) {
+	store := readyWorkflowRunStore(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	now := metav1.Now()
+	tests := []struct {
+		value     string
+		label     string
+		succeeded *metav1.Condition
+		start     *metav1.Time
+		cancel    bool
+		approval  bool
+	}{
+		{value: "queued", label: "Queued"},
+		{value: "running", label: "Running", start: &now, succeeded: &metav1.Condition{Status: metav1.ConditionUnknown}},
+		{value: "cancelling", label: "Cancelling", cancel: true},
+		{value: "succeeded", label: "Succeeded", succeeded: &metav1.Condition{Status: metav1.ConditionTrue}},
+		{value: "failed", label: "Failed", succeeded: &metav1.Condition{Status: metav1.ConditionFalse, Reason: "JobFailed"}},
+		{value: "cancelled", label: "Cancelled", succeeded: &metav1.Condition{Status: metav1.ConditionFalse, Reason: "JobCancelled"}},
+		{value: "timed_out", label: "Timed out", succeeded: &metav1.Condition{Status: metav1.ConditionFalse, Reason: "JobTimedOut"}},
+		{value: "awaiting_approval", label: "Awaiting approval", approval: true},
+	}
+	for _, test := range tests {
+		run := testWorkflowRun("team", test.value, now.Time)
+		run.Status.StartTime = test.start
+		run.Spec.CancelRequested = test.cancel
+		if test.succeeded != nil {
+			condition := *test.succeeded
+			condition.Type = actionsv1alpha1.WorkflowRunConditionSucceeded
+			run.Status.Conditions = []metav1.Condition{condition}
+		}
+		if test.approval {
+			run.Status.Conditions = []metav1.Condition{{Type: actionsv1alpha1.WorkflowRunConditionApproved, Status: metav1.ConditionFalse, Reason: "ApprovalRequired"}}
+		}
+		store.upsert(run)
+	}
+	for _, test := range tests {
+		result := store.List(WorkflowRunFilter{Status: test.value}, 100)
+		if len(result.Runs) != 1 || result.Runs[0].Name != test.value || result.Runs[0].Status != test.label {
+			t.Fatalf("status %q: %#v", test.value, result)
+		}
+	}
+	run := testWorkflowRun("team", "failed", now.Time)
+	store.upsert(run)
+	if result := store.List(WorkflowRunFilter{Status: "failed"}, 100); len(result.Runs) != 0 || result.Statuses[0] != (WorkflowRunOption{Value: "awaiting_approval", Label: "Awaiting approval"}) {
+		t.Fatalf("updated statuses = %#v", result)
 	}
 }

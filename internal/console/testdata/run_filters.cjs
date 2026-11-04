@@ -3,13 +3,15 @@ const {readFileSync} = require('node:fs');
 const vm = require('node:vm');
 
 const scripts = Array.from(readFileSync(0, 'utf8').matchAll(/<script>([\s\S]*?)<\/script>/g), match => match[1]);
-const choices = {project: ['', 'team/project', 'team/other'], repository: ['', '123', '456'], workflow: ['', 'ci.yaml', 'test.yaml']};
+const choices = {project: ['', 'team/project', 'team/other'], repository: ['', '123', '456'], workflow: ['', 'ci.yaml', 'test.yaml'], status: ['', 'queued', 'failed'], ref: ['refs/heads/main', 'refs/tags/main'], event: ['', 'push', 'pull_request']};
 class Select {
   constructor(values, value = '') { this.options = values.map(value => ({value, text: value})); this.value = value; }
   replaceChildren(...options) { this.options = options; }
 }
 function page(selection = {}, count = 3, options = choices, durations = {values: {}, active: false}) {
   const elements = Object.fromEntries(Object.keys(choices).map(name => [name, new Select(options[name], selection[name] || '')]));
+  const refs = new Select(options.ref);
+  elements.ref = {value: selection.ref || ''};
   const listeners = new Map();
   const button = {hidden: false};
   const clear = {hidden: !Object.values(selection).some(Boolean), addEventListener: (name, callback) => listeners.set('clear:' + name, callback)};
@@ -27,8 +29,8 @@ function page(selection = {}, count = 3, options = choices, durations = {values:
   };
   const status = {};
   const view = {
-    elements, listeners, button, clear, nodes, status, duration,
-    getElementById: id => ({'run-filters': form, 'clear-filters': clear, 'filter-status': status}[id] || elements[id.replace('run-', '')]),
+    elements, listeners, button, clear, nodes, status, duration, refs,
+    getElementById: id => ({'run-filters': form, 'clear-filters': clear, 'filter-status': status, 'run-refs': refs}[id] || elements[id.replace('run-', '')]),
     querySelector: selector => nodes[selector],
     querySelectorAll: selector => selector === '[data-duration]' ? [duration] : [],
   };
@@ -155,5 +157,73 @@ async function main() {
   view.elements.workflow.focus();
   await settle(requests.at(-1), page({}, 3));
   assert.equal(view.activeElement, view.elements.workflow, 'Completing a clear request must not take focus back from another control');
+
+  const selection = {project: 'team/project', repository: '123', workflow: 'ci.yaml', status: 'failed', ref: 'refs/heads/main', event: 'pull_request'};
+  for (const [name, value] of Object.entries(selection)) view.elements[name].value = value;
+  const status = change('status', 'queued');
+  selection.status = 'queued';
+  assert.equal(status.url, '/?project=team%2Fproject&repository=123&workflow=ci.yaml&status=queued&ref=refs%2Fheads%2Fmain&event=pull_request');
+  assert.equal(view.elements.ref.value, 'refs/heads/main');
+  assert.equal(view.elements.event.value, 'pull_request');
+  assert.equal(view.elements.event.disabled, false);
+  await settle(status, page(selection));
+
+  const ref = change('ref', 'refs/tags/main');
+  selection.ref = 'refs/tags/main';
+  assert.equal(new URLSearchParams(ref.url.split('?')[1]).get('status'), 'queued');
+  assert.equal(new URLSearchParams(ref.url.split('?')[1]).get('event'), 'pull_request');
+  await settle(ref, page(selection));
+  const event = change('event', 'push');
+  selection.event = 'push';
+  await settle(event, page(selection));
+  assert.equal(view.elements.ref.value, 'refs/tags/main');
+
+  const scope = change('project', 'team/other');
+  selection.project = 'team/other';
+  selection.repository = '';
+  selection.workflow = '';
+  assert.equal(scope.url, '/?project=team%2Fother&status=queued&ref=refs%2Ftags%2Fmain&event=push');
+  const scopedChoices = {...choices, ref: ['refs/heads/feature', 'refs/tags/main']};
+  await settle(scope, page(selection, 0, scopedChoices));
+  assert.equal(view.refs.options[0].value, 'refs/heads/feature');
+  assert.equal(view.elements.status.value, 'queued');
+  assert.equal(view.elements.ref.value, 'refs/tags/main');
+  assert.equal(view.elements.event.value, 'push');
+
+  const selectedURL = location.search;
+  const selectedHistoryLength = history.length;
+  location.search = '?status=failed&ref=refs%2Fheads%2Fmain&event=pull_request';
+  windowEvents.get('popstate')();
+  await settle(requests.at(-1), page({status: 'failed', ref: 'refs/heads/main', event: 'pull_request'}));
+  assert.equal(view.elements.status.value, 'failed');
+  assert.equal(view.elements.ref.value, 'refs/heads/main');
+  assert.equal(view.elements.event.value, 'pull_request');
+  location.search = selectedURL;
+  windowEvents.get('popstate')();
+  await settle(requests.at(-1), page(selection, 0, scopedChoices));
+  assert.equal(view.elements.ref.value, 'refs/tags/main');
+  assert.equal(history.length, selectedHistoryLength);
+
+  view.listeners.get('clear:click')({button: 0, preventDefault() {}});
+  await settle(requests.at(-1), page());
+  for (const element of Object.values(view.elements)) assert.equal(element.value, '');
+  assert.equal(location.search, '');
+
+  const pendingStatus = change('status', 'failed');
+  view.elements.ref.focus();
+  view.elements.ref.value = 'refs/heads/feature';
+  await settle(pendingStatus, page({status: 'failed'}, 1));
+  assert.equal(view.elements.ref.value, 'refs/heads/feature', 'A pending response must preserve text entered after its request started');
+  assert.equal(location.search, '?status=failed', 'Uncommitted text must not affect the applied URL');
+  await settle(change('ref', 'refs/heads/feature'), page({status: 'failed', ref: 'refs/heads/feature'}, 1));
+  assert.equal(location.search, '?status=failed&ref=refs%2Fheads%2Ffeature');
+
+  location.search = '?ref=refs%2Ftags%2Fmain';
+  windowEvents.get('popstate')();
+  await settle(requests.at(-1), page({ref: 'refs/tags/main'}, 1));
+  assert.equal(view.elements.ref.value, 'refs/tags/main', 'History navigation must restore an unchanged ref even while its input is focused');
+  view.listeners.get('clear:click')({button: 0, preventDefault() {}});
+  await settle(requests.at(-1), page());
+  assert.equal(view.elements.ref.value, '', 'Clear must reset an unchanged ref even while its input is focused');
 }
 main().catch(error => { console.error(error); process.exitCode = 1; });

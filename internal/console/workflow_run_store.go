@@ -31,10 +31,13 @@ type WorkflowRunSummary struct {
 	Name          string
 	Project       string
 	Event         string
+	EventName     string
+	Ref           string
 	RefName       string
 	Revision      string
 	ShortRevision string
 	Status        string
+	StatusValue   string
 	StatusClass   string
 	Created       string
 	Duration      executionDuration
@@ -148,12 +151,13 @@ func WorkflowRunCacheTransform(object any) (any, error) {
 	return run, nil
 }
 
-// List filters before limiting results and derives cascading choices from all retained runs.
+// List filters before limiting results and derives choices from all retained runs in scope.
 func (s *WorkflowRunStore) List(filter WorkflowRunFilter, limit int) WorkflowRunList {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	result := WorkflowRunList{Runs: make([]WorkflowRunSummary, 0, min(max(limit, 0), len(s.ordered)))}
 	projects, repositories, workflows := map[string]string{}, map[string]string{}, map[string]string{}
+	statuses, refs, events := map[string]string{}, map[string]string{}, map[string]string{}
 	now := time.Now()
 	for _, entry := range s.ordered {
 		run := entry.summary
@@ -179,6 +183,16 @@ func (s *WorkflowRunStore) List(filter WorkflowRunFilter, limit int) WorkflowRun
 		if filter.WorkflowPath != "" && filter.WorkflowPath != run.WorkflowPath {
 			continue
 		}
+		statuses[run.StatusValue] = run.Status
+		if run.Ref != "" {
+			refs[run.Ref] = runRefLabel(run.Ref)
+		}
+		events[run.EventName] = run.Event
+		if (filter.Status != "" && filter.Status != run.StatusValue) ||
+			(filter.Ref != "" && filter.Ref != run.Ref) ||
+			(filter.Event != "" && filter.Event != run.EventName) {
+			continue
+		}
 		if len(result.Runs) >= limit {
 			result.Truncated = true
 			continue
@@ -201,6 +215,20 @@ func (s *WorkflowRunStore) List(filter WorkflowRunFilter, limit int) WorkflowRun
 			workflows[filter.WorkflowPath] = filter.WorkflowPath
 		}
 	}
+	if filter.Status != "" {
+		if _, exists := statuses[filter.Status]; !exists {
+			statuses[filter.Status] = strings.ToUpper(filter.Status[:1]) + strings.ReplaceAll(filter.Status[1:], "_", " ")
+		}
+	}
+	if filter.Ref != "" {
+		refs[filter.Ref] = runRefLabel(filter.Ref)
+	}
+	if filter.Event != "" {
+		events[filter.Event] = strings.ReplaceAll(filter.Event, "_", " ")
+	}
+	result.Statuses = runFilterOptions(statuses)
+	result.Refs = runFilterOptions(refs)
+	result.Events = runFilterOptions(events)
 	result.Projects = runFilterOptions(projects)
 	result.Repositories = runFilterOptions(repositories)
 	result.Workflows = runFilterOptions(workflows)
@@ -314,18 +342,19 @@ func workflowRunSummary(run *actionsv1alpha1.WorkflowRun) (WorkflowRunSummary, b
 	if workflowName == "" {
 		workflowName = run.Spec.WorkflowPath
 	}
-	refName := github.Revision.HeadRef
-	if refName == "" {
-		refName = shortRef(github.Revision.Ref)
+	ref := github.Revision.Ref
+	if github.Revision.HeadRef != "" {
+		ref = "refs/heads/" + github.Revision.HeadRef
 	}
+	refName := shortRef(ref)
 	status := workflowstatus.Run(run)
 	summary := WorkflowRunSummary{
 		URL: runPath(run), Repository: github.Repository.Owner + "/" + github.Repository.Name,
 		RepositoryID: github.Repository.ID, WorkflowPath: run.Spec.WorkflowPath, RunLabel: workflowRunLabel(run),
 		WorkflowName: workflowName, Namespace: run.Namespace, Name: run.Name, Project: run.Spec.ProjectRef.Name,
-		Event: strings.ReplaceAll(string(github.Event.Name), "_", " "), RefName: refName,
+		Event: strings.ReplaceAll(string(github.Event.Name), "_", " "), EventName: string(github.Event.Name), Ref: ref, RefName: refName,
 		Revision: github.Revision.SHA, ShortRevision: shortRevision(github.Revision.SHA),
-		Status: status, StatusClass: statusClass(status), Active: !workflowrun.Terminal(run) && run.Status.CompletionTime == nil,
+		Status: status, StatusValue: strings.ToLower(strings.ReplaceAll(status, " ", "_")), StatusClass: statusClass(status), Active: !workflowrun.Terminal(run) && run.Status.CompletionTime == nil,
 		start: run.Status.StartTime.DeepCopy(), completion: run.Status.CompletionTime.DeepCopy(),
 	}
 	if !run.CreationTimestamp.IsZero() {

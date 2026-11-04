@@ -657,7 +657,11 @@ func (h *Handler) main(writer http.ResponseWriter, request *http.Request) {
 		http.Error(writer, "Console run index is not ready", http.StatusServiceUnavailable)
 		return
 	}
-	filter := WorkflowRunFilter{Project: request.URL.Query().Get("project"), WorkflowPath: request.URL.Query().Get("workflow")}
+	query := request.URL.Query()
+	filter := WorkflowRunFilter{
+		Project: query.Get("project"), WorkflowPath: query.Get("workflow"),
+		Status: query.Get("status"), Ref: query.Get("ref"), Event: query.Get("event"),
+	}
 	if repository := request.URL.Query().Get("repository"); repository != "" {
 		id, err := strconv.ParseInt(repository, 10, 64)
 		if err != nil || id <= 0 {
