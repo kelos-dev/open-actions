@@ -83,14 +83,26 @@ to retain those runs indefinitely. The Helm chart passes
 `controller.workflowRunTTLSecondsAfterFinished` to both components.
 
 The Console landing page lists up to 100 WorkflowRuns across all namespaces,
-newest first, and links to each run's details and jobs. Project, repository, and
-workflow filters are saved in the page URL and applied before the 100-run limit.
-Selecting a filter updates the list and dependent choices immediately, without
-reloading the page or moving keyboard focus. The URL follows the applied filters,
-and browser Back and Forward restore previous selections. Without JavaScript,
-choose **Apply** to submit the filters.
+newest first, and links to each run's details and jobs. Project, repository,
+workflow, status, branch/ref, and event filters are saved in the page URL and
+combined before the 100-run limit.
+Selecting a dropdown filter updates the list and dependent choices immediately,
+without reloading the page or moving keyboard focus. Branch/ref applies when you
+press Enter or leave the field. The URL follows the applied filters, and browser
+Back and Forward restore previous selections. Without JavaScript, choose
+**Apply** to submit the filters.
 The choices come from all retained runs; repository choices follow the selected
 Project, and workflow choices follow the selected Project and repository.
+Status, branch/ref, and event choices come from runs in the selected Project,
+repository, and workflow, independently of the other three filters. Changing
+one of these filters does not clear the others, and changing scope preserves
+them. Selected values remain available when no retained runs match.
+Branch/ref accepts an exact full Git ref, with searchable suggestions labeled
+as branches or tags (for example, `refs/heads/main` and `refs/tags/main` remain
+separate choices). Pull request runs match their head branch rather than the
+synthetic merge ref. Event URL values use GitHub event names such as
+`pull_request`; status URL values use lowercase labels with underscores, such
+as `awaiting_approval` and `timed_out`.
 Repositories are selected by their GitHub ID, so a repository rename retains
 its history. Workflows are selected by their exact repository-relative path,
 so workflows with the same display name remain distinct. With all repositories

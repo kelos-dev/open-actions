@@ -43,7 +43,7 @@ const mainPageTemplate = `<!doctype html>
   <title>Workflow runs · Open Actions</title>
   <style>
     :root{color-scheme:dark;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#0d1117;color:#f0f6fc}*{box-sizing:border-box}body{margin:0;background:#0d1117;color:#f0f6fc;font-size:14px}a{color:#58a6ff;text-decoration:none}a:hover{text-decoration:underline}.topbar{height:64px;display:flex;align-items:center;gap:24px;padding:0 24px;border-bottom:1px solid #21262d;background:#010409}.brand{display:flex;align-items:center;gap:10px;color:#f0f6fc;font-weight:600}.brand:hover{text-decoration:none}.brand-mark{display:grid;place-items:center;width:30px;height:30px;border:1px solid #30363d;border-radius:7px;color:#58a6ff;font-size:12px;font-weight:800}.page{width:min(1180px,100%);margin:0 auto;padding:32px 32px 56px}.page-heading{display:flex;align-items:flex-end;justify-content:space-between;gap:24px;margin-bottom:20px}.page-heading h1{margin:0 0 6px;font-size:24px;font-weight:600;letter-spacing:-.01em}.page-heading p{margin:0;color:#8b949e}.count{min-width:20px;padding:2px 8px;border-radius:20px;background:#30363d;color:#c9d1d9;font-size:12px;text-align:center}.runs{overflow:hidden;border:1px solid #30363d;border-radius:6px}.run{display:grid;grid-template-columns:minmax(280px,1fr) minmax(150px,.55fr) 130px 170px;align-items:center;gap:20px;min-height:76px;padding:14px 16px;border-bottom:1px solid #21262d}.run:last-child{border-bottom:0}.run:hover{background:#161b2266}.run-link{display:flex;align-items:center;gap:12px;min-width:0;color:#f0f6fc}.run-link:hover{color:#58a6ff;text-decoration:none}.status-mark{display:grid;place-items:center;flex:0 0 auto;width:20px;height:20px;border:2px solid currentColor;border-radius:50%;font-size:11px;font-weight:800}.status-mark.succeeded{color:#3fb950}.status-mark.failed{color:#f85149}.status-mark.running,.status-mark.cancelling{color:#d29922;border-style:dashed}.status-mark.queued{color:#8b949e}.status-mark.succeeded::after{content:"✓"}.status-mark.failed::after{content:"×"}.status-mark.queued::after{content:"·"}.run-name{min-width:0}.run-name strong,.run-name small{display:block;overflow-wrap:anywhere}.run-name small{margin-top:4px;color:#8b949e;font-weight:400}.revision{min-width:0;color:#c9d1d9}.revision span{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.revision code{display:inline-block;margin-top:4px;color:#8b949e;font:12px ui-monospace,SFMono-Regular,Consolas,monospace}.detail{color:#8b949e;font-size:13px}.status{color:#c9d1d9}.status small{display:block;margin-top:4px;color:#8b949e}.time{display:block;margin-top:4px}.empty{padding:52px 24px;text-align:center}.empty strong{display:block;margin-bottom:6px;font-size:16px}.empty span{color:#8b949e}@media(max-width:800px){.topbar{padding:0 16px}.page{padding:24px 16px 40px}.page-heading{align-items:flex-start}.run{grid-template-columns:minmax(0,1fr) auto}.run .revision,.run .event{display:none}.run .status{text-align:right}}
-    .filters{display:grid;grid-template-columns:minmax(140px,.7fr) minmax(180px,.8fr) minmax(240px,1.5fr) auto auto;align-items:end;gap:12px;margin-bottom:20px}.filters .filter{min-width:0}.filters label{display:block;min-width:0;color:#8b949e;font-size:12px;font-weight:600}.filters select{display:block;width:100%;min-width:0;height:34px;margin-top:6px;padding:0 8px;border:1px solid #30363d;border-radius:6px;background:#161b22;color:#f0f6fc;font:13px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}.filters button{height:34px;padding:0 12px;border:1px solid #30363d;border-radius:6px;background:#21262d;color:#f0f6fc;font:inherit;cursor:pointer}.filters a{line-height:34px;white-space:nowrap}.filter-status{color:#8b949e}.filter-status:empty{margin:0}.run-number{margin-left:6px;color:#8b949e;font-size:12px;font-weight:400}.run-name .workflow-path{white-space:normal;overflow-wrap:anywhere;font-size:12px}.filters select:focus-visible,.filters button:focus-visible{outline:2px solid #58a6ff;outline-offset:2px}@media(max-width:800px){.filters{grid-template-columns:1fr 1fr}.filters .workflow-filter{grid-column:1/-1}}@media(max-width:480px){.filters{grid-template-columns:1fr}.filters .workflow-filter{grid-column:auto}.run{grid-template-columns:minmax(0,1fr);gap:10px}.run .status{display:flex;flex-wrap:wrap;align-items:center;gap:8px 12px;padding-left:32px;text-align:left}.run .status small,.run .status .time{margin-top:0}}
+    .filters{display:grid;grid-template-columns:minmax(140px,.7fr) minmax(180px,.8fr) minmax(240px,1.5fr);align-items:end;gap:12px;margin-bottom:20px}.filters .filter{min-width:0}.filters label{display:block;min-width:0;color:#8b949e;font-size:12px;font-weight:600}.filters select,.filters input{display:block;width:100%;min-width:0;height:34px;margin-top:6px;padding:0 8px;border:1px solid #30363d;border-radius:6px;background:#161b22;color:#f0f6fc;font:13px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}.filters button{height:34px;padding:0 12px;border:1px solid #30363d;border-radius:6px;background:#21262d;color:#f0f6fc;font:inherit;cursor:pointer}.filter-actions{grid-column:1/-1;display:flex;justify-content:flex-end;gap:16px}.filters a{line-height:34px;white-space:nowrap}.filter-status{color:#8b949e}.filter-status:empty{margin:0}.run-number{margin-left:6px;color:#8b949e;font-size:12px;font-weight:400}.run-name .workflow-path{white-space:normal;overflow-wrap:anywhere;font-size:12px}.filters select:focus-visible,.filters input:focus-visible,.filters button:focus-visible{outline:2px solid #58a6ff;outline-offset:2px}@media(max-width:800px){.filters{grid-template-columns:1fr 1fr}.filters .workflow-filter,.filters .event-filter{grid-column:1/-1}}@media(max-width:480px){.filters{grid-template-columns:1fr}.filters .workflow-filter,.filters .event-filter{grid-column:auto}.run{grid-template-columns:minmax(0,1fr);gap:10px}.run .status{display:flex;flex-wrap:wrap;align-items:center;gap:8px 12px;padding-left:32px;text-align:left}.run .status small,.run .status .time{margin-top:0}}
   </style>
 </head>
 <body>
@@ -54,7 +54,10 @@ const mainPageTemplate = `<!doctype html>
       <div class="filter"><label for="run-project">Project</label><select id="run-project" name="project"><option value="">All projects</option>{{range .Projects}}<option value="{{.Value}}"{{if eq .Value $.Filter.Project}} selected{{end}}>{{.Label}}</option>{{end}}</select></div>
       <div class="filter"><label for="run-repository">Repository</label><select id="run-repository" name="repository"><option value="">All repositories</option>{{range .Repositories}}<option value="{{.Value}}"{{if eq .Value $.RepositoryFilter}} selected{{end}}>{{.Label}}</option>{{end}}</select></div>
       <div class="filter workflow-filter"><label for="run-workflow">Workflow</label><select id="run-workflow" name="workflow"><option value="">All workflows</option>{{range .Workflows}}<option value="{{.Value}}"{{if eq .Value $.Filter.WorkflowPath}} selected{{end}}>{{.Label}}</option>{{end}}</select></div>
-      <button type="submit">Apply</button><a id="clear-filters" href="/"{{if not .Filtered}} hidden{{end}}>Clear filters</a>
+      <div class="filter"><label for="run-status">Status</label><select id="run-status" name="status"><option value="">All statuses</option>{{range .Statuses}}<option value="{{.Value}}"{{if eq .Value $.Filter.Status}} selected{{end}}>{{.Label}}</option>{{end}}</select></div>
+      <div class="filter"><label for="run-ref">Branch/ref</label><input id="run-ref" name="ref" type="search" list="run-refs" value="{{.Filter.Ref}}" placeholder="All branches and tags" autocomplete="off"><datalist id="run-refs">{{range .Refs}}<option value="{{.Value}}">{{.Label}}</option>{{end}}</datalist></div>
+      <div class="filter event-filter"><label for="run-event">Event</label><select id="run-event" name="event"><option value="">All events</option>{{range .Events}}<option value="{{.Value}}"{{if eq .Value $.Filter.Event}} selected{{end}}>{{.Label}}</option>{{end}}</select></div>
+      <div class="filter-actions"><button type="submit">Apply</button><a id="clear-filters" href="/"{{if not .Filtered}} hidden{{end}}>Clear filters</a></div>
     </form>
     <p class="filter-status" id="filter-status" role="status"></p>
     <section class="runs" aria-label="Workflow runs" data-duration-url="{{.DurationsURL}}">
@@ -72,7 +75,8 @@ const mainPageTemplate = `<!doctype html>
     const filterStatus = document.getElementById('filter-status');
     const filterButton = filters.querySelector('button');
     const clearFilters = document.getElementById('clear-filters');
-    const filterNames = ['project', 'repository', 'workflow'];
+    const scopeNames = ['project', 'repository', 'workflow'];
+    const filterNames = [...scopeNames, 'status', 'ref', 'event'];
     let filterRequest;
     let requestedFilterURL;
     filterButton.hidden = true;
@@ -93,6 +97,7 @@ const mainPageTemplate = `<!doctype html>
       if (filterRequest) filterRequest.abort();
       const request = new AbortController();
       filterRequest = request;
+      const refAtRequest = filters.elements.ref.value;
       document.querySelector('.runs').setAttribute('aria-busy', 'true');
       filterStatus.textContent = 'Updating workflow runs…';
       filterButton.hidden = true;
@@ -105,9 +110,11 @@ const mainPageTemplate = `<!doctype html>
           const select = filters.elements[name];
           const next = page.getElementById('run-' + name);
           const value = next.value;
-          const sameOptions = select.options.length === next.options.length && Array.from(select.options).every((option, index) => option.value === next.options[index].value && option.text === next.options[index].text);
-          if (!sameOptions) select.replaceChildren(...next.options);
-          select.value = value;
+          const options = name === 'ref' ? document.getElementById('run-refs') : select;
+          const nextOptions = name === 'ref' ? page.getElementById('run-refs') : next;
+          const sameOptions = options.options.length === nextOptions.options.length && Array.from(options.options).every((option, index) => option.value === nextOptions.options[index].value && option.text === nextOptions.options[index].text);
+          if (!sameOptions) options.replaceChildren(...nextOptions.options);
+          if (name !== 'ref' || select.value === refAtRequest) select.value = value;
         }
         stopDurationTracking();
         const runs = page.querySelector('.runs');
@@ -134,8 +141,8 @@ const mainPageTemplate = `<!doctype html>
       }
     }
     filters.addEventListener('change', event => {
-      const index = filterNames.indexOf(event.target.name);
-      for (const name of filterNames.slice(index + 1)) {
+      const index = scopeNames.indexOf(event.target.name);
+      for (const name of index < 0 ? [] : scopeNames.slice(index + 1)) {
         filters.elements[name].value = '';
         filters.elements[name].disabled = true;
       }
