@@ -384,12 +384,12 @@ func (r *WorkflowRunReconciler) reconcileWorkflowRun(ctx context.Context, run *a
 					return ctrl.Result{}, err
 				}
 			}
-			waiting, waitingForPlanning, err := r.handleConcurrency(ctx, run)
+			waiting, err := r.handleConcurrency(ctx, run)
 			if err != nil {
 				return ctrl.Result{}, err
 			}
 			if waiting {
-				return r.waitingForConcurrency(ctx, run, run.Status.WorkflowName, run.Status.Jobs.Total, waitingForPlanning)
+				return r.waitingForConcurrency(ctx, run, run.Status.WorkflowName, run.Status.Jobs.Total)
 			}
 			return r.observeWorkflowJobs(ctx, run, run.Status.WorkflowName, run.Status.Jobs.Total)
 		}
@@ -555,12 +555,12 @@ func (r *WorkflowRunReconciler) reconcileWorkflowRun(ctx context.Context, run *a
 	if err := r.ensureWorkflowJobs(ctx, run, project, plannedJobs); err != nil {
 		return r.planningFailed(ctx, run, "ChildCreationFailed", err, childCreationFailureDisposition(err))
 	}
-	waiting, waitingForPlanning, err := r.handleConcurrency(ctx, run)
+	waiting, err := r.handleConcurrency(ctx, run)
 	if err != nil {
 		return r.planningFailed(ctx, run, "ConcurrencyCheckFailed", err, planningFailureRetry)
 	}
 	if waiting {
-		return r.waitingForConcurrency(ctx, run, definition.Name, jobCount, waitingForPlanning)
+		return r.waitingForConcurrency(ctx, run, definition.Name, jobCount)
 	}
 	return r.observeWorkflowJobs(ctx, run, definition.Name, jobCount)
 }
@@ -3066,7 +3066,7 @@ func (r *WorkflowRunReconciler) reconcileWorkflowJobGraphWithDependencies(ctx co
 			}
 			switch gate.state {
 			case concurrencyGateSuperseded:
-				if err := r.completeUnscheduledWorkflowJob(ctx, job, actionsv1alpha1.WorkflowJobResultCancelled, concurrencySupersededReason, "A newer pending member replaced this workflow job"); err != nil {
+				if err := r.completeUnscheduledWorkflowJob(ctx, job, actionsv1alpha1.WorkflowJobResultCancelled, concurrencySupersededReason, "Another pending member replaced this workflow job"); err != nil {
 					return err
 				}
 				continue
@@ -3483,46 +3483,39 @@ func podActive(pod *corev1.Pod) bool {
 	return pod.Status.Phase != corev1.PodSucceeded && pod.Status.Phase != corev1.PodFailed
 }
 
-func (r *WorkflowRunReconciler) handleConcurrency(ctx context.Context, run *actionsv1alpha1.WorkflowRun) (bool, bool, error) {
+func (r *WorkflowRunReconciler) handleConcurrency(ctx context.Context, run *actionsv1alpha1.WorkflowRun) (bool, error) {
 	decision := workflowRunConcurrencyDecision(run)
 	if decision == nil {
-		return false, false, nil
+		return false, nil
 	}
 	group := decision.Group
-	planning, err := r.olderWorkflowRunPlanning(ctx, run)
-	if err != nil {
-		return false, false, err
-	}
-	if planning {
-		return true, true, nil
-	}
 	scope, err := workflowRunConcurrencyScope(run)
 	if err != nil {
-		return false, false, err
+		return false, err
 	}
 	planned := meta.FindStatusCondition(run.Status.Conditions, actionsv1alpha1.WorkflowRunConditionPlanned)
 	registered := waitingForConcurrencyCondition(planned) || planned != nil && planned.Status == metav1.ConditionTrue
 	result, err := r.acquireConcurrency(ctx, run.Namespace, scope, group, workflowRunConcurrencyMember(run), registered)
 	if err != nil {
-		return false, false, err
+		return false, err
 	}
 	if result.displaced != nil {
 		if err := r.requestConcurrencyCancellation(ctx, run.Namespace, *result.displaced, true); err != nil {
-			return false, false, err
+			return false, err
 		}
 	}
 	if result.cancelOwner != nil {
 		if err := r.requestConcurrencyCancellation(ctx, run.Namespace, *result.cancelOwner, false); err != nil {
-			return false, false, err
+			return false, err
 		}
 	}
 	if result.state == concurrencyGateSuperseded {
 		if err := r.cancelWorkflowRun(ctx, run); err != nil {
-			return false, false, err
+			return false, err
 		}
-		return true, false, nil
+		return true, nil
 	}
-	return result.state == concurrencyGateWaiting, false, nil
+	return result.state == concurrencyGateWaiting, nil
 }
 
 func (r *WorkflowRunReconciler) cancelWorkflowRun(ctx context.Context, run *actionsv1alpha1.WorkflowRun) error {
@@ -3637,17 +3630,14 @@ func (r *WorkflowRunReconciler) executionWorkloadsRemain(ctx context.Context, ru
 	return len(pods.Items) > 0, nil
 }
 
-func (r *WorkflowRunReconciler) waitingForConcurrency(ctx context.Context, run *actionsv1alpha1.WorkflowRun, workflowName string, total int32, waitingForPlanning bool) (ctrl.Result, error) {
+func (r *WorkflowRunReconciler) waitingForConcurrency(ctx context.Context, run *actionsv1alpha1.WorkflowRun, workflowName string, total int32) (ctrl.Result, error) {
 	before := run.Status.DeepCopy()
 	run.Status.ObservedGeneration = run.Generation
 	run.Status.WorkflowName = workflowName
 	run.Status.Jobs = &actionsv1alpha1.WorkflowRunJobStatus{Total: total, Queued: total}
 	reason := "WaitingForConcurrency"
-	message := "An earlier WorkflowRun still owns the concurrency group"
-	if waitingForPlanning {
-		reason = workflowRunPlanningWaitReason
-		message = "An earlier WorkflowRun is still planning"
-	} else if concurrency := workflowRunConcurrencyDecision(run); concurrency != nil && concurrency.CancelInProgress {
+	message := "Another workflow run or job owns the concurrency group"
+	if concurrency := workflowRunConcurrencyDecision(run); concurrency != nil && concurrency.CancelInProgress {
 		reason = "WaitingForConcurrencyCancellation"
 	}
 	meta.SetStatusCondition(&run.Status.Conditions, metav1.Condition{
@@ -3674,7 +3664,8 @@ func workflowRunConcurrencyWaitCondition(condition *metav1.Condition) bool {
 	if waitingForConcurrencyCondition(condition) {
 		return true
 	}
-	return condition != nil && condition.Status == metav1.ConditionUnknown && condition.Reason == workflowRunPlanningWaitReason
+	// Runs with this persisted condition have already created their job plans.
+	return condition != nil && condition.Status == metav1.ConditionUnknown && condition.Reason == "WaitingForPriorRunPlanning"
 }
 
 func (r *WorkflowRunReconciler) planningFailed(ctx context.Context, run *actionsv1alpha1.WorkflowRun, reason string, cause error, disposition planningFailureDisposition) (ctrl.Result, error) {

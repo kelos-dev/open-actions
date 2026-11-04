@@ -1219,7 +1219,7 @@ The resources expose these condition contracts:
 | `WorkflowRun` | `Approved` | `True` | `ApprovalGranted`, `ApprovalNotRequired` |
 | `WorkflowRun` | `Approved` | `False` | `ApprovalRequired`, `RevisionSuperseded`, `JobCancelled` |
 | `WorkflowRun` | `Planned` | `True` | `JobsPlanned` |
-| `WorkflowRun` | `Planned` | `Unknown` | `ApprovalRequired`, `ApprovalValidationFailed`, `WaitingForPriorRunPlanning`, `WaitingForConcurrency`, `WaitingForConcurrencyCancellation`, `ProjectUnavailable`, `CredentialsUnavailable`, `ProjectValuesUnavailable`, `GitHubAuthenticationFailed`, `WorkflowFetchFailed`, `ChildCreationFailed`, `ConcurrencyCheckFailed` |
+| `WorkflowRun` | `Planned` | `Unknown` | `ApprovalRequired`, `ApprovalValidationFailed`, `WaitingForConcurrency`, `WaitingForConcurrencyCancellation`, `ProjectUnavailable`, `CredentialsUnavailable`, `ProjectValuesUnavailable`, `GitHubAuthenticationFailed`, `WorkflowFetchFailed`, `ChildCreationFailed`, `ConcurrencyCheckFailed` |
 | `WorkflowRun` | `Planned` | `False` | `ProjectUnavailable`, `WorkflowFetchFailed`, `WorkflowInvalid`, `TriggerInvalid`, `RerunInvalid`, `ChildCreationFailed`, `RevisionSuperseded`, `JobCancelled`, `ExecutionStateLost` |
 | `WorkflowRun` | `Succeeded` | `Unknown` | `JobsWaiting`, `JobsQueued`, `JobsRunning` |
 | `WorkflowRun` | `Succeeded` | `True` | `JobsSucceeded` |
@@ -1674,8 +1674,8 @@ for graph cleanup jobs.
 Workflow and `jobs.<id>.concurrency` accept either a scalar group or a mapping
 with `group` and `cancel-in-progress`. Groups are
 case-insensitive, scoped by Project and repository, and shared by workflow runs
-and jobs. At most one member executes while one newer member waits. A newer
-waiting member cancels and replaces the existing waiting member. When
+and jobs. At most one member executes while one pending member waits. A newly
+admitted waiting member cancels and replaces the existing waiting member. When
 `cancel-in-progress` is `true`, it also requests graceful cancellation of the
 executing member. Cancelling an executing job does not cancel its WorkflowRun or
 unrelated jobs. A replacement acquires the group only after the executing
@@ -1691,8 +1691,10 @@ WorkflowRun's group fails with reason `ConcurrencyEvaluationFailed` because the
 run holds that group until all of its jobs finish. WorkflowRuns and WorkflowJobs
 store their evaluated group and cancellation decision under `status.concurrency`
 before entering the gate, so controller restarts resume the same acquisition or
-replacement decision. A run waits for an older run in the same repository until
-that run has evaluated its workflow concurrency configuration.
+replacement decision. Runs enter their evaluated group independently after
+planning. Runs awaiting approval or still planning do not reserve a group or
+block other runs from entering their groups. Group admission does not guarantee
+WorkflowRun creation order.
 
 At workflow scope, the `group` and `cancel-in-progress` expressions are
 evaluated together during planning. Both may use `github`, `inputs`, and `vars`;

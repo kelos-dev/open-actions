@@ -27,11 +27,10 @@ const (
 	concurrencyRepositoryAnnotation = "actions.kelos.dev/concurrency-repository-id"
 	concurrencyPendingAnnotation    = "actions.kelos.dev/concurrency-pending"
 
-	concurrencyWaitingReason      = "WaitingForConcurrency"
-	concurrencyAcquiredReason     = "ConcurrencyAcquired"
-	concurrencySupersededReason   = "ConcurrencySuperseded"
-	concurrencyCancelledReason    = "ConcurrencyCancelled"
-	workflowRunPlanningWaitReason = "WaitingForPriorRunPlanning"
+	concurrencyWaitingReason    = "WaitingForConcurrency"
+	concurrencyAcquiredReason   = "ConcurrencyAcquired"
+	concurrencySupersededReason = "ConcurrencySuperseded"
+	concurrencyCancelledReason  = "ConcurrencyCancelled"
 )
 
 type concurrencyScope struct {
@@ -90,35 +89,6 @@ func workflowRunConcurrencyDecision(run *actionsv1alpha1.WorkflowRun) *actionsv1
 		Group:            run.Status.ConcurrencyGroup,
 		CancelInProgress: planned != nil && planned.Reason == "WaitingForConcurrencyCancellation",
 	}
-}
-
-func (r *WorkflowRunReconciler) olderWorkflowRunPlanning(ctx context.Context, current *actionsv1alpha1.WorkflowRun) (bool, error) {
-	scope, err := workflowRunConcurrencyScope(current)
-	if err != nil {
-		return false, err
-	}
-	runs := &actionsv1alpha1.WorkflowRunList{}
-	if err := r.APIReader.List(ctx, runs, client.InNamespace(current.Namespace)); err != nil {
-		return false, err
-	}
-	for index := range runs.Items {
-		other := &runs.Items[index]
-		if other.UID == current.UID || terminalRun(other) || !workflowRunMatchesConcurrencyScope(other, scope) || !workflowRunOlderThan(other, current) {
-			continue
-		}
-		planned := meta.FindStatusCondition(other.Status.Conditions, actionsv1alpha1.WorkflowRunConditionPlanned)
-		if planned == nil || (planned.Status == metav1.ConditionUnknown && !waitingForConcurrencyCondition(planned)) {
-			return true, nil
-		}
-	}
-	return false, nil
-}
-
-func workflowRunOlderThan(left, right *actionsv1alpha1.WorkflowRun) bool {
-	if left.CreationTimestamp.Time.Equal(right.CreationTimestamp.Time) {
-		return left.Name < right.Name
-	}
-	return left.CreationTimestamp.Time.Before(right.CreationTimestamp.Time)
 }
 
 func workflowJobConcurrencyMember(job *actionsv1alpha1.WorkflowJob) concurrencyMember {
@@ -575,10 +545,10 @@ func (r *WorkflowRunReconciler) releaseConcurrency(ctx context.Context, namespac
 
 func (r *WorkflowRunReconciler) requestConcurrencyCancellation(ctx context.Context, namespace string, member concurrencyMember, superseded bool) error {
 	reason := concurrencyCancelledReason
-	message := "A newer concurrency member requested cancellation"
+	message := "Another concurrency member requested cancellation"
 	if superseded {
 		reason = concurrencySupersededReason
-		message = "A newer pending member replaced this concurrency member"
+		message = "Another pending member replaced this concurrency member"
 	}
 	switch member.Kind {
 	case "WorkflowRun":

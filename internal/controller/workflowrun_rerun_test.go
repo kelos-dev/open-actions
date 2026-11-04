@@ -21,6 +21,7 @@ import (
 	"github.com/kelos-dev/open-actions/internal/runner"
 	"github.com/kelos-dev/open-actions/internal/workflowrun"
 	batchv1 "k8s.io/api/batch/v1"
+	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -104,7 +105,11 @@ func newDeferredRerunFixture(t *testing.T, data string) *deferredRerunFixture {
 		},
 	}
 	setTestWorkflowRunIdentity(root)
-	c := fake.NewClientBuilder().WithScheme(runnerTestScheme(t)).WithStatusSubresource(&actionsv1alpha1.WorkflowRun{}, &actionsv1alpha1.WorkflowJob{}).WithObjects(root, project, secret).Build()
+	scheme := runnerTestScheme(t)
+	if err := coordinationv1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	c := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&actionsv1alpha1.WorkflowRun{}, &actionsv1alpha1.WorkflowJob{}).WithObjects(root, project, secret).Build()
 	f := &deferredRerunFixture{t: t, root: root, reconciler: &WorkflowRunReconciler{Client: c, APIReader: c, GitHub: github, GitHubAPIBase: server.URL, GitHubServerURL: "https://github.example", ActionCloneBaseURL: "https://github.example"}}
 	f.reconcile(root)
 	return f
