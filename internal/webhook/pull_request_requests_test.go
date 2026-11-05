@@ -29,20 +29,24 @@ import (
 )
 
 func TestPullRequestGitRequestsFromDiscoveryThroughPlanning(t *testing.T) {
-	for _, count := range []int{1, 10} {
+	for _, count := range []int{1, 10, 50} {
 		t.Run(fmt.Sprintf("workflows=%d", count), func(t *testing.T) {
 			data := []byte("name: CI\non: pull_request\njobs:\n  build:\n    runs-on: linux\n    steps:\n      - run: echo hello\n")
 			baseData := strings.Replace(string(data), "on: pull_request", "on: push", 1)
 			gitRoot, revision := testPullRequestGitRepository(t, []byte(baseData), nil, false)
 			work := filepath.Join(gitRoot, "work")
+			workflowData := make(map[string]string, count)
 			for index := range count {
-				writeTestFile(t, work, fmt.Sprintf(".open-actions/workflows/head-%d.yaml", index), string(data))
+				path := fmt.Sprintf(".open-actions/workflows/head-%d.yaml", index)
+				workflowData[path] = strings.Replace(string(data), "name: CI", fmt.Sprintf("name: CI %d", index), 1)
+				writeTestFile(t, work, path, workflowData[path])
 			}
 			runTestGit(t, work, "add", ".")
 			runTestGit(t, work, "commit", "--quiet", "-m", "workflows")
 			revision.HeadSHA = strings.TrimSpace(runTestGit(t, work, "rev-parse", "HEAD"))
 			runTestGit(t, work, "push", "--quiet", filepath.Join(gitRoot, "acme", "example"), "head")
 			remote := filepath.Join(gitRoot, "acme", "example")
+			runTestGit(t, remote, "config", "uploadpack.allowFilter", "true")
 			runTestGit(t, remote, "config", "uploadpack.allowReachableSHA1InWant", "true")
 			gitPath, err := exec.LookPath("git")
 			if err != nil {
@@ -55,7 +59,9 @@ func TestPullRequestGitRequestsFromDiscoveryThroughPlanning(t *testing.T) {
 				backend.ServeHTTP(w, r)
 			}))
 			defer gitServer.Close()
+			var apiCalls atomic.Int32
 			apiServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				apiCalls.Add(1)
 				switch r.URL.Path {
 				case "/app/installations/2/access_tokens":
 					_ = json.NewEncoder(w).Encode(map[string]any{"token": "installation-token", "expires_at": time.Now().Add(time.Hour)})
@@ -126,13 +132,16 @@ func TestPullRequestGitRequestsFromDiscoveryThroughPlanning(t *testing.T) {
 				if err := cluster.Get(t.Context(), client.ObjectKey{Namespace: run.Namespace, Name: run.Annotations[actionsv1alpha1.AnnotationWorkflowFile]}, object); err != nil {
 					t.Fatal(err)
 				}
-				if object.Data[workflowsnapshot.DataKey] != string(data) {
+				if object.Data[workflowsnapshot.DataKey] != workflowData[run.Spec.WorkflowPath] {
 					t.Fatalf("workflow snapshot data = %q", object.Data[workflowsnapshot.DataKey])
 				}
 			}
-			t.Logf("workflows=%d: Git HTTP requests after discovery=%d, after planning=%d", count, afterDiscovery, gitCalls.Load())
-			if afterDiscovery == 0 || gitCalls.Load() != afterDiscovery {
-				t.Fatalf("planning downloaded commits again: Git HTTP requests %d -> %d", afterDiscovery, gitCalls.Load())
+			t.Logf("workflows=%d: Git HTTP requests after discovery=%d, after planning=%d, GitHub API requests=%d", count, afterDiscovery, gitCalls.Load(), apiCalls.Load())
+			if afterDiscovery != 4 || gitCalls.Load() != afterDiscovery {
+				t.Fatalf("Git HTTP requests: discovery=%d, after planning=%d; want 4", afterDiscovery, gitCalls.Load())
+			}
+			if apiCalls.Load() != 4 {
+				t.Fatalf("GitHub API requests = %d, want 4", apiCalls.Load())
 			}
 		})
 	}

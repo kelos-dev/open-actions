@@ -3,6 +3,7 @@ package github
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -21,6 +22,7 @@ type fileCacheFixture struct {
 	tokenRequests atomic.Int32
 	fileRequests  atomic.Int32
 	statusCode    atomic.Int32
+	contents      atomic.Value
 }
 
 func newFileCacheFixture(t *testing.T) *fileCacheFixture {
@@ -28,6 +30,7 @@ func newFileCacheFixture(t *testing.T) *fileCacheFixture {
 	f := &fileCacheFixture{privateKey: testPrivateKey(t)}
 	f.now.Store(time.Now().UnixNano())
 	f.statusCode.Store(http.StatusOK)
+	f.contents.Store("[]")
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		switch {
 		case request.Method == http.MethodPost:
@@ -35,6 +38,12 @@ func newFileCacheFixture(t *testing.T) *fileCacheFixture {
 			fmt.Fprintf(writer, `{"token":"token-%d","expires_at":%q}`, id, time.Unix(0, f.now.Load()).Add(time.Hour).UTC().Format(time.RFC3339))
 		case request.Method == http.MethodDelete:
 			writer.WriteHeader(http.StatusNoContent)
+		case strings.HasSuffix(request.URL.Path, "/contents/workflows"):
+			if code := int(f.statusCode.Load()); code != http.StatusOK {
+				http.Error(writer, "directory unavailable", code)
+				return
+			}
+			fmt.Fprint(writer, f.contents.Load().(string))
 		default:
 			id := f.fileRequests.Add(1)
 			if code := int(f.statusCode.Load()); code != http.StatusOK {
@@ -52,6 +61,137 @@ func newFileCacheFixture(t *testing.T) *fileCacheFixture {
 	}
 	f.client.now = func() time.Time { return time.Unix(0, f.now.Load()) }
 	return f
+}
+
+func TestDirectoryBlobReuse(t *testing.T) {
+	for _, scenario := range []string{"unchanged", "changed", "renamed", "other repository", "job token", "mutable ref", "missing SHA", "symlink", "expired token", "revoked token", "unauthorized token"} {
+		t.Run(scenario, func(t *testing.T) {
+			f := newFileCacheFixture(t)
+			installation := f.installation(t)
+			if scenario == "job token" {
+				var err error
+				installation, err = f.client.Installation(t.Context(), 1, 2, f.privateKey, "example", InstallationPermissions{"contents": "read"})
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			for round := range 2 {
+				repository, filePath := "example", "workflows/ci.yaml"
+				revision := strings.Repeat("a", 40)
+				content := Content{Type: "file", SHA: strings.Repeat("b", 40)}
+				if scenario == "mutable ref" {
+					revision = "main"
+				}
+				if scenario == "missing SHA" {
+					content.SHA = ""
+				}
+				if scenario == "symlink" {
+					content.Type = "symlink"
+				}
+				if round == 1 {
+					if scenario != "mutable ref" {
+						revision = strings.Repeat("c", 40)
+					}
+					switch scenario {
+					case "changed":
+						content.SHA = strings.Repeat("d", 40)
+					case "renamed":
+						filePath = "workflows/renamed.yaml"
+					case "other repository":
+						repository = "other"
+					case "expired token":
+						f.now.Add(int64(time.Hour))
+						installation = f.installation(t)
+					case "revoked token":
+						if err := installation.Revoke(t.Context()); err != nil {
+							t.Fatal(err)
+						}
+						installation = f.installation(t)
+					case "unauthorized token":
+						f.statusCode.Store(http.StatusUnauthorized)
+						if _, err := installation.GetRepository(t.Context(), "acme", repository); err == nil {
+							t.Fatal("unauthorized repository request succeeded")
+						}
+						f.statusCode.Store(http.StatusOK)
+						installation = f.installation(t)
+					}
+				}
+				content.Path = filePath
+				encoded, err := json.Marshal([]Content{content})
+				if err != nil {
+					t.Fatal(err)
+				}
+				f.contents.Store(string(encoded))
+				if _, err := installation.ListDirectory(t.Context(), "acme", repository, "workflows", revision); err != nil {
+					t.Fatal(err)
+				}
+				before := f.fileRequests.Load()
+				data, err := installation.GetFile(t.Context(), "acme", repository, filePath, revision)
+				if err != nil {
+					t.Fatal(err)
+				}
+				wantRequests := before + 1
+				if round == 1 && (scenario == "unchanged" || scenario == "renamed") {
+					wantRequests = before
+				}
+				if f.fileRequests.Load() != wantRequests || string(data) != fmt.Sprintf("file-%d", wantRequests) {
+					t.Fatalf("file bytes = %q, requests = %d; want file-%d, %d", data, f.fileRequests.Load(), wantRequests, wantRequests)
+				}
+			}
+		})
+	}
+}
+
+func TestFileCacheAliasEviction(t *testing.T) {
+	cache := newFileCache(2, 100)
+	key := func(path string) fileCacheKey { return fileCacheKey{path: path} }
+	cache.link(key("first"), key("blob"))
+	loads := 0
+	read := func(path string) {
+		t.Helper()
+		if _, err := cache.load(t.Context(), key(path), func(context.Context) ([]byte, error) {
+			loads++
+			return []byte("content"), nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	read("first")
+	cache.link(key("second"), key("blob"))
+	read("first")
+	cache.link(key("third"), key("blob"))
+	read("first")
+	read("third")
+	if loads != 1 {
+		t.Fatalf("retained aliases reloaded content: loads = %d", loads)
+	}
+	read("second")
+	if loads != 2 || len(cache.aliases) != 2 {
+		t.Fatalf("alias eviction: loads = %d, aliases = %d; want 2 each", loads, len(cache.aliases))
+	}
+}
+
+func TestDirectoryPreservesWarmFile(t *testing.T) {
+	f := newFileCacheFixture(t)
+	installation := f.installation(t)
+	first, second := strings.Repeat("a", 40), strings.Repeat("b", 40)
+	if _, err := installation.GetFile(t.Context(), "acme", "example", "workflows/ci.yaml", first); err != nil {
+		t.Fatal(err)
+	}
+	contents, err := json.Marshal([]Content{{Type: "file", Path: "workflows/ci.yaml", SHA: strings.Repeat("c", 40)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.contents.Store(string(contents))
+	for _, revision := range []string{first, second} {
+		if _, err := installation.ListDirectory(t.Context(), "acme", "example", "workflows", revision); err != nil {
+			t.Fatal(err)
+		}
+		data, err := installation.GetFile(t.Context(), "acme", "example", "workflows/ci.yaml", revision)
+		if err != nil || string(data) != "file-1" || f.fileRequests.Load() != 1 {
+			t.Fatalf("warm file = %q, %v; file requests = %d, want 1", data, err, f.fileRequests.Load())
+		}
+	}
 }
 
 func (f *fileCacheFixture) installation(t *testing.T) *InstallationClient {
@@ -243,13 +383,16 @@ func TestFileCacheBoundsAndCopies(t *testing.T) {
 
 func TestFileCacheSharesConcurrentRequests(t *testing.T) {
 	cache := newFileCache(2, 10)
+	for _, path := range []string{"ci.yaml", "renamed.yaml"} {
+		cache.link(fileCacheKey{path: path}, fileCacheKey{path: "blob"})
+	}
 	started, release := make(chan struct{}), make(chan struct{})
 	var once sync.Once
 	unblock := func() { once.Do(func() { close(release) }) }
 	defer unblock()
 	var loads atomic.Int32
-	read := func(ctx context.Context) ([]byte, error) {
-		return cache.load(ctx, fileCacheKey{path: "ci.yaml"}, func(context.Context) ([]byte, error) {
+	read := func(ctx context.Context, path string) ([]byte, error) {
+		return cache.load(ctx, fileCacheKey{path: path}, func(context.Context) ([]byte, error) {
 			if loads.Add(1) == 1 {
 				close(started)
 			}
@@ -258,15 +401,15 @@ func TestFileCacheSharesConcurrentRequests(t *testing.T) {
 		})
 	}
 	results := make(chan []byte, 11)
-	go func() { data, _ := read(t.Context()); results <- data }()
+	go func() { data, _ := read(t.Context(), "ci.yaml"); results <- data }()
 	<-started
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
-	if _, err := read(ctx); !errors.Is(err, context.Canceled) {
+	if _, err := read(ctx, "renamed.yaml"); !errors.Is(err, context.Canceled) {
 		t.Fatalf("canceled waiter: %v", err)
 	}
 	for range 10 {
-		go func() { data, _ := read(t.Context()); results <- data }()
+		go func() { data, _ := read(t.Context(), "renamed.yaml"); results <- data }()
 	}
 	unblock()
 	for range 11 {

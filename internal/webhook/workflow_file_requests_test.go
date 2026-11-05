@@ -2,6 +2,7 @@ package webhook
 
 import (
 	"context"
+	"crypto/sha1"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -28,6 +29,10 @@ func TestWorkflowFileRequestsFromDiscoveryThroughPlanning(t *testing.T) {
 		t.Run(fmt.Sprintf("workflows=%d", count), func(t *testing.T) {
 			const directory = ".open-actions/workflows"
 			const data = "on: push\njobs:\n  test:\n    runs-on: linux\n    steps:\n      - run: echo hello\n"
+			workflowData := make(map[string]string, count)
+			for index := range count {
+				workflowData[fmt.Sprintf("ci-%d.yaml", index)] = fmt.Sprintf("name: CI %d\n%s", index, data)
+			}
 			var fileCalls, directoryCalls, tokenCalls atomic.Int32
 			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 				switch request.URL.Path {
@@ -39,7 +44,9 @@ func TestWorkflowFileRequestsFromDiscoveryThroughPlanning(t *testing.T) {
 					contents := make([]map[string]string, count)
 					for index := range contents {
 						name := fmt.Sprintf("ci-%d.yaml", index)
-						contents[index] = map[string]string{"name": name, "path": directory + "/" + name, "type": "file"}
+						blob := workflowData[name]
+						sha := fmt.Sprintf("%x", sha1.Sum([]byte(fmt.Sprintf("blob %d\x00%s", len(blob), blob))))
+						contents[index] = map[string]string{"name": name, "path": directory + "/" + name, "type": "file", "sha": sha}
 					}
 					_ = json.NewEncoder(writer).Encode(contents)
 				default:
@@ -49,7 +56,8 @@ func TestWorkflowFileRequestsFromDiscoveryThroughPlanning(t *testing.T) {
 						return
 					}
 					fileCalls.Add(1)
-					fmt.Fprintf(writer, `{"encoding":"base64","content":%q}`, base64.StdEncoding.EncodeToString([]byte(data)))
+					name := strings.TrimPrefix(request.URL.Path, "/repos/acme/example/contents/"+directory+"/")
+					fmt.Fprintf(writer, `{"encoding":"base64","content":%q}`, base64.StdEncoding.EncodeToString([]byte(workflowData[name])))
 				}
 			}))
 			defer server.Close()
@@ -77,7 +85,10 @@ func TestWorkflowFileRequestsFromDiscoveryThroughPlanning(t *testing.T) {
 			event.Repository.ID = 1
 			event.Repository.Name = "example"
 			event.Repository.Owner.Login = "acme"
-			for round, revision := range []string{strings.Repeat("a", 40), strings.Repeat("a", 40), strings.Repeat("b", 40)} {
+			for round, revision := range []string{strings.Repeat("a", 40), strings.Repeat("a", 40), strings.Repeat("b", 40), strings.Repeat("c", 40)} {
+				if round == 3 {
+					workflowData["ci-0.yaml"] = "name: Changed\n" + data
+				}
 				body := []byte(fmt.Sprintf(`{"sender":{"login":"octocat"},"round":%d}`, round))
 				normalized := normalizedEvent{Name: "push", Actor: "octocat", SHA: revision, Ref: "refs/heads/main"}
 				if err := handler.enqueueDelivery(t.Context(), project, event, normalized, fmt.Sprint(round), body); err != nil {
@@ -102,8 +113,11 @@ func TestWorkflowFileRequestsFromDiscoveryThroughPlanning(t *testing.T) {
 					}
 				}
 				wantFiles, wantDirectories := int32(count), int32(1)
-				if round == 2 {
-					wantFiles, wantDirectories = 2*int32(count), 2
+				if round >= 2 {
+					wantDirectories = int32(round)
+				}
+				if round == 3 {
+					wantFiles++
 				}
 				t.Logf("round=%d workflows=%d: file GETs=%d, directory GETs=%d, token POSTs=%d", round, count, fileCalls.Load(), directoryCalls.Load(), tokenCalls.Load())
 				if fileCalls.Load() != wantFiles || directoryCalls.Load() != wantDirectories || tokenCalls.Load() != 1 {
