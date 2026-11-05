@@ -22,6 +22,7 @@ import (
 	"github.com/kelos-dev/open-actions/internal/gitrepository"
 	actionmetrics "github.com/kelos-dev/open-actions/internal/metrics"
 	"github.com/kelos-dev/open-actions/internal/workflow"
+	"github.com/kelos-dev/open-actions/internal/workflowsnapshot"
 	corev1 "k8s.io/api/core/v1"
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -123,6 +124,7 @@ type DeliveryReconciler struct {
 type workflowSelection struct {
 	Path  string
 	Event normalizedEvent
+	Data  []byte
 }
 
 func (h *GitHubHandler) enqueueDelivery(ctx context.Context, project *actionsv1alpha1.Project, event *payload, normalized normalizedEvent, deliveryID string, signedBody []byte) error {
@@ -499,7 +501,7 @@ candidateLoop:
 					}
 					return ctrl.Result{}, r.finish(ctx, object, deliveryStateFailed, 0, err.Error())
 				}
-				candidateSelections = append(candidateSelections, workflowSelection{Path: workflowPath, Event: candidate})
+				candidateSelections = append(candidateSelections, workflowSelection{Path: workflowPath, Event: candidate, Data: cachedWorkflow.Data})
 			}
 		}
 		seenFiles = candidateSeenFiles
@@ -635,6 +637,8 @@ func (r *DeliveryReconciler) cachedWorkflowRevision(ctx context.Context, project
 			item := revisionWorkflow{Path: workflowPath, Definition: definition}
 			if err != nil {
 				item.Error = err.Error()
+			} else if mergedRepository != nil {
+				item.Data = data
 			}
 			result.Workflows = append(result.Workflows, item)
 		}
@@ -653,6 +657,9 @@ func (r *DeliveryReconciler) createWorkflowRun(ctx context.Context, project *act
 	}
 	name := workflowRunName(selection.Path, string(project.UID), replayID)
 	annotations := map[string]string{}
+	if selection.Data != nil {
+		annotations[actionsv1alpha1.AnnotationWorkflowFile] = workflowsnapshot.ConfigMapName(name)
+	}
 	if delivery.EventSnapshot != "" {
 		annotations[eventsnapshot.Annotation] = delivery.EventSnapshot
 	}
@@ -692,7 +699,7 @@ func (r *DeliveryReconciler) createWorkflowRun(ctx context.Context, project *act
 		if err := matchingWorkflowRun(alias, desired); err != nil {
 			return err
 		}
-		return r.ensureEventSnapshotOwner(ctx, alias)
+		return r.ensureWorkflowRunSnapshots(ctx, alias, selection.Data)
 	} else if !apierrors.IsNotFound(err) {
 		return err
 	}
@@ -707,9 +714,24 @@ func (r *DeliveryReconciler) createWorkflowRun(ctx context.Context, project *act
 		if err := matchingWorkflowRun(existing, desired); err != nil {
 			return err
 		}
-		return r.ensureEventSnapshotOwner(ctx, existing)
+		return r.ensureWorkflowRunSnapshots(ctx, existing, selection.Data)
 	}
-	return r.ensureEventSnapshotOwner(ctx, desired)
+	return r.ensureWorkflowRunSnapshots(ctx, desired, selection.Data)
+}
+
+func (r *DeliveryReconciler) ensureWorkflowRunSnapshots(ctx context.Context, run *actionsv1alpha1.WorkflowRun, data []byte) error {
+	if err := r.ensureEventSnapshotOwner(ctx, run); err != nil {
+		return err
+	}
+	if data == nil {
+		return nil
+	}
+	err := workflowsnapshot.Ensure(ctx, r.Client, r.APIReader, run, data)
+	var invalid *workflowsnapshot.InvalidSnapshotError
+	if errors.As(err, &invalid) {
+		return apierrors.NewConflict(corev1.Resource("configmaps"), invalid.Name, err)
+	}
+	return err
 }
 
 func forkPullRequestPolicy(project *actionsv1alpha1.Project, dependabot bool) (bool, *actionsv1alpha1.WorkflowRunForkPullRequest) {

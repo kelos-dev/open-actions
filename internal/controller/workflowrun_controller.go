@@ -464,7 +464,12 @@ func (r *WorkflowRunReconciler) reconcileWorkflowRun(ctx context.Context, run *a
 		}
 	}
 	var workflowData []byte
-	if githubSource.Revision.BaseSHA != "" {
+	if run.Annotations[actionsv1alpha1.AnnotationWorkflowFile] != "" {
+		workflowData, err = r.loadWorkflowFileSnapshot(ctx, run)
+		if err != nil {
+			return r.planningFailed(ctx, run, "WorkflowFetchFailed", err, childCreationFailureDisposition(err))
+		}
+	} else if githubSource.Revision.BaseSHA != "" {
 		mergedRepository, mergeErr := r.GitRepository.Merge(ctx, githubSource.Repository.Owner, githubSource.Repository.Name, installation.Token(), gitrepository.Revision{
 			BaseSHA: githubSource.Revision.BaseSHA, HeadSHA: githubSource.Revision.HeadSHA, MergeBaseSHA: githubSource.Revision.MergeBaseSHA,
 		})
@@ -506,8 +511,10 @@ func (r *WorkflowRunReconciler) reconcileWorkflowRun(ctx context.Context, run *a
 	if definition.Name == "" {
 		definition.Name = run.Spec.WorkflowPath
 	}
-	if err := r.ensureWorkflowFileSnapshot(ctx, run, workflowData); err != nil {
-		return r.planningFailed(ctx, run, "ChildCreationFailed", err, childCreationFailureDisposition(err))
+	if run.Annotations[actionsv1alpha1.AnnotationWorkflowFile] == "" {
+		if err := r.ensureWorkflowFileSnapshot(ctx, run, workflowData); err != nil {
+			return r.planningFailed(ctx, run, "ChildCreationFailed", err, childCreationFailureDisposition(err))
+		}
 	}
 	run.Status.WorkflowName = definition.Name
 	planningRun, planningEvent, err := resolvePlanningEvent(run, definition, eventPayload)
@@ -1787,43 +1794,25 @@ func (r *WorkflowRunReconciler) ensureNeedsContextConfigMap(ctx context.Context,
 	return nil
 }
 
+func (r *WorkflowRunReconciler) loadWorkflowFileSnapshot(ctx context.Context, run *actionsv1alpha1.WorkflowRun) ([]byte, error) {
+	name := run.Annotations[actionsv1alpha1.AnnotationWorkflowFile]
+	object := &corev1.ConfigMap{}
+	if err := r.APIReader.Get(ctx, client.ObjectKey{Namespace: run.Namespace, Name: name}, object); err != nil {
+		return nil, fmt.Errorf("get workflow file ConfigMap %q for WorkflowRun %q: %w", name, run.Name, err)
+	}
+	if err := workflowsnapshot.Validate(object, run); err != nil {
+		return nil, &terminalPlanningError{cause: err}
+	}
+	return []byte(object.Data[workflowsnapshot.DataKey]), nil
+}
+
 func (r *WorkflowRunReconciler) ensureWorkflowFileSnapshot(ctx context.Context, run *actionsv1alpha1.WorkflowRun, data []byte) error {
-	configMap := &corev1.ConfigMap{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      childName(run.Name, "workflow-file"),
-			Namespace: run.Namespace,
-			Labels:    map[string]string{actionsv1alpha1.LabelWorkflowRunUID: string(run.UID)},
-		},
-		Immutable: pointerTo(true),
-		Data:      map[string]string{workflowsnapshot.DataKey: string(data)},
+	err := workflowsnapshot.Ensure(ctx, r.Client, r.APIReader, run, data)
+	var invalid *workflowsnapshot.InvalidSnapshotError
+	if errors.As(err, &invalid) {
+		return &terminalPlanningError{cause: err}
 	}
-	if err := controllerutil.SetControllerReference(run, configMap, r.Scheme()); err != nil {
-		return &terminalPlanningError{cause: fmt.Errorf("set WorkflowRun %q as owner of workflow file ConfigMap %q: %w", run.Name, configMap.Name, err)}
-	}
-	if err := r.Create(ctx, configMap); err != nil {
-		if !apierrors.IsAlreadyExists(err) {
-			return fmt.Errorf("create workflow file ConfigMap %q for WorkflowRun %q: %w", configMap.Name, run.Name, err)
-		}
-		existing := &corev1.ConfigMap{}
-		if err := r.APIReader.Get(ctx, client.ObjectKeyFromObject(configMap), existing); err != nil {
-			return fmt.Errorf("get workflow file ConfigMap %q for WorkflowRun %q: %w", configMap.Name, run.Name, err)
-		}
-		if !metav1.IsControlledBy(existing, run) || existing.Immutable == nil || !*existing.Immutable || existing.Data[workflowsnapshot.DataKey] != string(data) {
-			return &terminalPlanningError{cause: fmt.Errorf("workflow file ConfigMap %q does not contain the expected immutable snapshot for WorkflowRun %q", existing.Name, run.Name)}
-		}
-	}
-	if run.Annotations[actionsv1alpha1.AnnotationWorkflowFile] == configMap.Name {
-		return nil
-	}
-	before := run.DeepCopy()
-	if run.Annotations == nil {
-		run.Annotations = map[string]string{}
-	}
-	run.Annotations[actionsv1alpha1.AnnotationWorkflowFile] = configMap.Name
-	if err := r.Patch(ctx, run, client.MergeFrom(before)); err != nil {
-		return fmt.Errorf("record workflow file ConfigMap %q on WorkflowRun %q: %w", configMap.Name, run.Name, err)
-	}
-	return nil
+	return err
 }
 
 func (r *WorkflowRunReconciler) ensureWorkflowPlan(ctx context.Context, run *actionsv1alpha1.WorkflowRun, project *actionsv1alpha1.Project, plannedJobs []plannedWorkflowJob, deferredJobs []deferredJobPlan, definition *workflow.Definition) error {
