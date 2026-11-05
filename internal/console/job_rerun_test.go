@@ -283,7 +283,7 @@ func TestConsoleRejectsUnavailableJobRerun(t *testing.T) {
 				if test.name == "active attempt" {
 					latest.Status.Conditions = nil
 				} else {
-					latest.Spec.Rerun.Attempt = maxRerunAttempt
+					latest.Spec.Rerun.Attempt = workflowrun.MaxAttempt
 				}
 				if err := handler.client.Update(context.Background(), latest); err != nil {
 					t.Fatal(err)
