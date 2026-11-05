@@ -137,9 +137,9 @@ run lists and include the same context in their browser titles. Job IDs are
 shown alongside differing job display names, including in the log sidebar.
 
 A run page renders the immutable workflow file snapshot retained by the
-controller with that WorkflowRun. Runs created before snapshot support or whose
-workflow has not yet been fetched and validated report that the file is
-unavailable. The Console presents runner output as line-oriented GitHub Actions
+controller with that WorkflowRun. Runs whose workflow file has not yet been
+fetched and validated report that the file is unavailable. The Console presents
+runner output as line-oriented GitHub Actions
 logs. It supports `group` and `endgroup`, debug and annotation commands, command lines,
 escaped command data and properties, and `stop-commands` markers. It also shows
 action input and output names without persisting their values. Workflow step
@@ -1354,6 +1354,14 @@ After a workflow file is fetched and validated, its WorkflowRun carries an
 holds the exact file in its `workflow.yaml` key. The ConfigMap is owned by the
 WorkflowRun and is garbage-collected with it. The Console reports the workflow
 file as unavailable when the annotation or ConfigMap is missing.
+
+For valid workflows discovered from a locally integrated pull request, discovery
+retains the selected workflow file before planning. Planning reads that snapshot
+without downloading the same Git commits and reconstructing the integration
+again. Planning retries also reuse an existing snapshot. A referenced snapshot
+that has not yet been stored causes planning to retry; a snapshot with the wrong
+owner, mutable contents, or no workflow file is rejected. Runs without a snapshot
+reference fetch the pinned workflow and retain it during planning.
 
 ## Workflow API
 

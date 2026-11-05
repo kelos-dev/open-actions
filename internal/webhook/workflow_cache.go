@@ -24,6 +24,7 @@ type revisionWorkflow struct {
 	Path       string
 	Definition *workflow.Definition
 	Error      string
+	Data       []byte
 }
 
 type workflowRevision struct {

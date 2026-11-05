@@ -1814,11 +1814,10 @@ func (h *Handler) loadWorkflowFile(ctx context.Context, run *actionsv1alpha1.Wor
 		}
 		return "", false, fmt.Errorf("load workflow file ConfigMap %q for WorkflowRun %q: %w", name, run.Name, err)
 	}
-	data, found := configMap.Data[workflowsnapshot.DataKey]
-	if !metav1.IsControlledBy(configMap, run) || configMap.Immutable == nil || !*configMap.Immutable || !found {
-		return "", false, fmt.Errorf("workflow file ConfigMap %q is not an immutable snapshot owned by WorkflowRun %q", name, run.Name)
+	if err := workflowsnapshot.Validate(configMap, run); err != nil {
+		return "", false, err
 	}
-	return data, true, nil
+	return configMap.Data[workflowsnapshot.DataKey], true, nil
 }
 
 func (h *Handler) jobLogs(writer http.ResponseWriter, request *http.Request, run *actionsv1alpha1.WorkflowRun, jobName string) {
