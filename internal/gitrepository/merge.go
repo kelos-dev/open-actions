@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 )
 
@@ -68,7 +69,7 @@ func (c *Client) Merge(ctx context.Context, owner, repository, token string, rev
 	}
 	environment := gitEnvironment(remoteURL, token)
 	result.environment = environment
-	if err := c.fetch(ctx, directory, environment, "origin", true, revision); err != nil {
+	if err := c.fetch(ctx, directory, environment, "origin", 1, revision.BaseSHA, revision.HeadSHA, revision.MergeBaseSHA); err != nil {
 		return nil, errors.Join(err, result.Close())
 	}
 	result.SHA, err = c.createMergeCommit(ctx, directory, environment, revision)
@@ -84,11 +85,15 @@ func (c *Client) IntegrateCheckout(ctx context.Context, directory, owner, reposi
 	}
 	remoteURL := c.repositoryURL(owner, repository)
 	environment := gitEnvironment(remoteURL, token)
-	depthOne, err := c.isShallowRepository(ctx, directory, environment)
+	shallow, err := c.isShallowRepository(ctx, directory, environment)
 	if err != nil {
 		return err
 	}
-	if err := c.fetch(ctx, directory, environment, remoteURL, depthOne, revision); err != nil {
+	depth := 0
+	if shallow {
+		depth = 1
+	}
+	if err := c.fetch(ctx, directory, environment, remoteURL, depth, revision.BaseSHA, revision.HeadSHA, revision.MergeBaseSHA); err != nil {
 		return err
 	}
 	sha, err := c.createMergeCommit(ctx, directory, environment, revision)
@@ -151,21 +156,24 @@ func (r *Repository) Close() error {
 	return nil
 }
 
-func (c *Client) fetch(ctx context.Context, directory string, environment []string, remote string, depthOne bool, revision Revision) error {
+func (c *Client) fetch(ctx context.Context, directory string, environment []string, remote string, depth int, revisions ...string) error {
 	seen := map[string]struct{}{}
-	for _, sha := range []string{revision.BaseSHA, revision.HeadSHA, revision.MergeBaseSHA} {
+	commits := make([]string, 0, len(revisions))
+	for _, sha := range revisions {
 		if _, found := seen[sha]; found {
 			continue
 		}
 		seen[sha] = struct{}{}
-		arguments := []string{"-c", "protocol.version=2", "fetch", "--quiet", "--no-tags"}
-		if depthOne {
-			arguments = append(arguments, "--depth=1")
-		}
-		arguments = append(arguments, "--filter=blob:none", remote, sha)
-		if err := c.run(ctx, directory, environment, nil, "git", arguments...); err != nil {
-			return fmt.Errorf("fetch commit %s: %w", sha, err)
-		}
+		commits = append(commits, sha)
+	}
+	arguments := []string{"-c", "protocol.version=2", "fetch", "--quiet", "--no-tags"}
+	if depth > 0 {
+		arguments = append(arguments, "--depth="+strconv.Itoa(depth))
+	}
+	arguments = append(arguments, "--filter=blob:none", remote)
+	arguments = append(arguments, commits...)
+	if err := c.run(ctx, directory, environment, nil, "git", arguments...); err != nil {
+		return fmt.Errorf("fetch commits %s: %w", strings.Join(commits, ", "), err)
 	}
 	return nil
 }
