@@ -156,24 +156,24 @@ func (r *Repository) Close() error {
 	return nil
 }
 
-func (c *Client) fetch(ctx context.Context, directory string, environment []string, remote string, depth int, revisions ...string) error {
+func (c *Client) fetch(ctx context.Context, directory string, environment []string, remote string, depth int, objects ...string) error {
 	seen := map[string]struct{}{}
-	commits := make([]string, 0, len(revisions))
-	for _, sha := range revisions {
+	objectIDs := make([]string, 0, len(objects))
+	for _, sha := range objects {
 		if _, found := seen[sha]; found {
 			continue
 		}
 		seen[sha] = struct{}{}
-		commits = append(commits, sha)
+		objectIDs = append(objectIDs, sha)
 	}
 	arguments := []string{"-c", "protocol.version=2", "fetch", "--quiet", "--no-tags"}
 	if depth > 0 {
 		arguments = append(arguments, "--depth="+strconv.Itoa(depth))
 	}
 	arguments = append(arguments, "--filter=blob:none", remote)
-	arguments = append(arguments, commits...)
+	arguments = append(arguments, objectIDs...)
 	if err := c.run(ctx, directory, environment, nil, "git", arguments...); err != nil {
-		return fmt.Errorf("fetch commits %s: %w", strings.Join(commits, ", "), err)
+		return fmt.Errorf("fetch objects %s: %w", strings.Join(objectIDs, ", "), err)
 	}
 	return nil
 }

@@ -80,6 +80,7 @@ type Content struct {
 	Name string `json:"name"`
 	Path string `json:"path"`
 	Type string `json:"type"`
+	SHA  string `json:"sha"`
 }
 
 type Repository struct {
@@ -549,6 +550,16 @@ func (c *InstallationClient) ListDirectory(ctx context.Context, owner, repositor
 	contents := []Content{}
 	if err := c.doJSONWithQuery(ctx, http.MethodGet, requestPath, url.Values{"ref": []string{revision}}, &contents); err != nil {
 		return nil, fmt.Errorf("list repository directory %q from %s/%s at revision %q: %w", directory, owner, repository, revision, err)
+	}
+	if fullCommitSHA(revision) && c.cachedTokenActive() {
+		for _, content := range contents {
+			if content.Type != "file" || !fullCommitSHA(content.SHA) {
+				continue
+			}
+			key := fileCacheKey{installation: c, path: repositoryContentPath(owner, repository, content.Path), revision: revision}
+			blob := fileCacheKey{installation: c, path: "repos/" + owner + "/" + repository + "/git/blobs", revision: content.SHA}
+			c.client.files.link(key, blob)
+		}
 	}
 	return contents, nil
 }

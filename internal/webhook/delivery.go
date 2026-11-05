@@ -621,6 +621,11 @@ func (r *DeliveryReconciler) cachedWorkflowRevision(ctx context.Context, project
 		if len(paths) > maxWorkflowFiles {
 			return result, nil
 		}
+		if mergedRepository != nil {
+			if err := mergedRepository.PrefetchFiles(ctx, paths); err != nil {
+				return workflowRevision{}, err
+			}
+		}
 		result.Workflows = make([]revisionWorkflow, 0, len(paths))
 		for _, workflowPath := range paths {
 			var data []byte

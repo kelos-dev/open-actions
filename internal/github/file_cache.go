@@ -24,6 +24,11 @@ type fileCacheEntry struct {
 	data []byte
 }
 
+type fileCacheAlias struct {
+	key    fileCacheKey
+	target fileCacheKey
+}
+
 type fileRequest struct {
 	done chan struct{}
 	data []byte
@@ -31,24 +36,60 @@ type fileRequest struct {
 }
 
 type fileCache struct {
-	mutex      sync.Mutex
-	maxEntries int
-	maxBytes   int
-	bytes      int
-	entries    map[fileCacheKey]*list.Element
-	pending    map[fileCacheKey]*fileRequest
-	recent     list.List
+	mutex       sync.Mutex
+	maxEntries  int
+	maxBytes    int
+	bytes       int
+	entries     map[fileCacheKey]*list.Element
+	aliases     map[fileCacheKey]*list.Element
+	pending     map[fileCacheKey]*fileRequest
+	recent      list.List
+	aliasRecent list.List
 }
 
 func newFileCache(maxEntries, maxBytes int) *fileCache {
 	return &fileCache{
 		maxEntries: maxEntries, maxBytes: maxBytes,
 		entries: map[fileCacheKey]*list.Element{}, pending: map[fileCacheKey]*fileRequest{},
+		aliases: map[fileCacheKey]*list.Element{},
+	}
+}
+
+func (c *fileCache) link(key, target fileCacheKey) {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+	if c.maxEntries < 1 {
+		return
+	}
+	if element := c.entries[key]; element != nil && c.pending[target] == nil {
+		delete(c.entries, key)
+		if c.entries[target] == nil {
+			element.Value.(*fileCacheEntry).key = target
+			c.entries[target] = element
+		} else {
+			c.bytes -= len(element.Value.(*fileCacheEntry).data)
+			c.recent.Remove(element)
+		}
+	}
+	if element := c.aliases[key]; element != nil {
+		element.Value.(*fileCacheAlias).target = target
+		c.aliasRecent.MoveToFront(element)
+		return
+	}
+	c.aliases[key] = c.aliasRecent.PushFront(&fileCacheAlias{key: key, target: target})
+	for len(c.aliases) > c.maxEntries {
+		element := c.aliasRecent.Back()
+		delete(c.aliases, element.Value.(*fileCacheAlias).key)
+		c.aliasRecent.Remove(element)
 	}
 }
 
 func (c *fileCache) load(ctx context.Context, key fileCacheKey, loader func(context.Context) ([]byte, error)) ([]byte, error) {
 	c.mutex.Lock()
+	if element := c.aliases[key]; element != nil {
+		key = element.Value.(*fileCacheAlias).target
+		c.aliasRecent.MoveToFront(element)
+	}
 	if element := c.entries[key]; element != nil {
 		c.recent.MoveToFront(element)
 		data := bytes.Clone(element.Value.(*fileCacheEntry).data)
