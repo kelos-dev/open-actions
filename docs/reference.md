@@ -75,6 +75,15 @@ found. Missing contexts require reading the remaining history. GitHub App bot
 identities are cached for five minutes per App and private key, and concurrent
 lookups share a request. Failed identity lookups are not cached.
 
+Workflow files read at a full commit SHA through an active cached control-plane
+installation client are reused by webhook discovery and workflow planning.
+The file cache is local to the process and holds at most 512 files and 16 MiB of
+file contents, evicting the least recently used files. Entries are scoped to
+the installation client, repository, path, and commit SHA. A token refresh,
+local revocation, or unauthorized response prevents that installation client
+from reusing cached files. Branches, tags, and other revision expressions are
+fetched from GitHub on each file read, and failed fetches are not cached.
+
 `--max-job-timeout` is the cluster-wide upper bound for workflow job execution
 and defaults to `6h`. It must be a positive whole number of minutes. The Helm
 chart configures it through `controller.maxJobTimeout`.

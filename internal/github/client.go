@@ -46,6 +46,7 @@ type Client struct {
 	appMutex            sync.Mutex
 	appCache            map[appCacheKey]cachedApp
 	appPending          map[appCacheKey]*appRequest
+	files               *fileCache
 }
 
 type InstallationClient struct {
@@ -299,6 +300,7 @@ func NewClient(baseURL string, httpClient *http.Client) (*Client, error) {
 		installationCache: map[installationCacheKey]cachedInstallation{}, installationPending: map[installationCacheKey]*installationRequest{},
 		rateLimitReset: map[int64]time.Time{},
 		appCache:       map[appCacheKey]cachedApp{}, appPending: map[appCacheKey]*appRequest{},
+		files: newFileCache(maxCachedFiles, maxCachedFileBytes),
 	}, nil
 }
 
@@ -552,6 +554,17 @@ func (c *InstallationClient) ListDirectory(ctx context.Context, owner, repositor
 }
 
 func (c *InstallationClient) GetFile(ctx context.Context, owner, repository, filePath, revision string) ([]byte, error) {
+	load := func(ctx context.Context) ([]byte, error) {
+		return c.getFile(ctx, owner, repository, filePath, revision)
+	}
+	if !fullCommitSHA(revision) || !c.cachedTokenActive() {
+		return load(ctx)
+	}
+	key := fileCacheKey{installation: c, path: repositoryContentPath(owner, repository, filePath), revision: revision}
+	return c.client.files.load(ctx, key, load)
+}
+
+func (c *InstallationClient) getFile(ctx context.Context, owner, repository, filePath, revision string) ([]byte, error) {
 	requestPath := repositoryContentPath(owner, repository, filePath)
 	content := struct {
 		Content  string `json:"content"`
