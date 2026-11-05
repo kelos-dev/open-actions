@@ -378,6 +378,9 @@ func (r *WorkflowRunReconciler) reconcileWorkflowRun(ctx context.Context, run *a
 		return r.observeWorkflowJobs(ctx, run, run.Status.WorkflowName, run.Status.Jobs.Total)
 	}
 	if workflowRunConcurrencyWaitCondition(planned) && run.Status.Jobs != nil {
+		if run.Spec.CancelRequested {
+			return r.observeWorkflowJobs(ctx, run, run.Status.WorkflowName, run.Status.Jobs.Total)
+		}
 		if concurrency := workflowRunConcurrencyDecision(run); concurrency != nil {
 			if run.Status.Concurrency == nil {
 				if err := r.persistWorkflowRunConcurrencyDecision(ctx, run, concurrency.Group, concurrency.CancelInProgress); err != nil {
@@ -2296,6 +2299,11 @@ func (r *WorkflowRunReconciler) reconcileDeferredJobs(ctx context.Context, run *
 				continue
 			}
 		}
+		if workflowRunCancelledBeforeConcurrency(run) {
+			changed, err := r.completeDeferredJobPlanning(ctx, run, planConfigMap, plan, jobsByID, actionsv1alpha1.WorkflowJobResultCancelled, "CancellationRequested", "The workflow run was cancelled before concurrency admission")
+			state.changed = state.changed || changed
+			return state, err
+		}
 		resultPlaceholders, err := r.deferredJobResultPlaceholders(run, planConfigMap, plan)
 		if err != nil {
 			return state, &terminalPlanningError{cause: err}
@@ -2575,6 +2583,18 @@ func (r *WorkflowRunReconciler) observeWorkflowJobs(ctx context.Context, run *ac
 	jobs := &actionsv1alpha1.WorkflowJobList{}
 	if err := reader.List(ctx, jobs, client.InNamespace(run.Namespace), client.MatchingLabels{actionsv1alpha1.LabelWorkflowRunUID: string(run.UID)}); err != nil {
 		return ctrl.Result{}, err
+	}
+	if workflowRunCancelledBeforeConcurrency(run) {
+		// Cancellation-time jobs may execute only after workflow concurrency admission.
+		for index := range jobs.Items {
+			job := &jobs.Items[index]
+			if workflowJobTerminal(job) {
+				continue
+			}
+			if err := r.completeUnscheduledWorkflowJob(ctx, job, actionsv1alpha1.WorkflowJobResultCancelled, "CancellationRequested", "The workflow run was cancelled before concurrency admission"); err != nil {
+				return ctrl.Result{}, err
+			}
+		}
 	}
 	lostState := ""
 	planState, err := r.reconcileDeferredJobs(ctx, run, jobs)
@@ -3666,6 +3686,11 @@ func workflowRunConcurrencyWaitCondition(condition *metav1.Condition) bool {
 	}
 	// Runs with this persisted condition have already created their job plans.
 	return condition != nil && condition.Status == metav1.ConditionUnknown && condition.Reason == "WaitingForPriorRunPlanning"
+}
+
+func workflowRunCancelledBeforeConcurrency(run *actionsv1alpha1.WorkflowRun) bool {
+	planned := meta.FindStatusCondition(run.Status.Conditions, actionsv1alpha1.WorkflowRunConditionPlanned)
+	return run.Spec.CancelRequested && workflowRunConcurrencyWaitCondition(planned)
 }
 
 func (r *WorkflowRunReconciler) planningFailed(ctx context.Context, run *actionsv1alpha1.WorkflowRun, reason string, cause error, disposition planningFailureDisposition) (ctrl.Result, error) {
