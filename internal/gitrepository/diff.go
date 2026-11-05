@@ -35,15 +35,12 @@ func (c *Client) ChangedFiles(ctx context.Context, owner, repository, token stri
 	if err := c.run(ctx, directory, r.environment, nil, "git", "remote", "add", "origin", remoteURL); err != nil {
 		return nil, err
 	}
-	depth := "--depth=1"
+	depth := 1
 	if revision.BaseParent {
-		depth = "--depth=2"
+		depth = 2
 	}
-	// Fetch the base last so its parent remains visible at a shallow boundary.
-	for _, sha := range []string{revision.HeadSHA, revision.BaseSHA} {
-		if err := c.run(ctx, directory, r.environment, nil, "git", "-c", "protocol.version=2", "fetch", "--quiet", "--no-tags", "--filter=blob:none", depth, "origin", sha); err != nil {
-			return nil, fmt.Errorf("fetch diff commit %s from %s/%s: %w", sha, owner, repository, err)
-		}
+	if err := c.fetch(ctx, directory, r.environment, "origin", depth, revision.HeadSHA, revision.BaseSHA); err != nil {
+		return nil, fmt.Errorf("fetch diff commits from %s/%s: %w", owner, repository, err)
 	}
 	base := revision.BaseSHA
 	if revision.BaseParent {
