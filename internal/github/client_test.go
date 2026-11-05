@@ -500,9 +500,9 @@ func TestCommitStatusAndRepositoryAccess(t *testing.T) {
 	if err != nil || botLogin != "open-actions[bot]" {
 		t.Fatalf("AppBotLogin() = %q, %v", botLogin, err)
 	}
-	statuses, err := installation.ListCommitStatuses(context.Background(), "acme", "example", revision)
+	statuses, err := installation.ListLatestCommitStatuses(context.Background(), "acme", "example", revision, []string{"Open Actions / ci.yaml"})
 	if err != nil || len(statuses) != 1 || statuses[0].ID != 11 || statuses[0].State != "pending" || statuses[0].Creator.Login != "open-actions[bot]" {
-		t.Fatalf("ListCommitStatuses() = %#v, %v", statuses, err)
+		t.Fatalf("ListLatestCommitStatuses() = %#v, %v", statuses, err)
 	}
 	created, err := installation.CreateCommitStatus(context.Background(), "acme", "example", revision, CreateCommitStatusRequest{
 		State: "success", TargetURL: "https://actions.example/runs/default/ci", Description: "The workflow succeeded", Context: "Open Actions / ci.yaml",

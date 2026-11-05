@@ -61,6 +61,20 @@ reporting to be judged permanently unavailable. GitHub statuses can lag behind
 the workflow's Kubernetes status. Workflow discovery and runner credential
 creation still require GitHub API access and remain subject to its rate limits.
 
+The status reporter records attempted reports in Kubernetes before sending them
+to GitHub. After initial recovery, normal job status transitions do not read
+GitHub status history. Retries check reports that may have reached GitHub before
+their result was recorded, including after a controller restart. Validation
+recovery remembers when no recoverable validation status exists for the
+reporting owner.
+
+Recovery reads GitHub's
+[commit-status history](https://docs.github.com/en/rest/commits/statuses#list-commit-statuses-for-a-reference)
+in pages of 100 and stops once the latest entry for every needed context is
+found. Missing contexts require reading the remaining history. GitHub App bot
+identities are cached for five minutes per App and private key, and concurrent
+lookups share a request. Failed identity lookups are not cached.
+
 `--max-job-timeout` is the cluster-wide upper bound for workflow job execution
 and defaults to `6h`. It must be a positive whole number of minutes. The Helm
 chart configures it through `controller.maxJobTimeout`.

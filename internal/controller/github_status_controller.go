@@ -195,13 +195,19 @@ func (r *GitHubStatusReconciler) shouldReportGitHubStatuses(ctx context.Context,
 }
 
 type githubStatusOwner struct {
-	UID        string `json:"uid"`
-	RootUID    string `json:"rootUID"`
-	Attempt    int32  `json:"attempt"`
-	CreatedAt  int64  `json:"createdAt"`
-	IdentityID int64  `json:"identityID,omitempty"`
-	LeaseToken string `json:"leaseToken,omitempty"`
-	LeaseUntil int64  `json:"leaseUntil,omitempty"`
+	UID        string                      `json:"uid"`
+	RootUID    string                      `json:"rootUID"`
+	Attempt    int32                       `json:"attempt"`
+	CreatedAt  int64                       `json:"createdAt"`
+	IdentityID int64                       `json:"identityID,omitempty"`
+	LeaseToken string                      `json:"leaseToken,omitempty"`
+	LeaseUntil int64                       `json:"leaseUntil,omitempty"`
+	Reporting  *githubStatusReportingState `json:"reporting,omitempty"`
+}
+
+type githubStatusReportingState struct {
+	ValidationChecked bool              `json:"validationChecked"`
+	ReportDigests     map[string]string `json:"reportDigests"`
 }
 
 func (r *GitHubStatusReconciler) reconcileGitHubStatuses(ctx context.Context, run *actionsv1alpha1.WorkflowRun) error {
@@ -316,6 +322,18 @@ func (r *GitHubStatusReconciler) reconcileGitHubStatuses(ctx context.Context, ru
 	githubConfig := project.Spec.Source.GitHub
 	githubSource := run.Spec.Source.GitHub
 	reportError := func() error {
+		ownerObject := &corev1.ConfigMap{}
+		ownerKey := client.ObjectKey{Namespace: run.Namespace, Name: githubStatusOwnerPrefix + statusKey}
+		if err := r.APIReader.Get(ctx, ownerKey, ownerObject); err != nil {
+			return fmt.Errorf("get GitHub reporting state for WorkflowRun %q: %w", run.Name, err)
+		}
+		owner := githubStatusOwner{}
+		if err := json.Unmarshal([]byte(ownerObject.Data[githubStatusOwnerDataKey]), &owner); err != nil {
+			return fmt.Errorf("decode GitHub reporting state for WorkflowRun %q: %w", run.Name, err)
+		}
+		if owner.UID != string(run.UID) || owner.LeaseToken != leaseToken {
+			return apierrors.NewConflict(corev1.Resource("configmaps"), ownerObject.Name, fmt.Errorf("GitHub reporting lease for WorkflowRun %q changed", run.Name))
+		}
 		privateKey, err := secretValue(ctx, r.APIReader, project.Namespace, githubConfig.PrivateKeySecretRef)
 		if err != nil {
 			return fmt.Errorf("read credentials for GitHub statuses on WorkflowRun %q: %w", run.Name, err)
@@ -325,7 +343,16 @@ func (r *GitHubStatusReconciler) reconcileGitHubStatuses(ctx context.Context, ru
 			return fmt.Errorf("authenticate GitHub status reporter for WorkflowRun %q: %w", run.Name, err)
 		}
 
-		statuses, err := installation.ListCommitStatuses(ctx, githubSource.Repository.Owner, githubSource.Repository.Name, githubStatusRevision(githubSource))
+		contexts := make([]string, 0, len(updates)+1)
+		for _, item := range updates {
+			if owner.Reporting == nil || owner.Reporting.ReportDigests[strings.ToLower(item.request.Context)] == item.reportDigest {
+				contexts = append(contexts, item.request.Context)
+			}
+		}
+		if validationRecovery != nil && (owner.Reporting == nil || !owner.Reporting.ValidationChecked || owner.Reporting.ReportDigests[strings.ToLower(validationRecovery.request.Context)] == validationRecovery.reportDigest) {
+			contexts = append(contexts, validationRecovery.request.Context)
+		}
+		statuses, err := installation.ListLatestCommitStatuses(ctx, githubSource.Repository.Owner, githubSource.Repository.Name, githubStatusRevision(githubSource), contexts)
 		if err != nil {
 			return err
 		}
@@ -351,6 +378,29 @@ func (r *GitHubStatusReconciler) reconcileGitHubStatuses(ctx context.Context, ru
 					updates = append([]commitStatusUpdate{*validationRecovery}, updates...)
 				}
 			}
+		}
+		if owner.Reporting == nil {
+			owner.Reporting = &githubStatusReportingState{}
+		}
+		if owner.Reporting.ReportDigests == nil {
+			owner.Reporting.ReportDigests = map[string]string{}
+		}
+		if validationRecovery != nil {
+			owner.Reporting.ValidationChecked = true
+		}
+		for _, item := range updates {
+			owner.Reporting.ReportDigests[strings.ToLower(item.request.Context)] = item.reportDigest
+		}
+		// Persist intent before sending reports so retries can recover writes whose
+		// responses or Kubernetes status updates were lost.
+		data, err := json.Marshal(owner)
+		if err != nil {
+			return err
+		}
+		before := ownerObject.DeepCopy()
+		ownerObject.Data[githubStatusOwnerDataKey] = string(data)
+		if err := r.Patch(ctx, ownerObject, client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{})); err != nil {
+			return fmt.Errorf("record GitHub report requests for WorkflowRun %q: %w", run.Name, err)
 		}
 		for _, item := range updates {
 			status := recovered[strings.ToLower(item.request.Context)]
@@ -473,6 +523,14 @@ func (r *GitHubStatusReconciler) claimGitHubStatusOwnership(ctx context.Context,
 		}
 		if storedOwner.LeaseToken != "" && storedOwner.LeaseUntil > r.now().UnixNano() {
 			return apierrors.NewConflict(corev1.Resource("configmaps"), object.Name, errors.New("GitHub status reporting is already in progress"))
+		}
+		nextOwner := desiredOwner
+		if storedOwner.UID == desiredOwner.UID {
+			nextOwner.Reporting = storedOwner.Reporting
+		}
+		data, err := json.Marshal(nextOwner)
+		if err != nil {
+			return err
 		}
 		before := object.DeepCopy()
 		object.Data[githubStatusOwnerDataKey] = string(data)

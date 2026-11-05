@@ -43,6 +43,9 @@ type Client struct {
 	installationPending map[installationCacheKey]*installationRequest
 	rateLimitMutex      sync.Mutex
 	rateLimitReset      map[int64]time.Time
+	appMutex            sync.Mutex
+	appCache            map[appCacheKey]cachedApp
+	appPending          map[appCacheKey]*appRequest
 }
 
 type InstallationClient struct {
@@ -151,22 +154,34 @@ type CreateCommitStatusRequest struct {
 	Context     string `json:"context"`
 }
 
-// ListCommitStatuses returns commit statuses in reverse chronological order.
-func (c *InstallationClient) ListCommitStatuses(ctx context.Context, owner, repository, revision string) ([]CommitStatus, error) {
+// ListLatestCommitStatuses returns the latest status for each requested context.
+// Contexts are case-insensitive, as in GitHub's commit-status API.
+func (c *InstallationClient) ListLatestCommitStatuses(ctx context.Context, owner, repository, revision string, contexts []string) ([]CommitStatus, error) {
 	const perPage = 100
+	remaining := make(map[string]struct{}, len(contexts))
+	for _, name := range contexts {
+		remaining[strings.ToLower(name)] = struct{}{}
+	}
 	statuses := []CommitStatus{}
 	requestPath := "repos/" + owner + "/" + repository + "/commits/" + revision + "/statuses"
-	for page := 1; ; page++ {
+	for page := 1; len(remaining) > 0; page++ {
 		response := []CommitStatus{}
 		query := url.Values{"page": []string{strconv.Itoa(page)}, "per_page": []string{strconv.Itoa(perPage)}}
 		if err := c.doJSONWithQuery(ctx, http.MethodGet, requestPath, query, &response); err != nil {
 			return nil, fmt.Errorf("list commit statuses for %s/%s at revision %q: %w", owner, repository, revision, err)
 		}
-		statuses = append(statuses, response...)
+		for _, status := range response {
+			key := strings.ToLower(status.Context)
+			if _, wanted := remaining[key]; wanted {
+				statuses = append(statuses, status)
+				delete(remaining, key)
+			}
+		}
 		if len(response) < perPage {
-			return statuses, nil
+			break
 		}
 	}
+	return statuses, nil
 }
 
 // APIError describes a non-success response from the GitHub API.
@@ -283,6 +298,7 @@ func NewClient(baseURL string, httpClient *http.Client) (*Client, error) {
 		baseURL: parsed, httpClient: httpClient, now: time.Now,
 		installationCache: map[installationCacheKey]cachedInstallation{}, installationPending: map[installationCacheKey]*installationRequest{},
 		rateLimitReset: map[int64]time.Time{},
+		appCache:       map[appCacheKey]cachedApp{}, appPending: map[appCacheKey]*appRequest{},
 	}, nil
 }
 
@@ -291,8 +307,7 @@ func ValidatePrivateKey(data []byte) error {
 	return err
 }
 
-// AppBotLogin returns the bot login associated with a GitHub App.
-func (c *Client) AppBotLogin(ctx context.Context, appID int64, privateKey []byte) (string, error) {
+func (c *Client) appBotLogin(ctx context.Context, appID int64, privateKey []byte) (string, error) {
 	key, err := parsePrivateKey(privateKey)
 	if err != nil {
 		return "", err
