@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -598,6 +599,56 @@ func TestGitHubValidationSuccessRequiresAnExistingAppReport(t *testing.T) {
 	}
 }
 
+func TestGitHubStatusRecoveryStopsAfterNeededContexts(t *testing.T) {
+	var history []githubclient.CommitStatus
+	var reports []githubclient.CreateCommitStatusRequest
+	listCalls := 0
+	reporter, _, clusterClient, run, build, dependent := githubStatusTestControllers(t, func(writer http.ResponseWriter, request *http.Request) {
+		var report githubclient.CreateCommitStatusRequest
+		if err := json.NewDecoder(request.Body).Decode(&report); err != nil {
+			t.Error(err)
+		}
+		reports = append(reports, report)
+		fmt.Fprint(writer, `{"id":42}`)
+	}, func() []githubclient.CommitStatus {
+		listCalls++
+		if listCalls > 1 {
+			t.Error("status recovery read more history after finding all needed contexts")
+			return nil
+		}
+		return history
+	})
+	for index, job := range []*actionsv1alpha1.WorkflowJob{build, dependent} {
+		request := workflowJobCommitStatusRequest(reporter.ConsoleURL, run, job, workflowJobCommitStatusReport(run, job))
+		status := githubclient.CommitStatus{ID: int64(index + 1), State: request.State, Context: request.Context, TargetURL: request.TargetURL, Description: request.Description}
+		status.Creator.Login = "open-actions[bot]"
+		if job == build {
+			status.Creator.Login = "another-app[bot]"
+		}
+		history = append(history, status)
+	}
+	validation := githubclient.CommitStatus{ID: 3, Context: githubWorkflowValidationContext(run.Spec.WorkflowPath), State: "failure"}
+	validation.Creator.Login = "another-app[bot]"
+	history = append(history, validation)
+	for len(history) < 100 {
+		history = append(history, githubclient.CommitStatus{ID: int64(len(history) + 1), Context: history[0].Context, State: "success"})
+	}
+	for range 2 {
+		if _, err := reporter.Reconcile(t.Context(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(run)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if listCalls != 1 || len(reports) != 1 || reports[0].Context != history[0].Context || reports[0].State != "pending" {
+		t.Fatalf("status recovery: lists = %d, reports = %#v", listCalls, reports)
+	}
+	if err := clusterClient.Get(t.Context(), client.ObjectKeyFromObject(dependent), dependent); err != nil {
+		t.Fatal(err)
+	}
+	if status := workflowJobCommitStatus(dependent); status == nil || status.State != actionsv1alpha1.GitHubCommitStatusStatePending {
+		t.Fatalf("recovered job status = %#v", status)
+	}
+}
+
 func TestWorkflowJobCommitStatusReportMapsLifecycle(t *testing.T) {
 	completion := metav1.Now()
 	tests := []struct {
@@ -931,15 +982,53 @@ func TestGitHubStatusOwnershipLeaseSerializesReporters(t *testing.T) {
 	if err != nil || !current || olderLease == "" {
 		t.Fatalf("older claim = %t, %q, %v", current, olderLease, err)
 	}
+	key := client.ObjectKey{Namespace: project.Namespace, Name: githubStatusOwnerPrefix + "status-key"}
+	loadOwner := func() (*corev1.ConfigMap, githubStatusOwner) {
+		t.Helper()
+		object := &corev1.ConfigMap{}
+		if err := clusterClient.Get(t.Context(), key, object); err != nil {
+			t.Fatal(err)
+		}
+		owner := githubStatusOwner{}
+		if err := json.Unmarshal([]byte(object.Data[githubStatusOwnerDataKey]), &owner); err != nil {
+			t.Fatal(err)
+		}
+		return object, owner
+	}
+	object, owner := loadOwner()
+	owner.Reporting = &githubStatusReportingState{ValidationChecked: true, ReportDigests: map[string]string{"build": "digest"}}
+	data, err := json.Marshal(owner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	object.Data[githubStatusOwnerDataKey] = string(data)
+	if err := clusterClient.Update(t.Context(), object); err != nil {
+		t.Fatal(err)
+	}
 	if _, _, err := reconciler.claimGitHubStatusOwnership(context.Background(), newer, project, "status-key"); !apierrors.IsConflict(err) {
 		t.Fatalf("concurrent newer claim error = %v", err)
 	}
 	if err := reconciler.releaseGitHubStatusLease(context.Background(), project.Namespace, "status-key", olderLease); err != nil {
 		t.Fatal(err)
 	}
+	current, olderLease, err = reconciler.claimGitHubStatusOwnership(t.Context(), older, project, "status-key")
+	if err != nil || !current || olderLease == "" {
+		t.Fatalf("same owner claim = %t, %q, %v", current, olderLease, err)
+	}
+	_, owner = loadOwner()
+	if owner.Reporting == nil || !owner.Reporting.ValidationChecked || owner.Reporting.ReportDigests["build"] != "digest" {
+		t.Fatalf("reporting state for the same owner = %#v", owner.Reporting)
+	}
+	if err := reconciler.releaseGitHubStatusLease(t.Context(), project.Namespace, "status-key", olderLease); err != nil {
+		t.Fatal(err)
+	}
 	current, newerLease, err := reconciler.claimGitHubStatusOwnership(context.Background(), newer, project, "status-key")
 	if err != nil || !current || newerLease == "" {
 		t.Fatalf("newer claim = %t, %q, %v", current, newerLease, err)
+	}
+	_, owner = loadOwner()
+	if owner.Reporting != nil {
+		t.Fatalf("reporting state after ownership handoff = %#v, want nil", owner.Reporting)
 	}
 }
 
@@ -1244,13 +1333,19 @@ func githubStatusTestControllers(t *testing.T, publish http.HandlerFunc, statusH
 		case request.URL.Path == "/app":
 			fmt.Fprint(writer, `{"id":1,"slug":"open-actions"}`)
 		case request.URL.Path == "/app/installations/2/access_tokens":
-			fmt.Fprint(writer, `{"token":"statuses-token"}`)
+			fmt.Fprintf(writer, `{"token":"statuses-token","expires_at":%q}`, time.Now().Add(time.Hour).UTC().Format(time.RFC3339))
 		case request.Method == http.MethodGet && strings.HasSuffix(request.URL.Path, "/statuses"):
+			statuses := []githubclient.CommitStatus{}
 			if len(statusHistory) != 0 {
-				_ = json.NewEncoder(writer).Encode(statusHistory[0]())
-			} else {
-				fmt.Fprint(writer, `[]`)
+				statuses = statusHistory[0]()
 			}
+			page, err := strconv.Atoi(request.URL.Query().Get("page"))
+			if err != nil || page < 1 || request.URL.Query().Get("per_page") != "100" {
+				http.Error(writer, "unexpected status pagination", http.StatusBadRequest)
+				return
+			}
+			start := min((page-1)*100, len(statuses))
+			_ = json.NewEncoder(writer).Encode(statuses[start:min(start+100, len(statuses))])
 		case request.Method == http.MethodPost && strings.Contains(request.URL.Path, "/statuses/"):
 			publish(writer, request)
 		default:
