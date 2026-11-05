@@ -1693,6 +1693,10 @@ executing member. Cancelling an executing job does not cancel its WorkflowRun or
 unrelated jobs. A replacement acquires the group only after the executing
 member's active workload and cancellation-aware cleanup have stopped.
 
+A workflow run cancelled while waiting for its group completes without acquiring
+the group. All of its jobs are cancelled without Runner assignment, including
+cancellation-aware jobs and jobs with deferred matrix expansion.
+
 Workflow concurrency is acquired before any jobs in the run become ready. Job
 concurrency is evaluated after direct dependencies reach terminal results and
 the job condition passes, when `needs`, `strategy`, and `matrix` values are
