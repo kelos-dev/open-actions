@@ -546,8 +546,9 @@ immutable `spec.source.github.actor` records the source actor. Set
 `spec.cancelRequested` to gracefully cancel ordinary jobs while
 allowing cancellation-aware reporting and cleanup jobs to finish. Deleting a
 WorkflowRun force-cancels and removes its child resources. A Runner's
-`spec.projectRef` is immutable, and changes to `spec.execution` apply only to
-Kubernetes Jobs created afterward. `spec.execution.resources` sets CPU, memory,
+`spec.projectRef` is immutable. Pod execution settings apply to Kubernetes Jobs
+created afterward; Service settings are captured when execution is prepared.
+`spec.execution.resources` sets CPU, memory,
 and huge page requests and limits for the workflow Pod as a whole. Requests
 cannot exceed their corresponding limits. During native Job validation,
 Kubernetes also requires huge page requests to equal their limits and be
@@ -575,7 +576,16 @@ that Runner, but are not added to the workflow `env` expression context.
 Secret-backed values are exposed to every assigned workflow, including fork
 pull requests regardless of `spec.source.github.forkPullRequests.sendSecrets`.
 Controller-defined variables take precedence over configured entries with the
-same name. `spec.execution.runner.imagePullPolicy` controls
+same name.
+
+All runner Pods disable Kubernetes Service-link environment injection, including
+Runners without `spec.execution.service`. Workflow steps should use cluster DNS
+names such as `cache.NAMESPACE.svc` to reach namespace Services. The kubelet does
+not supply `<NAME>_SERVICE_HOST`, `<NAME>_SERVICE_PORT`, or `<NAME>_PORT_*` variables
+for those Services. Kubernetes API Service variables (`KUBERNETES_SERVICE_*`)
+are injected independently of Service links.
+
+`spec.execution.runner.imagePullPolicy` controls
 when Kubernetes pulls the runner image and accepts `Always`, `IfNotPresent`, or
 `Never`; omitting it uses Kubernetes defaulting. `spec.execution.imagePullSecrets`
 accepts up to 32 unique Secret references in the Runner's namespace that
@@ -1053,15 +1063,138 @@ numeric non-root user. The complete example Dockerfile is available at
 
 A RunnerSet creates and owns homogeneous Runner resources from
 `spec.template.spec`. `spec.replicas` defaults to one and may be zero. Template
-changes update non-terminating managed Runners and affect only WorkflowJobs
-created or assigned afterward according to the corresponding Runner field's
-contract. Scaling down removes idle Runners before busy Runners. A busy Runner
+changes update non-terminating managed Runners. Execution settings take effect
+according to the corresponding Runner field's contract. Scaling down removes
+idle Runners before busy Runners. A busy Runner
 selected for removal stops accepting assignments, finishes its current
 WorkflowJob, and then terminates. `status.replicas`, `readyReplicas`,
 `busyReplicas`, `idleReplicas`, and `terminatingReplicas` summarize the managed
 Runners. The scale subresource supports `kubectl scale` and compatible scaling
 controllers. See the [RunnerSet sample](../config/samples/actions_v1alpha1_runnerset.yaml)
 for a complete manifest.
+
+### Exposing a workflow job
+
+Set `spec.execution.service` on a Runner or
+`spec.template.spec.execution.service` on a RunnerSet to expose each assigned
+WorkflowJob through its own Kubernetes
+[Service](https://kubernetes.io/docs/concepts/services-networking/service/).
+Omitting `service` disables automatic exposure. For example:
+
+```yaml
+apiVersion: actions.kelos.dev/v1alpha1
+kind: RunnerSet
+metadata:
+  name: preview
+  namespace: open-actions
+spec:
+  replicas: 1
+  template:
+    spec:
+      projectRef:
+        name: default
+      labels:
+        - preview
+      execution:
+        runner:
+          image: ghcr.io/kelos-dev/open-actions-runner:latest
+        service:
+          ports:
+            - name: http
+              port: 80
+              targetPort: 8080
+```
+
+The complete manifest is available in the
+[Service RunnerSet sample](../config/samples/actions_v1alpha1_runnerset-service.yaml).
+Use the controller's release tag for the runner image. Every job assigned to
+these Runners receives a Service, including fork pull request jobs. Use a
+dedicated label such as `preview` when only preview workflows should use these
+Runners. The example RunnerSet has only that label, so workflows requesting
+`ubuntu-latest` do not match it.
+
+| Field | Behavior |
+| --- | --- |
+| `service.type` | `ClusterIP` (default), `NodePort`, or `LoadBalancer`. Kubernetes allocates addresses and any node ports. |
+| `service.ports` | Required list of 1–16 ports with unique names and unique port/protocol combinations. |
+| `service.ports[].name` | Required DNS label of at most 63 characters. |
+| `service.ports[].port` | Required Service port, from 1 to 65535. |
+| `service.ports[].targetPort` | Optional numeric Pod port, from 1 to 65535; defaults to `port`. Named targets are not supported. |
+| `service.ports[].protocol` | `TCP` (default), `UDP`, or `SCTP`. |
+
+The controller owns each Service's name, namespace, selector, and owner
+reference. It captures the configuration when preparing execution; subsequent
+Runner or RunnerSet edits apply to executions whose configuration has not yet
+been captured. Each Service selects exactly one WorkflowJob UID, isolating
+concurrent runs, matrix combinations, and rerun attempts. Deleted Services are
+recreated from the captured settings while their jobs remain active. The
+controller creates the Service before the runner Job and records its name in
+`WorkflowJob.status.serviceRef.name`. This reference indicates that the Service
+exists, not that the application is ready or that an external load balancer has
+finished provisioning.
+
+The workflow uses standard
+[GitHub Actions syntax](https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax).
+Its server must listen on `0.0.0.0` and keep running while clients use it.
+Save this example in the Project's configured workflow directory and dispatch
+it from the Console:
+
+```yaml
+name: Preview
+on:
+  workflow_dispatch:
+jobs:
+  preview:
+    runs-on: preview
+    timeout-minutes: 30
+    steps:
+      - name: Serve preview
+        run: |
+          node <<'JS'
+          const http = require('node:http');
+          http.createServer((request, response) => {
+            response.end('Workflow preview\n');
+          }).listen(8080, '0.0.0.0');
+          JS
+```
+
+This example uses Node.js from the standard runner image and stays in the
+foreground until cancellation or timeout. The job timeout is capped by the
+controller's `--max-job-timeout`. A numeric `targetPort` does not require a
+`containerPort` declaration on the runner Pod. Pod readiness does not check
+application readiness, so clients may need to wait for server startup.
+
+From a machine with Kubernetes credentials, find the WorkflowJob resource name
+and wait for its Service reference:
+
+```bash
+OPEN_ACTIONS_NAMESPACE=open-actions
+kubectl -n "$OPEN_ACTIONS_NAMESPACE" get workflowjobs
+WORKFLOW_JOB=REPLACE_WITH_WORKFLOWJOB_RESOURCE_NAME
+kubectl -n "$OPEN_ACTIONS_NAMESPACE" wait --timeout=120s \
+  --for=jsonpath='{.status.serviceRef.name}' "workflowjob/$WORKFLOW_JOB"
+SERVICE_NAME=$(kubectl -n "$OPEN_ACTIONS_NAMESPACE" get workflowjob "$WORKFLOW_JOB" \
+  -o jsonpath='{.status.serviceRef.name}')
+kubectl -n "$OPEN_ACTIONS_NAMESPACE" port-forward "service/$SERVICE_NAME" 8081:80
+```
+
+Open `http://localhost:8081` while the port forward is running. Cluster clients
+can reach `http://SERVICE_NAME.NAMESPACE.svc` using the values above. For
+external access, configure `service.type: LoadBalancer` when the cluster
+provides a load balancer, or route an Ingress to the generated Service.
+NetworkPolicies must allow the intended traffic to the runner Pod's port.
+Workflows need no Kubernetes credentials to receive a Service; the controller
+manages it. Runner Pods disable Kubernetes Service links, so concurrent jobs'
+Services do not inject environment variables into workflow steps. Use the
+Service reference and cluster DNS to discover the endpoint.
+
+Completion, cancellation, timeout, or startup failure causes the controller to
+request Service deletion and clear `status.serviceRef`. Kubernetes garbage
+collection also removes the Service when its owning WorkflowJob is deleted.
+A load balancer may take additional time to release its resources. Retaining a
+completed Pod does not keep its server running. For an application that must
+remain available after the workflow finishes, deploy it as a separate
+Deployment and Service.
 
 ### Docker execution
 
@@ -1331,6 +1464,11 @@ their Pods carry the
 runner result format required to complete that job. Native Jobs also carry
 `actions.kelos.dev/job-deadline`: `startup` means deadline expiry is reported
 as `JobStartFailed`, while `execution` means it is reported as `JobTimedOut`.
+WorkflowJobs with automatic Service exposure carry the controller-owned
+`actions.kelos.dev/job-service` annotation containing their captured Service
+configuration. Users must not set or modify it. The controller uses this
+configuration to restore the Service without depending on later Runner edits.
+
 WorkflowJobs configured for archived logs carry the controller-owned
 `actions.kelos.dev/log-archive` annotation with value `"true"`. The Console and
 CLI use it to select the archived log source. Users must not set or modify it.
