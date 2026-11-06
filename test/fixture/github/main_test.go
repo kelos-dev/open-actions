@@ -81,6 +81,12 @@ func TestConcurrencyWorkflowsAreValid(t *testing.T) {
 	}
 }
 
+func TestJobServiceWorkflowIsValid(t *testing.T) {
+	if _, err := workflow.Parse([]byte(jobServiceWorkflowData)); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestSelectiveRerunWorkflowIsValid(t *testing.T) {
 	for _, data := range []string{selectiveRerunWorkflowData, selectiveMatrixRerunWorkflowData} {
 		definition, err := workflow.Parse([]byte(data))

@@ -1,0 +1,21 @@
+apiVersion: actions.kelos.dev/v1alpha1
+kind: RunnerSet
+metadata:
+  name: preview
+  namespace: open-actions
+spec:
+  replicas: 1
+  template:
+    spec:
+      projectRef:
+        name: default
+      labels:
+        - preview
+      execution:
+        runner:
+          image: ghcr.io/kelos-dev/open-actions-runner:latest
+        service:
+          ports:
+            - name: http
+              port: 80
+              targetPort: 8080

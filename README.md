@@ -282,6 +282,12 @@ Completed native Jobs and runner Pods are retained with their WorkflowRun.
 Jobs started without archiving read Pod logs and remain subject to kubelet
 rotation.
 
+To expose servers running in workflow jobs, configure `execution.service` on a
+Runner or RunnerSet template. Open Actions creates a separate Service for each
+job and removes it when the job finishes. See
+[exposing a workflow job](docs/reference.md#exposing-a-workflow-job) for the API,
+a complete example, local port forwarding, and external access options.
+
 ## API reference
 
 See the [API reference](docs/reference.md) for Kubernetes resources, command-line

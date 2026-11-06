@@ -222,6 +222,7 @@ type WorkflowJobSourceStatus struct {
 // +kubebuilder:validation:XValidation:rule="!has(oldSelf.runnerRef) || self.runnerRef == oldSelf.runnerRef",message="runnerRef is immutable after assignment"
 // +kubebuilder:validation:XValidation:rule="!has(oldSelf.result) || self.result == oldSelf.result",message="result is immutable after completion"
 // +kubebuilder:validation:XValidation:rule="!has(self.runnerRef) || (size(self.runnerRef.name) > 0 && size(self.runnerRef.name) <= 253 && self.runnerRef.name.matches('^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?([.][a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?)*$'))",message="`runnerRef.name` must be a DNS subdomain"
+// +kubebuilder:validation:XValidation:rule="!has(self.serviceRef) || (size(self.serviceRef.name) > 0 && size(self.serviceRef.name) <= 63 && self.serviceRef.name.matches('^[a-z]([-a-z0-9]*[a-z0-9])?$'))",message="`serviceRef.name` must be a Service name"
 type WorkflowJobStatus struct {
 	// ObservedGeneration is the most recent generation observed by the
 	// controller.
@@ -237,6 +238,11 @@ type WorkflowJobStatus struct {
 	// It is set once when the job is claimed.
 	// +optional
 	RunnerRef *corev1.LocalObjectReference `json:"runnerRef,omitempty"`
+
+	// ServiceRef identifies the managed Service in this job's namespace. It is
+	// set after the Service is created and cleared when the job is completed.
+	// +optional
+	ServiceRef *corev1.LocalObjectReference `json:"serviceRef,omitempty"`
 
 	// StartTime is when the runner container started.
 	// +optional

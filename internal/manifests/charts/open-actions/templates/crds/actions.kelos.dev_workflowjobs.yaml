@@ -390,6 +390,22 @@ spec:
                     type: string
                 type: object
                 x-kubernetes-map-type: atomic
+              serviceRef:
+                description: |-
+                  ServiceRef identifies the managed Service in this job's namespace. It is
+                  set after the Service is created and cleared when the job is completed.
+                properties:
+                  name:
+                    default: ""
+                    description: |-
+                      Name of the referent.
+                      This field is effectively required, but due to backwards compatibility is
+                      allowed to be empty. Instances of this type with an empty value here are
+                      almost certainly wrong.
+                      More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                    type: string
+                type: object
+                x-kubernetes-map-type: atomic
               source:
                 description: Source contains provider-specific reporting state.
                 properties:
@@ -434,6 +450,9 @@ spec:
             - message: '`runnerRef.name` must be a DNS subdomain'
               rule: '!has(self.runnerRef) || (size(self.runnerRef.name) > 0 && size(self.runnerRef.name)
                 <= 253 && self.runnerRef.name.matches(''^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?([.][a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?)*$''))'
+            - message: '`serviceRef.name` must be a Service name'
+              rule: '!has(self.serviceRef) || (size(self.serviceRef.name) > 0 && size(self.serviceRef.name)
+                <= 63 && self.serviceRef.name.matches(''^[a-z]([-a-z0-9]*[a-z0-9])?$''))'
         required:
         - spec
         type: object
