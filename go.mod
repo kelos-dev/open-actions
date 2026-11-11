@@ -1,6 +1,6 @@
 module github.com/kelos-dev/open-actions
 
-go 1.25.0
+go 1.27.4
 
 require (
 	github.com/dlclark/regexp2/v2 v2.6.0
