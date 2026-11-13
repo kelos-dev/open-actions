@@ -22,12 +22,14 @@ func main() {
 type commandDependencies struct {
 	defaultKubeconfig string
 	newRunClients     runClientFactory
+	runCommand        installer.CommandFunc
 }
 
 func run(ctx context.Context, arguments []string, stdout, stderr io.Writer) error {
 	return runWithDependencies(ctx, arguments, stdout, stderr, commandDependencies{
 		defaultKubeconfig: os.Getenv(clientcmd.RecommendedConfigPathEnvVar),
 		newRunClients:     newKubernetesRunClients,
+		runCommand:        installer.RunCommand,
 	})
 }
 
