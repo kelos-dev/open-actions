@@ -1,17 +1,25 @@
 package workflowrun
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/base32"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 
 	actionsv1alpha1 "github.com/kelos-dev/open-actions/api/v1alpha1"
 	"github.com/kelos-dev/open-actions/internal/eventsnapshot"
+	corev1 "k8s.io/api/core/v1"
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 )
 
 const (
@@ -235,4 +243,195 @@ func (h *JobHistory) Add(run *actionsv1alpha1.WorkflowRun, jobs []actionsv1alpha
 		}
 	}
 	return retained
+}
+
+// MaxAttempt is the highest rerun attempt a WorkflowRun lineage can reach.
+const MaxAttempt = int32(2147483647)
+
+// ConflictError reports that a WorkflowRun lineage does not allow the
+// requested rerun. Its message is safe to show to the requester.
+type ConflictError struct {
+	Message string
+}
+
+func (e *ConflictError) Error() string {
+	return e.Message
+}
+
+// Lineage returns the original WorkflowRun and the latest valid attempt of the
+// lineage that run belongs to.
+func Lineage(ctx context.Context, reader client.Reader, run *actionsv1alpha1.WorkflowRun) (*actionsv1alpha1.WorkflowRun, *actionsv1alpha1.WorkflowRun, error) {
+	root := run
+	if run.Spec.Rerun != nil {
+		root = &actionsv1alpha1.WorkflowRun{}
+		key := client.ObjectKey{Namespace: run.Namespace, Name: run.Spec.Rerun.OriginalRunRef.Name}
+		if err := reader.Get(ctx, key, root); err != nil {
+			return nil, nil, fmt.Errorf("load original WorkflowRun %q for WorkflowRun %q: %w", key.Name, run.Name, err)
+		}
+		if root.UID != run.Spec.Rerun.OriginalRunRef.UID || root.Spec.Rerun != nil {
+			return nil, nil, fmt.Errorf("WorkflowRun %q does not have a valid original WorkflowRun", run.Name)
+		}
+	}
+	runs := &actionsv1alpha1.WorkflowRunList{}
+	if err := reader.List(ctx, runs, client.InNamespace(root.Namespace), client.MatchingLabels{actionsv1alpha1.LabelWorkflowRunRootUID: string(root.UID)}); err != nil {
+		return nil, nil, fmt.Errorf("load rerun attempts for WorkflowRun %q: %w", root.Name, err)
+	}
+	if run.Spec.Rerun != nil {
+		found := false
+		for index := range runs.Items {
+			found = runs.Items[index].UID == run.UID
+			if found {
+				break
+			}
+		}
+		if !found {
+			runs.Items = append(runs.Items, *run.DeepCopy())
+		}
+	}
+	latest, err := LatestAttempt(root, runs.Items)
+	if err != nil {
+		return nil, nil, fmt.Errorf("resolve rerun attempts for WorkflowRun %q: %w", root.Name, err)
+	}
+	return root, latest, nil
+}
+
+// RerunPlan identifies the next attempt of a WorkflowRun lineage.
+type RerunPlan struct {
+	// Root is the original WorkflowRun of the lineage.
+	Root *actionsv1alpha1.WorkflowRun
+	// Latest is the attempt that the next attempt follows.
+	Latest *actionsv1alpha1.WorkflowRun
+	// Attempt is the number of the next attempt.
+	Attempt int32
+}
+
+// PlanRerun resolves the next attempt of the lineage that run belongs to. It
+// returns a ConflictError when the latest attempt cannot be rerun.
+func PlanRerun(ctx context.Context, reader client.Reader, run *actionsv1alpha1.WorkflowRun) (*RerunPlan, error) {
+	root, latest, err := Lineage(ctx, reader, run)
+	if err != nil {
+		return nil, err
+	}
+	if !Terminal(latest) {
+		return nil, &ConflictError{Message: "the latest workflow attempt is not complete"}
+	}
+	attempt := int32(2)
+	if latest.Spec.Rerun != nil {
+		if latest.Spec.Rerun.Attempt == MaxAttempt {
+			return nil, &ConflictError{Message: "workflow rerun attempt limit reached"}
+		}
+		attempt = latest.Spec.Rerun.Attempt + 1
+	}
+	return &RerunPlan{Root: root, Latest: latest, Attempt: attempt}, nil
+}
+
+// FailedJobIDs selects the failed jobs of the latest attempt and their
+// dependents. It returns a ConflictError when the latest attempt did not fail
+// because of a job.
+func (p *RerunPlan) FailedJobIDs(ctx context.Context, reader client.Reader) ([]string, error) {
+	if !Failed(p.Latest) {
+		return nil, &ConflictError{Message: "the latest workflow attempt did not fail because of a job"}
+	}
+	jobs := &actionsv1alpha1.WorkflowJobList{}
+	if err := reader.List(ctx, jobs, client.InNamespace(p.Latest.Namespace), client.MatchingLabels{actionsv1alpha1.LabelWorkflowRunUID: string(p.Latest.UID)}); err != nil {
+		return nil, fmt.Errorf("load WorkflowJobs for WorkflowRun %q: %w", p.Latest.Name, err)
+	}
+	jobIDs, err := FailedJobIDs(p.Latest, jobs.Items)
+	if err != nil {
+		return nil, &ConflictError{Message: err.Error()}
+	}
+	return jobIDs, nil
+}
+
+// Create creates the planned attempt for jobIDs, or for every job when jobIDs
+// is empty, and returns it. It returns a ConflictError when another request
+// already created the attempt. The returned WorkflowRun is the persisted
+// attempt when an ambiguous create error hid a successful create.
+func (p *RerunPlan) Create(ctx context.Context, kube client.Client, jobIDs []string) (*actionsv1alpha1.WorkflowRun, error) {
+	desired := NewRerun(p.Root, p.Latest, p.Attempt, jobIDs)
+	if desired.Annotations[eventsnapshot.Annotation] != "" {
+		if err := protectRerunEventSnapshot(ctx, kube, p.Root, desired.Name); err != nil {
+			return nil, fmt.Errorf("protect event snapshot for WorkflowRun %q rerun: %w", p.Root.Name, err)
+		}
+	}
+	if err := kube.Create(ctx, desired); err != nil {
+		if apierrors.IsAlreadyExists(err) {
+			return nil, &ConflictError{Message: "another workflow rerun was requested"}
+		}
+		persisted := &actionsv1alpha1.WorkflowRun{}
+		getErr := kube.Get(ctx, client.ObjectKeyFromObject(desired), persisted)
+		switch {
+		case getErr == nil && MatchingRerun(persisted, desired):
+			return persisted, nil
+		case apierrors.IsNotFound(getErr):
+			if desired.Annotations[eventsnapshot.Annotation] != "" {
+				err = errors.Join(err, releaseRerunEventSnapshotProtection(ctx, kube, p.Root, desired.Name))
+			}
+		case getErr != nil:
+			err = errors.Join(err, fmt.Errorf("check rerun WorkflowRun %q after create error: %w", desired.Name, getErr))
+		default:
+			err = errors.Join(err, fmt.Errorf("WorkflowRun %q does not match the requested rerun", persisted.Name))
+		}
+		return nil, fmt.Errorf("create rerun WorkflowRun %q for WorkflowRun %q: %w", desired.Name, p.Latest.Name, err)
+	}
+	return desired, nil
+}
+
+// MatchingRerun reports whether an existing WorkflowRun is the requested rerun attempt.
+func MatchingRerun(existing, desired *actionsv1alpha1.WorkflowRun) bool {
+	return apiequality.Semantic.DeepEqual(existing.Spec, desired.Spec) &&
+		existing.Labels[actionsv1alpha1.LabelWorkflowRunRootUID] == desired.Labels[actionsv1alpha1.LabelWorkflowRunRootUID] &&
+		existing.Annotations[eventsnapshot.Annotation] == desired.Annotations[eventsnapshot.Annotation]
+}
+
+// protectRerunEventSnapshot keeps the original run's GitHub event snapshot
+// available until the controller plans the named rerun attempt.
+func protectRerunEventSnapshot(ctx context.Context, kube client.Client, root *actionsv1alpha1.WorkflowRun, rerunName string) error {
+	if !root.DeletionTimestamp.IsZero() {
+		return fmt.Errorf("WorkflowRun %q is being deleted", root.Name)
+	}
+	secret := &corev1.Secret{}
+	name := root.Annotations[eventsnapshot.Annotation]
+	if err := kube.Get(ctx, client.ObjectKey{Namespace: root.Namespace, Name: name}, secret); err != nil {
+		return err
+	}
+	data, found := secret.Data[eventsnapshot.DataKey]
+	if !secret.DeletionTimestamp.IsZero() || !ownsEventSnapshot(secret, root.Name, root.UID) || secret.Immutable == nil || !*secret.Immutable || !found {
+		return fmt.Errorf("GitHub event snapshot Secret %q is invalid for WorkflowRun %q", name, root.Name)
+	}
+	if _, err := eventsnapshot.Decode(data); err != nil {
+		return fmt.Errorf("GitHub event snapshot Secret %q is invalid for WorkflowRun %q: %w", name, root.Name, err)
+	}
+	if target := root.Annotations[eventsnapshot.RerunTargetAnnotation]; target != "" && target != rerunName {
+		return fmt.Errorf("WorkflowRun %q is already creating rerun %q", root.Name, target)
+	}
+	if controllerutil.ContainsFinalizer(root, eventsnapshot.RerunProtectionFinalizer) && root.Annotations[eventsnapshot.RerunTargetAnnotation] == rerunName {
+		return nil
+	}
+	if root.Annotations == nil {
+		root.Annotations = map[string]string{}
+	}
+	root.Annotations[eventsnapshot.RerunTargetAnnotation] = rerunName
+	root.Annotations[eventsnapshot.RerunDeadlineAnnotation] = time.Now().UTC().Add(time.Minute).Format(time.RFC3339Nano)
+	controllerutil.AddFinalizer(root, eventsnapshot.RerunProtectionFinalizer)
+	return kube.Update(ctx, root)
+}
+
+func releaseRerunEventSnapshotProtection(ctx context.Context, kube client.Client, root *actionsv1alpha1.WorkflowRun, rerunName string) error {
+	if root.Annotations[eventsnapshot.RerunTargetAnnotation] != rerunName {
+		return nil
+	}
+	delete(root.Annotations, eventsnapshot.RerunTargetAnnotation)
+	delete(root.Annotations, eventsnapshot.RerunDeadlineAnnotation)
+	controllerutil.RemoveFinalizer(root, eventsnapshot.RerunProtectionFinalizer)
+	return kube.Update(ctx, root)
+}
+
+func ownsEventSnapshot(secret *corev1.Secret, name string, uid types.UID) bool {
+	for _, owner := range secret.OwnerReferences {
+		if owner.APIVersion == actionsv1alpha1.GroupVersion.String() && owner.Kind == "WorkflowRun" && owner.Name == name && owner.UID == uid {
+			return true
+		}
+	}
+	return false
 }
