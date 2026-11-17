@@ -153,6 +153,9 @@ func TestRunnerBuildsOwnedJob(t *testing.T) {
 	if job.Spec.Template.Spec.AutomountServiceAccountToken == nil || *job.Spec.Template.Spec.AutomountServiceAccountToken {
 		t.Error("service account token must not be mounted")
 	}
+	if job.Spec.Template.Spec.EnableServiceLinks == nil || *job.Spec.Template.Spec.EnableServiceLinks {
+		t.Error("Service links must not inject environment variables into workflow steps")
+	}
 	if job.Spec.Template.Spec.SecurityContext == nil ||
 		job.Spec.Template.Spec.SecurityContext.RunAsNonRoot == nil || !*job.Spec.Template.Spec.SecurityContext.RunAsNonRoot ||
 		job.Spec.Template.Spec.SecurityContext.SeccompProfile == nil || job.Spec.Template.Spec.SecurityContext.SeccompProfile.Type != corev1.SeccompProfileTypeRuntimeDefault {
@@ -2013,25 +2016,29 @@ func TestMissingPlanFailsAssignedWorkflowJob(t *testing.T) {
 
 func TestExecuteWorkflowJobMintsPlannedTokenPermissions(t *testing.T) {
 	t.Run("external action", func(t *testing.T) {
-		testExecuteWorkflowJobMintsPlannedTokenPermissions(t, []runner.Step{{Uses: "actions/checkout@v4"}}, true, time.Hour)
+		testExecuteWorkflowJobMintsPlannedTokenPermissions(t, []runner.Step{{Uses: "actions/checkout@v4"}}, true, time.Hour, nil)
 	})
 	t.Run("script only", func(t *testing.T) {
-		testExecuteWorkflowJobMintsPlannedTokenPermissions(t, []runner.Step{{Run: "true"}}, false, time.Hour)
+		testExecuteWorkflowJobMintsPlannedTokenPermissions(t, []runner.Step{{Run: "true"}}, false, time.Hour, nil)
 	})
 	t.Run("expiring credentials", func(t *testing.T) {
-		testExecuteWorkflowJobMintsPlannedTokenPermissions(t, []runner.Step{{Uses: "actions/checkout@v4"}}, true, installationTokenStartMargin)
+		testExecuteWorkflowJobMintsPlannedTokenPermissions(t, []runner.Step{{Uses: "actions/checkout@v4"}}, true, installationTokenStartMargin, nil)
 	})
+}
+
+func TestExecuteWorkflowJobCreatesService(t *testing.T) {
+	testExecuteWorkflowJobMintsPlannedTokenPermissions(t, []runner.Step{{Run: "true"}}, false, time.Hour, serviceTestRunner().Spec.Execution.Service)
 }
 
 func TestCacheControllerCredentials(t *testing.T) {
 	for _, mode := range []string{"", "read", "write-only", "none"} {
 		t.Run("mode="+mode, func(t *testing.T) {
-			testExecuteWorkflowJobMintsPlannedTokenPermissions(t, []runner.Step{{Run: "true"}}, false, time.Hour, mode)
+			testExecuteWorkflowJobMintsPlannedTokenPermissions(t, []runner.Step{{Run: "true"}}, false, time.Hour, nil, mode)
 		})
 	}
 }
 
-func testExecuteWorkflowJobMintsPlannedTokenPermissions(t *testing.T, steps []runner.Step, wantActionToken bool, tokenLifetime time.Duration, cacheModes ...string) {
+func testExecuteWorkflowJobMintsPlannedTokenPermissions(t *testing.T, steps []runner.Step, wantActionToken bool, tokenLifetime time.Duration, service *actionsv1alpha1.RunnerServiceSpec, cacheModes ...string) {
 	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
 		t.Fatal(err)
@@ -2144,6 +2151,7 @@ func testExecuteWorkflowJobMintsPlannedTokenPermissions(t *testing.T, steps []ru
 		ObjectMeta: metav1.ObjectMeta{Name: "runner", Namespace: "default", UID: types.UID("runner-uid")},
 		Spec:       actionsv1alpha1.RunnerSpec{Execution: runnerExecution("runner:test")},
 	}
+	runnerObject.Spec.Execution.Service = service
 	clusterClient := fake.NewClientBuilder().WithScheme(scheme).
 		WithStatusSubresource(&actionsv1alpha1.WorkflowJob{}, &batchv1.Job{}).
 		WithObjects(project, run, workflowJob, plan, credentials, runnerObject).Build()
@@ -2207,6 +2215,14 @@ func testExecuteWorkflowJobMintsPlannedTokenPermissions(t *testing.T, steps []ru
 	}
 	if stored.Annotations[joblog.ArchiveAnnotation] != "true" {
 		t.Fatalf("archive annotation = %v", stored.Annotations)
+	}
+	if service != nil {
+		endpoint := getJobService(t, reconciler, stored)
+		if stored.Status.ServiceRef == nil || stored.Status.ServiceRef.Name != endpoint.Name || endpoint.Spec.Ports[0].TargetPort.IntVal != 8080 {
+			t.Fatalf("WorkflowJob Service: status %#v, ports %#v", stored.Status, endpoint.Spec.Ports)
+		}
+	} else if stored.Status.ServiceRef != nil {
+		t.Fatalf("Service was created without configuration: %#v", stored.Status.ServiceRef)
 	}
 	claims, err := tokens.ParseRuntimeToken(string(auth.Data[artifact.TokenSecretKey]), time.Now())
 	if err != nil || claims.WorkflowJobBackendID != string(workflowJob.UID) {

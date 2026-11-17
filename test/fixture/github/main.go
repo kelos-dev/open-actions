@@ -951,6 +951,9 @@ func main() {
 	mux.HandleFunc("/repos/acme/example/contents/"+cacheWorkflowPath, func(writer http.ResponseWriter, _ *http.Request) {
 		writeJSON(writer, map[string]string{"encoding": "base64", "content": base64.StdEncoding.EncodeToString([]byte(cacheWorkflowData))})
 	})
+	mux.HandleFunc("/repos/acme/example/contents/"+jobServiceWorkflowPath, func(writer http.ResponseWriter, _ *http.Request) {
+		writeJSON(writer, map[string]string{"encoding": "base64", "content": base64.StdEncoding.EncodeToString([]byte(jobServiceWorkflowData))})
+	})
 	mux.HandleFunc("/repos/acme/example/contents/"+artifactWorkflowPath, func(writer http.ResponseWriter, _ *http.Request) {
 		writeJSON(writer, map[string]string{"encoding": "base64", "content": base64.StdEncoding.EncodeToString([]byte(artifactWorkflowData))})
 	})

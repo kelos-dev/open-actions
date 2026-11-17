@@ -27,6 +27,7 @@ func TestRunnerSetCreatesDesiredRunners(t *testing.T) {
 			Template: actionsv1alpha1.RunnerTemplateSpec{Spec: runnerSetTestRunnerSpec()},
 		},
 	}
+	runnerSet.Spec.Template.Spec.Execution.Service = serviceTestRunner().Spec.Execution.Service
 	clusterClient := runnerSetTestClient(scheme, runnerSet)
 	reconciler := runnerSetTestReconciler(clusterClient)
 	request := ctrl.Request{NamespacedName: client.ObjectKeyFromObject(runnerSet)}
@@ -51,6 +52,9 @@ func TestRunnerSetCreatesDesiredRunners(t *testing.T) {
 		}
 		if runner.Spec.Execution.Runner.Image != "runner:test" || len(runner.Spec.Execution.Runner.Env) != 1 || runner.Spec.Execution.Runner.Env[0].Name != "CACHE_URL" || runner.Spec.Execution.Runner.Env[0].Value != "https://cache.example" || len(runner.Spec.Labels) != 2 {
 			t.Errorf("Runner %q spec = %#v", runner.Name, runner.Spec)
+		}
+		if runner.Spec.Execution.Service == nil || len(runner.Spec.Execution.Service.Ports) != 1 || runner.Spec.Execution.Service.Ports[0].Name != "http" || *runner.Spec.Execution.Service.Ports[0].TargetPort != 8080 {
+			t.Fatalf("Runner %q Service configuration = %#v", runner.Name, runner.Spec.Execution.Service)
 		}
 	}
 	stored := &actionsv1alpha1.RunnerSet{}

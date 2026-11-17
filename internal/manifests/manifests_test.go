@@ -117,6 +117,28 @@ func TestConsoleAnonymousWorkflowConfiguration(t *testing.T) {
 	}
 }
 
+func TestControllerCanManageJobServices(t *testing.T) {
+	data, err := fs.ReadFile(Chart(), "templates/rbac.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	role := rbacv1.ClusterRole{}
+	if err := yaml.Unmarshal(bytes.Split(data, []byte("---"))[0], &role); err != nil {
+		t.Fatal(err)
+	}
+	for _, verb := range []string{"get", "create", "patch", "delete"} {
+		allowed := false
+		for _, rule := range role.Rules {
+			if slices.Contains(rule.APIGroups, "") && slices.Contains(rule.Resources, "services") && slices.Contains(rule.Verbs, verb) && len(rule.ResourceNames) == 0 {
+				allowed = true
+			}
+		}
+		if !allowed {
+			t.Fatalf("controller cannot %s Services: %#v", verb, role.Rules)
+		}
+	}
+}
+
 func TestConsoleCanManageProjectValuesAcrossNamespaces(t *testing.T) {
 	chart := Chart()
 	data, err := fs.ReadFile(chart, "templates/console-rbac.yaml")

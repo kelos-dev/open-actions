@@ -325,7 +325,7 @@ func (r *RunnerReconciler) assignedWorkflowJob(ctx context.Context, runnerObject
 			return nil, err
 		}
 		if terminalWorkflowJob(workflowJob) {
-			if err := r.cleanupAuthSecret(ctx, workflowJob); err != nil {
+			if err := r.cleanupWorkflowJobResources(ctx, workflowJob); err != nil {
 				return nil, err
 			}
 			if err := r.updateRunnerStatus(ctx, runnerObject, metav1.ConditionTrue, "Ready", "Runner is operational", nil); err != nil {
@@ -699,6 +699,10 @@ func (r *RunnerReconciler) executeWorkflowJob(ctx context.Context, runnerObject 
 			return false, fmt.Errorf("configure log archive for WorkflowJob %q: %w", workflowJob.Name, err)
 		}
 	}
+	if err := r.prepareWorkflowJobService(ctx, workflowJob, runnerObject); err != nil {
+		revokeInstallations()
+		return false, err
+	}
 	if err := r.ensureAuthSecret(ctx, workflowJob, jobInstallation.Token(), actionToken, artifactToken); err != nil {
 		revokeInstallations()
 		return false, err
@@ -857,7 +861,7 @@ func (r *RunnerReconciler) cancelWorkflowJob(ctx context.Context, workflowJob *a
 	}
 	err := r.completeAssignedWorkflowJob(ctx, workflowJob, actionsv1alpha1.WorkflowJobResultCancelled, cancellation.reason, cancellation.message)
 	if apierrors.IsNotFound(err) {
-		return r.cleanupAuthSecret(ctx, workflowJob)
+		return r.cleanupWorkflowJobResources(ctx, workflowJob)
 	}
 	return err
 }
@@ -900,6 +904,11 @@ func (r *RunnerReconciler) observeNativeJob(ctx context.Context, workflowJob *ac
 		if err := r.reconcileNativeJobDeadline(ctx, workflowJob, nativeJob, runnerStartTime); err != nil {
 			return true, false, err
 		}
+		if workflowJobCancellationCondition(workflowJob) == nil {
+			if err := r.reconcileWorkflowJobService(ctx, workflowJob); err != nil {
+				return true, false, err
+			}
+		}
 	}
 	var executionResult *runner.Result
 	var resultInvalid bool
@@ -914,7 +923,7 @@ func (r *RunnerReconciler) observeNativeJob(ctx context.Context, workflowJob *ac
 		return true, terminal, err
 	}
 	if terminal {
-		if err := r.cleanupAuthSecret(ctx, workflowJob); err != nil {
+		if err := r.cleanupWorkflowJobResources(ctx, workflowJob); err != nil {
 			return true, true, err
 		}
 	}
@@ -1202,6 +1211,7 @@ func (r *RunnerReconciler) buildJob(workflowJob *actionsv1alpha1.WorkflowJob, ru
 			Resources:                     runnerPodResources(runnerObject.Spec.Execution.Resources),
 			TerminationGracePeriodSeconds: terminationGracePeriodSeconds,
 			AutomountServiceAccountToken:  pointerTo(false),
+			EnableServiceLinks:            pointerTo(false),
 			ImagePullSecrets:              imagePullSecrets,
 			RestartPolicy:                 corev1.RestartPolicyNever,
 			SecurityContext: &corev1.PodSecurityContext{
@@ -1588,7 +1598,7 @@ func (r *RunnerReconciler) completeAssignedWorkflowJob(ctx context.Context, work
 			recordConditionWarning(r.Recorder, workflowJob, before.Conditions, workflowJob.Status.Conditions, actionsv1alpha1.WorkflowJobConditionSucceeded)
 		}
 	}
-	return r.cleanupAuthSecret(ctx, workflowJob)
+	return r.cleanupWorkflowJobResources(ctx, workflowJob)
 }
 
 func (r *RunnerReconciler) failQueuedWorkflowJob(ctx context.Context, workflowJob *actionsv1alpha1.WorkflowJob, reason, message string) error {

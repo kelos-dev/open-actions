@@ -75,8 +75,9 @@ spec:
                       execution:
                         description: |-
                           Execution describes the supported configuration of the environment used
-                          to execute assigned WorkflowJobs. The controller owns the underlying Pod
-                          and Job configuration. Changes apply only to Jobs created afterward.
+                          to execute assigned WorkflowJobs. The controller owns the generated
+                          resources. Pod settings apply to Jobs created afterward; Service settings
+                          are captured when execution is prepared.
                         properties:
                           docker:
                             description: |-
@@ -693,6 +694,80 @@ spec:
                             required:
                             - image
                             type: object
+                          service:
+                            description: |-
+                              Service exposes each assigned WorkflowJob through a separate Kubernetes
+                              Service. Omit it to disable exposure. Settings are captured when execution
+                              is prepared and do not change Services for jobs already being executed.
+                            properties:
+                              ports:
+                                description: |-
+                                  Ports maps Service ports to numeric ports on the workflow Pod. Kubernetes
+                                  allocates node ports automatically for NodePort and LoadBalancer Services.
+                                items:
+                                  description: RunnerServicePort maps one Service
+                                    port to a port on the workflow Pod.
+                                  properties:
+                                    name:
+                                      description: Name is the unique DNS label identifying
+                                        this port in the Service.
+                                      maxLength: 63
+                                      minLength: 1
+                                      pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
+                                      type: string
+                                    port:
+                                      description: Port is the port clients use to
+                                        reach the Service.
+                                      format: int32
+                                      maximum: 65535
+                                      minimum: 1
+                                      type: integer
+                                    protocol:
+                                      default: TCP
+                                      description: Protocol is the transport protocol
+                                        used by this port.
+                                      enum:
+                                      - TCP
+                                      - UDP
+                                      - SCTP
+                                      type: string
+                                    targetPort:
+                                      description: TargetPort is the numeric port
+                                        on the workflow Pod. Omit it to use Port.
+                                      format: int32
+                                      maximum: 65535
+                                      minimum: 1
+                                      type: integer
+                                  required:
+                                  - name
+                                  - port
+                                  type: object
+                                maxItems: 16
+                                minItems: 1
+                                type: array
+                                x-kubernetes-list-map-keys:
+                                - name
+                                x-kubernetes-list-type: map
+                              type:
+                                default: ClusterIP
+                                description: |-
+                                  Type is the Kubernetes Service type. ExternalName is not supported because
+                                  the Service must route traffic to the assigned WorkflowJob's Pod.
+                                enum:
+                                - ClusterIP
+                                - NodePort
+                                - LoadBalancer
+                                type: string
+                            required:
+                            - ports
+                            type: object
+                            x-kubernetes-validations:
+                            - message: service port and protocol combinations must
+                                be unique
+                              rule: 'self.ports.all(p, self.ports.filter(q, p.port
+                                == q.port && (has(p.protocol) ? p.protocol : ''TCP'')
+                                == (has(q.protocol) ? q.protocol : ''TCP'')).size()
+                                == 1)'
                           terminationGracePeriodSeconds:
                             description: |-
                               TerminationGracePeriodSeconds is how long Kubernetes waits for a workflow

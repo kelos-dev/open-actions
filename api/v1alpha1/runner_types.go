@@ -24,8 +24,9 @@ type RunnerSpec struct {
 	ProjectRef corev1.LocalObjectReference `json:"projectRef"`
 
 	// Execution describes the supported configuration of the environment used
-	// to execute assigned WorkflowJobs. The controller owns the underlying Pod
-	// and Job configuration. Changes apply only to Jobs created afterward.
+	// to execute assigned WorkflowJobs. The controller owns the generated
+	// resources. Pod settings apply to Jobs created afterward; Service settings
+	// are captured when execution is prepared.
 	// +required
 	Execution RunnerExecutionSpec `json:"execution"`
 
@@ -75,6 +76,61 @@ type RunnerExecutionSpec struct {
 	// privileged sidecar and is available to workflow steps through DOCKER_HOST.
 	// +optional
 	Docker *RunnerDockerSpec `json:"docker,omitempty"`
+
+	// Service exposes each assigned WorkflowJob through a separate Kubernetes
+	// Service. Omit it to disable exposure. Settings are captured when execution
+	// is prepared and do not change Services for jobs already being executed.
+	// +optional
+	Service *RunnerServiceSpec `json:"service,omitempty"`
+}
+
+// RunnerServiceSpec configures the Service created for one WorkflowJob.
+// The controller owns its name, namespace, selector, and owner reference.
+// +kubebuilder:validation:XValidation:rule="self.ports.all(p, self.ports.filter(q, p.port == q.port && (has(p.protocol) ? p.protocol : 'TCP') == (has(q.protocol) ? q.protocol : 'TCP')).size() == 1)",message="service port and protocol combinations must be unique"
+type RunnerServiceSpec struct {
+	// Type is the Kubernetes Service type. ExternalName is not supported because
+	// the Service must route traffic to the assigned WorkflowJob's Pod.
+	// +kubebuilder:default=ClusterIP
+	// +kubebuilder:validation:Enum=ClusterIP;NodePort;LoadBalancer
+	// +optional
+	Type corev1.ServiceType `json:"type,omitempty"`
+
+	// Ports maps Service ports to numeric ports on the workflow Pod. Kubernetes
+	// allocates node ports automatically for NodePort and LoadBalancer Services.
+	// +listType=map
+	// +listMapKey=name
+	// +kubebuilder:validation:MinItems=1
+	// +kubebuilder:validation:MaxItems=16
+	// +required
+	Ports []RunnerServicePort `json:"ports"`
+}
+
+// RunnerServicePort maps one Service port to a port on the workflow Pod.
+type RunnerServicePort struct {
+	// Name is the unique DNS label identifying this port in the Service.
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=63
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`
+	// +required
+	Name string `json:"name"`
+
+	// Port is the port clients use to reach the Service.
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=65535
+	// +required
+	Port int32 `json:"port"`
+
+	// TargetPort is the numeric port on the workflow Pod. Omit it to use Port.
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=65535
+	// +optional
+	TargetPort *int32 `json:"targetPort,omitempty"`
+
+	// Protocol is the transport protocol used by this port.
+	// +kubebuilder:default=TCP
+	// +kubebuilder:validation:Enum=TCP;UDP;SCTP
+	// +optional
+	Protocol corev1.Protocol `json:"protocol,omitempty"`
 }
 
 // RunnerContainerSpec describes the container that executes workflow steps.
