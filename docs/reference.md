@@ -739,9 +739,19 @@ Manage repository Secrets and variable ConfigMaps through Kubernetes.
 
 Secret values never enter job-plan ConfigMaps, custom-resource specs or status,
 controller logs, or Console records. The runner marks values derived from the
-`secrets` context as sensitive and masks configured secrets in raw, standard
-and unpadded Base64, JSON-string, percent-encoded, XML-escaped, and common
-shell-escaped forms. Secrets named `ACTIONS_STEP_DEBUG` or
+`secrets` context as sensitive. Before executing the job, it registers Project
+secrets referenced by the job's expressions for masking, including references
+in skipped steps and unevaluated branches. Static names such as `secrets.NAME`
+and `secrets['NAME']` select individual values. Dynamic indexing, `secrets.*`,
+and whole-context reads such as `toJSON(secrets)` register all Project secrets.
+Registered secrets remain masked throughout the job in raw, standard and
+unpadded Base64, JSON-string, percent-encoded, XML-escaped, and common
+shell-escaped forms. Unreferenced Project secrets do not mask workflow logs or
+suppress job outputs unless the job uses dynamic indexing or whole-context
+access. Runner credentials are always masked, and `::add-mask::` registers
+additional values for the rest of the job. This follows GitHub's
+[job-scoped secret redaction](https://docs.github.com/en/actions/concepts/security/secrets#automatically-redacted-secrets).
+Secrets named `ACTIONS_STEP_DEBUG` or
 `ACTIONS_RUNNER_DEBUG` are exempt from masking, matched without regard to case,
 to match GitHub's debug-secret whitelist; their values can therefore appear in
 logs and outputs. Project variables are non-sensitive and are not masked.
