@@ -249,12 +249,6 @@ func NewExecutor(config ExecutorConfig) (*Executor, error) {
 	if config.ArtifactToken != "" {
 		addCredentialMasks(masker, config.ArtifactToken)
 	}
-	for name, secret := range config.Secrets {
-		if strings.EqualFold(name, actionsStepDebugName) || strings.EqualFold(name, actionsRunnerDebugName) {
-			continue
-		}
-		masker.addSecret(secret)
-	}
 	return &Executor{
 		logger:      config.Logger.With(runnerLogMarker, true),
 		runnerName:  config.RunnerName,
@@ -427,6 +421,9 @@ func (e *Executor) ExecuteResult(ctx context.Context, plan *Plan, workspace stri
 func (e *Executor) executePlan(ctx context.Context, plan *Plan, workspace string, cleanupTimeout time.Duration) (Result, error) {
 	resultVersion := resultVersionForPlan(plan.Version)
 	emptyResult := Result{Version: resultVersion, Conclusion: failureConclusion(resultVersion)}
+	if err := e.registerJobSecretMasks(plan); err != nil {
+		return emptyResult, err
+	}
 	contexts := newExecutionContexts(ctx, cleanupTimeout)
 	defer contexts.close()
 	if err := os.MkdirAll(workspace, 0o755); err != nil {

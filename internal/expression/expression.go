@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"sort"
 	"strconv"
 	"strings"
 )
@@ -205,6 +206,61 @@ func (p *Program) UsesContext(name string) bool {
 		}
 	}
 	return false
+}
+
+// ContextReferences returns sorted, uppercase names of directly referenced
+// context properties, including references in unevaluated branches. all is
+// true when a reference uses the whole context or a nonliteral index.
+func (p *Program) ContextReferences(name string) (properties []string, all bool) {
+	names := map[string]struct{}{}
+	var visit func(node)
+	isContext := func(input node) bool {
+		context, ok := input.(contextNode)
+		return ok && strings.EqualFold(context.name, name)
+	}
+	visit = func(input node) {
+		switch typed := input.(type) {
+		case contextNode:
+			all = all || isContext(typed)
+		case propertyNode:
+			if isContext(typed.target) {
+				names[strings.ToUpper(typed.name)] = struct{}{}
+			} else {
+				visit(typed.target)
+			}
+		case indexNode:
+			if isContext(typed.target) {
+				if literal, ok := typed.index.(literalNode); ok && literal.value.kind == stringKind {
+					names[strings.ToUpper(literal.value.text)] = struct{}{}
+				} else {
+					all = true
+				}
+			} else {
+				visit(typed.target)
+			}
+			visit(typed.index)
+		case unaryNode:
+			visit(typed.operand)
+		case binaryNode:
+			visit(typed.left)
+			visit(typed.right)
+		case callNode:
+			for _, argument := range typed.arguments {
+				visit(argument)
+			}
+		}
+	}
+	for _, item := range p.segments {
+		visit(item.expression)
+	}
+	if all {
+		return nil, true
+	}
+	for property := range names {
+		properties = append(properties, property)
+	}
+	sort.Strings(properties)
+	return properties, false
 }
 
 func usesContext(input node, name string) bool {
